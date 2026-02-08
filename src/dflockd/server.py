@@ -29,14 +29,16 @@ READ_TIMEOUT_S = getenv_int("DFLOCKD_READ_TIMEOUT_S", 23)
 
 # ---- Lease / GC tuning ----
 DEFAULT_LEASE_TTL_S = getenv_int(
-    "DEFAULT_LEASE_TTL_S", 33
+    "DFLOCKD_DEFAULT_LEASE_TTL_S", 33
 )  # default lock lease duration
 LEASE_SWEEP_INTERVAL_S = getenv_int(
-    "LEASE_SWEEP_INTERVAL_S", 1
+    "DFLOCKD_LEASE_SWEEP_INTERVAL_S", 1
 )  # how often to expire leases
-GC_LOOP_SLEEP = getenv_int("GC_LOOP_SLEEP", 5)  # how often to prune unused lock states
+GC_LOOP_SLEEP = getenv_int(
+    "DFLOCKD_GC_LOOP_SLEEP", 5
+)  # how often to prune unused lock states
 GC_MAX_UNUSED_TIME = getenv_int(
-    "GC_MAX_UNUSED_TIME", 60
+    "DFLOCKD_GC_MAX_UNUSED_TIME", 60
 )  # idle seconds before deleting unused lock state
 #
 # ---- Behavior toggles ----
@@ -45,11 +47,11 @@ AUTO_RELEASE_ON_DISCONNECT = os.environ.get(
     "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "1"
 ).lower() in ("1", "yes", "true")
 MAX_LOCKS = getenv_int(
-    "MAX_LOCKS", 1024
+    "DFLOCKD_MAX_LOCKS", 1024
 )  # maximum number of unique locks to track (per Request.key)
 
 # ---------------------------
-log = logging.getLogger("distlockd-server")
+log = logging.getLogger("dflockd")
 tracking_lock = asyncio.Lock()
 
 
@@ -585,12 +587,54 @@ async def main() -> None:
 _CLI_CONFIG = [
     ("--host", "DFLOCKD_HOST", "HOST", str, "0.0.0.0", "Bind address"),
     ("--port", "DFLOCKD_PORT", "PORT", int, 6388, "Bind port"),
-    ("--default-lease-ttl", "DEFAULT_LEASE_TTL_S", "DEFAULT_LEASE_TTL_S", int, 33, "Default lock lease duration (seconds)"),
-    ("--lease-sweep-interval", "LEASE_SWEEP_INTERVAL_S", "LEASE_SWEEP_INTERVAL_S", int, 1, "Lease expiry check interval (seconds)"),
-    ("--gc-interval", "GC_LOOP_SLEEP", "GC_LOOP_SLEEP", int, 5, "Lock state GC interval (seconds)"),
-    ("--gc-max-idle", "GC_MAX_UNUSED_TIME", "GC_MAX_UNUSED_TIME", int, 60, "Idle seconds before pruning lock state"),
-    ("--max-locks", "MAX_LOCKS", "MAX_LOCKS", int, 1024, "Maximum number of unique lock keys"),
-    ("--read-timeout", "DFLOCKD_READ_TIMEOUT_S", "READ_TIMEOUT_S", int, 23, "Client read timeout (seconds)"),
+    (
+        "--default-lease-ttl",
+        "DEFAULT_LEASE_TTL_S",
+        "DEFAULT_LEASE_TTL_S",
+        int,
+        33,
+        "Default lock lease duration (seconds)",
+    ),
+    (
+        "--lease-sweep-interval",
+        "LEASE_SWEEP_INTERVAL_S",
+        "LEASE_SWEEP_INTERVAL_S",
+        int,
+        1,
+        "Lease expiry check interval (seconds)",
+    ),
+    (
+        "--gc-interval",
+        "GC_LOOP_SLEEP",
+        "GC_LOOP_SLEEP",
+        int,
+        5,
+        "Lock state GC interval (seconds)",
+    ),
+    (
+        "--gc-max-idle",
+        "GC_MAX_UNUSED_TIME",
+        "GC_MAX_UNUSED_TIME",
+        int,
+        60,
+        "Idle seconds before pruning lock state",
+    ),
+    (
+        "--max-locks",
+        "MAX_LOCKS",
+        "MAX_LOCKS",
+        int,
+        1024,
+        "Maximum number of unique lock keys",
+    ),
+    (
+        "--read-timeout",
+        "DFLOCKD_READ_TIMEOUT_S",
+        "READ_TIMEOUT_S",
+        int,
+        23,
+        "Client read timeout (seconds)",
+    ),
 ]
 
 

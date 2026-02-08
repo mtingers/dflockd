@@ -40,12 +40,12 @@ uv run dflockd --port 7000 --max-locks 512
 |---|---|---|
 | `--host` | `0.0.0.0` | `DFLOCKD_HOST` |
 | `--port` | `6388` | `DFLOCKD_PORT` |
-| `--default-lease-ttl` | `33` | `DEFAULT_LEASE_TTL_S` |
-| `--lease-sweep-interval` | `1` | `LEASE_SWEEP_INTERVAL_S` |
-| `--gc-interval` | `5` | `GC_LOOP_SLEEP` |
-| `--gc-max-idle` | `60` | `GC_MAX_UNUSED_TIME` |
-| `--max-locks` | `1024` | `MAX_LOCKS` |
-| `--read-timeout` | `23` | `DFLOCKD_READ_TIMEOUT_S` |
+| `--default-lease-ttl` | `33` | `DFLOCKD_DEFAULT_LEASE_TTL_S` |
+| `--lease-sweep-interval` | `1` | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` |
+| `--gc-interval` | `5` | `DFLOCKD_GC_LOOP_SLEEP` |
+| `--gc-max-idle` | `60` | `DFLOCKD_GC_MAX_UNUSED_TIME` |
+| `--max-locks` | `1024` | `DFLOCKD_MAX_LOCKS` |
+| `--read-timeout` | `23` | `DFLOCKD_DFLOCKD_READ_TIMEOUT_S` |
 
 ## Protocol
 
