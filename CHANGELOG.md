@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.1] - 2026-02-07
+
+### Added
+
+- `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` CLI flag
+
+### Fixed
+
+- `DFLOCKD_DFLOCKD_READ_TIMEOUT_S` env var typo in README (now `DFLOCKD_READ_TIMEOUT_S`)
+- Server configuration env var names in README missing `DFLOCKD_` prefix
+- `MAX_LOCKS` default in README corrected from `256` to `1024`
+
+[v0.4.1]: https://github.com/mtingers/dflockd/releases/tag/v0.4.1
+
 ## [v0.4.0] - 2026-02-07
 
 ### Added
