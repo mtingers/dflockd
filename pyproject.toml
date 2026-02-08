@@ -19,10 +19,10 @@ dflockd = "dflockd.server:cli"
 asyncio_mode = "auto"
 
 [project.optional-dependencies]
-dev = ["pytest-asyncio>=1.3.0", "pytest-cov>=7.0.0"]
+dev = ["pytest-asyncio>=1.3.0", "pytest-cov>=7.0.0", "pyright>=1.1"]
 
 [dependency-groups]
-dev = ["pytest-asyncio>=1.3.0", "pytest-cov>=7.0.0"]
+dev = ["pytest-asyncio>=1.3.0", "pytest-cov>=7.0.0", "pyright>=1.1"]
 docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
 [project.urls]
 Homepage = "https://github.com/mtingers/kompoz"
