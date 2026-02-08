@@ -40,6 +40,7 @@ All settings can be configured via environment variables. Environment variables 
 | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle lock state is pruned |
 | `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
+| `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects |
 
 ```bash
 # Example: configure via environment
@@ -68,3 +69,17 @@ Idle lock state (no owner, no waiters) is pruned after `gc-max-idle` seconds. Th
 ### Read timeout
 
 The `read-timeout` controls how long the server waits for a client to send a complete request line. Idle connections that send no data within this window are disconnected. This prevents resource exhaustion from abandoned connections.
+
+### Auto release on disconnect
+
+When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), the server automatically releases any locks held by a client when its TCP connection closes — whether gracefully or due to a crash. Pending waiters from that connection are also cancelled. The released lock is transferred to the next FIFO waiter, if any.
+
+Accepts `1`, `yes`, or `true` (case-insensitive) to enable; any other value disables it.
+
+```bash
+# Disable auto-release (locks persist until lease expiry)
+export DFLOCKD_AUTO_RELEASE_ON_DISCONNECT=0
+```
+
+!!! warning
+    Disabling this means locks from disconnected clients will only be freed when their lease expires. This increases the window where a lock is held by a dead client.

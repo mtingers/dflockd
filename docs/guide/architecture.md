@@ -60,11 +60,13 @@ This prevents unbounded memory growth from transient keys.
 
 ## Connection cleanup
 
-When a TCP connection closes (graceful or abrupt), the server:
+When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), the server performs cleanup when a TCP connection closes (graceful or abrupt):
 
 1. Cancels any pending waiter futures belonging to that connection.
 2. Releases any locks held by that connection.
 3. Transfers released locks to the next FIFO waiter, if any.
+
+If disabled, locks from disconnected clients are only freed when their lease expires.
 
 ## Concurrency model
 
