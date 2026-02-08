@@ -30,7 +30,17 @@ docs-serve: ## Serve documentation locally
 docs-build: ## Build documentation site
 	uv run --group docs mkdocs build --strict
 
-build-publish: ## Build new version and publish to pypi
+build-publish: ## Build new minor version and publish to pypi
 	uv version --bump minor
+	uv build
+	uv publish
+
+build-publish-patch: ## Build new version, bump patchlevel, and publish to pypi
+	uv version --bump patch
+	uv build
+	uv publish
+
+build-publish-major: ## Build new major version and publish to pypi
+	uv version --bump major
 	uv build
 	uv publish
