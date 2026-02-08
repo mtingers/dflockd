@@ -1,6 +1,6 @@
 [project]
 name = "dflockd"
-version = "0.1.0"
+version = "0.3.0"
 description = "A lightweight distributed lock server using a simple line-based TCP protocol with FIFO ordering, automatic lease expiry, and background renewal."
 readme = "README.md"
 license = "MIT"
