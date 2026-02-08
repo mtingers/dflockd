@@ -1,6 +1,24 @@
 # dflockd
 
+<!--toc:start-->
+- [dflockd](#dflockd)
+  - [Quick start](#quick-start)
+  - [Server configuration](#server-configuration)
+  - [CLI arguments](#cli-arguments)
+  - [Protocol](#protocol)
+    - [Commands](#commands)
+    - [Behavior](#behavior)
+  - [Client usage](#client-usage)
+    - [Async client](#async-client)
+    - [Sync client](#sync-client)
+    - [Manual acquire/release](#manual-acquirerelease)
+    - [Parameters](#parameters)
+  - [Multi-server sharding](#multi-server-sharding)
+<!--toc:end-->
+
 A lightweight distributed lock server using a simple line-based TCP protocol with FIFO ordering, automatic lease expiry, and background renewal.
+
+[Read the docs here](https://mtingers.github.io/dflockd/)
 
 ## Quick start
 
@@ -18,15 +36,15 @@ The server listens on `0.0.0.0:6388` by default.
 
 All tuning is via environment variables:
 
-| Variable | Default | Description |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `6388` | Bind port |
-| `DEFAULT_LEASE_TTL_S` | `33` | Default lock lease duration (seconds) |
-| `LEASE_SWEEP_INTERVAL_S` | `1` | How often to check for expired leases |
-| `GC_LOOP_SLEEP` | `5` | How often to prune idle lock state |
-| `GC_MAX_UNUSED_TIME` | `60` | Seconds before idle lock state is pruned |
-| `MAX_LOCKS` | `256` | Maximum number of unique lock keys |
+| Variable                 | Default   | Description                              |
+| ------------------------ | --------- | ---------------------------------------- |
+| `HOST`                   | `0.0.0.0` | Bind address                             |
+| `PORT`                   | `6388`    | Bind port                                |
+| `DEFAULT_LEASE_TTL_S`    | `33`      | Default lock lease duration (seconds)    |
+| `LEASE_SWEEP_INTERVAL_S` | `1`       | How often to check for expired leases    |
+| `GC_LOOP_SLEEP`          | `5`       | How often to prune idle lock state       |
+| `GC_MAX_UNUSED_TIME`     | `60`      | Seconds before idle lock state is pruned |
+| `MAX_LOCKS`              | `256`     | Maximum number of unique lock keys       |
 
 ## CLI arguments
 
@@ -36,16 +54,16 @@ Settings can also be passed as command-line flags. Environment variables take pr
 uv run dflockd --port 7000 --max-locks 512
 ```
 
-| Flag | Default | Env var override |
-|---|---|---|
-| `--host` | `0.0.0.0` | `DFLOCKD_HOST` |
-| `--port` | `6388` | `DFLOCKD_PORT` |
-| `--default-lease-ttl` | `33` | `DFLOCKD_DEFAULT_LEASE_TTL_S` |
-| `--lease-sweep-interval` | `1` | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` |
-| `--gc-interval` | `5` | `DFLOCKD_GC_LOOP_SLEEP` |
-| `--gc-max-idle` | `60` | `DFLOCKD_GC_MAX_UNUSED_TIME` |
-| `--max-locks` | `1024` | `DFLOCKD_MAX_LOCKS` |
-| `--read-timeout` | `23` | `DFLOCKD_DFLOCKD_READ_TIMEOUT_S` |
+| Flag                     | Default   | Env var override                 |
+| ------------------------ | --------- | -------------------------------- |
+| `--host`                 | `0.0.0.0` | `DFLOCKD_HOST`                   |
+| `--port`                 | `6388`    | `DFLOCKD_PORT`                   |
+| `--default-lease-ttl`    | `33`      | `DFLOCKD_DEFAULT_LEASE_TTL_S`    |
+| `--lease-sweep-interval` | `1`       | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` |
+| `--gc-interval`          | `5`       | `DFLOCKD_GC_LOOP_SLEEP`          |
+| `--gc-max-idle`          | `60`      | `DFLOCKD_GC_MAX_UNUSED_TIME`     |
+| `--max-locks`            | `1024`    | `DFLOCKD_MAX_LOCKS`              |
+| `--read-timeout`         | `23`      | `DFLOCKD_DFLOCKD_READ_TIMEOUT_S` |
 
 ## Protocol
 
@@ -54,27 +72,33 @@ The wire protocol is line-based UTF-8 over TCP. Each request is exactly 3 lines:
 ### Commands
 
 **Lock (acquire)**
+
 ```
 l
 <key>
 <timeout_s> [<lease_ttl_s>]
 ```
+
 Response: `ok <token> <lease_ttl>\n` or `timeout\n`
 
 **Renew**
+
 ```
 n
 <key>
 <token> [<lease_ttl_s>]
 ```
+
 Response: `ok <seconds_remaining>\n` or `error\n`
 
 **Release**
+
 ```
 r
 <key>
 <token>
 ```
+
 Response: `ok\n` or `error\n`
 
 ### Behavior
@@ -126,14 +150,14 @@ if lock.acquire():
 
 ### Parameters
 
-| Parameter | Default | Description |
-|---|---|---|
-| `key` | *(required)* | Lock name |
-| `acquire_timeout_s` | `10` | Seconds to wait for lock acquisition |
-| `lease_ttl_s` | `None` (server default) | Lease duration in seconds |
-| `servers` | `[("127.0.0.1", 6388)]` | List of `(host, port)` tuples |
-| `sharding_strategy` | `stable_hash_shard` | `Callable[[str, int], int]` — maps `(key, num_servers)` to server index |
-| `renew_ratio` | `0.5` | Renew at `lease * ratio` seconds |
+| Parameter           | Default                 | Description                                                             |
+| ------------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `key`               | _(required)_            | Lock name                                                               |
+| `acquire_timeout_s` | `10`                    | Seconds to wait for lock acquisition                                    |
+| `lease_ttl_s`       | `None` (server default) | Lease duration in seconds                                               |
+| `servers`           | `[("127.0.0.1", 6388)]` | List of `(host, port)` tuples                                           |
+| `sharding_strategy` | `stable_hash_shard`     | `Callable[[str, int], int]` — maps `(key, num_servers)` to server index |
+| `renew_ratio`       | `0.5`                   | Renew at `lease * ratio` seconds                                        |
 
 ## Multi-server sharding
 
