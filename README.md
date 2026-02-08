@@ -36,15 +36,17 @@ The server listens on `0.0.0.0:6388` by default.
 
 All tuning is via environment variables:
 
-| Variable                 | Default   | Description                              |
-| ------------------------ | --------- | ---------------------------------------- |
-| `HOST`                   | `0.0.0.0` | Bind address                             |
-| `PORT`                   | `6388`    | Bind port                                |
-| `DEFAULT_LEASE_TTL_S`    | `33`      | Default lock lease duration (seconds)    |
-| `LEASE_SWEEP_INTERVAL_S` | `1`       | How often to check for expired leases    |
-| `GC_LOOP_SLEEP`          | `5`       | How often to prune idle lock state       |
-| `GC_MAX_UNUSED_TIME`     | `60`      | Seconds before idle lock state is pruned |
-| `MAX_LOCKS`              | `256`     | Maximum number of unique lock keys       |
+| Variable | Default | Description |
+|---|---|---|
+| `DFLOCKD_HOST` | `0.0.0.0` | Bind address |
+| `DFLOCKD_PORT` | `6388` | Bind port |
+| `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lock lease duration (seconds) |
+| `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | How often to check for expired leases |
+| `DFLOCKD_GC_LOOP_SLEEP` | `5` | How often to prune idle lock state |
+| `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle lock state is pruned |
+| `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
+| `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
+| `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects (`1`, `yes`, `true` to enable) |
 
 ## CLI arguments
 
@@ -63,7 +65,8 @@ uv run dflockd --port 7000 --max-locks 512
 | `--gc-interval`          | `5`       | `DFLOCKD_GC_LOOP_SLEEP`          |
 | `--gc-max-idle`          | `60`      | `DFLOCKD_GC_MAX_UNUSED_TIME`     |
 | `--max-locks`            | `1024`    | `DFLOCKD_MAX_LOCKS`              |
-| `--read-timeout`         | `23`      | `DFLOCKD_DFLOCKD_READ_TIMEOUT_S` |
+| `--read-timeout`         | `23`      | `DFLOCKD_READ_TIMEOUT_S`         |
+| `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` |
 
 ## Protocol
 

@@ -903,6 +903,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#auto-release-on-disconnect" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Auto release on disconnect
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1296,6 +1307,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#auto-release-on-disconnect" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Auto release on disconnect
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1382,6 +1404,11 @@
 <td><code>23</code></td>
 <td>Client read timeout (seconds)</td>
 </tr>
+<tr>
+<td><code>--auto-release-on-disconnect</code> / <code>--no-auto-release-on-disconnect</code></td>
+<td><code>true</code></td>
+<td>Release locks when a client disconnects</td>
+</tr>
 </tbody>
 </table>
 <h2 id="environment-variables">Environment variables<a class="headerlink" href="#environment-variables" title="Permanent link">&para;</a></h2>
@@ -1435,6 +1462,11 @@
 <td><code>23</code></td>
 <td>Client read timeout (seconds)</td>
 </tr>
+<tr>
+<td><code>DFLOCKD_AUTO_RELEASE_ON_DISCONNECT</code></td>
+<td><code>1</code></td>
+<td>Release locks when a client disconnects</td>
+</tr>
 </tbody>
 </table>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Example: configure via environment</span>
@@ -1455,6 +1487,16 @@
 <p>Idle lock state (no owner, no waiters) is pruned after <code>gc-max-idle</code> seconds. The GC runs every <code>gc-interval</code> seconds. For workloads with many transient keys, lower <code>gc-max-idle</code> to reclaim memory faster.</p>
 <h3 id="read-timeout">Read timeout<a class="headerlink" href="#read-timeout" title="Permanent link">&para;</a></h3>
 <p>The <code>read-timeout</code> controls how long the server waits for a client to send a complete request line. Idle connections that send no data within this window are disconnected. This prevents resource exhaustion from abandoned connections.</p>
+<h3 id="auto-release-on-disconnect">Auto release on disconnect<a class="headerlink" href="#auto-release-on-disconnect" title="Permanent link">&para;</a></h3>
+<p>When <code>DFLOCKD_AUTO_RELEASE_ON_DISCONNECT</code> is enabled (the default), the server automatically releases any locks held by a client when its TCP connection closes — whether gracefully or due to a crash. Pending waiters from that connection are also cancelled. The released lock is transferred to the next FIFO waiter, if any.</p>
+<p>Accepts <code>1</code>, <code>yes</code>, or <code>true</code> (case-insensitive) to enable; any other value disables it.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Disable auto-release (locks persist until lease expiry)</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">DFLOCKD_AUTO_RELEASE_ON_DISCONNECT</span><span class="o">=</span><span class="m">0</span>
+</code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Disabling this means locks from disconnected clients will only be freed when their lease expires. This increases the window where a lock is held by a dead client.</p>
+</div>
 
 
 

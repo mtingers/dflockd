@@ -635,16 +635,30 @@ _CLI_CONFIG = [
         23,
         "Client read timeout (seconds)",
     ),
+    (
+        "--auto-release-on-disconnect",
+        "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT",
+        "AUTO_RELEASE_ON_DISCONNECT",
+        bool,
+        True,
+        "Release locks when a client disconnects",
+    ),
 ]
 
 
 def cli():
     global HOST, PORT, DEFAULT_LEASE_TTL_S, LEASE_SWEEP_INTERVAL_S
     global GC_LOOP_SLEEP, GC_MAX_UNUSED_TIME, MAX_LOCKS, READ_TIMEOUT_S
+    global AUTO_RELEASE_ON_DISCONNECT
 
     parser = argparse.ArgumentParser(description="dflockd — distributed lock server")
     for flag, _env, _glob, typ, default, helptext in _CLI_CONFIG:
-        parser.add_argument(flag, type=typ, default=default, help=helptext)
+        if typ is bool:
+            parser.add_argument(
+                flag, action=argparse.BooleanOptionalAction, default=default, help=helptext,
+            )
+        else:
+            parser.add_argument(flag, type=typ, default=default, help=helptext)
     args = parser.parse_args()
 
     for flag, env_var, global_name, *_ in _CLI_CONFIG:

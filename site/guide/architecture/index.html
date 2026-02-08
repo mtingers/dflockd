@@ -1374,12 +1374,13 @@
 </ul>
 <p>This prevents unbounded memory growth from transient keys.</p>
 <h2 id="connection-cleanup">Connection cleanup<a class="headerlink" href="#connection-cleanup" title="Permanent link">&para;</a></h2>
-<p>When a TCP connection closes (graceful or abrupt), the server:</p>
+<p>When <code>DFLOCKD_AUTO_RELEASE_ON_DISCONNECT</code> is enabled (the default), the server performs cleanup when a TCP connection closes (graceful or abrupt):</p>
 <ol>
 <li>Cancels any pending waiter futures belonging to that connection.</li>
 <li>Releases any locks held by that connection.</li>
 <li>Transfers released locks to the next FIFO waiter, if any.</li>
 </ol>
+<p>If disabled, locks from disconnected clients are only freed when their lease expires.</p>
 <h2 id="concurrency-model">Concurrency model<a class="headerlink" href="#concurrency-model" title="Permanent link">&para;</a></h2>
 <p>All lock state mutations are serialized through a single <code>asyncio.Lock</code> (<code>tracking_lock</code>). This ensures consistency without complex fine-grained locking, while asyncio's cooperative scheduling keeps throughput high for the I/O-bound workload.</p>
 

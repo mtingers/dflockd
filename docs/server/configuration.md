@@ -25,6 +25,7 @@ dflockd --host 127.0.0.1 --port 7000 --max-locks 512
 | `--gc-max-idle` | `60` | Seconds before idle lock state is pruned |
 | `--max-locks` | `1024` | Maximum number of unique lock keys |
 | `--read-timeout` | `23` | Client read timeout (seconds) |
+| `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
 
 ## Environment variables
 
