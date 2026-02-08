@@ -21,7 +21,11 @@ def _readline(rfile: io.TextIOWrapper) -> str:
 
 
 def acquire(
-    sock: socket.socket, rfile: io.TextIOWrapper, key: str, acquire_timeout_s: int, lease_ttl_s: int | None = None
+    sock: socket.socket,
+    rfile: io.TextIOWrapper,
+    key: str,
+    acquire_timeout_s: int,
+    lease_ttl_s: int | None = None,
 ) -> tuple[str, int]:
     arg = (
         str(acquire_timeout_s)
@@ -46,7 +50,11 @@ def acquire(
 
 
 def renew(
-    sock: socket.socket, rfile: io.TextIOWrapper, key: str, token: str, lease_ttl_s: int | None = None
+    sock: socket.socket,
+    rfile: io.TextIOWrapper,
+    key: str,
+    token: str,
+    lease_ttl_s: int | None = None,
 ) -> int:
     arg = token if lease_ttl_s is None else f"{token} {lease_ttl_s}"
     sock.sendall(_encode_lines("n", key, arg))
@@ -74,7 +82,9 @@ class DistributedLock:
     key: str
     acquire_timeout_s: int = 10
     lease_ttl_s: int | None = None
-    servers: list[tuple[str, int]] = field(default_factory=lambda: list(DEFAULT_SERVERS))
+    servers: list[tuple[str, int]] = field(
+        default_factory=lambda: list(DEFAULT_SERVERS)
+    )
     sharding_strategy: ShardingStrategy = stable_hash_shard
     renew_ratio: float = 0.5
 
@@ -102,9 +112,7 @@ class DistributedLock:
         self._rfile = self._sock.makefile("r", encoding="utf-8")
 
     def _start_renew(self):
-        self._renew_thread = threading.Thread(
-            target=self._renew_loop, daemon=True
-        )
+        self._renew_thread = threading.Thread(target=self._renew_loop, daemon=True)
         self._renew_thread.start()
 
     def _stop_renew(self):
@@ -119,7 +127,11 @@ class DistributedLock:
         assert sock is not None and rfile is not None
         try:
             self.token, self.lease = acquire(
-                sock, rfile, self.key, self.acquire_timeout_s, self.lease_ttl_s,
+                sock,
+                rfile,
+                self.key,
+                self.acquire_timeout_s,
+                self.lease_ttl_s,
             )
         except TimeoutError:
             self.close()
@@ -146,7 +158,11 @@ class DistributedLock:
         assert sock is not None and rfile is not None
         try:
             self.token, self.lease = acquire(
-                sock, rfile, self.key, self.acquire_timeout_s, self.lease_ttl_s,
+                sock,
+                rfile,
+                self.key,
+                self.acquire_timeout_s,
+                self.lease_ttl_s,
             )
         except BaseException:
             self.close()

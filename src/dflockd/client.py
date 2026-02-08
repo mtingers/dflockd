@@ -20,8 +20,11 @@ async def _readline(reader: asyncio.StreamReader) -> str:
 
 
 async def acquire(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-    key: str, acquire_timeout_s: int, lease_ttl_s: int | None = None,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    key: str,
+    acquire_timeout_s: int,
+    lease_ttl_s: int | None = None,
 ) -> tuple[str, int]:
     # l\nkey\n"<timeout> [<lease>]"\n
     arg = (
@@ -49,8 +52,11 @@ async def acquire(
 
 
 async def renew(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-    key: str, token: str, lease_ttl_s: int | None = None,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    key: str,
+    token: str,
+    lease_ttl_s: int | None = None,
 ) -> int:
     # n\nkey\n"<token> [<lease>]"\n
     arg = token if lease_ttl_s is None else f"{token} {lease_ttl_s}"
@@ -68,7 +74,9 @@ async def renew(
     return -1
 
 
-async def release(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, key: str, token: str) -> None:
+async def release(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, key: str, token: str
+) -> None:
     writer.write(_encode_lines("r", key, token))
     await writer.drain()
 
@@ -82,7 +90,9 @@ class DistributedLock:
     key: str
     acquire_timeout_s: int = 10
     lease_ttl_s: int | None = None  # if None, server default
-    servers: list[tuple[str, int]] = field(default_factory=lambda: list(DEFAULT_SERVERS))
+    servers: list[tuple[str, int]] = field(
+        default_factory=lambda: list(DEFAULT_SERVERS)
+    )
     sharding_strategy: ShardingStrategy = stable_hash_shard
     renew_ratio: float = 0.5  # renew at lease * ratio
 

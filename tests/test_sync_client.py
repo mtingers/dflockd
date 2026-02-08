@@ -132,6 +132,7 @@ class TestAcquireRelease:
 
     async def test_acquire_timeout(self, server_port):
         """Second acquire on same key with timeout=0 should raise TimeoutError."""
+
         def _work():
             s1, r1 = _connect(server_port)
             s2, r2 = _connect(server_port)
@@ -170,6 +171,7 @@ class TestAcquireRelease:
 
     async def test_multiple_keys(self, server_port):
         """Acquire different keys on the same connection sequentially."""
+
         def _work():
             sock, rfile = _connect(server_port)
             try:
@@ -241,7 +243,9 @@ class TestRenew:
 class TestDistributedLockContextManager:
     async def test_basic_lifecycle(self, server_port):
         def _work():
-            lock = sc.DistributedLock(key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)])
+            lock = sc.DistributedLock(
+                key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)]
+            )
             with lock as lk:
                 assert lk is lock
                 assert lk.token is not None
@@ -254,7 +258,10 @@ class TestDistributedLockContextManager:
     async def test_custom_lease(self, server_port):
         def _work():
             lock = sc.DistributedLock(
-                key="k1", acquire_timeout_s=5, lease_ttl_s=15, servers=[("127.0.0.1", server_port)],
+                key="k1",
+                acquire_timeout_s=5,
+                lease_ttl_s=15,
+                servers=[("127.0.0.1", server_port)],
             )
             with lock:
                 assert lock.lease == 15
@@ -263,8 +270,11 @@ class TestDistributedLockContextManager:
 
     async def test_exception_inside_context(self, server_port):
         """Lock is released even if an exception is raised inside the block."""
+
         def _work():
-            lock = sc.DistributedLock(key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)])
+            lock = sc.DistributedLock(
+                key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)]
+            )
             with pytest.raises(ValueError, match="boom"):
                 with lock:
                     assert lock.token is not None
@@ -276,8 +286,11 @@ class TestDistributedLockContextManager:
 
     async def test_reuse_after_exit(self, server_port):
         """A lock object can be used again after exiting its context."""
+
         def _work():
-            lock = sc.DistributedLock(key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)])
+            lock = sc.DistributedLock(
+                key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)]
+            )
             with lock:
                 token1 = lock.token
             with lock:
@@ -295,7 +308,9 @@ class TestDistributedLockContextManager:
 class TestDistributedLockMethods:
     async def test_acquire_release(self, server_port):
         def _work():
-            lock = sc.DistributedLock(key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)])
+            lock = sc.DistributedLock(
+                key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)]
+            )
             ok = lock.acquire()
             assert ok is True
             assert lock.token is not None
@@ -308,10 +323,16 @@ class TestDistributedLockMethods:
     async def test_acquire_timeout_returns_false(self, server_port):
         def _work():
             lock1 = sc.DistributedLock(
-                key="k1", acquire_timeout_s=5, lease_ttl_s=30, servers=[("127.0.0.1", server_port)],
+                key="k1",
+                acquire_timeout_s=5,
+                lease_ttl_s=30,
+                servers=[("127.0.0.1", server_port)],
             )
             lock2 = sc.DistributedLock(
-                key="k1", acquire_timeout_s=0, lease_ttl_s=30, servers=[("127.0.0.1", server_port)],
+                key="k1",
+                acquire_timeout_s=0,
+                lease_ttl_s=30,
+                servers=[("127.0.0.1", server_port)],
             )
             lock1.acquire()
             try:
@@ -325,8 +346,11 @@ class TestDistributedLockMethods:
 
     async def test_close_after_acquire(self, server_port):
         """Calling close() directly (without release) still cleans up."""
+
         def _work():
-            lock = sc.DistributedLock(key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)])
+            lock = sc.DistributedLock(
+                key="k1", acquire_timeout_s=5, servers=[("127.0.0.1", server_port)]
+            )
             lock.acquire()
             assert lock.token is not None
             lock.close()
@@ -348,6 +372,7 @@ class TestRenewLoop:
         old_sweep = srv.LEASE_SWEEP_INTERVAL_S
         srv.LEASE_SWEEP_INTERVAL_S = 0.2
         try:
+
             def _work():
                 lock = sc.DistributedLock(
                     key="k1",
@@ -368,10 +393,14 @@ class TestRenewLoop:
 
     async def test_renew_stops_on_release(self, server_port):
         """After release(), the renew thread should be stopped."""
+
         def _work():
             lock = sc.DistributedLock(
-                key="k1", acquire_timeout_s=5, lease_ttl_s=5,
-                servers=[("127.0.0.1", server_port)], renew_ratio=0.3,
+                key="k1",
+                acquire_timeout_s=5,
+                lease_ttl_s=5,
+                servers=[("127.0.0.1", server_port)],
+                renew_ratio=0.3,
             )
             lock.acquire()
             assert lock._renew_thread is not None
@@ -396,7 +425,9 @@ class TestMutualExclusion:
 
         def _worker(n: int):
             lock = sc.DistributedLock(
-                key="mutex", acquire_timeout_s=10, lease_ttl_s=5,
+                key="mutex",
+                acquire_timeout_s=10,
+                lease_ttl_s=5,
                 servers=[("127.0.0.1", server_port)],
             )
             with lock:
@@ -431,7 +462,10 @@ class TestMutualExclusion:
 
         def _worker(n: int, key: str):
             lock = sc.DistributedLock(
-                key=key, acquire_timeout_s=5, lease_ttl_s=5, servers=[("127.0.0.1", server_port)],
+                key=key,
+                acquire_timeout_s=5,
+                lease_ttl_s=5,
+                servers=[("127.0.0.1", server_port)],
             )
             with lock:
                 held[n] = True
@@ -457,6 +491,7 @@ class TestMutualExclusion:
 class TestDisconnect:
     async def test_abrupt_close_frees_lock(self, server_port):
         """Closing the socket without releasing lets the server clean up."""
+
         def _work():
             s1, r1 = _connect(server_port)
             sc.acquire(s1, r1, "k1", 5)
