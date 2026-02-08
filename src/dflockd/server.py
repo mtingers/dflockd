@@ -655,7 +655,10 @@ def cli():
     for flag, _env, _glob, typ, default, helptext in _CLI_CONFIG:
         if typ is bool:
             parser.add_argument(
-                flag, action=argparse.BooleanOptionalAction, default=default, help=helptext,
+                flag,
+                action=argparse.BooleanOptionalAction,
+                default=default,
+                help=helptext,
             )
         else:
             parser.add_argument(flag, type=typ, default=default, help=helptext)
