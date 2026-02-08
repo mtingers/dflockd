@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Documentation site (MkDocs Material) with architecture, configuration, client, protocol, and sharding guides
+- `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` documented in server configuration
+
+### Fixed
+
+- Pyright CI dependency
+- Ruff dev dependency
+
+### Changed
+
+- Bump `actions/checkout` from 4 to 6
+- Bump `actions/setup-python` from 5 to 6
+- Bump `actions/upload-pages-artifact` from 3 to 4
+- Bump `astral-sh/setup-uv` from 4 to 7
+- Update `uv-build` requirement from >=0.9.28,<0.10.0 to >=0.9.28,<0.11.0
+
 ## [0.3.0] - 2026-02-07
 
 ### Added
@@ -26,4 +46,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI workflow with linting, type checking, and tests (Python 3.13, 3.14)
 - GitHub Pages documentation deployment workflow
 
+[Unreleased]: https://github.com/mtingers/dflockd/compare/0.3.0...HEAD
 [0.3.0]: https://github.com/mtingers/dflockd/releases/tag/0.3.0
