@@ -3,6 +3,7 @@ name = "dflockd"
 version = "0.1.0"
 description = "A lightweight distributed lock server using a simple line-based TCP protocol with FIFO ordering, automatic lease expiry, and background renewal."
 readme = "README.md"
+license = "MIT"
 authors = [{ name = "Matth Ingersoll", email = "matth@mtingers.com" }]
 requires-python = ">=3.13"
 dependencies = []
@@ -17,8 +18,15 @@ dflockd = "dflockd.server:cli"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
+[project.optional-dependencies]
+dev = ["pytest-asyncio>=1.3.0", "pytest-cov>=7.0.0"]
+
 [dependency-groups]
-dev = [
-    "pytest-asyncio>=1.3.0",
-    "pytest-cov>=7.0.0",
-]
+dev = ["pytest-asyncio>=1.3.0", "pytest-cov>=7.0.0"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
+[project.urls]
+Homepage = "https://github.com/mtingers/kompoz"
+Repository = "https://github.com/mtingers/kompoz"
+Documentation = "https://mtingers.github.io/kompoz/"
+"Bug Tracker" = "https://github.com/mtingers/kompoz/issues"
+Changelog = "https://github.com/mtingers/kompoz/blob/main/CHANGELOG.md"
