@@ -1,5 +1,10 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [0.3.0] - 2026-02-07
 
 ### Added
@@ -17,7 +22,7 @@
 - CLI with `--host`, `--port`, `--default-lease-ttl`, `--max-locks`, and other flags
 - Environment variable configuration with `DFLOCKD_` prefix (overrides CLI flags)
 - TypeScript client (`ts/`)
-- Async and sync benchmark scripts
+- Async and sync benchmark scripts (`examples/bench_async.py`, `examples/bench_sync.py`)
 - CI workflow with linting, type checking, and tests (Python 3.13, 3.14)
 - GitHub Pages documentation deployment workflow
 
