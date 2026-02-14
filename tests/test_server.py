@@ -9,7 +9,6 @@ import pytest
 import dflockd.server as srv
 from dflockd.server import (
     Ack,
-    EnqueuedState,
     MaxLocksError,
     NotEnqueuedError,
     ProtocolError,
