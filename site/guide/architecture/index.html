@@ -733,6 +733,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#two-phase-acquire-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two-phase acquire flow
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#background-tasks" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1241,6 +1252,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#two-phase-acquire-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two-phase acquire flow
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#background-tasks" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1358,6 +1380,19 @@
 </li>
 <li>When a lock is released or expires, the next waiter in FIFO order is granted the lock.</li>
 </ol>
+<h2 id="two-phase-acquire-flow">Two-phase acquire flow<a class="headerlink" href="#two-phase-acquire-flow" title="Permanent link">&para;</a></h2>
+<p>The two-phase flow splits acquisition into enqueue (<code>e</code>) and wait (<code>w</code>), allowing application logic between joining the queue and blocking:</p>
+<ol>
+<li>A client sends an enqueue request (<code>e</code>) for key <code>K</code> with optional lease TTL.</li>
+<li>If <code>K</code> is free and has no waiters, the lock is granted immediately (fast path). The server returns <code>acquired &lt;token&gt; &lt;lease&gt;</code> and the client can begin renewal.</li>
+<li>Otherwise, the client is appended to the waiter deque and the server returns <code>queued</code> immediately (non-blocking).</li>
+<li>The client performs application logic (e.g. notifying an external system).</li>
+<li>The client sends a wait request (<code>w</code>) for key <code>K</code> with timeout <code>T</code>.</li>
+<li>If the lock was already acquired (fast path), the server resets the lease and returns <code>ok &lt;token&gt; &lt;lease&gt;</code>.</li>
+<li>Otherwise, the client blocks until the lock is granted or timeout elapses.</li>
+<li>On success, the lease is reset to <code>now + lease_ttl_s</code>, giving the client the full TTL from the moment <code>w</code> returns.</li>
+</ol>
+<p>The two-phase flow uses an <code>EnqueuedState</code> tracked per <code>(conn_id, key)</code>. This state is cleaned up on disconnect, timeout, or successful wait.</p>
 <h2 id="background-tasks">Background tasks<a class="headerlink" href="#background-tasks" title="Permanent link">&para;</a></h2>
 <h3 id="lease-expiry-loop">Lease expiry loop<a class="headerlink" href="#lease-expiry-loop" title="Permanent link">&para;</a></h3>
 <p>Runs every <code>LEASE_SWEEP_INTERVAL_S</code> seconds (default: 1s). For each held lock:</p>
@@ -1376,6 +1411,7 @@
 <h2 id="connection-cleanup">Connection cleanup<a class="headerlink" href="#connection-cleanup" title="Permanent link">&para;</a></h2>
 <p>When <code>DFLOCKD_AUTO_RELEASE_ON_DISCONNECT</code> is enabled (the default), the server performs cleanup when a TCP connection closes (graceful or abrupt):</p>
 <ol>
+<li>Cleans up any two-phase enqueued state (<code>_conn_enqueued</code>) for the connection, cancelling pending waiters and removing them from lock queues.</li>
 <li>Cancels any pending waiter futures belonging to that connection.</li>
 <li>Releases any locks held by that connection.</li>
 <li>Transfers released locks to the next FIFO waiter, if any.</li>

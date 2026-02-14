@@ -1086,13 +1086,37 @@
 <p>All notable changes to this project will be documented in this file.</p>
 <p>The format is based on <a href="https://keepachangelog.com/en/1.1.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
-<h2 id="v040-2026-02-07"><a href="https://github.com/mtingers/dflockd/releases/tag/v0.4.0">v0.4.0</a> - 2026-02-07<a class="headerlink" href="#v040-2026-02-07" title="Permanent link">&para;</a></h2>
+<h2 id="v050-2026-02-14"><a href="https://github.com/mtingers/dflockd/releases/tag/v0.5.0">v0.5.0</a> - 2026-02-14<a class="headerlink" href="#v050-2026-02-14" title="Permanent link">&para;</a></h2>
 <h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Two-phase lock acquisition with <code>e</code> (enqueue) and <code>w</code> (wait) protocol commands</li>
+<li><code>fifo_enqueue()</code> and <code>fifo_wait()</code> server functions for split enqueue/wait flow</li>
+<li><code>enqueue()</code> and <code>wait()</code> module-level functions in async and sync clients</li>
+<li><code>DistributedLock.enqueue()</code> and <code>DistributedLock.wait()</code> methods in async and sync clients</li>
+<li><code>Status.acquired</code> and <code>Status.queued</code> server response statuses</li>
+<li><code>NotEnqueuedError</code> and <code>EnqueuedState</code> server internals for two-phase state tracking</li>
+<li>Connection cleanup for two-phase enqueued state on disconnect</li>
+<li>Two-phase example script (<code>examples/two_phase_demo.py</code>)</li>
+<li>Documentation for two-phase flow in protocol, client, architecture, and examples docs</li>
+</ul>
+<h2 id="v041-2026-02-07"><a href="https://github.com/mtingers/dflockd/releases/tag/v0.4.1">v0.4.1</a> - 2026-02-07<a class="headerlink" href="#v041-2026-02-07" title="Permanent link">&para;</a></h2>
+<h3 id="added_1">Added<a class="headerlink" href="#added_1" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>--auto-release-on-disconnect</code> / <code>--no-auto-release-on-disconnect</code> CLI flag</li>
+</ul>
+<h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>DFLOCKD_DFLOCKD_READ_TIMEOUT_S</code> env var typo in README (now <code>DFLOCKD_READ_TIMEOUT_S</code>)</li>
+<li>Server configuration env var names in README missing <code>DFLOCKD_</code> prefix</li>
+<li><code>MAX_LOCKS</code> default in README corrected from <code>256</code> to <code>1024</code></li>
+</ul>
+<h2 id="v040-2026-02-07"><a href="https://github.com/mtingers/dflockd/releases/tag/v0.4.0">v0.4.0</a> - 2026-02-07<a class="headerlink" href="#v040-2026-02-07" title="Permanent link">&para;</a></h2>
+<h3 id="added_2">Added<a class="headerlink" href="#added_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Documentation site (MkDocs Material) with architecture, configuration, client, protocol, and sharding guides</li>
 <li><code>DFLOCKD_AUTO_RELEASE_ON_DISCONNECT</code> documented in server configuration</li>
 </ul>
-<h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_1">Fixed<a class="headerlink" href="#fixed_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Pyright CI dependency</li>
 <li>Ruff dev dependency</li>
@@ -1106,7 +1130,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Update <code>uv-build</code> requirement from &gt;=0.9.28,&lt;0.10.0 to &gt;=0.9.28,&lt;0.11.0</li>
 </ul>
 <h2 id="v030-2026-02-07"><a href="https://github.com/mtingers/dflockd/releases/tag/0.3.0">v0.3.0</a> - 2026-02-07<a class="headerlink" href="#v030-2026-02-07" title="Permanent link">&para;</a></h2>
-<h3 id="added_1">Added<a class="headerlink" href="#added_1" title="Permanent link">&para;</a></h3>
+<h3 id="added_3">Added<a class="headerlink" href="#added_3" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Async lock server with strict FIFO ordering per key</li>
 <li>Automatic lease expiry with configurable TTL and sweep interval</li>

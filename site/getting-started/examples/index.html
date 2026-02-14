@@ -635,6 +635,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#two-phase-lock-acquisition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two-phase lock acquisition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#multi-server-sharding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1191,6 +1202,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#two-phase-lock-acquisition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two-phase lock acquisition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#multi-server-sharding" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1314,37 +1336,83 @@
 </div>
 </div>
 </div>
+<h2 id="two-phase-lock-acquisition">Two-phase lock acquisition<a class="headerlink" href="#two-phase-lock-acquisition" title="Permanent link">&para;</a></h2>
+<p>Split enqueue and wait to notify an external system between joining the queue and blocking:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="3:2"><input checked="checked" id="__tabbed_3_1" name="__tabbed_3" type="radio" /><input id="__tabbed_3_2" name="__tabbed_3" type="radio" /><div class="tabbed-labels"><label for="__tabbed_3_1">Async</label><label for="__tabbed_3_2">Sync</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.client</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedLock</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="n">lock</span> <span class="o">=</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">acquire_timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">lease_ttl_s</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>    <span class="n">status</span> <span class="o">=</span> <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">enqueue</span><span class="p">()</span>       <span class="c1"># &quot;acquired&quot; or &quot;queued&quot;</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;enqueue: </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>    <span class="k">await</span> <span class="n">notify_external_system</span><span class="p">()</span>      <span class="c1"># your application logic</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>    <span class="k">if</span> <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">wait</span><span class="p">(</span><span class="n">timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>   <span class="c1"># blocks until granted</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>        <span class="k">try</span><span class="p">:</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;lock held: </span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>            <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a>        <span class="k">finally</span><span class="p">:</span>
+<a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a>            <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
+<a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a>
+<a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a><span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.sync_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedLock</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="n">lock</span> <span class="o">=</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">acquire_timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">lease_ttl_s</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">status</span> <span class="o">=</span> <span class="n">lock</span><span class="o">.</span><span class="n">enqueue</span><span class="p">()</span>           <span class="c1"># &quot;acquired&quot; or &quot;queued&quot;</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;enqueue: </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">notify_external_system</span><span class="p">()</span>          <span class="c1"># your application logic</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="k">if</span> <span class="n">lock</span><span class="o">.</span><span class="n">wait</span><span class="p">(</span><span class="n">timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>       <span class="c1"># blocks until granted</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="k">try</span><span class="p">:</span>
+<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;lock held: </span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    <span class="k">finally</span><span class="p">:</span>
+<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>        <span class="n">lock</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
+</code></pre></div>
+</div>
+</div>
+</div>
+<p>If the lock is free at enqueue time, it is acquired immediately (fast path) and <code>wait()</code> returns <code>True</code> without blocking. The lease auto-renews in the background from the moment of acquisition.</p>
 <h2 id="multi-server-sharding">Multi-server sharding<a class="headerlink" href="#multi-server-sharding" title="Permanent link">&para;</a></h2>
 <p>Distribute keys across multiple dflockd instances. Each key deterministically routes to the same server:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.sync_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedLock</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">servers</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;server1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">),</span> <span class="p">(</span><span class="s2">&quot;server2&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">),</span> <span class="p">(</span><span class="s2">&quot;server3&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="k">with</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">servers</span><span class="o">=</span><span class="n">servers</span><span class="p">)</span> <span class="k">as</span> <span class="n">lock</span><span class="p">:</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;token=</span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2"> lease=</span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">lease</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.sync_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedLock</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="n">servers</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;server1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">),</span> <span class="p">(</span><span class="s2">&quot;server2&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">),</span> <span class="p">(</span><span class="s2">&quot;server3&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="k">with</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">servers</span><span class="o">=</span><span class="n">servers</span><span class="p">)</span> <span class="k">as</span> <span class="n">lock</span><span class="p">:</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;token=</span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2"> lease=</span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">lease</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="custom-sharding-strategy">Custom sharding strategy<a class="headerlink" href="#custom-sharding-strategy" title="Permanent link">&para;</a></h2>
 <p>Override the default CRC-32 sharding with your own logic:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.sync_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedLock</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">def</span><span class="w"> </span><span class="nf">my_strategy</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_servers</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Route all keys to the first server.&quot;&quot;&quot;</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="k">return</span> <span class="mi">0</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">servers</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;server1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">),</span> <span class="p">(</span><span class="s2">&quot;server2&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>
-<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="k">with</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">servers</span><span class="o">=</span><span class="n">servers</span><span class="p">,</span> <span class="n">sharding_strategy</span><span class="o">=</span><span class="n">my_strategy</span><span class="p">)</span> <span class="k">as</span> <span class="n">lock</span><span class="p">:</span>
-<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;token=</span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.sync_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedLock</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="k">def</span><span class="w"> </span><span class="nf">my_strategy</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_servers</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Route all keys to the first server.&quot;&quot;&quot;</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="k">return</span> <span class="mi">0</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="n">servers</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;server1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">),</span> <span class="p">(</span><span class="s2">&quot;server2&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="k">with</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">servers</span><span class="o">=</span><span class="n">servers</span><span class="p">,</span> <span class="n">sharding_strategy</span><span class="o">=</span><span class="n">my_strategy</span><span class="p">)</span> <span class="k">as</span> <span class="n">lock</span><span class="p">:</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;token=</span><span class="si">{</span><span class="n">lock</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 </code></pre></div>
 <h2 id="raw-tcp-protocol">Raw TCP protocol<a class="headerlink" href="#raw-tcp-protocol" title="Permanent link">&para;</a></h2>
 <p>You can interact with dflockd from any language using its line-based TCP protocol:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Acquire a lock with 10s timeout</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nb">printf</span><span class="w"> </span><span class="s1">&#39;l\nmy-key\n10\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>nc<span class="w"> </span>localhost<span class="w"> </span><span class="m">6388</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="c1"># Response: ok &lt;token&gt; &lt;lease_ttl&gt;</span>
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="c1"># Release (substitute your token)</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="nb">printf</span><span class="w"> </span><span class="s1">&#39;r\nmy-key\n&lt;token&gt;\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>nc<span class="w"> </span>localhost<span class="w"> </span><span class="m">6388</span>
-<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="c1"># Response: ok</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Acquire a lock with 10s timeout</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="nb">printf</span><span class="w"> </span><span class="s1">&#39;l\nmy-key\n10\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>nc<span class="w"> </span>localhost<span class="w"> </span><span class="m">6388</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="c1"># Response: ok &lt;token&gt; &lt;lease_ttl&gt;</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="c1"># Release (substitute your token)</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="nb">printf</span><span class="w"> </span><span class="s1">&#39;r\nmy-key\n&lt;token&gt;\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>nc<span class="w"> </span>localhost<span class="w"> </span><span class="m">6388</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="c1"># Response: ok</span>
 </code></pre></div>
 
 

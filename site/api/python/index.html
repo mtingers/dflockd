@@ -1112,6 +1112,28 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#enqueue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enqueue
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#wait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        wait
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1184,6 +1206,28 @@
     <span class="md-ellipsis">
       
         renew
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enqueue_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enqueue
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#wait_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        wait
       
     </span>
   </a>
@@ -1387,6 +1431,28 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#enqueue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enqueue
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#wait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        wait
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1459,6 +1525,28 @@
     <span class="md-ellipsis">
       
         renew
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enqueue_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enqueue
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#wait_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        wait
       
     </span>
   </a>
@@ -1573,6 +1661,16 @@
 <td>Acquire the lock. Returns <code>False</code> on timeout</td>
 </tr>
 <tr>
+<td><code>await enqueue()</code></td>
+<td><code>str</code></td>
+<td>Two-phase step 1: join queue. Returns <code>"acquired"</code> or <code>"queued"</code></td>
+</tr>
+<tr>
+<td><code>await wait(timeout_s=None)</code></td>
+<td><code>bool</code></td>
+<td>Two-phase step 2: block until granted. Returns <code>False</code> on timeout</td>
+</tr>
+<tr>
 <td><code>await release()</code></td>
 <td><code>bool</code></td>
 <td>Release the lock and stop renewal</td>
@@ -1619,17 +1717,35 @@
 <a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
 </code></pre></div>
 <p>Send a renew request. Returns seconds remaining, or <code>-1</code> if not reported by the server. Raises <code>RuntimeError</code> on failure.</p>
+<h4 id="enqueue">enqueue<a class="headerlink" href="#enqueue" title="Permanent link">&para;</a></h4>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">enqueue</span><span class="p">(</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="n">reader</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">StreamReader</span><span class="p">,</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="n">writer</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">StreamWriter</span><span class="p">,</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span>
+</code></pre></div>
+<p>Two-phase step 1: join the FIFO queue. Returns <code>(status, token, lease)</code> where status is <code>"acquired"</code> or <code>"queued"</code>. Raises <code>RuntimeError</code> on failure.</p>
+<h4 id="wait">wait<a class="headerlink" href="#wait" title="Permanent link">&para;</a></h4>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">wait</span><span class="p">(</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>    <span class="n">reader</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">StreamReader</span><span class="p">,</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="n">writer</span><span class="p">:</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">StreamWriter</span><span class="p">,</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>    <span class="n">wait_timeout_s</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
+</code></pre></div>
+<p>Two-phase step 2: block until lock is granted. Returns <code>(token, lease)</code>. Raises <code>TimeoutError</code> on timeout.</p>
 <hr />
 <h2 id="dflockdsync_client">dflockd.sync_client<a class="headerlink" href="#dflockdsync_client" title="Permanent link">&para;</a></h2>
 <h3 id="distributedlock_1">DistributedLock<a class="headerlink" href="#distributedlock_1" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nd">@dataclass</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">class</span><span class="w"> </span><span class="nc">DistributedLock</span><span class="p">:</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="n">acquire_timeout_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="n">servers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="n">sharding_strategy</span><span class="p">:</span> <span class="n">ShardingStrategy</span> <span class="o">=</span> <span class="n">stable_hash_shard</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="n">renew_ratio</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.5</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="k">class</span><span class="w"> </span><span class="nc">DistributedLock</span><span class="p">:</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>    <span class="n">acquire_timeout_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>    <span class="n">servers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>    <span class="n">sharding_strategy</span><span class="p">:</span> <span class="n">ShardingStrategy</span> <span class="o">=</span> <span class="n">stable_hash_shard</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>    <span class="n">renew_ratio</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.5</span>
 </code></pre></div>
 <p><strong>Methods:</strong></p>
 <table>
@@ -1647,6 +1763,16 @@
 <td>Acquire the lock. Returns <code>False</code> on timeout</td>
 </tr>
 <tr>
+<td><code>enqueue()</code></td>
+<td><code>str</code></td>
+<td>Two-phase step 1: join queue. Returns <code>"acquired"</code> or <code>"queued"</code></td>
+</tr>
+<tr>
+<td><code>wait(timeout_s=None)</code></td>
+<td><code>bool</code></td>
+<td>Two-phase step 2: block until granted. Returns <code>False</code> on timeout</td>
+</tr>
+<tr>
 <td><code>release()</code></td>
 <td><code>bool</code></td>
 <td>Release the lock and stop renewal</td>
@@ -1659,48 +1785,66 @@
 </tbody>
 </table>
 <p><strong>Context manager:</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">with</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">lock</span><span class="p">:</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>    <span class="o">...</span>  <span class="c1"># lock.token, lock.lease available</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">with</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">lock</span><span class="p">:</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>    <span class="o">...</span>  <span class="c1"># lock.token, lock.lease available</span>
 </code></pre></div>
 <h3 id="low-level-functions_1">Low-level functions<a class="headerlink" href="#low-level-functions_1" title="Permanent link">&para;</a></h3>
 <h4 id="acquire_1">acquire<a class="headerlink" href="#acquire_1" title="Permanent link">&para;</a></h4>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">acquire</span><span class="p">(</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="n">acquire_timeout_s</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
-</code></pre></div>
-<h4 id="release_1">release<a class="headerlink" href="#release_1" title="Permanent link">&para;</a></h4>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>    <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span>
-</code></pre></div>
-<h4 id="renew_1">renew<a class="headerlink" href="#renew_1" title="Permanent link">&para;</a></h4>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">renew</span><span class="p">(</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">acquire</span><span class="p">(</span>
 <a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
 <a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
 <a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="n">acquire_timeout_s</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
 <a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
 </code></pre></div>
+<h4 id="release_1">release<a class="headerlink" href="#release_1" title="Permanent link">&para;</a></h4>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>    <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span>
+</code></pre></div>
+<h4 id="renew_1">renew<a class="headerlink" href="#renew_1" title="Permanent link">&para;</a></h4>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">renew</span><span class="p">(</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>    <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
+</code></pre></div>
+<h4 id="enqueue_1">enqueue<a class="headerlink" href="#enqueue_1" title="Permanent link">&para;</a></h4>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">enqueue</span><span class="p">(</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>    <span class="n">lease_ttl_s</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span>
+</code></pre></div>
+<p>Two-phase step 1: join the FIFO queue. Returns <code>(status, token, lease)</code> where status is <code>"acquired"</code> or <code>"queued"</code>.</p>
+<h4 id="wait_1">wait<a class="headerlink" href="#wait_1" title="Permanent link">&para;</a></h4>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">wait</span><span class="p">(</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>    <span class="n">sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>    <span class="n">rfile</span><span class="p">:</span> <span class="n">io</span><span class="o">.</span><span class="n">TextIOWrapper</span><span class="p">,</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">wait_timeout_s</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
+</code></pre></div>
+<p>Two-phase step 2: block until lock is granted. Returns <code>(token, lease)</code>. Raises <code>TimeoutError</code> on timeout.</p>
 <hr />
 <h2 id="dflockdsharding">dflockd.sharding<a class="headerlink" href="#dflockdsharding" title="Permanent link">&para;</a></h2>
 <h3 id="shardingstrategy">ShardingStrategy<a class="headerlink" href="#shardingstrategy" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">ShardingStrategy</span> <span class="o">=</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="n">ShardingStrategy</span> <span class="o">=</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span>
 </code></pre></div>
 <p>A callable that maps <code>(key, num_servers)</code> to a server index.</p>
 <h3 id="stable_hash_shard">stable_hash_shard<a class="headerlink" href="#stable_hash_shard" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">stable_hash_shard</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_servers</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">stable_hash_shard</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_servers</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span>
 </code></pre></div>
 <p>Default sharding strategy using <code>zlib.crc32</code>. Deterministic across processes regardless of <code>PYTHONHASHSEED</code>.</p>
 <h3 id="default_servers">DEFAULT_SERVERS<a class="headerlink" href="#default_servers" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="n">DEFAULT_SERVERS</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="n">DEFAULT_SERVERS</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)]</span>
 </code></pre></div>
 
 

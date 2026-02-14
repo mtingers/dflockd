@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import statistics
 import time
+import random
 
 from dflockd.client import DistributedLock
 
@@ -32,19 +33,28 @@ async def worker(
     latencies: list[float] = []
     for _ in range(rounds):
         t0 = time.perf_counter()
-        async with DistributedLock(key, acquire_timeout_s=timeout_s, lease_ttl_s=10, servers=servers):
+        async with DistributedLock(
+            key, acquire_timeout_s=timeout_s, lease_ttl_s=10, servers=servers
+        ):
             pass  # acquire + immediate release
         latencies.append(time.perf_counter() - t0)
     return latencies
 
 
-async def run(workers: int, rounds: int, key: str, timeout_s: int, servers: list[tuple[str, int]]) -> None:
-    print(f"bench_async: {workers} workers x {rounds} rounds (key={key!r})")
+async def run(
+    workers: int, rounds: int, key: str, timeout_s: int, servers: list[tuple[str, int]]
+) -> None:
+    print(f"bench_async: {workers} workers x {rounds} rounds (key_prefix={key!r})")
     print()
 
     t_start = time.perf_counter()
     results = await asyncio.gather(
-        *(worker(key, rounds, timeout_s, servers) for _ in range(workers))
+        *(
+            worker(
+                f"{key}_{random.randint(100000, 10000000)}", rounds, timeout_s, servers
+            )
+            for _ in range(workers)
+        )
     )
     wall = time.perf_counter() - t_start
 
@@ -76,8 +86,9 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--key", default="bench")
     parser.add_argument("--timeout", type=int, default=30)
-    parser.add_argument("--servers", default="127.0.0.1:6388",
-                        help="Comma-separated host:port pairs")
+    parser.add_argument(
+        "--servers", default="127.0.0.1:6388", help="Comma-separated host:port pairs"
+    )
     args = parser.parse_args()
     servers = parse_servers(args.servers)
     asyncio.run(run(args.workers, args.rounds, args.key, args.timeout, servers))

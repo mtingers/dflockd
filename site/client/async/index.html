@@ -968,6 +968,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#two-phase-lock-acquisition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two-phase lock acquisition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#low-level-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1257,6 +1268,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#two-phase-lock-acquisition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two-phase lock acquisition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#low-level-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1401,18 +1423,52 @@
 <a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="k">finally</span><span class="p">:</span>
 <a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>    <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">aclose</span><span class="p">()</span>
 </code></pre></div>
+<h2 id="two-phase-lock-acquisition">Two-phase lock acquisition<a class="headerlink" href="#two-phase-lock-acquisition" title="Permanent link">&para;</a></h2>
+<p>The <code>enqueue()</code> / <code>wait()</code> methods split lock acquisition into two steps. This lets you notify an external system after joining the queue but before blocking:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">lock</span> <span class="o">=</span> <span class="n">DistributedLock</span><span class="p">(</span><span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">acquire_timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="c1"># Step 1: join the queue (returns immediately)</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">status</span> <span class="o">=</span> <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">enqueue</span><span class="p">()</span>  <span class="c1"># &quot;acquired&quot; or &quot;queued&quot;</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="c1"># Step 2: notify external system</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="k">await</span> <span class="n">notify_external_system</span><span class="p">(</span><span class="n">status</span><span class="p">)</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="c1"># Step 3: block until granted (no-op if already acquired)</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="k">if</span> <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">wait</span><span class="p">(</span><span class="n">timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>    <span class="k">try</span><span class="p">:</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>        <span class="c1"># critical section</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>        <span class="k">pass</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>    <span class="k">finally</span><span class="p">:</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>        <span class="k">await</span> <span class="n">lock</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
+</code></pre></div>
+<p><strong><code>enqueue()</code></strong> connects to the server and sends the <code>e</code> command. Returns <code>"acquired"</code> if the lock was free (fast path) or <code>"queued"</code> if there are other holders/waiters. On fast-path acquire, the renewal task starts immediately.</p>
+<p><strong><code>wait(timeout_s=None)</code></strong> sends the <code>w</code> command and blocks until the lock is granted. Returns <code>True</code> on success, <code>False</code> on timeout. If the lock was already acquired during <code>enqueue()</code>, returns <code>True</code> immediately without contacting the server. Uses <code>acquire_timeout_s</code> if <code>timeout_s</code> is not provided.</p>
 <h2 id="low-level-functions">Low-level functions<a class="headerlink" href="#low-level-functions" title="Permanent link">&para;</a></h2>
 <p>The module also exposes low-level protocol functions for direct use:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.client</span><span class="w"> </span><span class="kn">import</span> <span class="n">acquire</span><span class="p">,</span> <span class="n">release</span><span class="p">,</span> <span class="n">renew</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">open_connection</span><span class="p">(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="n">token</span><span class="p">,</span> <span class="n">lease</span> <span class="o">=</span> <span class="k">await</span> <span class="n">acquire</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="n">remaining</span> <span class="o">=</span> <span class="k">await</span> <span class="n">renew</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="k">await</span> <span class="n">release</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>
-<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="n">writer</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
-<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="k">await</span> <span class="n">writer</span><span class="o">.</span><span class="n">wait_closed</span><span class="p">()</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dflockd.client</span><span class="w"> </span><span class="kn">import</span> <span class="n">acquire</span><span class="p">,</span> <span class="n">release</span><span class="p">,</span> <span class="n">renew</span><span class="p">,</span> <span class="n">enqueue</span><span class="p">,</span> <span class="n">wait</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">open_connection</span><span class="p">(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">token</span><span class="p">,</span> <span class="n">lease</span> <span class="o">=</span> <span class="k">await</span> <span class="n">acquire</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="n">remaining</span> <span class="o">=</span> <span class="k">await</span> <span class="n">renew</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="k">await</span> <span class="n">release</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="n">writer</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="k">await</span> <span class="n">writer</span><span class="o">.</span><span class="n">wait_closed</span><span class="p">()</span>
+</code></pre></div>
+<p>The two-phase functions are also available at the low level:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">open_connection</span><span class="p">(</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">6388</span><span class="p">)</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="n">status</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">lease</span> <span class="o">=</span> <span class="k">await</span> <span class="n">enqueue</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">)</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1"># status is &quot;acquired&quot; or &quot;queued&quot;</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="k">if</span> <span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;queued&quot;</span><span class="p">:</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="n">token</span><span class="p">,</span> <span class="n">lease</span> <span class="o">=</span> <span class="k">await</span> <span class="n">wait</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">wait_timeout_s</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="k">await</span> <span class="n">release</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">writer</span><span class="p">,</span> <span class="s2">&quot;my-key&quot;</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="n">writer</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="k">await</span> <span class="n">writer</span><span class="o">.</span><span class="n">wait_closed</span><span class="p">()</span>
 </code></pre></div>
 
 

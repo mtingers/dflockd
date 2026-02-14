@@ -1197,6 +1197,7 @@
 <h2 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Strict FIFO ordering</strong> — waiters are granted locks in the order they enqueue, per key</li>
+<li><strong>Two-phase lock acquisition</strong> — split enqueue and wait to notify external systems between joining the queue and blocking</li>
 <li><strong>Automatic lease expiry</strong> — held locks expire if not renewed, preventing deadlocks</li>
 <li><strong>Background renewal</strong> — both async and sync clients auto-renew leases in the background</li>
 <li><strong>Disconnect cleanup</strong> — locks are released automatically when a client disconnects</li>
