@@ -36,6 +36,68 @@ my-job
 ```
 → `ok a1b2c3d4e5f6... 60`
 
+### Enqueue (two-phase step 1)
+
+Join the FIFO queue for a key and return immediately. If the lock is free, it is acquired immediately. Otherwise the caller is enqueued and must call `w` (wait) to block.
+
+**Request:**
+```
+e
+<key>
+[<lease_ttl_s>]
+```
+
+The 3rd line is an optional positive integer. If empty, the server default lease TTL is used.
+
+**Response:**
+
+- Immediate acquire: `acquired <token> <lease_ttl>\n`
+- Queued: `queued\n`
+- Max locks reached: `error_max_locks\n`
+- Already enqueued: `error\n`
+
+**Example:**
+```
+e
+my-job
+
+```
+→ `acquired a1b2c3d4e5f6... 33` or `queued`
+
+### Wait (two-phase step 2)
+
+Block until the lock is granted (after a prior `e` enqueue) or timeout. The lease is reset to `now + lease_ttl_s` on success, so the client gets the full TTL from the moment `w` returns.
+
+**Request:**
+```
+w
+<key>
+<timeout_s>
+```
+
+The 3rd line is a required integer >= 0 (same semantics as acquire timeout).
+
+**Response:**
+
+- Success: `ok <token> <lease_ttl>\n`
+- Timeout: `timeout\n`
+- Not enqueued: `error\n`
+
+**Example:**
+```
+e
+my-job
+
+```
+→ `queued`
+
+```
+w
+my-job
+10
+```
+→ `ok a1b2c3d4e5f6... 33`
+
 ### Release
 
 Release a held lock. The token must match the current owner.
@@ -88,7 +150,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `l`, `r`, or `n`) |
+| 3 | Invalid command (not `l`, `r`, `n`, `e`, or `w`) |
 | 4 | Invalid integer in argument |
 | 5 | Empty key |
 | 6 | Negative timeout |
@@ -114,6 +176,21 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 → n\nmy-key\nabc123def456... \n
 ← ok 32\n
+
+→ r\nmy-key\nabc123def456...\n
+← ok\n
+```
+
+## Two-phase example session
+
+```
+→ e\nmy-key\n\n
+← queued\n
+
+(notify external system here)
+
+→ w\nmy-key\n10\n
+← ok abc123def456... 33\n
 
 → r\nmy-key\nabc123def456...\n
 ← ok\n

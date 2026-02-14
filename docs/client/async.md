@@ -81,17 +81,60 @@ finally:
     await lock.aclose()
 ```
 
+## Two-phase lock acquisition
+
+The `enqueue()` / `wait()` methods split lock acquisition into two steps. This lets you notify an external system after joining the queue but before blocking:
+
+```python
+lock = DistributedLock("my-key", acquire_timeout_s=10)
+
+# Step 1: join the queue (returns immediately)
+status = await lock.enqueue()  # "acquired" or "queued"
+
+# Step 2: notify external system
+await notify_external_system(status)
+
+# Step 3: block until granted (no-op if already acquired)
+if await lock.wait(timeout_s=10):
+    try:
+        # critical section
+        pass
+    finally:
+        await lock.release()
+```
+
+**`enqueue()`** connects to the server and sends the `e` command. Returns `"acquired"` if the lock was free (fast path) or `"queued"` if there are other holders/waiters. On fast-path acquire, the renewal task starts immediately.
+
+**`wait(timeout_s=None)`** sends the `w` command and blocks until the lock is granted. Returns `True` on success, `False` on timeout. If the lock was already acquired during `enqueue()`, returns `True` immediately without contacting the server. Uses `acquire_timeout_s` if `timeout_s` is not provided.
+
 ## Low-level functions
 
 The module also exposes low-level protocol functions for direct use:
 
 ```python
-from dflockd.client import acquire, release, renew
+from dflockd.client import acquire, release, renew, enqueue, wait
 
 reader, writer = await asyncio.open_connection("127.0.0.1", 6388)
 
 token, lease = await acquire(reader, writer, "my-key", timeout_s=10)
 remaining = await renew(reader, writer, "my-key", token)
+await release(reader, writer, "my-key", token)
+
+writer.close()
+await writer.wait_closed()
+```
+
+The two-phase functions are also available at the low level:
+
+```python
+reader, writer = await asyncio.open_connection("127.0.0.1", 6388)
+
+status, token, lease = await enqueue(reader, writer, "my-key")
+# status is "acquired" or "queued"
+
+if status == "queued":
+    token, lease = await wait(reader, writer, "my-key", wait_timeout_s=10)
+
 await release(reader, writer, "my-key", token)
 
 writer.close()

@@ -12,6 +12,7 @@
     - [Async client](#async-client)
     - [Sync client](#sync-client)
     - [Manual acquire/release](#manual-acquirerelease)
+    - [Two-phase lock acquisition](#two-phase-lock-acquisition)
     - [Parameters](#parameters)
   - [Multi-server sharding](#multi-server-sharding)
 <!--toc:end-->
@@ -94,6 +95,26 @@ n
 
 Response: `ok <seconds_remaining>\n` or `error\n`
 
+**Enqueue (two-phase step 1)**
+
+```
+e
+<key>
+[<lease_ttl_s>]
+```
+
+Response: `acquired <token> <lease_ttl>\n` or `queued\n`
+
+**Wait (two-phase step 2)**
+
+```
+w
+<key>
+<timeout_s>
+```
+
+Response: `ok <token> <lease_ttl>\n` or `timeout\n`
+
 **Release**
 
 ```
@@ -149,6 +170,36 @@ if lock.acquire():
         pass  # critical section
     finally:
         lock.release()
+```
+
+### Two-phase lock acquisition
+
+The `enqueue()` / `wait()` methods split lock acquisition into two steps, allowing you to notify an external system after joining the queue but before blocking:
+
+```python
+from dflockd.sync_client import DistributedLock
+
+lock = DistributedLock("my-key")
+status = lock.enqueue()       # join queue, returns "acquired" or "queued"
+notify_external_system()      # your application logic here
+if lock.wait(timeout_s=10):   # block until granted (no-op if already acquired)
+    try:
+        pass  # critical section
+    finally:
+        lock.release()
+```
+
+Async equivalent:
+
+```python
+lock = DistributedLock("my-key")
+status = await lock.enqueue()
+await notify_external_system()
+if await lock.wait(timeout_s=10):
+    try:
+        pass  # critical section
+    finally:
+        await lock.release()
 ```
 
 ### Parameters

@@ -74,6 +74,56 @@ async def renew(
     return -1
 
 
+async def enqueue(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    key: str,
+    lease_ttl_s: int | None = None,
+) -> tuple[str, str | None, int | None]:
+    """
+    Two-phase enqueue: join FIFO queue, return immediately.
+    Returns (status, token, lease) where status is "acquired" or "queued".
+    """
+    arg = "" if lease_ttl_s is None else str(lease_ttl_s)
+    writer.write(_encode_lines("e", key, arg))
+    await writer.drain()
+
+    resp = await _readline(reader)
+    if resp.startswith("acquired "):
+        parts = resp.split()
+        token = parts[1]
+        lease = int(parts[2]) if len(parts) >= 3 else 30
+        return ("acquired", token, lease)
+    if resp == "queued":
+        return ("queued", None, None)
+    raise RuntimeError(f"enqueue failed: {resp!r}")
+
+
+async def wait(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    key: str,
+    wait_timeout_s: int,
+) -> tuple[str, int]:
+    """
+    Two-phase wait: block until lock is granted.
+    Returns (token, lease). Raises TimeoutError on timeout.
+    """
+    writer.write(_encode_lines("w", key, str(wait_timeout_s)))
+    await writer.drain()
+
+    resp = await _readline(reader)
+    if resp == "timeout":
+        raise TimeoutError(f"timeout waiting for {key!r}")
+    if not resp.startswith("ok "):
+        raise RuntimeError(f"wait failed: {resp!r}")
+
+    parts = resp.split()
+    token = parts[1]
+    lease = int(parts[2]) if len(parts) >= 3 else 30
+    return token, lease
+
+
 async def release(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, key: str, token: str
 ) -> None:
@@ -130,6 +180,51 @@ class DistributedLock:
             await self.aclose()
             raise
         # Start renew loop
+        self._renew_task = asyncio.create_task(self._renew_loop())
+        return True
+
+    async def enqueue(self) -> str:
+        """
+        Two-phase step 1: connect and enqueue. Returns "acquired" or "queued".
+        Starts renew loop on fast-path acquire.
+        """
+        self._closed = False
+        host, port = self._pick_server()
+        self._reader, self._writer = await asyncio.open_connection(host, port)
+        try:
+            status, tok, lease = await enqueue(
+                self._reader, self._writer, self.key, self.lease_ttl_s
+            )
+        except BaseException:
+            await self.aclose()
+            raise
+        if status == "acquired":
+            self.token = tok
+            self.lease = lease or 0
+            self._renew_task = asyncio.create_task(self._renew_loop())
+        return status
+
+    async def wait(self, timeout_s: int | None = None) -> bool:
+        """
+        Two-phase step 2: wait for lock grant. Returns True if granted, False on timeout.
+        If already acquired (fast path from enqueue), returns immediately.
+        """
+        if self.token is not None:
+            # Already acquired during enqueue
+            return True
+        if self._reader is None or self._writer is None:
+            raise RuntimeError("not connected; call enqueue() first")
+        timeout = timeout_s if timeout_s is not None else self.acquire_timeout_s
+        try:
+            self.token, self.lease = await wait(
+                self._reader, self._writer, self.key, timeout
+            )
+        except TimeoutError:
+            await self.aclose()
+            return False
+        except BaseException:
+            await self.aclose()
+            raise
         self._renew_task = asyncio.create_task(self._renew_loop())
         return True
 

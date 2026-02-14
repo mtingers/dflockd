@@ -519,6 +519,122 @@ class TestDisconnect:
 
 
 # ===========================================================================
+# Sync two-phase: enqueue + wait
+# ===========================================================================
+
+
+class TestSyncTwoPhase:
+    async def test_low_level_enqueue_wait_release(self, server_port):
+        """Low-level: enqueue + wait + release on a free lock."""
+
+        def _work():
+            sock, rfile = _connect(server_port)
+            try:
+                status, token, lease = sc.enqueue(sock, rfile, "k1")
+                assert status == "acquired"
+                assert token is not None
+                assert lease > 0
+
+                tok, ttl = sc.wait(sock, rfile, "k1", 5)
+                assert tok == token
+
+                sc.release(sock, rfile, "k1", tok)
+            finally:
+                _close(sock, rfile)
+
+        await asyncio.to_thread(_work)
+
+    async def test_queued_then_wait(self, server_port):
+        """conn1 holds lock, conn2 enqueues (queued), conn1 releases, conn2 waits."""
+
+        def _work():
+            s1, r1 = _connect(server_port)
+            s2, r2 = _connect(server_port)
+            try:
+                tok1, _ = sc.acquire(s1, r1, "k1", 5)
+
+                status, _, _ = sc.enqueue(s2, r2, "k1")
+                assert status == "queued"
+
+                # Release in a thread so conn2 can wait
+                def _release():
+                    time.sleep(0.1)
+                    sc.release(s1, r1, "k1", tok1)
+
+                t = threading.Thread(target=_release)
+                t.start()
+                tok2, lease2 = sc.wait(s2, r2, "k1", 5)
+                t.join()
+
+                assert tok2 is not None
+                assert lease2 > 0
+                sc.release(s2, r2, "k1", tok2)
+            finally:
+                _close(s1, r1)
+                _close(s2, r2)
+
+        await asyncio.to_thread(_work)
+
+    async def test_distributed_lock_two_phase(self, server_port):
+        """DistributedLock.enqueue() + wait() + release() flow."""
+
+        def _work():
+            lock = sc.DistributedLock(
+                key="k1",
+                acquire_timeout_s=5,
+                lease_ttl_s=5,
+                servers=[("127.0.0.1", server_port)],
+            )
+            status = lock.enqueue()
+            assert status == "acquired"
+            assert lock.token is not None
+
+            ok = lock.wait()
+            assert ok is True
+
+            lock.release()
+            assert lock.token is None
+
+        await asyncio.to_thread(_work)
+
+    async def test_distributed_lock_two_phase_contention(self, server_port):
+        """lock1 holds, lock2 does enqueue+wait, lock1 releases → lock2 gets it."""
+
+        def _work():
+            lock1 = sc.DistributedLock(
+                key="k1",
+                acquire_timeout_s=5,
+                lease_ttl_s=5,
+                servers=[("127.0.0.1", server_port)],
+            )
+            lock2 = sc.DistributedLock(
+                key="k1",
+                acquire_timeout_s=5,
+                lease_ttl_s=5,
+                servers=[("127.0.0.1", server_port)],
+            )
+
+            lock1.acquire()
+            status = lock2.enqueue()
+            assert status == "queued"
+
+            def _release():
+                time.sleep(0.1)
+                lock1.release()
+
+            t = threading.Thread(target=_release)
+            t.start()
+            ok = lock2.wait()
+            t.join()
+
+            assert ok is True
+            assert lock2.token is not None
+            lock2.release()
+
+        await asyncio.to_thread(_work)
+
+
+# ===========================================================================
 # Sharding
 # ===========================================================================
 

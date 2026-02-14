@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.0] - 2026-02-14
+
+### Added
+
+- Two-phase lock acquisition with `e` (enqueue) and `w` (wait) protocol commands
+- `fifo_enqueue()` and `fifo_wait()` server functions for split enqueue/wait flow
+- `enqueue()` and `wait()` module-level functions in async and sync clients
+- `DistributedLock.enqueue()` and `DistributedLock.wait()` methods in async and sync clients
+- `Status.acquired` and `Status.queued` server response statuses
+- `NotEnqueuedError` and `EnqueuedState` server internals for two-phase state tracking
+- Connection cleanup for two-phase enqueued state on disconnect
+- Two-phase example script (`examples/two_phase_demo.py`)
+- Documentation for two-phase flow in protocol, client, architecture, and examples docs
+
+[v0.5.0]: https://github.com/mtingers/dflockd/releases/tag/v0.5.0
+
 ## [v0.4.1] - 2026-02-07
 
 ### Added

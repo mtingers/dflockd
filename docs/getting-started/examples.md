@@ -74,6 +74,55 @@ Multiple workers competing for the same lock are granted access in FIFO order:
         t.join()
     ```
 
+## Two-phase lock acquisition
+
+Split enqueue and wait to notify an external system between joining the queue and blocking:
+
+=== "Async"
+
+    ```python
+    import asyncio
+    from dflockd.client import DistributedLock
+
+    async def main():
+        lock = DistributedLock("my-key", acquire_timeout_s=10, lease_ttl_s=20)
+
+        status = await lock.enqueue()       # "acquired" or "queued"
+        print(f"enqueue: {status}")
+
+        await notify_external_system()      # your application logic
+
+        if await lock.wait(timeout_s=10):   # blocks until granted
+            try:
+                print(f"lock held: {lock.token}")
+                await asyncio.sleep(1)
+            finally:
+                await lock.release()
+
+    asyncio.run(main())
+    ```
+
+=== "Sync"
+
+    ```python
+    from dflockd.sync_client import DistributedLock
+
+    lock = DistributedLock("my-key", acquire_timeout_s=10, lease_ttl_s=20)
+
+    status = lock.enqueue()           # "acquired" or "queued"
+    print(f"enqueue: {status}")
+
+    notify_external_system()          # your application logic
+
+    if lock.wait(timeout_s=10):       # blocks until granted
+        try:
+            print(f"lock held: {lock.token}")
+        finally:
+            lock.release()
+    ```
+
+If the lock is free at enqueue time, it is acquired immediately (fast path) and `wait()` returns `True` without blocking. The lease auto-renews in the background from the moment of acquisition.
+
 ## Multi-server sharding
 
 Distribute keys across multiple dflockd instances. Each key deterministically routes to the same server:

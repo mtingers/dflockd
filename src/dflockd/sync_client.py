@@ -69,6 +69,54 @@ def renew(
     return -1
 
 
+def enqueue(
+    sock: socket.socket,
+    rfile: io.TextIOWrapper,
+    key: str,
+    lease_ttl_s: int | None = None,
+) -> tuple[str, str | None, int | None]:
+    """
+    Two-phase enqueue: join FIFO queue, return immediately.
+    Returns (status, token, lease) where status is "acquired" or "queued".
+    """
+    arg = "" if lease_ttl_s is None else str(lease_ttl_s)
+    sock.sendall(_encode_lines("e", key, arg))
+
+    resp = _readline(rfile)
+    if resp.startswith("acquired "):
+        parts = resp.split()
+        token = parts[1]
+        lease = int(parts[2]) if len(parts) >= 3 else 30
+        return ("acquired", token, lease)
+    if resp == "queued":
+        return ("queued", None, None)
+    raise RuntimeError(f"enqueue failed: {resp!r}")
+
+
+def wait(
+    sock: socket.socket,
+    rfile: io.TextIOWrapper,
+    key: str,
+    wait_timeout_s: int,
+) -> tuple[str, int]:
+    """
+    Two-phase wait: block until lock is granted.
+    Returns (token, lease). Raises TimeoutError on timeout.
+    """
+    sock.sendall(_encode_lines("w", key, str(wait_timeout_s)))
+
+    resp = _readline(rfile)
+    if resp == "timeout":
+        raise TimeoutError(f"timeout waiting for {key!r}")
+    if not resp.startswith("ok "):
+        raise RuntimeError(f"wait failed: {resp!r}")
+
+    parts = resp.split()
+    token = parts[1]
+    lease = int(parts[2]) if len(parts) >= 3 else 30
+    return token, lease
+
+
 def release(sock: socket.socket, rfile: io.TextIOWrapper, key: str, token: str) -> None:
     sock.sendall(_encode_lines("r", key, token))
 
@@ -133,6 +181,47 @@ class DistributedLock:
                 self.acquire_timeout_s,
                 self.lease_ttl_s,
             )
+        except TimeoutError:
+            self.close()
+            return False
+        except BaseException:
+            self.close()
+            raise
+        self._start_renew()
+        return True
+
+    def enqueue(self) -> str:
+        """
+        Two-phase step 1: connect and enqueue. Returns "acquired" or "queued".
+        Starts renew loop on fast-path acquire.
+        """
+        self._connect()
+        sock, rfile = self._sock, self._rfile
+        assert sock is not None and rfile is not None
+        try:
+            status, tok, lease = enqueue(sock, rfile, self.key, self.lease_ttl_s)
+        except BaseException:
+            self.close()
+            raise
+        if status == "acquired":
+            self.token = tok
+            self.lease = lease or 0
+            self._start_renew()
+        return status
+
+    def wait(self, timeout_s: int | None = None) -> bool:
+        """
+        Two-phase step 2: wait for lock grant. Returns True if granted, False on timeout.
+        If already acquired (fast path from enqueue), returns immediately.
+        """
+        if self.token is not None:
+            return True
+        sock, rfile = self._sock, self._rfile
+        if sock is None or rfile is None:
+            raise RuntimeError("not connected; call enqueue() first")
+        timeout = timeout_s if timeout_s is not None else self.acquire_timeout_s
+        try:
+            self.token, self.lease = wait(sock, rfile, self.key, timeout)
         except TimeoutError:
             self.close()
             return False

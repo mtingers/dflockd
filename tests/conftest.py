@@ -11,9 +11,11 @@ def _reset_server_state():
     """Clear global lock state between every test."""
     srv._locks.clear()
     srv._conn_owned.clear()
+    srv._conn_enqueued.clear()
     yield
     srv._locks.clear()
     srv._conn_owned.clear()
+    srv._conn_enqueued.clear()
 
 
 @pytest_asyncio.fixture()

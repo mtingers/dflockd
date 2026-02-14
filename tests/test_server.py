@@ -9,11 +9,14 @@ import pytest
 import dflockd.server as srv
 from dflockd.server import (
     Ack,
+    EnqueuedState,
     MaxLocksError,
+    NotEnqueuedError,
     ProtocolError,
     Request,
     Status,
     _conn_add_owned,
+    _conn_enqueued,
     _conn_owned,
     _conn_remove_owned,
     _locks,
@@ -22,8 +25,10 @@ from dflockd.server import (
     _parse_int,
     cleanup_connection,
     fifo_acquire,
+    fifo_enqueue,
     fifo_release,
     fifo_renew,
+    fifo_wait,
     format_response,
     getenv_int,
     handle_request,
@@ -193,6 +198,43 @@ class TestReadRequest:
             await read_request(reader)
         assert exc.value.code == 8
 
+    @pytest.mark.asyncio
+    async def test_enqueue_default_lease(self):
+        reader = _make_reader("e", "mykey", "")
+        req = await read_request(reader)
+        assert req.cmd == "e"
+        assert req.key == "mykey"
+        assert req.lease_ttl_s == srv.DEFAULT_LEASE_TTL_S
+
+    @pytest.mark.asyncio
+    async def test_enqueue_custom_lease(self):
+        reader = _make_reader("e", "mykey", "60")
+        req = await read_request(reader)
+        assert req.cmd == "e"
+        assert req.lease_ttl_s == 60
+
+    @pytest.mark.asyncio
+    async def test_enqueue_zero_lease(self):
+        reader = _make_reader("e", "mykey", "0")
+        with pytest.raises(ProtocolError) as exc:
+            await read_request(reader)
+        assert exc.value.code == 9
+
+    @pytest.mark.asyncio
+    async def test_wait_parse(self):
+        reader = _make_reader("w", "mykey", "10")
+        req = await read_request(reader)
+        assert req.cmd == "w"
+        assert req.key == "mykey"
+        assert req.acquire_timeout_s == 10
+
+    @pytest.mark.asyncio
+    async def test_wait_negative_timeout(self):
+        reader = _make_reader("w", "mykey", "-1")
+        with pytest.raises(ProtocolError) as exc:
+            await read_request(reader)
+        assert exc.value.code == 6
+
 
 # ---------------------------------------------------------------------------
 # format_response
@@ -227,6 +269,14 @@ class TestFormatResponse:
     def test_error_max_locks(self):
         ack = Ack(Status.error_max_locks)
         assert format_response(ack) == b"error_max_locks\n"
+
+    def test_acquired_with_token(self):
+        ack = Ack(Status.acquired, token="abc", lease_ttl_s=30)
+        assert format_response(ack) == b"acquired abc 30\n"
+
+    def test_queued_bare(self):
+        ack = Ack(Status.queued)
+        assert format_response(ack) == b"queued\n"
 
 
 # ---------------------------------------------------------------------------
@@ -591,3 +641,242 @@ class TestNewToken:
         tok = _new_token()
         assert isinstance(tok, str)
         int(tok, 16)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# fifo_enqueue
+# ---------------------------------------------------------------------------
+
+
+class TestFifoEnqueue:
+    @pytest.mark.asyncio
+    async def test_immediate_acquire(self):
+        status, token, lease = await fifo_enqueue("k1", 30, conn_id=1)
+        assert status == Status.acquired
+        assert token is not None
+        assert lease == 30
+        assert _locks["k1"].owner_token == token
+        assert _locks["k1"].owner_conn_id == 1
+        # Should be in _conn_enqueued
+        assert (1, "k1") in _conn_enqueued
+
+    @pytest.mark.asyncio
+    async def test_queued_behind_holder(self):
+        await fifo_acquire("k1", 5, 30, conn_id=1)
+        status, token, lease = await fifo_enqueue("k1", 30, conn_id=2)
+        assert status == Status.queued
+        assert token is None
+        assert lease is None
+        assert (2, "k1") in _conn_enqueued
+        es = _conn_enqueued[(2, "k1")]
+        assert es.waiter is not None
+        assert not es.waiter.fut.done()
+
+    @pytest.mark.asyncio
+    async def test_double_enqueue_error(self):
+        await fifo_enqueue("k1", 30, conn_id=1)
+        with pytest.raises(ProtocolError) as exc:
+            await fifo_enqueue("k1", 30, conn_id=1)
+        assert exc.value.code == 8
+
+    @pytest.mark.asyncio
+    async def test_max_locks(self):
+        old = srv.MAX_LOCKS
+        srv.MAX_LOCKS = 1
+        try:
+            await fifo_enqueue("k1", 30, conn_id=1)
+            with pytest.raises(MaxLocksError):
+                await fifo_enqueue("k2", 30, conn_id=2)
+        finally:
+            srv.MAX_LOCKS = old
+
+
+# ---------------------------------------------------------------------------
+# fifo_wait
+# ---------------------------------------------------------------------------
+
+
+class TestFifoWait:
+    @pytest.mark.asyncio
+    async def test_fast_path_wait(self):
+        """Wait after fast-path enqueue (already acquired) returns immediately."""
+        status, token, lease = await fifo_enqueue("k1", 30, conn_id=1)
+        assert status == Status.acquired
+
+        result = await fifo_wait("k1", 5, conn_id=1)
+        assert result is not None
+        tok, ttl = result
+        assert tok == token
+        assert ttl == 30
+        # Should be removed from _conn_enqueued
+        assert (1, "k1") not in _conn_enqueued
+
+    @pytest.mark.asyncio
+    async def test_queued_then_wait(self):
+        """Wait for a queued enqueue; release grants the lock."""
+        tok1 = await fifo_acquire("k1", 5, 30, conn_id=1)
+        await fifo_enqueue("k1", 30, conn_id=2)
+
+        async def _do_wait():
+            return await fifo_wait("k1", 5, conn_id=2)
+
+        wait_task = asyncio.create_task(_do_wait())
+        await asyncio.sleep(0.05)
+
+        # Release conn1's lock → should grant to conn2's waiter
+        await fifo_release("k1", tok1)
+        result = await wait_task
+        assert result is not None
+        tok, ttl = result
+        assert tok is not None
+        assert ttl == 30
+        assert (2, "k1") not in _conn_enqueued
+
+    @pytest.mark.asyncio
+    async def test_timeout(self):
+        """Wait times out when lock is not granted."""
+        await fifo_acquire("k1", 5, 30, conn_id=1)
+        await fifo_enqueue("k1", 30, conn_id=2)
+
+        result = await fifo_wait("k1", 0, conn_id=2)
+        assert result is None
+        assert (2, "k1") not in _conn_enqueued
+
+    @pytest.mark.asyncio
+    async def test_not_enqueued_error(self):
+        """Wait without prior enqueue raises NotEnqueuedError."""
+        with pytest.raises(NotEnqueuedError):
+            await fifo_wait("k1", 5, conn_id=1)
+
+    @pytest.mark.asyncio
+    async def test_fast_path_lock_lost(self):
+        """Fast-path token but lease expired between enqueue and wait."""
+        status, token, lease = await fifo_enqueue("k1", 1, conn_id=1)
+        assert status == Status.acquired
+        # Manually expire the lease
+        _locks["k1"].lease_expires_at = _now() - 1
+        # Simulate lease expiry transferring lock away
+        _locks["k1"].owner_token = None
+        _locks["k1"].owner_conn_id = None
+
+        result = await fifo_wait("k1", 5, conn_id=1)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestTwoPhaseFlow
+# ---------------------------------------------------------------------------
+
+
+class TestTwoPhaseFlow:
+    @pytest.mark.asyncio
+    async def test_full_cycle(self):
+        """Full e→w→r cycle on a free lock."""
+        status, token, lease = await fifo_enqueue("k1", 30, conn_id=1)
+        assert status == Status.acquired
+
+        result = await fifo_wait("k1", 5, conn_id=1)
+        assert result is not None
+        tok, ttl = result
+        assert tok == token
+
+        ok = await fifo_release("k1", tok)
+        assert ok is True
+        assert _locks["k1"].owner_token is None
+
+    @pytest.mark.asyncio
+    async def test_contention_scenario(self):
+        """conn1 holds, conn2 does e+w, conn1 releases → conn2 gets lock."""
+        tok1 = await fifo_acquire("k1", 5, 30, conn_id=1)
+
+        status, _, _ = await fifo_enqueue("k1", 30, conn_id=2)
+        assert status == Status.queued
+
+        async def _do_wait():
+            return await fifo_wait("k1", 5, conn_id=2)
+
+        wait_task = asyncio.create_task(_do_wait())
+        await asyncio.sleep(0.05)
+
+        await fifo_release("k1", tok1)
+        result = await wait_task
+        assert result is not None
+        tok2, _ = result
+        assert _locks["k1"].owner_token == tok2
+        assert _locks["k1"].owner_conn_id == 2
+
+        await fifo_release("k1", tok2)
+
+
+# ---------------------------------------------------------------------------
+# TestCleanupConnection — enqueued state
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupConnectionEnqueued:
+    @pytest.mark.asyncio
+    async def test_enqueued_waiter_cleanup(self):
+        """Disconnecting a connection with a pending enqueued waiter cleans up."""
+        await fifo_acquire("k1", 5, 30, conn_id=1)
+        await fifo_enqueue("k1", 30, conn_id=2)
+        assert (2, "k1") in _conn_enqueued
+
+        await cleanup_connection(2)
+        assert (2, "k1") not in _conn_enqueued
+        # Waiter should be removed from the lock's queue
+        assert len(_locks["k1"].waiters) == 0
+
+    @pytest.mark.asyncio
+    async def test_fast_path_cleanup(self):
+        """Disconnecting a connection with a fast-path enqueued token cleans up."""
+        status, token, _ = await fifo_enqueue("k1", 30, conn_id=1)
+        assert status == Status.acquired
+        assert (1, "k1") in _conn_enqueued
+
+        await cleanup_connection(1)
+        assert (1, "k1") not in _conn_enqueued
+        # Lock should be released
+        assert _locks["k1"].owner_token is None
+
+
+# ---------------------------------------------------------------------------
+# handle_request — enqueue/wait
+# ---------------------------------------------------------------------------
+
+
+class TestHandleRequestEnqueueWait:
+    @pytest.mark.asyncio
+    async def test_enqueue_immediate(self):
+        req = Request(cmd="e", key="k1", lease_ttl_s=30)
+        ack = await handle_request(req, conn_id=1)
+        assert ack.status == Status.acquired
+        assert ack.token is not None
+        assert ack.lease_ttl_s == 30
+
+    @pytest.mark.asyncio
+    async def test_enqueue_queued(self):
+        req1 = Request(cmd="l", key="k1", acquire_timeout_s=5, lease_ttl_s=30)
+        await handle_request(req1, conn_id=1)
+
+        req2 = Request(cmd="e", key="k1", lease_ttl_s=30)
+        ack = await handle_request(req2, conn_id=2)
+        assert ack.status == Status.queued
+        assert ack.token is None
+
+    @pytest.mark.asyncio
+    async def test_wait_after_enqueue(self):
+        """Enqueue (fast path) then wait returns ok."""
+        req_e = Request(cmd="e", key="k1", lease_ttl_s=30)
+        ack_e = await handle_request(req_e, conn_id=1)
+        assert ack_e.status == Status.acquired
+
+        req_w = Request(cmd="w", key="k1", acquire_timeout_s=5)
+        ack_w = await handle_request(req_w, conn_id=1)
+        assert ack_w.status == Status.ok
+        assert ack_w.token is not None
+
+    @pytest.mark.asyncio
+    async def test_wait_not_enqueued(self):
+        req = Request(cmd="w", key="k1", acquire_timeout_s=5)
+        ack = await handle_request(req, conn_id=1)
+        assert ack.status == Status.error

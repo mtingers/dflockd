@@ -20,6 +20,8 @@ class DistributedLock:
 | Method | Returns | Description |
 |---|---|---|
 | `await acquire()` | `bool` | Acquire the lock. Returns `False` on timeout |
+| `await enqueue()` | `str` | Two-phase step 1: join queue. Returns `"acquired"` or `"queued"` |
+| `await wait(timeout_s=None)` | `bool` | Two-phase step 2: block until granted. Returns `False` on timeout |
 | `await release()` | `bool` | Release the lock and stop renewal |
 | `await aclose()` | `None` | Close the connection and clean up |
 
@@ -75,6 +77,32 @@ async def renew(
 
 Send a renew request. Returns seconds remaining, or `-1` if not reported by the server. Raises `RuntimeError` on failure.
 
+#### enqueue
+
+```python
+async def enqueue(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    key: str,
+    lease_ttl_s: int | None = None,
+) -> tuple[str, str | None, int | None]
+```
+
+Two-phase step 1: join the FIFO queue. Returns `(status, token, lease)` where status is `"acquired"` or `"queued"`. Raises `RuntimeError` on failure.
+
+#### wait
+
+```python
+async def wait(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    key: str,
+    wait_timeout_s: int,
+) -> tuple[str, int]
+```
+
+Two-phase step 2: block until lock is granted. Returns `(token, lease)`. Raises `TimeoutError` on timeout.
+
 ---
 
 ## dflockd.sync_client
@@ -97,6 +125,8 @@ class DistributedLock:
 | Method | Returns | Description |
 |---|---|---|
 | `acquire()` | `bool` | Acquire the lock. Returns `False` on timeout |
+| `enqueue()` | `str` | Two-phase step 1: join queue. Returns `"acquired"` or `"queued"` |
+| `wait(timeout_s=None)` | `bool` | Two-phase step 2: block until granted. Returns `False` on timeout |
 | `release()` | `bool` | Release the lock and stop renewal |
 | `close()` | `None` | Close the connection and clean up |
 
@@ -143,6 +173,32 @@ def renew(
     lease_ttl_s: int | None = None,
 ) -> int
 ```
+
+#### enqueue
+
+```python
+def enqueue(
+    sock: socket.socket,
+    rfile: io.TextIOWrapper,
+    key: str,
+    lease_ttl_s: int | None = None,
+) -> tuple[str, str | None, int | None]
+```
+
+Two-phase step 1: join the FIFO queue. Returns `(status, token, lease)` where status is `"acquired"` or `"queued"`.
+
+#### wait
+
+```python
+def wait(
+    sock: socket.socket,
+    rfile: io.TextIOWrapper,
+    key: str,
+    wait_timeout_s: int,
+) -> tuple[str, int]
+```
+
+Two-phase step 2: block until lock is granted. Returns `(token, lease)`. Raises `TimeoutError` on timeout.
 
 ---
 

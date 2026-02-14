@@ -59,8 +59,14 @@ class MaxLocksError(RuntimeError):
     pass
 
 
+class NotEnqueuedError(RuntimeError):
+    pass
+
+
 class Status(StrEnum):
     ok = "ok"
+    acquired = "acquired"
+    queued = "queued"
     error = "error"
     error_max_locks = "error_max_locks"
     timeout = "timeout"
@@ -104,6 +110,17 @@ _locks: dict[str, LockState] = {}
 
 # Tracks which keys a connection currently owns (for disconnect cleanup)
 _conn_owned: dict[int, set[str]] = {}
+
+
+@dataclass
+class EnqueuedState:
+    waiter: Waiter | None
+    token: str | None
+    lease_ttl_s: int
+
+
+# Tracks two-phase enqueue state: (conn_id, key) -> EnqueuedState
+_conn_enqueued: dict[tuple[int, str], EnqueuedState] = {}
 
 
 def _now() -> float:
@@ -152,7 +169,7 @@ async def read_request(reader: asyncio.StreamReader) -> Request:
     key = await read_line(reader)
     arg = await read_line(reader)
 
-    if cmd not in ("l", "r", "n"):
+    if cmd not in ("l", "r", "n", "e", "w"):
         raise ProtocolError(3, f"invalid cmd {cmd!r}")
     if not key:
         raise ProtocolError(5, "empty key")
@@ -184,32 +201,55 @@ async def read_request(reader: asyncio.StreamReader) -> Request:
             raise ProtocolError(7, "empty token")
         return Request(cmd=cmd, key=key, token=token)
 
-    # cmd == "n"
-    if len(parts) not in (1, 2):
-        raise ProtocolError(8, "renew arg must be: <token> [<lease_ttl>]")
-    token = parts[0].strip()
-    if not token:
-        raise ProtocolError(7, "empty token")
-    lease_ttl_s = (
-        DEFAULT_LEASE_TTL_S if len(parts) == 1 else _parse_int(parts[1], "lease_ttl")
-    )
-    if lease_ttl_s <= 0:
-        raise ProtocolError(9, "lease_ttl must be > 0")
-    return Request(cmd=cmd, key=key, token=token, lease_ttl_s=lease_ttl_s)
+    if cmd == "n":
+        if len(parts) not in (1, 2):
+            raise ProtocolError(8, "renew arg must be: <token> [<lease_ttl>]")
+        token = parts[0].strip()
+        if not token:
+            raise ProtocolError(7, "empty token")
+        lease_ttl_s = (
+            DEFAULT_LEASE_TTL_S
+            if len(parts) == 1
+            else _parse_int(parts[1], "lease_ttl")
+        )
+        if lease_ttl_s <= 0:
+            raise ProtocolError(9, "lease_ttl must be > 0")
+        return Request(cmd=cmd, key=key, token=token, lease_ttl_s=lease_ttl_s)
+
+    if cmd == "e":
+        # e\n<key>\n[<lease_ttl_s>]\n  — 3rd line optional positive int
+        stripped = arg.strip()
+        if stripped == "":
+            lease_ttl_s = DEFAULT_LEASE_TTL_S
+        else:
+            lease_ttl_s = _parse_int(stripped, "lease_ttl")
+            if lease_ttl_s <= 0:
+                raise ProtocolError(9, "lease_ttl must be > 0")
+        return Request(cmd=cmd, key=key, lease_ttl_s=lease_ttl_s)
+
+    # cmd == "w"
+    stripped = arg.strip()
+    if not stripped:
+        raise ProtocolError(8, "wait arg must be: <timeout>")
+    acquire_timeout_s = _parse_int(stripped, "timeout")
+    if acquire_timeout_s < 0:
+        raise ProtocolError(6, "timeout must be >= 0")
+    return Request(cmd=cmd, key=key, acquire_timeout_s=acquire_timeout_s)
 
 
 def format_response(ack: Ack) -> bytes:
-    if ack.status == Status.ok:
-        # Acquire response: "ok <token> <lease_ttl>"
+    if ack.status in (Status.ok, Status.acquired):
+        prefix = ack.status.value
+        # Acquire/enqueue-acquired response: "<prefix> <token> <lease_ttl>"
         if ack.token is not None:
             lease = (
                 ack.lease_ttl_s if ack.lease_ttl_s is not None else DEFAULT_LEASE_TTL_S
             )
-            return f"ok {ack.token} {lease}\n".encode()
+            return f"{prefix} {ack.token} {lease}\n".encode()
         # Renew response: "ok <extra>"
         if ack.extra is not None:
-            return f"ok {ack.extra}\n".encode()
-        return b"ok\n"
+            return f"{prefix} {ack.extra}\n".encode()
+        return f"{prefix}\n".encode()
     return f"{ack.status.value}\n".encode()
 
 
@@ -279,6 +319,122 @@ async def fifo_acquire(
     except TimeoutError:
         # Remove ourselves from the queue if still present
         async with tracking_lock:
+            st = _locks.get(key)
+            if st:
+                st.last_activity = _now()
+                st.waiters = deque(w for w in st.waiters if w is not waiter)
+        return None
+
+
+async def fifo_enqueue(
+    key: str, lease_ttl_s: int, conn_id: int
+) -> tuple[Status, str | None, int | None]:
+    """
+    Phase 1 of two-phase acquire: enqueue into the FIFO queue and return immediately.
+    Returns (acquired, token, lease) if lock was free, or (queued, None, None) if waiting.
+    """
+    eq_key = (conn_id, key)
+    async with tracking_lock:
+        if eq_key in _conn_enqueued:
+            raise ProtocolError(8, "already enqueued for this key")
+
+        if len(_locks) >= MAX_LOCKS and key not in _locks:
+            raise MaxLocksError(f"{len(_locks)} >= {MAX_LOCKS}")
+
+        st = _locks.get(key)
+        if st is None:
+            st = LockState(last_activity=_now())
+            _locks[key] = st
+
+        st.last_activity = _now()
+
+        # Fast path: free and no waiters => immediate acquire
+        if st.owner_token is None and not st.waiters:
+            token = _new_token()
+            st.owner_token = token
+            st.owner_conn_id = conn_id
+            st.lease_expires_at = _now() + lease_ttl_s
+            st.last_activity = _now()
+            _conn_add_owned(conn_id, key)
+            _conn_enqueued[eq_key] = EnqueuedState(
+                waiter=None, token=token, lease_ttl_s=lease_ttl_s
+            )
+            return (Status.acquired, token, lease_ttl_s)
+
+        # Slow path: create waiter and enqueue
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        waiter = Waiter(
+            fut=fut, conn_id=conn_id, lease_ttl_s=lease_ttl_s, enqueued_at=_now()
+        )
+        st.waiters.append(waiter)
+        _conn_enqueued[eq_key] = EnqueuedState(
+            waiter=waiter, token=None, lease_ttl_s=lease_ttl_s
+        )
+        return (Status.queued, None, None)
+
+
+async def fifo_wait(
+    key: str, wait_timeout_s: int, conn_id: int
+) -> tuple[str, int] | None:
+    """
+    Phase 2 of two-phase acquire: block until lock is granted or timeout.
+    Returns (token, lease_ttl_s) on success, None on timeout.
+    Resets lease to now + lease_ttl_s on success.
+    """
+    eq_key = (conn_id, key)
+
+    async with tracking_lock:
+        es = _conn_enqueued.get(eq_key)
+        if es is None:
+            raise NotEnqueuedError("not enqueued for this key")
+
+    lease_ttl_s = es.lease_ttl_s
+
+    # Fast path: already acquired during enqueue
+    if es.token is not None:
+        async with tracking_lock:
+            _conn_enqueued.pop(eq_key, None)
+            st = _locks.get(key)
+            if st and st.owner_token == es.token:
+                # Verify lock still held (lease may have expired)
+                if st.lease_expires_at > 0 and _now() >= st.lease_expires_at:
+                    # Lock was lost; clean up
+                    return None
+                # Reset lease
+                st.lease_expires_at = _now() + lease_ttl_s
+                st.last_activity = _now()
+                return (es.token, lease_ttl_s)
+            # Lock was lost (e.g. lease expired between enqueue and wait)
+            return None
+
+    # Slow path: waiter is pending
+    waiter = es.waiter
+    assert waiter is not None
+
+    try:
+        token = await asyncio.wait_for(waiter.fut, timeout=float(wait_timeout_s))
+        async with tracking_lock:
+            _conn_enqueued.pop(eq_key, None)
+            st = _locks.get(key)
+            if st:
+                # Reset lease to full TTL from now
+                st.lease_expires_at = _now() + lease_ttl_s
+                st.last_activity = _now()
+        return (token, lease_ttl_s)
+
+    except TimeoutError:
+        async with tracking_lock:
+            _conn_enqueued.pop(eq_key, None)
+            # Race check: future may have resolved between timeout and lock acquisition
+            if waiter.fut.done() and not waiter.fut.cancelled():
+                token = waiter.fut.result()
+                st = _locks.get(key)
+                if st:
+                    st.lease_expires_at = _now() + lease_ttl_s
+                    st.last_activity = _now()
+                return (token, lease_ttl_s)
+            # Remove from queue
             st = _locks.get(key)
             if st:
                 st.last_activity = _now()
@@ -439,12 +595,24 @@ async def cleanup_connection(conn_id: int):
     """
     Best-effort: if enabled, release locks currently owned by this conn_id
     and cancel any pending waiters from this connection.
+    Also cleans up any two-phase enqueued state for this connection.
     NOTE: This assumes tokens are not transferred between connections.
     """
     if not AUTO_RELEASE_ON_DISCONNECT:
         return
 
     async with tracking_lock:
+        # Clean up two-phase enqueued state for this connection
+        enqueued_keys = [k for (cid, k) in _conn_enqueued if cid == conn_id]
+        for key in enqueued_keys:
+            es = _conn_enqueued.pop((conn_id, key), None)
+            if es and es.waiter and not es.waiter.fut.done():
+                es.waiter.fut.cancel()
+                # Remove waiter from the lock's queue
+                st = _locks.get(key)
+                if st:
+                    st.waiters = deque(w for w in st.waiters if w is not es.waiter)
+
         # Cancel pending waiters from this connection across all locks
         for key, st in _locks.items():
             remaining = deque()
@@ -511,6 +679,25 @@ async def handle_request(req: Request, conn_id: int) -> Ack:
                 return Ack(Status.error)
             return Ack(Status.ok, extra=str(remaining))
 
+        if req.cmd == "e":
+            status, tok, lease = await fifo_enqueue(
+                req.key,
+                req.lease_ttl_s or DEFAULT_LEASE_TTL_S,
+                conn_id,
+            )
+            return Ack(status, token=tok, lease_ttl_s=lease)
+
+        if req.cmd == "w":
+            result = await fifo_wait(
+                req.key,
+                req.acquire_timeout_s or 0,
+                conn_id,
+            )
+            if result is None:
+                return Ack(Status.timeout)
+            tok, lease = result
+            return Ack(Status.ok, token=tok, lease_ttl_s=lease)
+
         return Ack(Status.error)
 
     except ProtocolError as err:
@@ -521,6 +708,8 @@ async def handle_request(req: Request, conn_id: int) -> Ack:
     except MaxLocksError as err:
         log.error("max_locks error: %s", err)
         return Ack(Status.error_max_locks)
+    except NotEnqueuedError:
+        return Ack(Status.error)
     except Exception:
         log.exception("exception handling request")
         return Ack(Status.error)

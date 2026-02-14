@@ -330,6 +330,113 @@ class TestDisconnectBehavior:
 # ===========================================================================
 
 
+# ===========================================================================
+# Async two-phase: enqueue + wait
+# ===========================================================================
+
+
+class TestAsyncTwoPhase:
+    @pytest.mark.asyncio
+    async def test_low_level_enqueue_wait_release(self, server_port):
+        """Low-level: enqueue + wait + release on a free lock."""
+        reader, writer = await _open(server_port)
+        try:
+            status, token, lease = await aclient.enqueue(reader, writer, "k1")
+            assert status == "acquired"
+            assert token is not None
+            assert lease > 0
+
+            # wait should return immediately (already acquired)
+            tok, ttl = await aclient.wait(reader, writer, "k1", 5)
+            assert tok == token
+
+            await aclient.release(reader, writer, "k1", tok)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_low_level_queued_then_wait(self, server_port):
+        """Low-level: conn1 holds, conn2 enqueues (queued), conn1 releases, conn2 waits."""
+        r1, w1 = await _open(server_port)
+        r2, w2 = await _open(server_port)
+        try:
+            # conn1 acquires
+            tok1, _ = await aclient.acquire(r1, w1, "k1", 5)
+
+            # conn2 enqueues — should be queued
+            status, _, _ = await aclient.enqueue(r2, w2, "k1")
+            assert status == "queued"
+
+            # Release conn1 in background, then conn2 waits
+            async def _release_soon():
+                await asyncio.sleep(0.1)
+                await aclient.release(r1, w1, "k1", tok1)
+
+            release_task = asyncio.create_task(_release_soon())
+            tok2, lease2 = await aclient.wait(r2, w2, "k1", 5)
+            await release_task
+
+            assert tok2 is not None
+            assert lease2 > 0
+            await aclient.release(r2, w2, "k1", tok2)
+        finally:
+            w1.close()
+            w2.close()
+
+    @pytest.mark.asyncio
+    async def test_distributed_lock_two_phase(self, server_port):
+        """DistributedLock.enqueue() + wait() + release() flow."""
+        lock = aclient.DistributedLock(
+            key="k1",
+            acquire_timeout_s=5,
+            lease_ttl_s=5,
+            servers=[("127.0.0.1", server_port)],
+        )
+        status = await lock.enqueue()
+        assert status == "acquired"
+        assert lock.token is not None
+
+        ok = await lock.wait()
+        assert ok is True
+
+        await lock.release()
+        assert lock.token is None
+
+    @pytest.mark.asyncio
+    async def test_distributed_lock_two_phase_contention(self, server_port):
+        """Two DistributedLock instances: lock1 holds, lock2 does enqueue+wait."""
+        lock1 = aclient.DistributedLock(
+            key="k1",
+            acquire_timeout_s=5,
+            lease_ttl_s=5,
+            servers=[("127.0.0.1", server_port)],
+        )
+        lock2 = aclient.DistributedLock(
+            key="k1",
+            acquire_timeout_s=5,
+            lease_ttl_s=5,
+            servers=[("127.0.0.1", server_port)],
+        )
+
+        await lock1.acquire()
+
+        status = await lock2.enqueue()
+        assert status == "queued"
+
+        async def _release_soon():
+            await asyncio.sleep(0.1)
+            await lock1.release()
+
+        release_task = asyncio.create_task(_release_soon())
+        ok = await lock2.wait()
+        await release_task
+
+        assert ok is True
+        assert lock2.token is not None
+        await lock2.release()
+
+
 class TestAsyncSharding:
     def test_empty_servers_raises(self):
         with pytest.raises(ValueError, match="non-empty"):

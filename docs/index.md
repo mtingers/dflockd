@@ -5,6 +5,7 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 ## Features
 
 - **Strict FIFO ordering** — waiters are granted locks in the order they enqueue, per key
+- **Two-phase lock acquisition** — split enqueue and wait to notify external systems between joining the queue and blocking
 - **Automatic lease expiry** — held locks expire if not renewed, preventing deadlocks
 - **Background renewal** — both async and sync clients auto-renew leases in the background
 - **Disconnect cleanup** — locks are released automatically when a client disconnects
