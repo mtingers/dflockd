@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.0.0] - 2026-02-15
+
+### Added
+
+- Complete server rewrite from Python to Go, delivering a single static binary with no runtime dependencies
+- Standard Go project layout (`cmd/dflockd/`, `internal/config/`, `internal/lock/`, `internal/protocol/`, `internal/server/`)
+- Comprehensive test suite (49 tests) covering lock operations, protocol parsing, and integration scenarios
+- `--version` flag printing the embedded version string
+- Cross-platform binary builds via GoReleaser (linux/darwin/windows on amd64/arm64, tar.gz archives, zip for Windows, SHA256 checksums)
+- Automated GitHub Releases workflow triggered on `v*` tag push
+- Dependabot configuration for Go module updates
+
+### Changed
+
+- CI and docs workflows updated for Go codebase
+- Makefile simplified for Go build toolchain with `VERSION` ldflags support
+
+### Removed
+
+- Python server, async client, and sync client
+- TypeScript client
+- Python test suite, benchmark scripts, and example scripts
+- Sharding module and documentation
+- Built `site/` artifacts
+
+[v1.0.0]: https://github.com/mtingers/dflockd/releases/tag/v1.0.0
+
 ## [v0.5.0] - 2026-02-14
 
 ### Added
