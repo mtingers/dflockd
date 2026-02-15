@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -13,8 +14,15 @@ import (
 	"github.com/mtingers/dflockd/internal/server"
 )
 
+var version = "dev"
+
 func main() {
 	cfg := config.Load()
+
+	if cfg.Version {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	logLevel := slog.LevelInfo
 	if cfg.Debug {

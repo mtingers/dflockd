@@ -4,13 +4,16 @@
 
 ```bash
 # Default: listens on 0.0.0.0:6388
-dflockd
+./dflockd
 
 # Custom port
-dflockd --port 7000
+./dflockd --port 7000
 
 # Multiple options
-dflockd --host 127.0.0.1 --port 7000 --max-locks 512
+./dflockd --host 127.0.0.1 --port 7000 --max-locks 512
+
+# Debug logging
+./dflockd --debug
 ```
 
 ## CLI flags
@@ -26,6 +29,7 @@ dflockd --host 127.0.0.1 --port 7000 --max-locks 512
 | `--max-locks` | `1024` | Maximum number of unique lock keys |
 | `--read-timeout` | `23` | Client read timeout (seconds) |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
+| `--debug` | `false` | Enable debug logging |
 
 ## Environment variables
 
@@ -42,19 +46,20 @@ All settings can be configured via environment variables. Environment variables 
 | `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
 | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects |
+| `DFLOCKD_DEBUG` | *(unset)* | Enable debug logging (`1`, `yes`, or `true`) |
 
 ```bash
 # Example: configure via environment
 export DFLOCKD_PORT=7000
 export DFLOCKD_MAX_LOCKS=2048
-dflockd
+./dflockd
 ```
 
 ## Tuning guide
 
 ### Lease TTL
 
-The `default-lease-ttl` controls how long a lock is held before it expires if not renewed. Clients automatically renew at `lease * renew_ratio` (default 0.5), so a 33-second TTL renews every ~16 seconds.
+The `default-lease-ttl` controls how long a lock is held before it expires if not renewed. Clients are responsible for sending renew (`n`) commands before the lease expires.
 
 - **Shorter TTL** (e.g. 10s): faster failover when clients crash, but more renewal traffic.
 - **Longer TTL** (e.g. 60s): less renewal traffic, but slower failover.

@@ -19,6 +19,7 @@ type Config struct {
 	ReadTimeout             time.Duration
 	AutoReleaseOnDisconnect bool
 	Debug                   bool
+	Version                 bool
 }
 
 func envInt(key string, def int) int {
@@ -62,6 +63,7 @@ func Load() *Config {
 	readTimeout := flag.Int("read-timeout", 23, "Client read timeout (seconds)")
 	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
 	// Env vars take precedence over CLI flags
@@ -117,6 +119,8 @@ func Load() *Config {
 	} else {
 		cfg.Debug = *debug
 	}
+
+	cfg.Version = *version
 
 	return cfg
 }

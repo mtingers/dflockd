@@ -2,29 +2,20 @@
 
 ## Requirements
 
-- Python 3.13 or later
-- No external dependencies
+- Go 1.23+ (for building from source)
 
-## Install from PyPI
+## Install with `go install`
 
-=== "pip"
+```bash
+go install github.com/mtingers/dflockd/cmd/dflockd@latest
+```
 
-    ```bash
-    pip install dflockd
-    ```
-
-=== "uv"
-
-    ```bash
-    uv add dflockd
-    ```
-
-## Install from source
+## Build from source
 
 ```bash
 git clone https://github.com/mtingers/dflockd.git
 cd dflockd
-uv sync
+make build
 ```
 
 ## Verify installation
@@ -32,11 +23,11 @@ uv sync
 Start the server to confirm everything is working:
 
 ```bash
-# If installed from PyPI
+# If installed with go install
 dflockd
 
-# If installed from source
-uv run dflockd
+# If built from source
+./dflockd
 ```
 
 You should see log output indicating the server is listening:

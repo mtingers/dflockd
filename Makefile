@@ -1,50 +1,31 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help lint format typecheck test test-cov clean docs-serve docs-build
+.PHONY: help build test lint clean run docs-serve docs-build
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-# lint: ## Run linter
-# 	uv run ruff check src/ tests/
+VERSION ?= dev
 
-# format: ## Format code
-# 	uv run ruff format src/ tests/
-#
-# typecheck: ## Run type checker
-# 	uv run pyright src/
-#
-# test: ## Run tests
-# 	uv run pytest
+build: ## Build the dflockd binary
+	go build -ldflags "-X main.version=$(VERSION)" -o dflockd ./cmd/dflockd
 
-# test-cov: ## Run tests with coverage
-# 	uv run pytest --cov=dflockd --cov-report=term-missing
+test: ## Run tests
+	go test ./... -v
 
-# clean: ## Remove build artifacts and caches
-# 	rm -rf build/ dist/ *.egg-info .mypy_cache .pytest_cache .ruff_cache htmlcov/ site/
-# 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-#
-# docs-serve: ## Serve documentation locally
-# 	uv run --group docs mkdocs serve
-#
-# docs-build: ## Build documentation site
-# 	uv run --group docs mkdocs build --strict
+lint: ## Run linter
+	go vet ./...
 
-# build-publish-nobump: ## Build and publish, no bump
-# 	uv build
-# 	uv publish
-#
-# build-publish: ## Build new minor version and publish to pypi
-# 	uv version --bump minor
-# 	uv build
-# 	uv publish
-#
-# build-publish-patch: ## Build new version, bump patchlevel, and publish to pypi
-# 	uv version --bump patch
-# 	uv build
-# 	uv publish
-#
-# build-publish-major: ## Build new major version and publish to pypi
-# 	uv version --bump major
-# 	uv build
-# 	uv publish
+clean: ## Remove build artifacts
+	rm -f dflockd
+
+run: build ## Build and run the server
+	./dflockd
+
+docs-serve: ## Serve documentation locally
+	uv pip install -q -r requirements_mkdocs.txt
+	mkdocs serve
+
+docs-build: ## Build documentation site
+	uv pip install -q -r requirements_mkdocs.txt
+	mkdocs build --strict
