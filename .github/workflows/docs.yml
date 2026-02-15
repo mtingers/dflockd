@@ -26,11 +26,8 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
-        run: uv pip install -q -r requirements_mkdocs.txt
-
       - name: Build documentation
-        run: mkdocs build --strict
+        run: uvx mkdocs build --strict
 
       - uses: actions/upload-pages-artifact@v4
         with:
