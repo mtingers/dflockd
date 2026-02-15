@@ -23,9 +23,7 @@ run: build ## Build and run the server
 	./dflockd
 
 docs-serve: ## Serve documentation locally
-	uv pip install -q -r requirements_mkdocs.txt
-	mkdocs serve
+	uvx --with mkdocs-material mkdocs serve
 
 docs-build: ## Build documentation site
-	uv pip install -q -r requirements_mkdocs.txt
-	mkdocs build --strict
+	uvx --with mkdocs-material mkdocs build --strict

@@ -27,7 +27,7 @@ jobs:
           python-version: "3.13"
 
       - name: Build documentation
-        run: uvx mkdocs build --strict
+        run: uvx --with mkdocs-material mkdocs build --strict
 
       - uses: actions/upload-pages-artifact@v4
         with:
