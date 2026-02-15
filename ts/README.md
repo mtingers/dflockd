@@ -58,6 +58,46 @@ try {
 }
 ```
 
+### Two-phase lock (enqueue / wait)
+
+Split acquisition into two steps so you can notify an external system
+(webhook, database, queue) between joining the FIFO queue and blocking.
+
+```ts
+import { DistributedLock } from "./client.js";
+
+const lock = new DistributedLock({
+  key: "my-resource",
+  acquireTimeoutS: 10,
+  leaseTtlS: 20,
+});
+
+// Step 1: join the queue (non-blocking, returns immediately)
+const status = await lock.enqueue(); // "acquired" or "queued"
+
+// Step 2: do something between enqueue and blocking
+console.log(`enqueue status: ${status}`);
+notifyExternalSystem(status);
+
+// Step 3: block until the lock is granted (or timeout)
+const granted = await lock.wait(10); // true on success, false on timeout
+if (!granted) {
+  console.error("timed out waiting for lock");
+  process.exit(1);
+}
+
+try {
+  // critical section — lock is held and auto-renewed
+} finally {
+  await lock.release();
+}
+```
+
+If the lock is free when `enqueue()` is called, it returns `"acquired"` and
+the lock is already held (fast path). `wait()` then returns `true` immediately
+without blocking. If the lock is contended, `enqueue()` returns `"queued"` and
+`wait()` blocks until the lock is granted or the timeout expires.
+
 ### Options
 
 | Option           | Type     | Default       | Description                                      |
@@ -91,13 +131,20 @@ For cases where you manage the socket yourself:
 
 ```ts
 import * as net from "net";
-import { acquire, renew, release } from "./client.js";
+import { acquire, enqueue, waitForLock, renew, release } from "./client.js";
 
 const sock = net.createConnection({ host: "127.0.0.1", port: 6388 });
 
+// Single-phase
 const { token, lease } = await acquire(sock, "my-key", 10);
 const remaining = await renew(sock, "my-key", token, 60);
 await release(sock, "my-key", token);
+
+// Two-phase
+const result = await enqueue(sock, "another-key");   // { status, token, lease }
+if (result.status === "queued") {
+  const granted = await waitForLock(sock, "another-key", 10); // { token, lease }
+}
 
 sock.destroy();
 ```
@@ -108,8 +155,10 @@ sock.destroy();
 # build first
 npm run build
 
-# run one of the three demos:
-node dist/example.js single    # acquire one lock, hold 5 s, release
-node dist/example.js withlock  # same thing using withLock()
-node dist/example.js ordering  # 9 concurrent workers, FIFO ordering
+# run one of the demos:
+node dist/example.js single               # acquire one lock, hold, release
+node dist/example.js withlock             # same thing using withLock()
+node dist/example.js ordering             # 9 concurrent workers, FIFO ordering
+node dist/example.js twophase             # two-phase enqueue → notify → wait → release
+node dist/example.js twophase-contention  # 4 workers competing with two-phase
 ```

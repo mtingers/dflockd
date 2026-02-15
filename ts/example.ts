@@ -70,6 +70,81 @@ async function demoLockOrdering(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// demo: two-phase lock (enqueue → notify → wait → work → release)
+// ---------------------------------------------------------------------------
+
+function notifyExternalSystem(workerId: number, status: string): void {
+  console.log(`  worker ${workerId}: notified external system (status=${status})`);
+}
+
+async function demoTwoPhase(): Promise<void> {
+  const lock = new DistributedLock({
+    key: "two-phase-key",
+    acquireTimeoutS: 10,
+    leaseTtlS: 20,
+  });
+
+  console.log("step 1: enqueue");
+  const status = await lock.enqueue();
+  console.log(`  enqueue returned: ${status}`);
+
+  console.log("step 2: notify external system");
+  notifyExternalSystem(0, status);
+
+  console.log("step 3: wait for lock");
+  const granted = await lock.wait(10);
+  console.log(`  wait returned: granted=${granted}, token=${lock.token}`);
+
+  if (granted) {
+    console.log("step 4: critical section");
+    await sleep(1000);
+    console.log("step 5: release");
+    await lock.release();
+  }
+
+  console.log("done");
+}
+
+// ---------------------------------------------------------------------------
+// demo: two-phase contention — N workers with enqueue/wait
+// ---------------------------------------------------------------------------
+
+async function twoPhaseWorker(workerId: number, holdTimeMs: number): Promise<void> {
+  const lock = new DistributedLock({
+    key: "shared-key",
+    acquireTimeoutS: 30,
+    leaseTtlS: 20,
+  });
+
+  console.log(`worker ${workerId}: enqueueing`);
+  const status = await lock.enqueue();
+  console.log(`worker ${workerId}: enqueue returned ${status}`);
+
+  notifyExternalSystem(workerId, status);
+
+  console.log(`worker ${workerId}: waiting for lock`);
+  const granted = await lock.wait(30);
+  if (!granted) {
+    console.log(`worker ${workerId}: timed out`);
+    return;
+  }
+
+  console.log(`worker ${workerId}: acquired token=${lock.token}`);
+  await sleep(holdTimeMs);
+  console.log(`worker ${workerId}: releasing`);
+  await lock.release();
+}
+
+async function demoTwoPhaseContention(): Promise<void> {
+  const numWorkers = 4;
+  console.log(`launching ${numWorkers} two-phase workers with shared lock...\n`);
+  await Promise.all(
+    Array.from({ length: numWorkers }, (_, i) => twoPhaseWorker(i, 500)),
+  );
+  console.log("\nall workers finished");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -86,8 +161,14 @@ async function main(): Promise<void> {
     case "ordering":
       await demoLockOrdering();
       break;
+    case "twophase":
+      await demoTwoPhase();
+      break;
+    case "twophase-contention":
+      await demoTwoPhaseContention();
+      break;
     default:
-      console.error(`usage: node example.js [single|withlock|ordering]`);
+      console.error(`usage: node example.js [single|withlock|ordering|twophase|twophase-contention]`);
       process.exit(1);
   }
 }

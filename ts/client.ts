@@ -131,6 +131,48 @@ export async function renew(
   return -1;
 }
 
+export async function enqueue(
+  sock: net.Socket,
+  key: string,
+  leaseTtlS?: number,
+): Promise<{ status: "acquired" | "queued"; token: string | null; lease: number | null }> {
+  const arg = leaseTtlS == null ? "" : String(leaseTtlS);
+  sock.write(encodeLines("e", key, arg));
+
+  const resp = await readline(sock);
+  if (resp.startsWith("acquired ")) {
+    const parts = resp.split(" ");
+    const token = parts[1];
+    const lease = parts.length >= 3 ? parseInt(parts[2], 10) : 33;
+    return { status: "acquired", token, lease };
+  }
+  if (resp === "queued") {
+    return { status: "queued", token: null, lease: null };
+  }
+  throw new LockError(`enqueue failed: '${resp}'`);
+}
+
+export async function waitForLock(
+  sock: net.Socket,
+  key: string,
+  waitTimeoutS: number,
+): Promise<{ token: string; lease: number }> {
+  sock.write(encodeLines("w", key, String(waitTimeoutS)));
+
+  const resp = await readline(sock);
+  if (resp === "timeout") {
+    throw new AcquireTimeoutError(key);
+  }
+  if (!resp.startsWith("ok ")) {
+    throw new LockError(`wait failed: '${resp}'`);
+  }
+
+  const parts = resp.split(" ");
+  const token = parts[1];
+  const lease = parts.length >= 3 ? parseInt(parts[2], 10) : 33;
+  return { token, lease };
+}
+
 export async function release(
   sock: net.Socket,
   key: string,
@@ -213,6 +255,55 @@ export class DistributedLock {
     } finally {
       await this.close();
     }
+  }
+
+  /**
+   * Two-phase step 1: connect and join the FIFO queue.
+   * Returns `"acquired"` (fast-path, lock is already held) or `"queued"`.
+   * If acquired immediately, the renew loop starts automatically.
+   */
+  async enqueue(): Promise<"acquired" | "queued"> {
+    this.closed = false;
+    this.sock = await connect(this.host, this.port);
+    try {
+      const result = await enqueue(this.sock, this.key, this.leaseTtlS);
+      if (result.status === "acquired") {
+        this.token = result.token;
+        this.lease = result.lease ?? 0;
+        this.startRenew();
+      }
+      return result.status;
+    } catch (err) {
+      await this.close();
+      throw err;
+    }
+  }
+
+  /**
+   * Two-phase step 2: block until the lock is granted.
+   * Returns `true` if granted, `false` on timeout.
+   * If already acquired during `enqueue()`, returns `true` immediately.
+   */
+  async wait(timeoutS?: number): Promise<boolean> {
+    if (this.token !== null) {
+      // Already acquired during enqueue (fast path)
+      return true;
+    }
+    if (!this.sock) {
+      throw new LockError("not connected; call enqueue() first");
+    }
+    const timeout = timeoutS ?? this.acquireTimeoutS;
+    try {
+      const result = await waitForLock(this.sock, this.key, timeout);
+      this.token = result.token;
+      this.lease = result.lease;
+    } catch (err) {
+      await this.close();
+      if (err instanceof AcquireTimeoutError) return false;
+      throw err;
+    }
+    this.startRenew();
+    return true;
   }
 
   /**
