@@ -1,6 +1,24 @@
 # dflockd (Go)
 
+<!--toc:start-->
+- [dflockd (Go)](#dflockd-go)
+  - [Client Libraries](#client-libraries)
+  - [Build](#build)
+  - [Run](#run)
+  - [Configuration](#configuration)
+  - [Tests](#tests)
+  - [Protocol](#protocol)
+    - [Commands](#commands)
+    - [Example session with netcat](#example-session-with-netcat)
+    - [Two-phase example](#two-phase-example)
+<!--toc:end-->
+
 Go implementation of the dflockd distributed lock server.
+
+## Client Libraries
+
+- [python client](https://github.com/mtingers/dflockd-client-py)
+- [typescript client](https://github.com/mtingers/dflockd-client-ts)
 
 ## Build
 
@@ -21,18 +39,18 @@ The server listens on `0.0.0.0:6388` by default.
 
 All settings can be passed as CLI flags or environment variables. Environment variables take precedence.
 
-| Flag | Env var | Default | Description |
-|------|---------|---------|-------------|
-| `--host` | `DFLOCKD_HOST` | `0.0.0.0` | Bind address |
-| `--port` | `DFLOCKD_PORT` | `6388` | Bind port |
-| `--default-lease-ttl` | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lock lease duration (seconds) |
-| `--lease-sweep-interval` | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | Lease expiry check interval (seconds) |
-| `--gc-interval` | `DFLOCKD_GC_LOOP_SLEEP` | `5` | Lock state GC interval (seconds) |
-| `--gc-max-idle` | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Idle seconds before pruning lock state |
-| `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
-| `--read-timeout` | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
-| `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release locks on client disconnect |
-| `--debug` | `DFLOCKD_DEBUG` | `false` | Enable debug logging |
+| Flag                                                               | Env var                              | Default   | Description                            |
+| ------------------------------------------------------------------ | ------------------------------------ | --------- | -------------------------------------- |
+| `--host`                                                           | `DFLOCKD_HOST`                       | `0.0.0.0` | Bind address                           |
+| `--port`                                                           | `DFLOCKD_PORT`                       | `6388`    | Bind port                              |
+| `--default-lease-ttl`                                              | `DFLOCKD_DEFAULT_LEASE_TTL_S`        | `33`      | Default lock lease duration (seconds)  |
+| `--lease-sweep-interval`                                           | `DFLOCKD_LEASE_SWEEP_INTERVAL_S`     | `1`       | Lease expiry check interval (seconds)  |
+| `--gc-interval`                                                    | `DFLOCKD_GC_LOOP_SLEEP`              | `5`       | Lock state GC interval (seconds)       |
+| `--gc-max-idle`                                                    | `DFLOCKD_GC_MAX_UNUSED_TIME`         | `60`      | Idle seconds before pruning lock state |
+| `--max-locks`                                                      | `DFLOCKD_MAX_LOCKS`                  | `1024`    | Maximum number of unique lock keys     |
+| `--read-timeout`                                                   | `DFLOCKD_READ_TIMEOUT_S`             | `23`      | Client read timeout (seconds)          |
+| `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true`    | Release locks on client disconnect     |
+| `--debug`                                                          | `DFLOCKD_DEBUG`                      | `false`   | Enable debug logging                   |
 
 Example:
 
@@ -129,20 +147,4 @@ r
 mykey
 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
 ok
-```
-
-## Project structure
-
-```
-
-cmd/dflockd/main.go           # entrypoint
-internal/
-  config/config.go             # configuration (env vars + CLI flags)
-  protocol/protocol.go         # wire protocol parsing and formatting
-  protocol/protocol_test.go    # protocol unit tests
-  lock/lock.go                 # lock manager (all lock logic)
-  lock/lock_test.go            # lock unit tests
-  server/server.go             # TCP server and connection handler
-  server/server_test.go        # integration tests
-go.mod
 ```
