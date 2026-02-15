@@ -15,6 +15,8 @@
 
 Go implementation of the dflockd distributed lock server.
 
+[Read the docs here](https://mtingers.github.io/dflockd/)
+
 ## Client Libraries
 
 - [python client](https://github.com/mtingers/dflockd-client-py)
