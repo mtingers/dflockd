@@ -10,6 +10,9 @@
 go install github.com/mtingers/dflockd/cmd/dflockd@latest
 ```
 
+See [GOPATH documentation](https://go.dev/wiki/GOPATH) for more information
+on how this works.
+
 ## Build from source
 
 ```bash
