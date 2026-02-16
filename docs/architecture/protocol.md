@@ -207,6 +207,6 @@ printf 'l\nmy-key\n10\n' | nc localhost 6388
 
 Client libraries are available for:
 
-- **Go** — in-repo `client/` package (`github.com/mtingers/dflockd/client`). See [Go Client](../guide/client.md).
+- **Go** — in-repo `client/` package (`github.com/mtingers/dflockd/client`). See [Go Client](../client.md).
 - **Python** — [dflockd-client-py](https://github.com/mtingers/dflockd-client-py)
 - **TypeScript** — [dflockd-client-ts](https://github.com/mtingers/dflockd-client-ts)

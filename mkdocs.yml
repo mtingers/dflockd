@@ -57,11 +57,11 @@ nav:
     - Installation: getting-started/installation.md
     - Quick Start: getting-started/quickstart.md
     - Examples: getting-started/examples.md
-  - Guide:
-    - Architecture: guide/architecture.md
-    - Go Client: guide/client.md
   - Server:
-    - Configuration: server/configuration.md
-  - API Reference:
-    - Wire Protocol: api/protocol.md
+    - Configuration: server.md
+  - Client:
+    - Go Client: client.md
+  - Architecture:
+    - Overview: architecture/overview.md
+    - Wire Protocol: architecture/protocol.md
   - Changelog: changelog.md

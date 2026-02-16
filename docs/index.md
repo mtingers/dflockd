@@ -29,4 +29,4 @@ printf 'r\nmy-key\n<token>\n' | nc localhost 6388
 - [Installation](getting-started/installation.md) — build from source or `go install`
 - [Quick Start](getting-started/quickstart.md) — run the server and acquire your first lock
 - [Examples](getting-started/examples.md) — TCP protocol examples and Go client usage
-- [Go Client](guide/client.md) — `client` package with automatic renewal, sharding, and two-phase locking
+- [Go Client](client.md) — `client` package with automatic renewal, sharding, and two-phase locking

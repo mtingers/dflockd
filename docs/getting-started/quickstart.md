@@ -6,7 +6,7 @@
 ./dflockd
 ```
 
-The server listens on `0.0.0.0:6388` by default. See [Server Configuration](../server/configuration.md) for tuning options.
+The server listens on `0.0.0.0:6388` by default. See [Server Configuration](../server.md) for tuning options.
 
 ## 2. Acquire a lock
 

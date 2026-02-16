@@ -1,4 +1,4 @@
-# Server Configuration
+# Server
 
 ## Running the server
 

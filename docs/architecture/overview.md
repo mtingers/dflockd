@@ -1,23 +1,23 @@
-# Architecture
+# Architecture Overview
 
 ## Overview
 
 dflockd is a single-process Go server that manages named locks with FIFO ordering, automatic lease expiry, and garbage collection of idle state.
 
 ```
-┌──────────┐    TCP     ┌─────────────────────────────────────┐
-│ Go client │◄─────────►│            dflockd server           │
-│ (client/) │  line-    │                                     │
-│           │  based    │  ┌──────────┐  ┌────────────────┐  │
-└──────────┘  UTF-8     │  │  Lock     │  │  Background    │  │
-                        │  │  State    │  │  Goroutines    │  │
-┌──────────┐            │  │          │  │                │  │
-│ TCP client│◄─────────►│  │  key →   │  │  • lease       │  │
-│ (any lang)│           │  │   owner  │  │    expiry      │  │
-└──────────┘            │  │   waiter │  │  • lock GC     │  │
-                        │  │   queue  │  │                │  │
-                        │  └──────────┘  └────────────────┘  │
-                        └─────────────────────────────────────┘
+┌───────────┐    TCP     ┌─────────────────────────────────────┐
+│ Go client │◄──────────►│            dflockd server           │
+│ (client/) │  line-     │                                     │
+│           │  based     │  ┌──────────┐  ┌────────────────┐   │
+└───────────┘  UTF-8     │  │  Lock    │  │  Background    │   │
+                         │  │  State   │  │  Goroutines    │   │
+┌───────────┐            │  │          │  │                │   │
+│ TCP client│◄──────────►│  │  key →   │  │  • lease       │   │
+│ (any lang)│            │  │   owner  │  │    expiry      │   │
+└───────────┘            │  │   waiter │  │  • lock GC     │   │
+                         │  │   queue  │  │                │   │
+                         │  └──────────┘  └────────────────┘   │
+                         └─────────────────────────────────────┘
 ```
 
 An in-repo Go client (`github.com/mtingers/dflockd/client`) provides a high-level `Lock` type with automatic lease renewal and CRC32-based sharding, as well as low-level protocol functions. External clients exist for [Python](https://github.com/mtingers/dflockd-client-py) and [TypeScript](https://github.com/mtingers/dflockd-client-ts). Any TCP client that speaks the line-based protocol can also interact with the server directly.
