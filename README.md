@@ -147,7 +147,7 @@ ok
 
 ## Client Libraries
 
-- **Go** (in-repo) — `go get github.com/mtingers/dflockd/client` ([docs](https://mtingers.github.io/dflockd/guide/client/))
+- **Go** (in-repo) — `go get github.com/mtingers/dflockd/client` ([docs](https://mtingers.github.io/dflockd/client/))
 - [Python client](https://github.com/mtingers/dflockd-client-py)
 - [TypeScript client](https://github.com/mtingers/dflockd-client-ts)
 
