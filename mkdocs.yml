@@ -59,6 +59,7 @@ nav:
     - Examples: getting-started/examples.md
   - Guide:
     - Architecture: guide/architecture.md
+    - Go Client: guide/client.md
   - Server:
     - Configuration: server/configuration.md
   - API Reference:

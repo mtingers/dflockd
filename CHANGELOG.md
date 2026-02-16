@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.1.0] - 2026-02-16
+
+### Added
+
+- Go client package (`client/`) with low-level protocol API (`Acquire`, `Release`, `Renew`, `Enqueue`, `Wait`) and high-level `Lock` type
+- Automatic background lease renewal in `Lock` type with configurable `RenewRatio`
+- CRC32-based sharding (`CRC32Shard`) matching the Python client's `stable_hash_shard`
+- Functional options pattern (`WithLeaseTTL`) for optional protocol parameters
+- Context cancellation support for `Lock.Acquire` and `Lock.Wait`
+- Integration test suite for the Go client (12 tests)
+
+[v1.1.0]: https://github.com/mtingers/dflockd/releases/tag/v1.1.0
+
 ## [v1.0.0] - 2026-02-15
 
 ### Added

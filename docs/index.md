@@ -9,6 +9,7 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 - **Automatic lease expiry** — held locks expire if not renewed, preventing deadlocks
 - **Disconnect cleanup** — locks are released automatically when a client disconnects
 - **Zero dependencies** — single Go binary
+- **Go client library** — high-level `Lock` type with automatic renewal and sharding, plus low-level protocol API
 - **Simple wire protocol** — line-based UTF-8 over TCP, easy to integrate from any language
 
 ## Quick example
@@ -27,4 +28,5 @@ printf 'r\nmy-key\n<token>\n' | nc localhost 6388
 
 - [Installation](getting-started/installation.md) — build from source or `go install`
 - [Quick Start](getting-started/quickstart.md) — run the server and acquire your first lock
-- [Examples](getting-started/examples.md) — TCP protocol examples for locking, FIFO ordering, and two-phase acquisition
+- [Examples](getting-started/examples.md) — TCP protocol examples and Go client usage
+- [Go Client](guide/client.md) — `client` package with automatic renewal, sharding, and two-phase locking

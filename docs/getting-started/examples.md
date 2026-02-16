@@ -1,6 +1,125 @@
 # Examples
 
-All examples use the raw TCP protocol via netcat. dflockd's line-based protocol works with any TCP client in any language.
+Examples are shown using both the raw TCP protocol (via netcat) and the Go client library. dflockd's line-based protocol works with any TCP client in any language.
+
+## Go client examples
+
+### Basic lock and release
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    l := &client.Lock{
+        Key:            "my-key",
+        AcquireTimeout: 10 * time.Second,
+        Servers:        []string{"127.0.0.1:6388"},
+    }
+
+    ok, err := l.Acquire(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timed out")
+    }
+    fmt.Println("acquired lock, token:", l.Token())
+
+    // Lock is automatically renewed in the background.
+    // Do work here...
+
+    if err := l.Release(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println("released")
+}
+```
+
+### Two-phase acquisition
+
+```go
+l := &client.Lock{
+    Key:     "my-key",
+    Servers: []string{"127.0.0.1:6388"},
+}
+
+status, err := l.Enqueue(context.Background())
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println("enqueue status:", status)
+
+if status == "queued" {
+    // Application logic between enqueue and wait
+    fmt.Println("notifying external system...")
+
+    ok, err := l.Wait(context.Background(), 30*time.Second)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timed out waiting")
+    }
+}
+
+defer l.Release(context.Background())
+fmt.Println("lock held, doing work...")
+```
+
+### Low-level API
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+defer c.Close()
+
+token, lease, err := client.Acquire(c, "my-key", 10*time.Second)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("acquired: token=%s lease=%ds\n", token, lease)
+
+remaining, err := client.Renew(c, "my-key", token)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("renewed: %ds remaining\n", remaining)
+
+if err := client.Release(c, "my-key", token); err != nil {
+    log.Fatal(err)
+}
+fmt.Println("released")
+```
+
+### Sharding across multiple servers
+
+```go
+l := &client.Lock{
+    Key: "my-key",
+    Servers: []string{
+        "10.0.0.1:6388",
+        "10.0.0.2:6388",
+        "10.0.0.3:6388",
+    },
+    // CRC32Shard is the default; each key is routed to one server
+}
+
+ok, err := l.Acquire(context.Background())
+// ...
+```
+
+## TCP protocol examples
 
 ## Basic lock and release
 

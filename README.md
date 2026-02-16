@@ -19,13 +19,49 @@ Go implementation of the dflockd distributed lock server.
 
 ## Client Libraries
 
-- [python client](https://github.com/mtingers/dflockd-client-py)
-- [typescript client](https://github.com/mtingers/dflockd-client-ts)
+- **Go** (in-repo) — `go get github.com/mtingers/dflockd/client` ([docs](https://mtingers.github.io/dflockd/guide/client/))
+- [Python client](https://github.com/mtingers/dflockd-client-py)
+- [TypeScript client](https://github.com/mtingers/dflockd-client-ts)
+
+### Go client quick start
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    l := &client.Lock{
+        Key:            "my-resource",
+        AcquireTimeout: 10 * time.Second,
+        Servers:        []string{"127.0.0.1:6388"},
+    }
+
+    ok, err := l.Acquire(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timed out waiting for lock")
+    }
+    defer l.Release(context.Background())
+
+    fmt.Println("lock acquired, doing work...")
+}
+```
+
+The `Lock` type handles server selection (CRC32 sharding), lease renewal in the background, and context cancellation. For lower-level control, use `client.Dial` with `client.Acquire`/`client.Release`/`client.Renew` directly. See the [full client docs](https://mtingers.github.io/dflockd/guide/client/) for details.
 
 ## Build
 
 ```bash
-cd go
 go build -o dflockd ./cmd/dflockd
 ```
 
@@ -65,7 +101,6 @@ DFLOCKD_PORT=7000 DFLOCKD_MAX_LOCKS=512 ./dflockd
 ## Tests
 
 ```bash
-cd go
 go test ./... -v
 ```
 
