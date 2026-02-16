@@ -1,6 +1,7 @@
 # dflockd (Go)
 
 <!--toc:start-->
+
 - [dflockd (Go)](#dflockd-go)
   - [Build](#build)
   - [Run](#run)
@@ -10,9 +11,8 @@
     - [Commands](#commands)
     - [Example session with netcat](#example-session-with-netcat)
     - [Two-phase example](#two-phase-example)
-  - [Client Libraries](#client-libraries)
-    - [Go client quick start](#go-client-quick-start)
-<!--toc:end-->
+  - [Client Libraries](#client-libraries) - [Go client quick start](#go-client-quick-start)
+      <!--toc:end-->
 
 Go implementation of the dflockd distributed lock server.
 
@@ -185,4 +185,6 @@ func main() {
 }
 ```
 
-The `Lock` type handles server selection (CRC32 sharding), lease renewal in the background, and context cancellation. For lower-level control, use `client.Dial` with `client.Acquire`/`client.Release`/`client.Renew` directly. See the [full client docs](https://mtingers.github.io/dflockd/guide/client/) for details.
+The `Lock` type handles server selection (optional sharding), lease renewal in
+the background, and context cancellation. For lower-level control,
+use `client.Dial` with `client.Acquire`/`client.Release`/`client.Renew` directly.
