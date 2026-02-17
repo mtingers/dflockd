@@ -2,9 +2,11 @@ package client_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -385,6 +387,310 @@ func TestContextCancellation(t *testing.T) {
 		// Success — Acquire returned after cancellation.
 	case <-time.After(3 * time.Second):
 		t.Fatal("Acquire did not return after context cancellation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore low-level tests
+// ---------------------------------------------------------------------------
+
+func TestSemAcquireRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, lease, err := client.SemAcquire(c, "sem1", 10*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if lease <= 0 {
+		t.Fatalf("expected positive lease, got %d", lease)
+	}
+
+	if err := client.SemRelease(c, "sem1", token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemAcquireTimeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Fill capacity (limit=1)
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	_, _, err = client.SemAcquire(c1, "sem1", 10*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second client tries with 0 timeout
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	_, _, err = client.SemAcquire(c2, "sem1", 0, 1)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !isTimeout(err) {
+		t.Fatalf("expected ErrTimeout, got %v", err)
+	}
+}
+
+func TestSemRenew(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, _, err := client.SemAcquire(c, "sem1", 10*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, err := client.SemRenew(c, "sem1", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+}
+
+func TestSemEnqueueWait(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// c1 fills capacity
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	token1, _, err := client.SemAcquire(c1, "sem1", 10*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// c2 enqueues
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	status, _, _, err := client.SemEnqueue(c2, "sem1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected 'queued', got %q", status)
+	}
+
+	// Release in background
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		client.SemRelease(c1, "sem1", token1)
+	}()
+
+	token2, lease2, err := client.SemWait(c2, "sem1", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token2 == "" {
+		t.Fatal("expected non-empty token from wait")
+	}
+	if lease2 <= 0 {
+		t.Fatalf("expected positive lease, got %d", lease2)
+	}
+}
+
+func TestSemLimitMismatch(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	_, _, err = client.SemAcquire(c1, "sem1", 10*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	_, _, err = client.SemAcquire(c2, "sem1", 10*time.Second, 5)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err != client.ErrLimitMismatch {
+		t.Fatalf("expected ErrLimitMismatch, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore high-level tests
+// ---------------------------------------------------------------------------
+
+func TestSemaphoreAcquireRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s := &client.Semaphore{
+		Key:            "hl-sem",
+		Limit:          3,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if s.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	if err := s.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemaphoreTwoPhase(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// s1 fills capacity
+	s1 := &client.Semaphore{
+		Key:            "hl-sem",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("s1 acquire failed")
+	}
+
+	// s2 enqueues
+	s2 := &client.Semaphore{
+		Key:     "hl-sem",
+		Limit:   1,
+		Servers: []string{addr},
+	}
+	status, err := s2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected 'queued', got %q", status)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s1.Release(context.Background())
+	}()
+
+	ok, err = s2.Wait(context.Background(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("s2 wait timed out")
+	}
+	if s2.Token() == "" {
+		t.Fatal("expected non-empty token after wait")
+	}
+
+	if err := s2.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemaphoreAutoRenewal(t *testing.T) {
+	cfg := testConfig()
+	cfg.DefaultLeaseTTL = 4 * time.Second
+	_, addr := startServer(t, cfg)
+
+	s := &client.Semaphore{
+		Key:            "renew-sem",
+		Limit:          3,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		RenewRatio:     0.25,
+	}
+
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("acquire failed")
+	}
+
+	// Wait longer than original lease
+	time.Sleep(5 * time.Second)
+
+	if err := s.Release(context.Background()); err != nil {
+		t.Fatalf("release after auto-renew failed: %v", err)
+	}
+}
+
+func TestSemaphoreConcurrent(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Acquire 3 slots concurrently on limit=3
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s := &client.Semaphore{
+				Key:            "conc-sem",
+				Limit:          3,
+				AcquireTimeout: 10 * time.Second,
+				Servers:        []string{addr},
+			}
+			ok, err := s.Acquire(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !ok {
+				errs <- fmt.Errorf("acquire returned false")
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+			if err := s.Release(context.Background()); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 

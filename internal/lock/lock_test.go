@@ -650,3 +650,499 @@ func TestGC_DoesNotPruneHeld(t *testing.T) {
 		t.Fatal("k1 should not be GC'd (still held)")
 	}
 }
+
+// ===========================================================================
+// Semaphore tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// SemAcquire
+// ---------------------------------------------------------------------------
+
+func TestSemAcquire_Immediate(t *testing.T) {
+	lm := testManager()
+	tok, err := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok == "" {
+		t.Fatal("expected token")
+	}
+	st := lm.sems["s1"]
+	if st.Limit != 3 {
+		t.Fatalf("limit: got %d want 3", st.Limit)
+	}
+	if len(st.Holders) != 1 {
+		t.Fatalf("holders: got %d want 1", len(st.Holders))
+	}
+}
+
+func TestSemAcquire_MultipleConcurrent(t *testing.T) {
+	lm := testManager()
+	tok1, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	tok2, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 3)
+	tok3, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 3, 3)
+	if tok1 == "" || tok2 == "" || tok3 == "" {
+		t.Fatal("all three should acquire immediately")
+	}
+	if len(lm.sems["s1"].Holders) != 3 {
+		t.Fatalf("holders: got %d want 3", len(lm.sems["s1"].Holders))
+	}
+}
+
+func TestSemAcquire_AtCapacityTimeout(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 2)
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 2)
+
+	// Third should timeout with 0 timeout
+	tok, err := lm.SemAcquire("s1", 0, 30*time.Second, 3, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "" {
+		t.Fatal("expected empty token (timeout)")
+	}
+}
+
+func TestSemAcquire_FIFOOrdering(t *testing.T) {
+	lm := testManager()
+	tok1, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	var tok2, tok3 string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		t, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 1)
+		mu.Lock()
+		tok2 = t
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		time.Sleep(20 * time.Millisecond)
+		t, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 3, 1)
+		mu.Lock()
+		tok3 = t
+		mu.Unlock()
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	lm.SemRelease("s1", tok1)
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if tok2 == "" {
+		mu.Unlock()
+		t.Fatal("conn2 should have acquired")
+	}
+	mu.Unlock()
+
+	lm.SemRelease("s1", tok2)
+	wg.Wait()
+
+	mu.Lock()
+	if tok3 == "" {
+		mu.Unlock()
+		t.Fatal("conn3 should have acquired")
+	}
+	mu.Unlock()
+}
+
+func TestSemAcquire_MaxLocks(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxLocks = 1
+	_, err := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lm.SemAcquire("s2", 5*time.Second, 30*time.Second, 2, 3)
+	if err != ErrMaxLocks {
+		t.Fatalf("expected ErrMaxLocks, got %v", err)
+	}
+}
+
+func TestSemAcquire_LimitMismatch(t *testing.T) {
+	lm := testManager()
+	_, err := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 5)
+	if err != ErrLimitMismatch {
+		t.Fatalf("expected ErrLimitMismatch, got %v", err)
+	}
+}
+
+func TestSemAcquire_MaxLocksSharedWithLocks(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxLocks = 2
+	lm.FIFOAcquire("lock1", 5*time.Second, 30*time.Second, 1)
+	lm.SemAcquire("sem1", 5*time.Second, 30*time.Second, 2, 3)
+	_, err := lm.SemAcquire("sem2", 5*time.Second, 30*time.Second, 3, 3)
+	if err != ErrMaxLocks {
+		t.Fatalf("expected ErrMaxLocks, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SemRelease
+// ---------------------------------------------------------------------------
+
+func TestSemRelease_Valid(t *testing.T) {
+	lm := testManager()
+	tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	if !lm.SemRelease("s1", tok) {
+		t.Fatal("release should succeed")
+	}
+	if len(lm.sems["s1"].Holders) != 0 {
+		t.Fatal("holders should be empty")
+	}
+}
+
+func TestSemRelease_WrongToken(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	if lm.SemRelease("s1", "wrong") {
+		t.Fatal("release with wrong token should fail")
+	}
+}
+
+func TestSemRelease_TransfersToWaiter(t *testing.T) {
+	lm := testManager()
+	tok1, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	done := make(chan string, 1)
+	go func() {
+		tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 1)
+		done <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.SemRelease("s1", tok1)
+	tok2 := <-done
+	if tok2 == "" {
+		t.Fatal("conn2 should have acquired")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SemRenew
+// ---------------------------------------------------------------------------
+
+func TestSemRenew_Valid(t *testing.T) {
+	lm := testManager()
+	tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	remaining, ok := lm.SemRenew("s1", tok, 60*time.Second)
+	if !ok {
+		t.Fatal("renew should succeed")
+	}
+	if remaining <= 0 {
+		t.Fatal("remaining should be > 0")
+	}
+}
+
+func TestSemRenew_WrongToken(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	_, ok := lm.SemRenew("s1", "wrong", 30*time.Second)
+	if ok {
+		t.Fatal("renew with wrong token should fail")
+	}
+}
+
+func TestSemRenew_Expired(t *testing.T) {
+	lm := testManager()
+	tok, _ := lm.SemAcquire("s1", 5*time.Second, 1*time.Second, 1, 3)
+	lm.mu.Lock()
+	lm.sems["s1"].Holders[tok].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	_, ok := lm.SemRenew("s1", tok, 30*time.Second)
+	if ok {
+		t.Fatal("renew of expired lease should fail")
+	}
+	if len(lm.sems["s1"].Holders) != 0 {
+		t.Fatal("expired holder should be removed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SemEnqueue / SemWait
+// ---------------------------------------------------------------------------
+
+func TestSemEnqueue_Immediate(t *testing.T) {
+	lm := testManager()
+	status, tok, lease, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "acquired" || tok == "" || lease != 30 {
+		t.Fatalf("unexpected: status=%s tok=%s lease=%d", status, tok, lease)
+	}
+}
+
+func TestSemEnqueue_Queued(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	status, tok, lease, err := lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || tok != "" || lease != 0 {
+		t.Fatalf("unexpected: status=%s tok=%s lease=%d", status, tok, lease)
+	}
+}
+
+func TestSemEnqueue_DoubleEnqueue(t *testing.T) {
+	lm := testManager()
+	lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	_, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	if err == nil {
+		t.Fatal("double enqueue should error")
+	}
+	if !IsAlreadyEnqueued(err) {
+		t.Fatalf("expected already-enqueued error, got %v", err)
+	}
+}
+
+func TestSemEnqueue_LimitMismatch(t *testing.T) {
+	lm := testManager()
+	lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	_, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 2, 5)
+	if err != ErrLimitMismatch {
+		t.Fatalf("expected ErrLimitMismatch, got %v", err)
+	}
+}
+
+func TestSemWait_FastPath(t *testing.T) {
+	lm := testManager()
+	status, token, _, _ := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	if status != "acquired" {
+		t.Fatal("expected acquired")
+	}
+
+	tok, ttl, err := lm.SemWait("s1", 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != token || ttl != 30 {
+		t.Fatalf("unexpected: tok=%s ttl=%d", tok, ttl)
+	}
+}
+
+func TestSemWait_QueuedThenWait(t *testing.T) {
+	lm := testManager()
+	tok1, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+
+	done := make(chan struct{})
+	var gotTok string
+	go func() {
+		gotTok, _, _ = lm.SemWait("s1", 5*time.Second, 2)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	lm.SemRelease("s1", tok1)
+	<-done
+
+	if gotTok == "" {
+		t.Fatal("should have received token")
+	}
+}
+
+func TestSemWait_Timeout(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+
+	tok, _, err := lm.SemWait("s1", 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "" {
+		t.Fatal("expected empty token (timeout)")
+	}
+}
+
+func TestSemWait_NotEnqueued(t *testing.T) {
+	lm := testManager()
+	_, _, err := lm.SemWait("s1", 5*time.Second, 1)
+	if err != ErrNotEnqueued {
+		t.Fatalf("expected ErrNotEnqueued, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore CleanupConnection
+// ---------------------------------------------------------------------------
+
+func TestSemCleanup_ReleasesOwned(t *testing.T) {
+	lm := testManager()
+	tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 100, 3)
+	if tok == "" {
+		t.Fatal("should acquire")
+	}
+	lm.CleanupConnection(100)
+	if len(lm.sems["s1"].Holders) != 0 {
+		t.Fatal("holders should be cleared")
+	}
+}
+
+func TestSemCleanup_CancelsPending(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	done := make(chan string, 1)
+	go func() {
+		tok, _ := lm.SemAcquire("s1", 10*time.Second, 30*time.Second, 2, 1)
+		done <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(2)
+	tok := <-done
+	if tok != "" {
+		t.Fatal("cancelled waiter should get empty token")
+	}
+}
+
+func TestSemCleanup_TransfersToWaiter(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	done := make(chan string, 1)
+	go func() {
+		tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 1)
+		done <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(1)
+	tok2 := <-done
+	if tok2 == "" {
+		t.Fatal("conn2 should have acquired after transfer")
+	}
+}
+
+func TestSemCleanup_EnqueuedWaiter(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+
+	lm.CleanupConnection(2)
+	if len(lm.sems["s1"].Waiters) != 0 {
+		t.Fatal("waiter should be removed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore LeaseExpiryLoop
+// ---------------------------------------------------------------------------
+
+func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+	tok, _ := lm.SemAcquire("s1", 5*time.Second, 1*time.Second, 1, 3)
+	if tok == "" {
+		t.Fatal("should acquire")
+	}
+	lm.mu.Lock()
+	lm.sems["s1"].Holders[tok].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.LeaseExpiryLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	if len(lm.sems["s1"].Holders) != 0 {
+		t.Fatal("holder should be evicted by expiry loop")
+	}
+}
+
+func TestSemLeaseExpiry_TransfersToWaiter(t *testing.T) {
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+	lm.SemAcquire("s1", 5*time.Second, 1*time.Second, 1, 1)
+
+	done := make(chan string, 1)
+	go func() {
+		tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 1)
+		done <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Expire holder
+	lm.mu.Lock()
+	for _, h := range lm.sems["s1"].Holders {
+		h.LeaseExpires = time.Now().Add(-1 * time.Second)
+	}
+	lm.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.LeaseExpiryLoop(ctx)
+
+	tok2 := <-done
+	cancel()
+
+	if tok2 == "" {
+		t.Fatal("conn2 should have acquired after expiry")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore GCLoop
+// ---------------------------------------------------------------------------
+
+func TestSemGC_PrunesIdle(t *testing.T) {
+	lm := testManager()
+	lm.cfg.GCInterval = 50 * time.Millisecond
+	lm.cfg.GCMaxIdleTime = 0
+
+	tok, _ := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	lm.SemRelease("s1", tok)
+	lm.mu.Lock()
+	lm.sems["s1"].LastActivity = time.Now().Add(-100 * time.Second)
+	lm.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.GCLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	lm.mu.Lock()
+	_, exists := lm.sems["s1"]
+	lm.mu.Unlock()
+	if exists {
+		t.Fatal("s1 should have been GC'd")
+	}
+}
+
+func TestSemGC_DoesNotPruneHeld(t *testing.T) {
+	lm := testManager()
+	lm.cfg.GCInterval = 50 * time.Millisecond
+	lm.cfg.GCMaxIdleTime = 0
+
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 3)
+	lm.mu.Lock()
+	lm.sems["s1"].LastActivity = time.Now().Add(-100 * time.Second)
+	lm.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.GCLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	lm.mu.Lock()
+	_, exists := lm.sems["s1"]
+	lm.mu.Unlock()
+	if !exists {
+		t.Fatal("s1 should not be GC'd (still has holders)")
+	}
+}

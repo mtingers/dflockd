@@ -66,7 +66,7 @@ The `default-lease-ttl` controls how long a lock is held before it expires if no
 
 ### Max locks
 
-The `max-locks` setting caps the number of unique lock keys tracked by the server. When the limit is reached, new lock requests for unknown keys return `error_max_locks`. Existing keys are unaffected.
+The `max-locks` setting caps the total number of unique lock keys **and** semaphore keys tracked by the server. Lock keys and semaphore keys share the same budget. When the limit is reached, new lock or semaphore requests for unknown keys return `error_max_locks`. Existing keys are unaffected.
 
 ### Garbage collection
 

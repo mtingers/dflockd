@@ -189,6 +189,93 @@ if status == "queued" {
 }
 ```
 
+## High-level API: `Semaphore`
+
+The `Semaphore` type manages the full lifecycle for a distributed semaphore slot: connecting, acquiring a slot (up to the limit), renewing the lease, and releasing.
+
+### Creating a Semaphore
+
+```go
+s := &client.Semaphore{
+    Key:            "worker-pool",
+    Limit:          3,                          // max concurrent holders
+    AcquireTimeout: 10 * time.Second,           // default: 10s
+    LeaseTTL:       60,                         // seconds; 0 = server default
+    Servers:        []string{"127.0.0.1:6388"}, // default: ["127.0.0.1:6388"]
+    ShardFunc:      client.CRC32Shard,          // default: CRC32Shard
+    RenewRatio:     0.5,                        // default: 0.5
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `Key` | (required) | The semaphore key name |
+| `Limit` | (required) | Maximum concurrent holders for this key |
+| `AcquireTimeout` | `10s` | How long to wait for a slot before timing out |
+| `LeaseTTL` | `0` (server default) | Custom lease TTL in seconds |
+| `Servers` | `["127.0.0.1:6388"]` | List of dflockd server addresses |
+| `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
+| `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew |
+
+### Single-phase acquire
+
+```go
+ok, err := s.Acquire(ctx)
+if err != nil {
+    // connection, server, or limit mismatch error
+}
+if !ok {
+    // timed out
+}
+// Slot is held; background renewal is running.
+
+err = s.Release(ctx)
+```
+
+### Two-phase acquire
+
+```go
+status, err := s.Enqueue(ctx)
+if status == "queued" {
+    ok, err := s.Wait(ctx, 30*time.Second)
+    if !ok {
+        log.Fatal("timed out")
+    }
+}
+defer s.Release(ctx)
+```
+
+## Low-level Semaphore API
+
+### SemAcquire
+
+```go
+token, leaseTTL, err := client.SemAcquire(c, "pool", 10*time.Second, 3)
+// With custom lease TTL:
+token, leaseTTL, err := client.SemAcquire(c, "pool", 10*time.Second, 3, client.WithLeaseTTL(60))
+```
+
+### SemRelease
+
+```go
+err := client.SemRelease(c, "pool", token)
+```
+
+### SemRenew
+
+```go
+remaining, err := client.SemRenew(c, "pool", token)
+```
+
+### SemEnqueue and SemWait
+
+```go
+status, token, leaseTTL, err := client.SemEnqueue(c, "pool", 3)
+if status == "queued" {
+    token, leaseTTL, err = client.SemWait(c, "pool", 10*time.Second)
+}
+```
+
 ## Error handling
 
 The client defines sentinel errors that can be checked with `errors.Is()`:
@@ -202,10 +289,11 @@ if errors.Is(err, client.ErrTimeout) {
 
 | Error | Meaning |
 |---|---|
-| `ErrTimeout` | The server returned `timeout` (lock not acquired within the deadline) |
-| `ErrMaxLocks` | The server returned `error_max_locks` (server lock limit reached) |
+| `ErrTimeout` | The server returned `timeout` (lock/slot not acquired within the deadline) |
+| `ErrMaxLocks` | The server returned `error_max_locks` (server lock+semaphore key limit reached) |
 | `ErrServer` | The server returned an unexpected error response |
-| `ErrNotQueued` | A `Wait` was attempted without a prior `Enqueue` |
+| `ErrNotQueued` | A `Wait`/`SemWait` was attempted without a prior `Enqueue`/`SemEnqueue` |
+| `ErrLimitMismatch` | The server returned `error_limit_mismatch` (semaphore limit doesn't match existing key) |
 
 ## Sharding
 

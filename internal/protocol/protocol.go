@@ -26,6 +26,7 @@ type Request struct {
 	AcquireTimeout time.Duration
 	LeaseTTL       time.Duration
 	Token          string
+	Limit          int
 }
 
 type Ack struct {
@@ -78,7 +79,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 	}
 
 	switch cmd {
-	case "l", "r", "n", "e", "w":
+	case "l", "r", "n", "e", "w", "sl", "sr", "sn", "se", "sw":
 	default:
 		return nil, &ProtocolError{Code: 3, Message: fmt.Sprintf("invalid cmd %q", cmd)}
 	}
@@ -166,6 +167,123 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		stripped := strings.TrimSpace(arg)
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: "wait arg must be: <timeout>"}
+		}
+		timeout, err := parseInt(stripped, "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+		}, nil
+
+	case "sl":
+		// sl arg: <timeout> <limit> [<lease_ttl>]
+		if len(parts) != 2 && len(parts) != 3 {
+			return nil, &ProtocolError{Code: 8, Message: "sl arg must be: <timeout> <limit> [<lease_ttl>]"}
+		}
+		timeout, err := parseInt(parts[0], "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		limit, err := parseInt(parts[1], "limit")
+		if err != nil {
+			return nil, err
+		}
+		if limit <= 0 {
+			return nil, &ProtocolError{Code: 13, Message: "limit must be > 0"}
+		}
+		leaseTTL := defaultLeaseTTL
+		if len(parts) == 3 {
+			lt, err := parseInt(parts[2], "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		if leaseTTL <= 0 {
+			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+			LeaseTTL:       leaseTTL,
+			Limit:          limit,
+		}, nil
+
+	case "sr":
+		// sr arg: <token> (same as r)
+		token := strings.TrimSpace(arg)
+		if token == "" {
+			return nil, &ProtocolError{Code: 7, Message: "empty token"}
+		}
+		return &Request{Cmd: cmd, Key: key, Token: token}, nil
+
+	case "sn":
+		// sn arg: <token> [<lease_ttl>] (same as n)
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, &ProtocolError{Code: 8, Message: "sn arg must be: <token> [<lease_ttl>]"}
+		}
+		token := strings.TrimSpace(parts[0])
+		if token == "" {
+			return nil, &ProtocolError{Code: 7, Message: "empty token"}
+		}
+		leaseTTL := defaultLeaseTTL
+		if len(parts) == 2 {
+			lt, err := parseInt(parts[1], "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		if leaseTTL <= 0 {
+			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+		}
+		return &Request{Cmd: cmd, Key: key, Token: token, LeaseTTL: leaseTTL}, nil
+
+	case "se":
+		// se arg: <limit> [<lease_ttl>]
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, &ProtocolError{Code: 8, Message: "se arg must be: <limit> [<lease_ttl>]"}
+		}
+		limit, err := parseInt(parts[0], "limit")
+		if err != nil {
+			return nil, err
+		}
+		if limit <= 0 {
+			return nil, &ProtocolError{Code: 13, Message: "limit must be > 0"}
+		}
+		leaseTTL := defaultLeaseTTL
+		if len(parts) == 2 {
+			lt, err := parseInt(parts[1], "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		if leaseTTL <= 0 {
+			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+		}
+		return &Request{
+			Cmd:      cmd,
+			Key:      key,
+			LeaseTTL: leaseTTL,
+			Limit:    limit,
+		}, nil
+
+	case "sw":
+		// sw arg: <timeout> (same as w)
+		stripped := strings.TrimSpace(arg)
+		if stripped == "" {
+			return nil, &ProtocolError{Code: 8, Message: "sw arg must be: <timeout>"}
 		}
 		timeout, err := parseInt(stripped, "timeout")
 		if err != nil {

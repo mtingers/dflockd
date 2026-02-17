@@ -624,6 +624,320 @@ func TestIntegration_EnqueueDefaultLease(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// Semaphore integration tests
+// ===========================================================================
+
+func TestIntegration_SemAcquireRelease(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Acquire semaphore slot (limit=3)
+	resp := connSendCmd(t, conn, reader, "sl", "sem1", "10 3")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+	token := parts[1]
+
+	// Release
+	resp = connSendCmd(t, conn, reader, "sr", "sem1", token)
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+}
+
+func TestIntegration_SemAtCapacityTimeout(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Fill capacity (limit=2)
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	connSendCmd(t, conn1, r1, "sl", "sem1", "10 2")
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+	connSendCmd(t, conn2, r2, "sl", "sem1", "10 2")
+
+	// Third should timeout
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn3.Close()
+	r3 := bufio.NewReader(conn3)
+	resp := connSendCmd(t, conn3, r3, "sl", "sem1", "0 2")
+	if resp != "timeout" {
+		t.Fatalf("expected 'timeout', got %q", resp)
+	}
+}
+
+func TestIntegration_SemRenew(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "sl", "sem1", "10 3")
+	token := strings.Fields(resp)[1]
+
+	resp = connSendCmd(t, conn, reader, "sn", "sem1", token)
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("expected 'ok <remaining>', got %q", resp)
+	}
+
+	// Bad token
+	resp = connSendCmd(t, conn, reader, "sn", "sem1", "badtoken")
+	if resp != "error" {
+		t.Fatalf("expected 'error', got %q", resp)
+	}
+}
+
+func TestIntegration_SemLimitMismatch(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	connSendCmd(t, conn1, r1, "sl", "sem1", "10 3")
+
+	// Different limit from different connection
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+	resp := connSendCmd(t, conn2, r2, "sl", "sem1", "10 5")
+	if resp != "error_limit_mismatch" {
+		t.Fatalf("expected 'error_limit_mismatch', got %q", resp)
+	}
+}
+
+func TestIntegration_SemTwoPhase(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires slot (limit=1)
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, r1, "sl", "sem1", "10 1")
+	token1 := strings.Fields(resp)[1]
+
+	// conn2 enqueues
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+	resp = connSendCmd(t, conn2, r2, "se", "sem1", "1")
+	if resp != "queued" {
+		t.Fatalf("expected 'queued', got %q", resp)
+	}
+
+	// conn2 waits in background
+	type result struct {
+		resp string
+		err  error
+	}
+	waitDone := make(chan result, 1)
+	go func() {
+		msg := "sw\nsem1\n10\n"
+		conn2.Write([]byte(msg))
+		conn2.SetReadDeadline(time.Now().Add(10 * time.Second))
+		line, err := r2.ReadString('\n')
+		waitDone <- result{resp: strings.TrimRight(line, "\r\n"), err: err}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// conn1 releases
+	resp = connSendCmd(t, conn1, r1, "sr", "sem1", token1)
+	if resp != "ok" {
+		t.Fatalf("release: expected 'ok', got %q", resp)
+	}
+
+	r := <-waitDone
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	parts := strings.Fields(r.resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("wait: expected 'ok <token> <lease>', got %q", r.resp)
+	}
+}
+
+func TestIntegration_SemDisconnectCleanup(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires then disconnects
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1 := bufio.NewReader(conn1)
+	connSendCmd(t, conn1, r1, "sl", "sem1", "10 1")
+	conn1.Close()
+
+	// Give server time to detect disconnect and cleanup
+	time.Sleep(200 * time.Millisecond)
+
+	// conn2 should be able to acquire immediately
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+	resp := connSendCmd(t, conn2, r2, "sl", "sem1", "0 1")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+}
+
+func TestIntegration_SemFIFOOrdering(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires (limit=1)
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, r1, "sl", "sem1", "10 1")
+	token1 := strings.Fields(resp)[1]
+
+	type result struct {
+		order int
+		resp  string
+	}
+	results := make(chan result, 2)
+
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			reader := bufio.NewReader(conn)
+			resp := connSendCmd(t, conn, reader, "sl", "sem1", "10 1")
+			results <- result{order: i, resp: resp}
+		}()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	connSendCmd(t, conn1, r1, "sr", "sem1", token1)
+
+	r := <-results
+	parts := strings.Fields(r.resp)
+	if parts[0] != "ok" {
+		t.Fatalf("first waiter: expected 'ok', got %q", r.resp)
+	}
+
+	// Release so second waiter gets it
+	tok2 := parts[1]
+	releaseConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseConn.Close()
+	rr := bufio.NewReader(releaseConn)
+	connSendCmd(t, releaseConn, rr, "sr", "sem1", tok2)
+
+	r = <-results
+	parts = strings.Fields(r.resp)
+	if parts[0] != "ok" {
+		t.Fatalf("second waiter: expected 'ok', got %q", r.resp)
+	}
+}
+
+func TestIntegration_SemMaxLocks(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxLocks = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Use 1 lock key + 1 sem key = 2 (at limit)
+	connSendCmd(t, conn, reader, "l", "lock1", "0")
+	connSendCmd(t, conn, reader, "sl", "sem1", "0 3")
+
+	// Third should hit max locks
+	resp := connSendCmd(t, conn, reader, "sl", "sem2", "0 3")
+	if resp != "error_max_locks" {
+		t.Fatalf("expected 'error_max_locks', got %q", resp)
+	}
+}
+
+func TestIntegration_SemCustomLease(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "sl", "sem1", "10 3 60")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[2] != "60" {
+		t.Fatalf("expected lease 60, got %q", resp)
+	}
+}
+
 func TestIntegration_TwoPhaseFullCycle(t *testing.T) {
 	// Full e→w→r cycle with contention
 	cfg := testConfig()

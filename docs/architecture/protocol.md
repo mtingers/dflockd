@@ -133,6 +133,104 @@ n
 !!! note
     A renew request for an already-expired lease will fail. The server does not resurrect expired locks — the lock transfers to the next waiter on expiry.
 
+## Semaphore Commands
+
+Semaphore commands mirror the lock commands but allow up to N concurrent holders per key (where N = `limit`). The first acquirer sets the limit for a key; subsequent requests must match or receive `error_limit_mismatch`.
+
+### Semaphore Acquire (`sl`)
+
+Request a semaphore slot on a key with a timeout and limit.
+
+**Request:**
+```
+sl
+<key>
+<acquire_timeout_s> <limit> [<lease_ttl_s>]
+```
+
+**Response:**
+
+- Success: `ok <token> <lease_ttl>\n`
+- Timeout: `timeout\n`
+- Max locks reached: `error_max_locks\n`
+- Limit mismatch: `error_limit_mismatch\n`
+
+**Example:**
+```
+sl
+worker-pool
+10 3
+```
+→ `ok a1b2c3d4e5f6... 33`
+
+### Semaphore Enqueue (`se`) — two-phase step 1
+
+Join the semaphore queue for a key and return immediately.
+
+**Request:**
+```
+se
+<key>
+<limit> [<lease_ttl_s>]
+```
+
+**Response:**
+
+- Immediate acquire: `acquired <token> <lease_ttl>\n`
+- Queued: `queued\n`
+- Max locks reached: `error_max_locks\n`
+- Limit mismatch: `error_limit_mismatch\n`
+- Already enqueued: `error\n`
+
+### Semaphore Wait (`sw`) — two-phase step 2
+
+Block until a semaphore slot is granted (after a prior `se` enqueue) or timeout.
+
+**Request:**
+```
+sw
+<key>
+<timeout_s>
+```
+
+**Response:**
+
+- Success: `ok <token> <lease_ttl>\n`
+- Timeout: `timeout\n`
+- Not enqueued: `error\n`
+
+### Semaphore Release (`sr`)
+
+Release a held semaphore slot. The token must match a current holder.
+
+**Request:**
+```
+sr
+<key>
+<token>
+```
+
+**Response:**
+
+- Success: `ok\n`
+- Token mismatch or unknown key: `error\n`
+
+### Semaphore Renew (`sn`)
+
+Extend the lease on a held semaphore slot.
+
+**Request:**
+```
+sn
+<key>
+<token> [<lease_ttl_s>]
+```
+
+**Response:**
+
+- Success: `ok <seconds_remaining>\n`
+- Token mismatch, unknown key, or already expired: `error\n`
+
 ## Protocol constraints
 
 | Constraint | Value |
@@ -150,7 +248,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `l`, `r`, `n`, `e`, or `w`) |
+| 3 | Invalid command (not `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, or `sw`) |
 | 4 | Invalid integer in argument |
 | 5 | Empty key |
 | 6 | Negative timeout |
@@ -160,13 +258,16 @@ Protocol violations cause the server to respond with `error\n` and close the con
 | 10 | Read timeout (no data within server's read timeout) |
 | 11 | Client disconnected |
 | 12 | Line too long (exceeds 256 bytes) |
+| 13 | Zero or negative semaphore limit |
 
 ## Behavior
 
 - Locks are granted in **strict FIFO order** per key.
-- If a lease expires without renewal, the lock automatically passes to the next waiter.
-- When a connection closes, all locks held by that connection are released and transferred to waiters.
-- The server prunes idle lock state (no owner, no waiters) after a configurable idle period.
+- Semaphore slots are granted in **strict FIFO order** per key, up to the configured limit.
+- If a lease expires without renewal, the lock/slot automatically passes to the next waiter.
+- When a connection closes, all locks and semaphore slots held by that connection are released and transferred to waiters.
+- The server prunes idle lock and semaphore state (no owner/holders, no waiters) after a configurable idle period.
+- Lock keys and semaphore keys share the same `--max-locks` budget.
 
 ## Example session
 

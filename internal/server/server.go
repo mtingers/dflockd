@@ -210,6 +210,61 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 			return &protocol.Ack{Status: "timeout"}
 		}
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
+
+	case "sl":
+		tok, err := s.lm.SemAcquire(req.Key, req.AcquireTimeout, req.LeaseTTL, connID, req.Limit)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxLocks) {
+				return &protocol.Ack{Status: "error_max_locks"}
+			}
+			if errors.Is(err, lock.ErrLimitMismatch) {
+				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if tok == "" {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
+
+	case "sr":
+		if s.lm.SemRelease(req.Key, req.Token) {
+			return &protocol.Ack{Status: "ok"}
+		}
+		return &protocol.Ack{Status: "error"}
+
+	case "sn":
+		remaining, ok := s.lm.SemRenew(req.Key, req.Token, req.LeaseTTL)
+		if !ok {
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d", remaining)}
+
+	case "se":
+		status, tok, lease, err := s.lm.SemEnqueue(req.Key, req.LeaseTTL, connID, req.Limit)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxLocks) {
+				return &protocol.Ack{Status: "error_max_locks"}
+			}
+			if errors.Is(err, lock.ErrLimitMismatch) {
+				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
+
+	case "sw":
+		tok, lease, err := s.lm.SemWait(req.Key, req.AcquireTimeout, connID)
+		if err != nil {
+			if errors.Is(err, lock.ErrNotEnqueued) {
+				return &protocol.Ack{Status: "error"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if tok == "" {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
 	}
 
 	return &protocol.Ack{Status: "error"}

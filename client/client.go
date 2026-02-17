@@ -16,10 +16,11 @@ import (
 
 // Sentinel errors returned by protocol operations.
 var (
-	ErrTimeout   = errors.New("dflockd: timeout")
-	ErrMaxLocks  = errors.New("dflockd: max locks reached")
-	ErrServer    = errors.New("dflockd: server error")
-	ErrNotQueued = errors.New("dflockd: not enqueued")
+	ErrTimeout       = errors.New("dflockd: timeout")
+	ErrMaxLocks      = errors.New("dflockd: max locks reached")
+	ErrServer        = errors.New("dflockd: server error")
+	ErrNotQueued     = errors.New("dflockd: not enqueued")
+	ErrLimitMismatch = errors.New("dflockd: limit mismatch")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -189,8 +190,138 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 }
 
 // ---------------------------------------------------------------------------
+// Low-level semaphore protocol functions
+// ---------------------------------------------------------------------------
+
+// SemAcquire sends a semaphore acquire ("sl") command. Returns the token,
+// lease TTL in seconds, and any error. Returns ErrTimeout on timeout,
+// ErrLimitMismatch if the limit doesn't match the existing semaphore.
+func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, opts ...Option) (token string, leaseTTL int, err error) {
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(int(acquireTimeout.Seconds())) + " " + strconv.Itoa(limit)
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+
+	resp, err := c.sendRecv("sl", key, arg)
+	if err != nil {
+		return "", 0, err
+	}
+	return parseSemAcquireResponse(resp)
+}
+
+// SemRelease sends a semaphore release ("sr") command for the given key and token.
+func SemRelease(c *Conn, key, token string) error {
+	resp, err := c.sendRecv("sr", key, token)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: sem_release: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// SemRenew sends a semaphore renew ("sn") command and returns the remaining lease seconds.
+func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := token
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+
+	resp, err := c.sendRecv("sn", key, arg)
+	if err != nil {
+		return 0, err
+	}
+
+	parts := strings.Fields(resp)
+	if len(parts) == 2 && parts[0] == "ok" {
+		r, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, fmt.Errorf("%w: sem_renew: bad remaining %q", ErrServer, parts[1])
+		}
+		return r, nil
+	}
+	return 0, fmt.Errorf("%w: sem_renew: %s", ErrServer, resp)
+}
+
+// SemEnqueue sends a semaphore enqueue ("se") command. Returns the status
+// ("acquired" or "queued"), and if acquired, the token and lease TTL.
+func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token string, leaseTTL int, err error) {
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(limit)
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+
+	resp, err := c.sendRecv("se", key, arg)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	if resp == "queued" {
+		return "queued", "", 0, nil
+	}
+	if resp == "error_max_locks" {
+		return "", "", 0, ErrMaxLocks
+	}
+	if resp == "error_limit_mismatch" {
+		return "", "", 0, ErrLimitMismatch
+	}
+
+	parts := strings.Fields(resp)
+	if len(parts) == 3 && parts[0] == "acquired" {
+		ttl, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return "", "", 0, fmt.Errorf("%w: sem_enqueue: bad lease %q", ErrServer, parts[2])
+		}
+		return "acquired", parts[1], ttl, nil
+	}
+	return "", "", 0, fmt.Errorf("%w: sem_enqueue: %s", ErrServer, resp)
+}
+
+// SemWait sends a semaphore wait ("sw") command after a prior SemEnqueue.
+func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTTL int, err error) {
+	arg := strconv.Itoa(int(waitTimeout.Seconds()))
+	resp, err := c.sendRecv("sw", key, arg)
+	if err != nil {
+		return "", 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, ErrTimeout
+	}
+	if resp == "error" {
+		return "", 0, ErrNotQueued
+	}
+	return parseOKTokenLease(resp, "sem_wait")
+}
+
+// ---------------------------------------------------------------------------
 // Response parsing helpers
 // ---------------------------------------------------------------------------
+
+func parseSemAcquireResponse(resp string) (string, int, error) {
+	if resp == "timeout" {
+		return "", 0, ErrTimeout
+	}
+	if resp == "error_max_locks" {
+		return "", 0, ErrMaxLocks
+	}
+	if resp == "error_limit_mismatch" {
+		return "", 0, ErrLimitMismatch
+	}
+	return parseOKTokenLease(resp, "sem_acquire")
+}
 
 func parseAcquireResponse(resp string) (string, int, error) {
 	if resp == "timeout" {
@@ -507,6 +638,276 @@ func (l *Lock) startRenew() {
 				l.mu.Unlock()
 
 				_, _ = Renew(conn, key, token, l.opts()...)
+			}
+		}
+	}()
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore — high-level distributed semaphore
+// ---------------------------------------------------------------------------
+
+// Semaphore provides a high-level interface for acquiring, holding, and
+// releasing a distributed semaphore slot, including automatic lease renewal.
+type Semaphore struct {
+	Key            string
+	Limit          int
+	AcquireTimeout time.Duration // default 10s
+	LeaseTTL       int           // custom lease TTL in seconds; 0 = server default
+	Servers        []string      // e.g. ["127.0.0.1:6388"]
+	ShardFunc      ShardFunc     // defaults to CRC32Shard
+	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
+
+	mu          sync.Mutex
+	conn        *Conn
+	token       string
+	lease       int
+	cancelRenew context.CancelFunc
+	renewDone   chan struct{}
+}
+
+func (s *Semaphore) shardFunc() ShardFunc {
+	if s.ShardFunc != nil {
+		return s.ShardFunc
+	}
+	return CRC32Shard
+}
+
+func (s *Semaphore) acquireTimeout() time.Duration {
+	if s.AcquireTimeout > 0 {
+		return s.AcquireTimeout
+	}
+	return 10 * time.Second
+}
+
+func (s *Semaphore) renewRatio() float64 {
+	if s.RenewRatio > 0 {
+		return s.RenewRatio
+	}
+	return 0.5
+}
+
+func (s *Semaphore) serverAddr() string {
+	servers := s.Servers
+	if len(servers) == 0 {
+		servers = []string{"127.0.0.1:6388"}
+	}
+	idx := s.shardFunc()(s.Key, len(servers))
+	return servers[idx]
+}
+
+func (s *Semaphore) opts() []Option {
+	if s.LeaseTTL > 0 {
+		return []Option{WithLeaseTTL(s.LeaseTTL)}
+	}
+	return nil
+}
+
+func (s *Semaphore) connect() error {
+	conn, err := Dial(s.serverAddr())
+	if err != nil {
+		return err
+	}
+	s.conn = conn
+	return nil
+}
+
+// Acquire connects to the server, acquires a semaphore slot, and starts
+// background lease renewal. Returns false (with nil error) on timeout.
+func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.connect(); err != nil {
+		return false, err
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.conn.Close()
+		case <-done:
+		}
+	}()
+
+	token, lease, err := SemAcquire(s.conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
+	close(done)
+
+	if err != nil {
+		if errors.Is(err, ErrTimeout) {
+			s.conn.Close()
+			s.conn = nil
+			return false, nil
+		}
+		if ctx.Err() != nil {
+			s.conn = nil
+			return false, ctx.Err()
+		}
+		s.conn.Close()
+		s.conn = nil
+		return false, err
+	}
+
+	s.token = token
+	s.lease = lease
+	s.startRenew()
+	return true, nil
+}
+
+// Enqueue performs the first phase of two-phase semaphore acquire.
+func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.connect(); err != nil {
+		return "", err
+	}
+
+	status, token, lease, err := SemEnqueue(s.conn, s.Key, s.Limit, s.opts()...)
+	if err != nil {
+		s.conn.Close()
+		s.conn = nil
+		return "", err
+	}
+
+	if status == "acquired" {
+		s.token = token
+		s.lease = lease
+		s.startRenew()
+	}
+	return status, nil
+}
+
+// Wait performs the second phase of two-phase semaphore acquire.
+func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		return false, ErrNotQueued
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.conn.Close()
+		case <-done:
+		}
+	}()
+
+	token, lease, err := SemWait(s.conn, s.Key, timeout)
+	close(done)
+
+	if err != nil {
+		if errors.Is(err, ErrTimeout) {
+			return false, nil
+		}
+		if ctx.Err() != nil {
+			s.conn = nil
+			return false, ctx.Err()
+		}
+		return false, err
+	}
+
+	s.token = token
+	s.lease = lease
+	s.startRenew()
+	return true, nil
+}
+
+func (s *Semaphore) stopRenew() {
+	if s.cancelRenew != nil {
+		s.cancelRenew()
+		s.cancelRenew = nil
+	}
+	if s.renewDone != nil {
+		done := s.renewDone
+		s.renewDone = nil
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+}
+
+// Release stops renewal, releases the semaphore slot, and closes the connection.
+func (s *Semaphore) Release(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.stopRenew()
+
+	if s.conn == nil {
+		return nil
+	}
+
+	err := SemRelease(s.conn, s.Key, s.token)
+	s.conn.Close()
+	s.conn = nil
+	s.token = ""
+	return err
+}
+
+// Close stops renewal and closes the connection without explicitly releasing.
+func (s *Semaphore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.stopRenew()
+
+	if s.conn == nil {
+		return nil
+	}
+
+	err := s.conn.Close()
+	s.conn = nil
+	s.token = ""
+	return err
+}
+
+// Token returns the current semaphore slot token, or "" if not acquired.
+func (s *Semaphore) Token() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token
+}
+
+func (s *Semaphore) startRenew() {
+	if s.cancelRenew != nil {
+		s.cancelRenew()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancelRenew = cancel
+
+	done := make(chan struct{})
+	s.renewDone = done
+
+	interval := time.Duration(float64(s.lease)*s.renewRatio()) * time.Second
+	if interval < 1*time.Second {
+		interval = 1 * time.Second
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.mu.Lock()
+				if s.conn == nil || s.token == "" {
+					s.mu.Unlock()
+					return
+				}
+				conn := s.conn
+				key := s.Key
+				token := s.token
+				s.mu.Unlock()
+
+				_, _ = SemRenew(conn, key, token, s.opts()...)
 			}
 		}
 	}()
