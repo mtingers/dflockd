@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.0] - 2026-02-16
+
+### Added
+
+- Distributed key-based semaphore support allowing up to N concurrent holders per key
+- Five new protocol commands: `sl` (acquire), `sr` (release), `sn` (renew), `se` (enqueue), `sw` (wait)
+- Per-request `limit` parameter; first acquirer sets the limit, subsequent requests must match or receive `error_limit_mismatch`
+- `ErrLimitMismatch` sentinel error and `error_limit_mismatch` protocol status
+- Protocol error code 13 for zero or negative semaphore limit
+- Low-level client functions: `SemAcquire`, `SemRelease`, `SemRenew`, `SemEnqueue`, `SemWait`
+- High-level `Semaphore` type with `Acquire`, `Enqueue`, `Wait`, `Release`, `Close`, `Token` and automatic background lease renewal
+- Semaphore lease expiry, GC pruning, and disconnect cleanup integrated into existing background loops
+- Semaphore keys share the `--max-locks` budget with lock keys
+- Comprehensive test suite for semaphore functionality (62 new tests across all layers)
+- Documentation for semaphore commands in protocol spec, client docs, server docs, and README
+
+### Fixed
+
+- `CleanupConnection` early return when a connection had no lock keys, which would skip cleanup of other connection state
+
+[v1.2.0]: https://github.com/mtingers/dflockd/releases/tag/v1.2.0
+
 ## [v1.1.0] - 2026-02-16
 
 ### Added
