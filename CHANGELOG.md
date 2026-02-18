@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.4.0] - 2026-02-18
+
+### Added
+
+- Runtime `stats` protocol command returning a JSON snapshot of active connections, held locks, semaphores, and idle entries awaiting GC
+- `Stats()` method on `LockManager` for programmatic access to server state
+- Documentation for `stats` command in protocol spec, server docs, and examples
+
+[v1.4.0]: https://github.com/mtingers/dflockd/releases/tag/v1.4.0
+
 ## [v1.3.0] - 2026-02-18
 
 ### Added
