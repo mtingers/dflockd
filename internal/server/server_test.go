@@ -3,6 +3,8 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/testutil"
 )
 
 func testConfig() *config.Config {
@@ -1010,5 +1013,189 @@ func TestIntegration_TwoPhaseFullCycle(t *testing.T) {
 	resp = connSendCmd(t, conn2, r2, "r", "mykey", token2)
 	if resp != "ok" {
 		t.Fatalf("r conn2: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_Stats(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Acquire a lock
+	resp := connSendCmd(t, conn, reader, "l", "lockkey", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("lock: expected 'ok <token> <lease>', got %q", resp)
+	}
+
+	// Acquire a semaphore slot
+	resp = connSendCmd(t, conn, reader, "sl", "semkey", "10 3")
+	parts = strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("sem: expected 'ok <token> <lease>', got %q", resp)
+	}
+
+	// Send stats command
+	resp = connSendCmd(t, conn, reader, "stats", "_", "")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("stats: expected 'ok <json>', got %q", resp)
+	}
+	jsonStr := strings.TrimPrefix(resp, "ok ")
+
+	var stats lock.Stats
+	if err := json.Unmarshal([]byte(jsonStr), &stats); err != nil {
+		t.Fatalf("stats: invalid JSON: %v\njson: %s", err, jsonStr)
+	}
+
+	// Verify connections (at least 1)
+	if stats.Connections < 1 {
+		t.Fatalf("expected connections >= 1, got %d", stats.Connections)
+	}
+
+	// Verify held lock
+	if len(stats.Locks) != 1 {
+		t.Fatalf("expected 1 lock, got %d", len(stats.Locks))
+	}
+	if stats.Locks[0].Key != "lockkey" {
+		t.Fatalf("expected lock key 'lockkey', got %q", stats.Locks[0].Key)
+	}
+	if stats.Locks[0].LeaseExpiresInS <= 0 {
+		t.Fatalf("expected positive lease_expires_in_s, got %f", stats.Locks[0].LeaseExpiresInS)
+	}
+
+	// Verify held semaphore
+	if len(stats.Semaphores) != 1 {
+		t.Fatalf("expected 1 semaphore, got %d", len(stats.Semaphores))
+	}
+	if stats.Semaphores[0].Key != "semkey" {
+		t.Fatalf("expected sem key 'semkey', got %q", stats.Semaphores[0].Key)
+	}
+	if stats.Semaphores[0].Limit != 3 {
+		t.Fatalf("expected sem limit 3, got %d", stats.Semaphores[0].Limit)
+	}
+	if stats.Semaphores[0].Holders != 1 {
+		t.Fatalf("expected 1 holder, got %d", stats.Semaphores[0].Holders)
+	}
+
+	// No idle entries expected
+	if len(stats.IdleLocks) != 0 {
+		t.Fatalf("expected 0 idle locks, got %d", len(stats.IdleLocks))
+	}
+	if len(stats.IdleSemaphores) != 0 {
+		t.Fatalf("expected 0 idle semaphores, got %d", len(stats.IdleSemaphores))
+	}
+}
+
+// ===========================================================================
+// TLS integration tests
+// ===========================================================================
+
+// startTLSServer creates a server on a TLS listener and returns the address
+// and client TLS config.
+func startTLSServer(t *testing.T, cfg *config.Config) (context.CancelFunc, string, *tls.Config) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	serverTLS, clientTLS := testutil.SelfSignedTLS(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn := tls.NewListener(ln, serverTLS)
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, tlsLn)
+	}()
+
+	cleanup := func() {
+		cancel()
+		<-done
+	}
+
+	return cleanup, addr, clientTLS
+}
+
+func TestIntegration_TLS_LockAndRelease(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, clientTLS := startTLSServer(t, cfg)
+	defer cleanup()
+
+	conn, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Lock
+	resp := connSendCmd(t, conn, reader, "l", "mykey", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+	token := parts[1]
+
+	// Release
+	resp = connSendCmd(t, conn, reader, "r", "mykey", token)
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+}
+
+func TestIntegration_TLS_PlainClientRejected(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startTLSServer(t, cfg)
+	defer cleanup()
+
+	// Plain TCP dial against TLS listener should fail on protocol exchange.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send a command — the TLS handshake never completed so the server
+	// should close the connection or return an error.
+	msg := "l\nmykey\n10\n"
+	conn.Write([]byte(msg))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	reader := bufio.NewReader(conn)
+	_, err = reader.ReadString('\n')
+	if err == nil {
+		t.Fatal("expected error reading from TLS server with plain client")
+	}
+}
+
+func TestIntegration_TLS_ValidationError(t *testing.T) {
+	cfg := testConfig()
+	cfg.TLSCert = "/tmp/nonexistent.pem"
+	// Only cert set, no key — should return validation error.
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := srv.Run(ctx)
+	if err == nil {
+		t.Fatal("expected error when only --tls-cert is set")
+	}
+	if !strings.Contains(err.Error(), "both --tls-cert and --tls-key must be provided") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.3.0] - 2026-02-18
+
+### Added
+
+- Optional TLS encryption for client-server communication
+- Server flags `--tls-cert` / `--tls-key` and env vars `DFLOCKD_TLS_CERT` / `DFLOCKD_TLS_KEY` to enable TLS
+- `DialTLS` client function for low-level TLS connections
+- `TLSConfig` field on `Lock` and `Semaphore` high-level types
+- TLS integration tests for both server and client packages
+- `internal/testutil` package with ephemeral self-signed certificate helper for tests
+
+[v1.3.0]: https://github.com/mtingers/dflockd/releases/tag/v1.3.0
+
 ## [v1.2.0] - 2026-02-16
 
 ### Added

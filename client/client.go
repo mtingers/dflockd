@@ -4,6 +4,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -49,6 +50,15 @@ type Conn struct {
 // Dial connects to a dflockd server at the given address (host:port).
 func Dial(addr string) (*Conn, error) {
 	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return &Conn{conn: conn, reader: bufio.NewReader(conn)}, nil
+}
+
+// DialTLS connects to a dflockd server at the given address using TLS.
+func DialTLS(addr string, cfg *tls.Config) (*Conn, error) {
+	conn, err := tls.Dial("tcp", addr, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +382,7 @@ type Lock struct {
 	Servers        []string      // e.g. ["127.0.0.1:6388"]
 	ShardFunc      ShardFunc     // defaults to CRC32Shard
 	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
+	TLSConfig      *tls.Config   // if non-nil, connect using TLS
 
 	mu          sync.Mutex
 	conn        *Conn
@@ -420,7 +431,14 @@ func (l *Lock) opts() []Option {
 
 // connect dials the appropriate shard server.
 func (l *Lock) connect() error {
-	conn, err := Dial(l.serverAddr())
+	addr := l.serverAddr()
+	var conn *Conn
+	var err error
+	if l.TLSConfig != nil {
+		conn, err = DialTLS(addr, l.TLSConfig)
+	} else {
+		conn, err = Dial(addr)
+	}
 	if err != nil {
 		return err
 	}
@@ -657,6 +675,7 @@ type Semaphore struct {
 	Servers        []string      // e.g. ["127.0.0.1:6388"]
 	ShardFunc      ShardFunc     // defaults to CRC32Shard
 	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
+	TLSConfig      *tls.Config   // if non-nil, connect using TLS
 
 	mu          sync.Mutex
 	conn        *Conn
@@ -704,7 +723,14 @@ func (s *Semaphore) opts() []Option {
 }
 
 func (s *Semaphore) connect() error {
-	conn, err := Dial(s.serverAddr())
+	addr := s.serverAddr()
+	var conn *Conn
+	var err error
+	if s.TLSConfig != nil {
+		conn, err = DialTLS(addr, s.TLSConfig)
+	} else {
+		conn, err = Dial(addr)
+	}
 	if err != nil {
 		return err
 	}

@@ -28,6 +28,8 @@
 | `--gc-max-idle` | `60` | Seconds before idle lock state is pruned |
 | `--max-locks` | `1024` | Maximum number of unique lock keys |
 | `--read-timeout` | `23` | Client read timeout (seconds) |
+| `--tls-cert` | *(unset)* | Path to TLS certificate PEM file |
+| `--tls-key` | *(unset)* | Path to TLS private key PEM file |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
 | `--debug` | `false` | Enable debug logging |
 
@@ -45,6 +47,8 @@ All settings can be configured via environment variables. Environment variables 
 | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle lock state is pruned |
 | `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
+| `DFLOCKD_TLS_CERT` | *(unset)* | Path to TLS certificate PEM file |
+| `DFLOCKD_TLS_KEY` | *(unset)* | Path to TLS private key PEM file |
 | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects |
 | `DFLOCKD_DEBUG` | *(unset)* | Enable debug logging (`1`, `yes`, or `true`) |
 
@@ -89,3 +93,41 @@ export DFLOCKD_AUTO_RELEASE_ON_DISCONNECT=0
 
 !!! warning
     Disabling this means locks from disconnected clients will only be freed when their lease expires. This increases the window where a lock is held by a dead client.
+
+## TLS
+
+To enable TLS encryption, provide both a PEM certificate and private key file:
+
+```bash
+./dflockd --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+```
+
+Or via environment variables:
+
+```bash
+export DFLOCKD_TLS_CERT=/path/to/cert.pem
+export DFLOCKD_TLS_KEY=/path/to/key.pem
+./dflockd
+```
+
+Both `--tls-cert` and `--tls-key` must be provided together. If only one is set, the server exits with an error. When TLS is enabled, the server requires all clients to connect using TLS — plain TCP connections will fail the TLS handshake and be dropped.
+
+The server enforces a minimum TLS version of 1.2.
+
+## Runtime stats
+
+The `stats` protocol command returns a JSON snapshot of the server's current state. This is useful for monitoring, debugging, and building health checks.
+
+```bash
+printf 'stats\n_\n\n' | nc localhost 6388
+# ok {"connections":2,"locks":[...],"semaphores":[...],"idle_locks":[],"idle_semaphores":[]}
+```
+
+The response includes:
+
+- **connections** — number of currently connected TCP clients
+- **locks** — held locks with key, owner connection ID, seconds until lease expires, and waiter count
+- **semaphores** — semaphores with at least one holder, showing key, limit, holder count, and waiter count
+- **idle_locks** / **idle_semaphores** — entries with no owner/holders (cached state awaiting GC), with seconds since last activity
+
+See [Wire Protocol](architecture/protocol.md#stats-stats) for the full JSON schema.

@@ -20,6 +20,8 @@ type Config struct {
 	AutoReleaseOnDisconnect bool
 	Debug                   bool
 	Version                 bool
+	TLSCert                 string
+	TLSKey                  string
 }
 
 func envInt(key string, def int) int {
@@ -62,6 +64,8 @@ func Load() *Config {
 	maxLocks := flag.Int("max-locks", 1024, "Maximum number of unique lock keys")
 	readTimeout := flag.Int("read-timeout", 23, "Client read timeout (seconds)")
 	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate PEM file")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key PEM file")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
@@ -113,6 +117,16 @@ func Load() *Config {
 		cfg.AutoReleaseOnDisconnect = envBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)
 	} else {
 		cfg.AutoReleaseOnDisconnect = *autoRelease
+	}
+	if os.Getenv("DFLOCKD_TLS_CERT") != "" {
+		cfg.TLSCert = envString("DFLOCKD_TLS_CERT", *tlsCert)
+	} else {
+		cfg.TLSCert = *tlsCert
+	}
+	if os.Getenv("DFLOCKD_TLS_KEY") != "" {
+		cfg.TLSKey = envString("DFLOCKD_TLS_KEY", *tlsKey)
+	} else {
+		cfg.TLSKey = *tlsKey
 	}
 	if os.Getenv("DFLOCKD_DEBUG") != "" {
 		cfg.Debug = envBool("DFLOCKD_DEBUG", *debug)

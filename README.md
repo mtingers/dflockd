@@ -46,6 +46,8 @@ All settings can be passed as CLI flags or environment variables. Environment va
 | `--gc-max-idle`                                                    | `DFLOCKD_GC_MAX_UNUSED_TIME`         | `60`      | Idle seconds before pruning lock state |
 | `--max-locks`                                                      | `DFLOCKD_MAX_LOCKS`                  | `1024`    | Maximum number of unique lock keys     |
 | `--read-timeout`                                                   | `DFLOCKD_READ_TIMEOUT_S`             | `23`      | Client read timeout (seconds)          |
+| `--tls-cert`                                                       | `DFLOCKD_TLS_CERT`                   | *(unset)* | Path to TLS certificate PEM file       |
+| `--tls-key`                                                        | `DFLOCKD_TLS_KEY`                    | *(unset)* | Path to TLS private key PEM file       |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true`    | Release locks on client disconnect     |
 | `--debug`                                                          | `DFLOCKD_DEBUG`                      | `false`   | Enable debug logging                   |
 
@@ -55,6 +57,26 @@ Example:
 ./dflockd --port 7000 --max-locks 512
 # or
 DFLOCKD_PORT=7000 DFLOCKD_MAX_LOCKS=512 ./dflockd
+```
+
+## TLS
+
+To enable TLS encryption, provide both a certificate and private key:
+
+```bash
+./dflockd --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+# or
+DFLOCKD_TLS_CERT=/path/to/cert.pem DFLOCKD_TLS_KEY=/path/to/key.pem ./dflockd
+```
+
+Both `--tls-cert` and `--tls-key` must be provided together. When TLS is enabled, clients must connect using TLS:
+
+```go
+l := &client.Lock{
+    Key:       "my-resource",
+    Servers:   []string{"127.0.0.1:6388"},
+    TLSConfig: &tls.Config{},  // configure CA, etc.
+}
 ```
 
 ## Tests
@@ -149,6 +171,16 @@ sw\n<key>\n<timeout_s>\n
 
 Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error\n`
 
+**Stats (`stats`)** — query server runtime state (connections, locks, semaphores, idle entries).
+
+```
+stats\n_\n\n
+```
+
+Response: `ok <json>\n`
+
+The JSON payload includes `connections`, `locks`, `semaphores`, `idle_locks`, and `idle_semaphores`. Key and arg lines are read but ignored.
+
 ### Example session with netcat
 
 ```bash
@@ -197,6 +229,16 @@ sr
 worker-pool
 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
 ok
+```
+
+### Stats example
+
+```bash
+$ nc localhost 6388
+stats
+_
+
+ok {"connections":1,"locks":[],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}
 ```
 
 ### Go semaphore quick start

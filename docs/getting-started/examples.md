@@ -119,6 +119,50 @@ ok, err := l.Acquire(context.Background())
 // ...
 ```
 
+### Connecting with TLS
+
+```go
+import (
+    "context"
+    "crypto/tls"
+    "crypto/x509"
+    "fmt"
+    "log"
+    "os"
+    "time"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    // Load CA certificate to verify the server
+    caCert, err := os.ReadFile("/path/to/ca.pem")
+    if err != nil {
+        log.Fatal(err)
+    }
+    pool := x509.NewCertPool()
+    pool.AppendCertsFromPEM(caCert)
+
+    l := &client.Lock{
+        Key:            "my-resource",
+        AcquireTimeout: 10 * time.Second,
+        Servers:        []string{"127.0.0.1:6388"},
+        TLSConfig:      &tls.Config{RootCAs: pool},
+    }
+
+    ok, err := l.Acquire(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timed out")
+    }
+    defer l.Release(context.Background())
+
+    fmt.Println("acquired lock over TLS")
+}
+```
+
 ## TCP protocol examples
 
 ## Basic lock and release
@@ -216,6 +260,45 @@ my-key
 ```
 
 If the lock was free at enqueue time, it is acquired immediately (fast path) and `w` returns `ok` without blocking. The lease is reset to the full TTL from the moment `w` returns.
+
+## Querying server stats
+
+The `stats` command returns a JSON snapshot of the server's current state — active connections, held locks, semaphores, and idle entries awaiting garbage collection.
+
+```bash
+nc localhost 6388
+stats
+_
+
+# Response: ok {"connections":1,"locks":[],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}
+```
+
+With locks and semaphores held:
+
+```bash
+# In an interactive session, acquire a lock and semaphore first, then check stats:
+nc localhost 6388
+l
+my-key
+10
+# Response: ok abc123def456... 33
+
+sl
+worker-pool
+10 3
+# Response: ok 789abc012def... 33
+
+stats
+_
+
+# Response: ok {"connections":1,"locks":[{"key":"my-key","owner_conn_id":1,"lease_expires_in_s":32.5,"waiters":0}],"semaphores":[{"key":"worker-pool","limit":3,"holders":1,"waiters":0}],"idle_locks":[],"idle_semaphores":[]}
+```
+
+One-liner with printf:
+
+```bash
+printf 'stats\n_\n\n' | nc localhost 6388
+```
 
 ## Scripted two-phase example
 

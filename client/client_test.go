@@ -2,6 +2,7 @@ package client_test
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/server"
+	"github.com/mtingers/dflockd/internal/testutil"
 )
 
 func testConfig() *config.Config {
@@ -733,4 +735,126 @@ func TestCRC32ShardSingleServer(t *testing.T) {
 
 func isTimeout(err error) bool {
 	return err != nil && (err == client.ErrTimeout || err.Error() == "dflockd: timeout")
+}
+
+// ---------------------------------------------------------------------------
+// TLS helpers and tests
+// ---------------------------------------------------------------------------
+
+func startTLSServer(t *testing.T, cfg *config.Config) (addr string, clientTLS *tls.Config) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := server.New(lm, cfg, log)
+
+	serverTLS, clientTLS := testutil.SelfSignedTLS(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn := tls.NewListener(ln, serverTLS)
+	addr = ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, tlsLn)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	return addr, clientTLS
+}
+
+func TestDialTLS(t *testing.T) {
+	addr, clientTLS := startTLSServer(t, testConfig())
+
+	c, err := client.DialTLS(addr, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, lease, err := client.Acquire(c, "tls-key", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if lease <= 0 {
+		t.Fatalf("expected positive lease, got %d", lease)
+	}
+
+	if err := client.Release(c, "tls-key", token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLockAcquireReleaseTLS(t *testing.T) {
+	addr, clientTLS := startTLSServer(t, testConfig())
+
+	l := &client.Lock{
+		Key:            "tls-lock",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		TLSConfig:      clientTLS,
+	}
+
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if l.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	if err := l.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemaphoreAcquireReleaseTLS(t *testing.T) {
+	addr, clientTLS := startTLSServer(t, testConfig())
+
+	s := &client.Semaphore{
+		Key:            "tls-sem",
+		Limit:          3,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		TLSConfig:      clientTLS,
+	}
+
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if s.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	if err := s.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDialTLS_BadCA(t *testing.T) {
+	addr, _ := startTLSServer(t, testConfig())
+
+	// Use an empty TLS config (no CA pool) — should fail verification.
+	_, err := client.DialTLS(addr, &tls.Config{})
+	if err == nil {
+		t.Fatal("expected error with untrusted CA")
+	}
 }

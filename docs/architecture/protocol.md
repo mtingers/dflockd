@@ -2,6 +2,10 @@
 
 dflockd uses a line-based UTF-8 protocol over TCP. Each request is exactly **3 lines**: `command\nkey\narg\n`. Each response is a single line.
 
+## Transport
+
+The protocol runs over plain TCP by default. The server optionally supports TLS encryption — when the server is started with `--tls-cert` and `--tls-key`, all connections must use TLS. The framing and command semantics are identical over both plain TCP and TLS; TLS is a transparent transport layer.
+
 ## Commands
 
 ### Lock (acquire)
@@ -231,6 +235,54 @@ sn
 - Success: `ok <seconds_remaining>\n`
 - Token mismatch, unknown key, or already expired: `error\n`
 
+## Stats Command
+
+### Stats (`stats`)
+
+Query server runtime state: active connections, held locks, held semaphores, pending waiters, and idle entries awaiting GC. The key and arg lines are read (to keep the wire format uniform) but ignored.
+
+**Request:**
+```
+stats
+_
+```
+
+The key and arg lines can be any value (they are discarded).
+
+**Response:**
+
+- Success: `ok <json>\n`
+
+The JSON payload contains:
+
+| Field | Type | Description |
+|---|---|---|
+| `connections` | int | Number of currently connected TCP clients |
+| `locks` | array | Held locks (owner token is set) |
+| `locks[].key` | string | Lock key |
+| `locks[].owner_conn_id` | int | Connection ID of the lock holder |
+| `locks[].lease_expires_in_s` | float | Seconds until the lease expires |
+| `locks[].waiters` | int | Number of clients waiting for this lock |
+| `semaphores` | array | Semaphores with at least one holder |
+| `semaphores[].key` | string | Semaphore key |
+| `semaphores[].limit` | int | Maximum concurrent holders |
+| `semaphores[].holders` | int | Current number of holders |
+| `semaphores[].waiters` | int | Number of clients waiting for a slot |
+| `idle_locks` | array | Lock entries with no owner (awaiting GC) |
+| `idle_locks[].key` | string | Lock key |
+| `idle_locks[].idle_s` | float | Seconds since last activity |
+| `idle_semaphores` | array | Semaphore entries with no holders (awaiting GC) |
+| `idle_semaphores[].key` | string | Semaphore key |
+| `idle_semaphores[].idle_s` | float | Seconds since last activity |
+
+**Example:**
+```
+stats
+_
+
+```
+→ `ok {"connections":2,"locks":[{"key":"my-job","owner_conn_id":3,"lease_expires_in_s":25.4,"waiters":1}],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}`
+
 ## Protocol constraints
 
 | Constraint | Value |
@@ -248,7 +300,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, or `sw`) |
+| 3 | Invalid command (not `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, or `stats`) |
 | 4 | Invalid integer in argument |
 | 5 | Empty key |
 | 6 | Negative timeout |
@@ -295,6 +347,13 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 → r\nmy-key\nabc123def456...\n
 ← ok\n
+```
+
+## Stats example session
+
+```
+→ stats\n_\n\n
+← ok {"connections":1,"locks":[],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}\n
 ```
 
 ## Interoperability

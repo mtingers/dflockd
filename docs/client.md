@@ -71,6 +71,7 @@ l := &client.Lock{
 | `Servers` | `["127.0.0.1:6388"]` | List of dflockd server addresses |
 | `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew (e.g. 0.5 = renew at half the lease) |
+| `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
 
 ### Single-phase acquire
 
@@ -158,6 +159,28 @@ if err != nil {
 defer c.Close()
 ```
 
+### Connecting with TLS
+
+```go
+c, err := client.DialTLS("127.0.0.1:6388", &tls.Config{
+    // Configure RootCAs, InsecureSkipVerify, etc.
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer c.Close()
+```
+
+For the high-level `Lock` and `Semaphore` types, set the `TLSConfig` field:
+
+```go
+l := &client.Lock{
+    Key:       "my-resource",
+    Servers:   []string{"127.0.0.1:6388"},
+    TLSConfig: &tls.Config{RootCAs: pool},
+}
+```
+
 ### Acquire
 
 ```go
@@ -216,6 +239,7 @@ s := &client.Semaphore{
 | `Servers` | `["127.0.0.1:6388"]` | List of dflockd server addresses |
 | `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew |
+| `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
 
 ### Single-phase acquire
 

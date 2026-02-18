@@ -3,6 +3,8 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,10 +18,11 @@ import (
 )
 
 type Server struct {
-	lm      *lock.LockManager
-	cfg     *config.Config
-	log     *slog.Logger
-	connSeq atomic.Uint64
+	lm        *lock.LockManager
+	cfg       *config.Config
+	log       *slog.Logger
+	connSeq   atomic.Uint64
+	connCount atomic.Int64
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
@@ -27,10 +30,30 @@ func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	hasCert := s.cfg.TLSCert != ""
+	hasKey := s.cfg.TLSKey != ""
+	if hasCert != hasKey {
+		return fmt.Errorf("both --tls-cert and --tls-key must be provided together")
+	}
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
+	}
+
+	if hasCert {
+		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("tls: %w", err)
+		}
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		listener = tls.NewListener(listener, tlsCfg)
+		s.log.Info("TLS enabled")
 	}
 
 	s.log.Info("listening", "addr", addr)
@@ -120,8 +143,10 @@ func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error
 func (s *Server) handleConn(conn net.Conn, connID uint64) {
 	peer := conn.RemoteAddr().String()
 	s.log.Debug("client connected", "peer", peer, "conn_id", connID)
+	s.connCount.Add(1)
 
 	defer func() {
+		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
 		conn.Close()
 		s.log.Debug("client closed", "peer", peer, "conn_id", connID)
@@ -162,6 +187,14 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
 
 	switch req.Cmd {
+	case "stats":
+		st := s.lm.Stats(s.connCount.Load())
+		data, err := json.Marshal(st)
+		if err != nil {
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: string(data)}
+
 	case "l":
 		tok, err := s.lm.FIFOAcquire(req.Key, req.AcquireTimeout, req.LeaseTTL, connID)
 		if err != nil {
