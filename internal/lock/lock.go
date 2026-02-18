@@ -1049,6 +1049,90 @@ func (lm *LockManager) SemWait(key string, timeout time.Duration, connID uint64)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+type LockInfo struct {
+	Key             string  `json:"key"`
+	OwnerConnID     uint64  `json:"owner_conn_id"`
+	LeaseExpiresInS float64 `json:"lease_expires_in_s"`
+	Waiters         int     `json:"waiters"`
+}
+
+type SemInfo struct {
+	Key     string `json:"key"`
+	Limit   int    `json:"limit"`
+	Holders int    `json:"holders"`
+	Waiters int    `json:"waiters"`
+}
+
+type IdleInfo struct {
+	Key   string  `json:"key"`
+	IdleS float64 `json:"idle_s"`
+}
+
+type Stats struct {
+	Connections    int64      `json:"connections"`
+	Locks          []LockInfo `json:"locks"`
+	Semaphores     []SemInfo  `json:"semaphores"`
+	IdleLocks      []IdleInfo `json:"idle_locks"`
+	IdleSemaphores []IdleInfo `json:"idle_semaphores"`
+}
+
+// Stats returns a snapshot of the current lock manager state.
+func (lm *LockManager) Stats(connections int64) *Stats {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	now := time.Now()
+	s := &Stats{
+		Connections:    connections,
+		Locks:          []LockInfo{},
+		Semaphores:     []SemInfo{},
+		IdleLocks:      []IdleInfo{},
+		IdleSemaphores: []IdleInfo{},
+	}
+
+	for key, st := range lm.locks {
+		if st.OwnerToken != "" {
+			expiresIn := st.LeaseExpires.Sub(now).Seconds()
+			if expiresIn < 0 {
+				expiresIn = 0
+			}
+			s.Locks = append(s.Locks, LockInfo{
+				Key:             key,
+				OwnerConnID:     st.OwnerConnID,
+				LeaseExpiresInS: expiresIn,
+				Waiters:         len(st.Waiters),
+			})
+		} else {
+			s.IdleLocks = append(s.IdleLocks, IdleInfo{
+				Key:   key,
+				IdleS: now.Sub(st.LastActivity).Seconds(),
+			})
+		}
+	}
+
+	for key, st := range lm.sems {
+		if len(st.Holders) > 0 {
+			s.Semaphores = append(s.Semaphores, SemInfo{
+				Key:     key,
+				Limit:   st.Limit,
+				Holders: len(st.Holders),
+				Waiters: len(st.Waiters),
+			})
+		} else {
+			s.IdleSemaphores = append(s.IdleSemaphores, IdleInfo{
+				Key:   key,
+				IdleS: now.Sub(st.LastActivity).Seconds(),
+			})
+		}
+	}
+
+	return s
+}
+
 // ResetForTest clears all state (for testing only).
 func (lm *LockManager) ResetForTest() {
 	lm.mu.Lock()

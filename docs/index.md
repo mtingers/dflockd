@@ -10,6 +10,7 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 - **Disconnect cleanup** — locks are released automatically when a client disconnects
 - **Zero dependencies** — single Go binary
 - **Go client library** — high-level `Lock` type with automatic renewal and sharding, plus low-level protocol API
+- **Runtime stats** — query active connections, held locks, semaphores, and idle entries via the `stats` command
 - **Simple wire protocol** — line-based UTF-8 over TCP, easy to integrate from any language
 
 ## Quick example

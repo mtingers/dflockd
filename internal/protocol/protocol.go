@@ -80,6 +80,8 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 
 	switch cmd {
 	case "l", "r", "n", "e", "w", "sl", "sr", "sn", "se", "sw":
+	case "stats":
+		return &Request{Cmd: "stats"}, nil
 	default:
 		return nil, &ProtocolError{Code: 3, Message: fmt.Sprintf("invalid cmd %q", cmd)}
 	}
