@@ -80,6 +80,9 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 
 	switch cmd {
 	case "l", "r", "n", "e", "w", "sl", "sr", "sn", "se", "sw":
+	case "auth":
+		argStr := strings.TrimSpace(arg)
+		return &Request{Cmd: "auth", Token: argStr}, nil
 	case "stats":
 		return &Request{Cmd: "stats"}, nil
 	default:

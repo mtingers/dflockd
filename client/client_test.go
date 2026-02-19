@@ -858,3 +858,132 @@ func TestDialTLS_BadCA(t *testing.T) {
 		t.Fatal("expected error with untrusted CA")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Auth helpers and tests
+// ---------------------------------------------------------------------------
+
+func startAuthServer(t *testing.T, cfg *config.Config, authToken string) (addr string) {
+	t.Helper()
+	cfg.AuthToken = authToken
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := server.New(lm, cfg, log)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr = ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, ln)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	return addr
+}
+
+func TestAuthenticate(t *testing.T) {
+	addr := startAuthServer(t, testConfig(), "secret123")
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.Authenticate(c, "secret123"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Acquire/release should work after auth
+	token, lease, err := client.Acquire(c, "auth-key", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || lease <= 0 {
+		t.Fatalf("unexpected token=%q lease=%d", token, lease)
+	}
+	if err := client.Release(c, "auth-key", token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticate_WrongToken(t *testing.T) {
+	addr := startAuthServer(t, testConfig(), "secret123")
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.Authenticate(c, "wrongtoken")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err != client.ErrAuth {
+		t.Fatalf("expected ErrAuth, got %v", err)
+	}
+}
+
+func TestLockAcquireReleaseAuth(t *testing.T) {
+	addr := startAuthServer(t, testConfig(), "secret123")
+
+	l := &client.Lock{
+		Key:            "auth-lock",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		AuthToken:      "secret123",
+	}
+
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if l.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	if err := l.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemaphoreAcquireReleaseAuth(t *testing.T) {
+	addr := startAuthServer(t, testConfig(), "secret123")
+
+	s := &client.Semaphore{
+		Key:            "auth-sem",
+		Limit:          3,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		AuthToken:      "secret123",
+	}
+
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if s.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	if err := s.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

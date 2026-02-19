@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.6.0] - 2026-02-18
+
+### Added
+
+- Optional token-based authentication for client connections
+- Server flag `--auth-token` and env var `DFLOCKD_AUTH_TOKEN` to set a shared secret
+- `auth` protocol command for clients to authenticate before issuing other commands
+- `Authenticate` client function for low-level auth on a `*Conn`
+- `AuthToken` field on `Lock` and `Semaphore` high-level types for automatic auth on connect
+- `ErrAuth` sentinel error returned when authentication fails
+- Constant-time token comparison using `crypto/subtle` to prevent timing attacks
+- Auth integration tests for both server and client packages
+- Documentation for auth in protocol spec, server docs, client docs, and examples
+
+[v1.6.0]: https://github.com/mtingers/dflockd/releases/tag/v1.6.0
+
 ## [v1.4.0] - 2026-02-18
 
 ### Added

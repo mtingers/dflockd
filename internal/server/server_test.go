@@ -1199,3 +1199,125 @@ func TestIntegration_TLS_ValidationError(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// ===========================================================================
+// Auth integration tests
+// ===========================================================================
+
+func startAuthServer(t *testing.T, cfg *config.Config, authToken string) (context.CancelFunc, string) {
+	t.Helper()
+	cfg.AuthToken = authToken
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, ln)
+	}()
+
+	cleanup := func() {
+		cancel()
+		<-done
+	}
+
+	return cleanup, addr
+}
+
+func TestIntegration_Auth_Success(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr := startAuthServer(t, cfg, "secret123")
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Authenticate
+	resp := connSendCmd(t, conn, reader, "auth", "_", "secret123")
+	if resp != "ok" {
+		t.Fatalf("auth: expected 'ok', got %q", resp)
+	}
+
+	// Lock should work after auth
+	resp = connSendCmd(t, conn, reader, "l", "mykey", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("lock: expected 'ok <token> <lease>', got %q", resp)
+	}
+	token := parts[1]
+
+	// Release
+	resp = connSendCmd(t, conn, reader, "r", "mykey", token)
+	if resp != "ok" {
+		t.Fatalf("release: expected 'ok', got %q", resp)
+	}
+}
+
+func TestIntegration_Auth_WrongToken(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr := startAuthServer(t, cfg, "secret123")
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "auth", "_", "wrongtoken")
+	if resp != "error_auth" {
+		t.Fatalf("expected 'error_auth', got %q", resp)
+	}
+}
+
+func TestIntegration_Auth_NoAuthSent(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr := startAuthServer(t, cfg, "secret123")
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Send a lock command instead of auth — should get error_auth
+	resp := connSendCmd(t, conn, reader, "l", "mykey", "10")
+	if resp != "error_auth" {
+		t.Fatalf("expected 'error_auth', got %q", resp)
+	}
+}
+
+func TestIntegration_Auth_NotRequired(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// No auth required — lock should work directly
+	resp := connSendCmd(t, conn, reader, "l", "mykey", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+}

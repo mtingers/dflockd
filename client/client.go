@@ -22,6 +22,7 @@ var (
 	ErrServer        = errors.New("dflockd: server error")
 	ErrNotQueued     = errors.New("dflockd: not enqueued")
 	ErrLimitMismatch = errors.New("dflockd: limit mismatch")
+	ErrAuth          = errors.New("dflockd: authentication failed")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -81,6 +82,23 @@ func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+// Authenticate sends an auth command with the given token. Returns nil on
+// success, ErrAuth if the server rejects the token.
+func Authenticate(c *Conn, token string) error {
+	resp, err := c.sendRecv("auth", "_", token)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return ErrAuth
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +401,7 @@ type Lock struct {
 	ShardFunc      ShardFunc     // defaults to CRC32Shard
 	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
 	TLSConfig      *tls.Config   // if non-nil, connect using TLS
+	AuthToken      string        // if non-empty, authenticate after connecting
 
 	mu          sync.Mutex
 	conn        *Conn
@@ -441,6 +460,12 @@ func (l *Lock) connect() error {
 	}
 	if err != nil {
 		return err
+	}
+	if l.AuthToken != "" {
+		if err := Authenticate(conn, l.AuthToken); err != nil {
+			conn.Close()
+			return err
+		}
 	}
 	l.conn = conn
 	return nil
@@ -676,6 +701,7 @@ type Semaphore struct {
 	ShardFunc      ShardFunc     // defaults to CRC32Shard
 	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
 	TLSConfig      *tls.Config   // if non-nil, connect using TLS
+	AuthToken      string        // if non-empty, authenticate after connecting
 
 	mu          sync.Mutex
 	conn        *Conn
@@ -733,6 +759,12 @@ func (s *Semaphore) connect() error {
 	}
 	if err != nil {
 		return err
+	}
+	if s.AuthToken != "" {
+		if err := Authenticate(conn, s.AuthToken); err != nil {
+			conn.Close()
+			return err
+		}
 	}
 	s.conn = conn
 	return nil

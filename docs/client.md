@@ -72,6 +72,7 @@ l := &client.Lock{
 | `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew (e.g. 0.5 = renew at half the lease) |
 | `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
+| `AuthToken` | `""` | If non-empty, authenticate with this token after connecting |
 
 ### Single-phase acquire
 
@@ -181,6 +182,32 @@ l := &client.Lock{
 }
 ```
 
+### Authenticating
+
+When the server requires authentication (`--auth-token`), call `Authenticate` after connecting:
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+defer c.Close()
+
+if err := client.Authenticate(c, "my-secret-token"); err != nil {
+    log.Fatal(err) // ErrAuth if token is wrong
+}
+```
+
+For the high-level types, set the `AuthToken` field:
+
+```go
+l := &client.Lock{
+    Key:       "my-resource",
+    Servers:   []string{"127.0.0.1:6388"},
+    AuthToken: "my-secret-token",
+}
+```
+
 ### Acquire
 
 ```go
@@ -240,6 +267,7 @@ s := &client.Semaphore{
 | `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew |
 | `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
+| `AuthToken` | `""` | If non-empty, authenticate with this token after connecting |
 
 ### Single-phase acquire
 
@@ -318,6 +346,7 @@ if errors.Is(err, client.ErrTimeout) {
 | `ErrServer` | The server returned an unexpected error response |
 | `ErrNotQueued` | A `Wait`/`SemWait` was attempted without a prior `Enqueue`/`SemEnqueue` |
 | `ErrLimitMismatch` | The server returned `error_limit_mismatch` (semaphore limit doesn't match existing key) |
+| `ErrAuth` | The server returned `error_auth` (authentication failed or wrong token) |
 
 ## Sharding
 

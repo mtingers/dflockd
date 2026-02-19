@@ -22,6 +22,7 @@ type Config struct {
 	Version                 bool
 	TLSCert                 string
 	TLSKey                  string
+	AuthToken               string
 }
 
 func envInt(key string, def int) int {
@@ -66,6 +67,7 @@ func Load() *Config {
 	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate PEM file")
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key PEM file")
+	authToken := flag.String("auth-token", "", "Shared secret token for client authentication")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
@@ -127,6 +129,11 @@ func Load() *Config {
 		cfg.TLSKey = envString("DFLOCKD_TLS_KEY", *tlsKey)
 	} else {
 		cfg.TLSKey = *tlsKey
+	}
+	if os.Getenv("DFLOCKD_AUTH_TOKEN") != "" {
+		cfg.AuthToken = envString("DFLOCKD_AUTH_TOKEN", *authToken)
+	} else {
+		cfg.AuthToken = *authToken
 	}
 	if os.Getenv("DFLOCKD_DEBUG") != "" {
 		cfg.Debug = envBool("DFLOCKD_DEBUG", *debug)

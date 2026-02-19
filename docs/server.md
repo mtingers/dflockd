@@ -30,6 +30,7 @@
 | `--read-timeout` | `23` | Client read timeout (seconds) |
 | `--tls-cert` | *(unset)* | Path to TLS certificate PEM file |
 | `--tls-key` | *(unset)* | Path to TLS private key PEM file |
+| `--auth-token` | *(unset)* | Shared secret for client authentication |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
 | `--debug` | `false` | Enable debug logging |
 
@@ -49,6 +50,7 @@ All settings can be configured via environment variables. Environment variables 
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
 | `DFLOCKD_TLS_CERT` | *(unset)* | Path to TLS certificate PEM file |
 | `DFLOCKD_TLS_KEY` | *(unset)* | Path to TLS private key PEM file |
+| `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for client authentication |
 | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects |
 | `DFLOCKD_DEBUG` | *(unset)* | Enable debug logging (`1`, `yes`, or `true`) |
 
@@ -113,6 +115,30 @@ export DFLOCKD_TLS_KEY=/path/to/key.pem
 Both `--tls-cert` and `--tls-key` must be provided together. If only one is set, the server exits with an error. When TLS is enabled, the server requires all clients to connect using TLS — plain TCP connections will fail the TLS handshake and be dropped.
 
 The server enforces a minimum TLS version of 1.2.
+
+## Authentication
+
+To require token-based authentication, set a shared secret:
+
+```bash
+./dflockd --auth-token my-secret-token
+```
+
+Or via environment variable:
+
+```bash
+export DFLOCKD_AUTH_TOKEN=my-secret-token
+./dflockd
+```
+
+When `--auth-token` is set, every new connection must send an `auth` command as its **first** message. If the token matches, the server responds with `ok` and the connection proceeds normally. If the token is wrong or a non-auth command is sent first, the server responds with `error_auth` and closes the connection.
+
+If `--auth-token` is not set (the default), no authentication is required and all connections are accepted as before.
+
+The token comparison uses constant-time comparison (`crypto/subtle.ConstantTimeCompare`) to prevent timing attacks.
+
+!!! warning
+    The auth token is sent in plaintext over the wire. Use together with TLS (`--tls-cert` / `--tls-key`) to protect the token in transit.
 
 ## Runtime stats
 

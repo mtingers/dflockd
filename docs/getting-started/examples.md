@@ -163,6 +163,41 @@ func main() {
 }
 ```
 
+### Connecting with authentication
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    l := &client.Lock{
+        Key:            "my-resource",
+        AcquireTimeout: 10 * time.Second,
+        Servers:        []string{"127.0.0.1:6388"},
+        AuthToken:      "my-secret-token",
+    }
+
+    ok, err := l.Acquire(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timed out")
+    }
+    defer l.Release(context.Background())
+
+    fmt.Println("authenticated and acquired lock")
+}
+```
+
 ## TCP protocol examples
 
 ## Basic lock and release

@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -155,6 +156,16 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 	reader := bufio.NewReader(conn)
 	defaultLeaseTTL := s.cfg.DefaultLeaseTTL
 	defaultLeaseTTLSec := int(defaultLeaseTTL.Seconds())
+
+	if s.cfg.AuthToken != "" {
+		req, err := protocol.ReadRequest(reader, s.cfg.ReadTimeout, conn, defaultLeaseTTL)
+		if err != nil || req.Cmd != "auth" ||
+			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
+			conn.Write(protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
+			return
+		}
+		conn.Write(protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
+	}
 
 	for {
 		req, err := protocol.ReadRequest(reader, s.cfg.ReadTimeout, conn, defaultLeaseTTL)

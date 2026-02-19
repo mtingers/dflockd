@@ -6,6 +6,36 @@ dflockd uses a line-based UTF-8 protocol over TCP. Each request is exactly **3 l
 
 The protocol runs over plain TCP by default. The server optionally supports TLS encryption — when the server is started with `--tls-cert` and `--tls-key`, all connections must use TLS. The framing and command semantics are identical over both plain TCP and TLS; TLS is a transparent transport layer.
 
+## Authentication
+
+### Auth (`auth`)
+
+Authenticate the connection with a shared secret token. When the server is started with `--auth-token`, this must be the **first** command sent on every new connection. If the server has no auth token configured, this command is not recognized and will return an error.
+
+**Request:**
+```
+auth
+_
+<token>
+```
+
+The key line is ignored (use `_` by convention).
+
+**Response:**
+
+- Success: `ok\n`
+- Failure: `error_auth\n` (connection is closed by the server)
+
+**Example:**
+```
+auth
+_
+my-secret-token
+```
+→ `ok`
+
+After a successful `auth`, the connection proceeds normally and all other commands are available.
+
 ## Commands
 
 ### Lock (acquire)
@@ -300,7 +330,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, or `stats`) |
+| 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, or `stats`) |
 | 4 | Invalid integer in argument |
 | 5 | Empty key |
 | 6 | Negative timeout |

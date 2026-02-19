@@ -48,6 +48,7 @@ All settings can be passed as CLI flags or environment variables. Environment va
 | `--read-timeout`                                                   | `DFLOCKD_READ_TIMEOUT_S`             | `23`      | Client read timeout (seconds)          |
 | `--tls-cert`                                                       | `DFLOCKD_TLS_CERT`                   | *(unset)* | Path to TLS certificate PEM file       |
 | `--tls-key`                                                        | `DFLOCKD_TLS_KEY`                    | *(unset)* | Path to TLS private key PEM file       |
+| `--auth-token`                                                     | `DFLOCKD_AUTH_TOKEN`                 | *(unset)* | Shared secret for client authentication |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true`    | Release locks on client disconnect     |
 | `--debug`                                                          | `DFLOCKD_DEBUG`                      | `false`   | Enable debug logging                   |
 
@@ -78,6 +79,28 @@ l := &client.Lock{
     TLSConfig: &tls.Config{},  // configure CA, etc.
 }
 ```
+
+## Authentication
+
+To require token-based authentication, set a shared secret:
+
+```bash
+./dflockd --auth-token my-secret-token
+# or
+DFLOCKD_AUTH_TOKEN=my-secret-token ./dflockd
+```
+
+When set, every client must send an `auth` command as its first message. If unset, no authentication is required (fully backward compatible).
+
+```go
+l := &client.Lock{
+    Key:       "my-resource",
+    Servers:   []string{"127.0.0.1:6388"},
+    AuthToken: "my-secret-token",
+}
+```
+
+Use together with TLS to protect the token in transit.
 
 ## Tests
 
