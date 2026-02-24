@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.7.0] - 2026-02-24
+
+### Added
+
+- `--max-connections` flag and `DFLOCKD_MAX_CONNECTIONS` env var to limit concurrent connections (default: 0 = unlimited)
+- `--max-waiters` flag and `DFLOCKD_MAX_WAITERS` env var to limit waiter queue depth per lock/semaphore key (default: 0 = unlimited)
+- `ErrMaxWaiters` sentinel error and `error_max_waiters` protocol status for rejected waiters
+- `--write-timeout` flag and `DFLOCKD_WRITE_TIMEOUT_S` env var to set write deadlines on responses (default: 5 seconds)
+- `writeResponse` server helper that sets and clears `SetWriteDeadline` on every write
+- Unit tests for max waiters across all four enqueue paths (FIFOAcquire, FIFOEnqueue, SemAcquire, SemEnqueue)
+- Integration tests for max connections, max waiters, and write timeout
+
+### Changed
+
+- Default bind address changed from `0.0.0.0` to `127.0.0.1` for safer defaults
+
+[v1.7.0]: https://github.com/mtingers/dflockd/releases/tag/v1.7.0
+
 ## [v1.6.0] - 2026-02-18
 
 ### Added

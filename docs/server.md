@@ -3,7 +3,7 @@
 ## Running the server
 
 ```bash
-# Default: listens on 0.0.0.0:6388
+# Default: listens on 127.0.0.1:6388
 ./dflockd
 
 # Custom port
@@ -20,14 +20,17 @@
 
 | Flag | Default | Description |
 |---|---|---|
-| `--host` | `0.0.0.0` | Bind address |
+| `--host` | `127.0.0.1` | Bind address |
 | `--port` | `6388` | Bind port |
 | `--default-lease-ttl` | `33` | Default lock lease duration (seconds) |
 | `--lease-sweep-interval` | `1` | How often to check for expired leases (seconds) |
 | `--gc-interval` | `5` | How often to prune idle lock state (seconds) |
 | `--gc-max-idle` | `60` | Seconds before idle lock state is pruned |
 | `--max-locks` | `1024` | Maximum number of unique lock keys |
+| `--max-connections` | `0` | Maximum concurrent connections (0 = unlimited) |
+| `--max-waiters` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
 | `--read-timeout` | `23` | Client read timeout (seconds) |
+| `--write-timeout` | `5` | Client write timeout (seconds) |
 | `--tls-cert` | *(unset)* | Path to TLS certificate PEM file |
 | `--tls-key` | *(unset)* | Path to TLS private key PEM file |
 | `--auth-token` | *(unset)* | Shared secret for client authentication |
@@ -40,14 +43,17 @@ All settings can be configured via environment variables. Environment variables 
 
 | Variable | Default | Description |
 |---|---|---|
-| `DFLOCKD_HOST` | `0.0.0.0` | Bind address |
+| `DFLOCKD_HOST` | `127.0.0.1` | Bind address |
 | `DFLOCKD_PORT` | `6388` | Bind port |
 | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lock lease duration (seconds) |
 | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | How often to check for expired leases |
 | `DFLOCKD_GC_LOOP_SLEEP` | `5` | How often to prune idle lock state |
 | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle lock state is pruned |
 | `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
+| `DFLOCKD_MAX_CONNECTIONS` | `0` | Maximum concurrent connections (0 = unlimited) |
+| `DFLOCKD_MAX_WAITERS` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
+| `DFLOCKD_WRITE_TIMEOUT_S` | `5` | Client write timeout (seconds) |
 | `DFLOCKD_TLS_CERT` | *(unset)* | Path to TLS certificate PEM file |
 | `DFLOCKD_TLS_KEY` | *(unset)* | Path to TLS private key PEM file |
 | `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for client authentication |
@@ -81,6 +87,18 @@ Idle lock state (no owner, no waiters) is pruned after `gc-max-idle` seconds. Th
 ### Read timeout
 
 The `read-timeout` controls how long the server waits for a client to send a complete request line. Idle connections that send no data within this window are disconnected. This prevents resource exhaustion from abandoned connections.
+
+### Write timeout
+
+The `write-timeout` controls how long the server waits for a response write to complete. If a client is reading slowly (or not at all), the write will fail after this deadline and the connection is closed. This prevents slow-reading clients from blocking server goroutines indefinitely.
+
+### Max connections
+
+The `max-connections` setting caps the total number of concurrent TCP connections. When the limit is reached, new connections are accepted and immediately closed. Set to `0` (the default) for unlimited connections.
+
+### Max waiters
+
+The `max-waiters` setting caps the number of pending waiters **per key** for both locks and semaphores. When the limit is reached, new acquire or enqueue requests for that key return `error_max_waiters`. This prevents unbounded memory growth from waiter queues on a single contended key. Set to `0` (the default) for unlimited waiters.
 
 ### Auto release on disconnect
 

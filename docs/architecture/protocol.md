@@ -54,6 +54,7 @@ l
 - Success: `ok <token> <lease_ttl>\n`
 - Timeout: `timeout\n`
 - Max locks reached: `error_max_locks\n`
+- Max waiters reached: `error_max_waiters\n`
 
 **Example:**
 ```
@@ -88,6 +89,7 @@ The 3rd line is an optional positive integer. If empty, the server default lease
 - Immediate acquire: `acquired <token> <lease_ttl>\n`
 - Queued: `queued\n`
 - Max locks reached: `error_max_locks\n`
+- Max waiters reached: `error_max_waiters\n`
 - Already enqueued: `error\n`
 
 **Example:**
@@ -188,6 +190,7 @@ sl
 - Timeout: `timeout\n`
 - Max locks reached: `error_max_locks\n`
 - Limit mismatch: `error_limit_mismatch\n`
+- Max waiters reached: `error_max_waiters\n`
 
 **Example:**
 ```
@@ -214,6 +217,7 @@ se
 - Queued: `queued\n`
 - Max locks reached: `error_max_locks\n`
 - Limit mismatch: `error_limit_mismatch\n`
+- Max waiters reached: `error_max_waiters\n`
 - Already enqueued: `error\n`
 
 ### Semaphore Wait (`sw`) — two-phase step 2
