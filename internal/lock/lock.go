@@ -155,8 +155,9 @@ func (lm *LockManager) connRemoveOwned(connID uint64, key string) {
 func (lm *LockManager) grantNextWaiterLocked(key string, st *LockState) {
 	for len(st.Waiters) > 0 {
 		w := st.Waiters[0]
-		st.Waiters[0] = nil // avoid memory leak
-		st.Waiters = st.Waiters[1:]
+		copy(st.Waiters, st.Waiters[1:])
+		st.Waiters[len(st.Waiters)-1] = nil // avoid memory leak
+		st.Waiters = st.Waiters[:len(st.Waiters)-1]
 		// Try to send token; if channel is closed (cancelled), skip.
 		token := newToken()
 		select {
@@ -378,6 +379,13 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		if st != nil && st.OwnerToken == esToken {
 			// Verify lock still held (lease may have expired)
 			if !st.LeaseExpires.IsZero() && !time.Now().Before(st.LeaseExpires) {
+				// Expired: clean up owner state and grant to next waiter
+				lm.connRemoveOwned(connID, key)
+				st.OwnerToken = ""
+				st.OwnerConnID = 0
+				st.LeaseExpires = time.Time{}
+				st.LastActivity = time.Now()
+				lm.grantNextWaiterLocked(key, st)
 				lm.mu.Unlock()
 				return "", 0, nil
 			}
@@ -387,7 +395,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 			lm.mu.Unlock()
 			return esToken, leaseSec, nil
 		}
-		// Lock was lost
+		// Lock was lost (expired and granted to another, or state GC'd)
 		lm.mu.Unlock()
 		return "", 0, nil
 	}
@@ -813,8 +821,9 @@ func (lm *LockManager) semConnRemoveOwned(connID uint64, key, token string) {
 func (lm *LockManager) semGrantNextWaiterLocked(key string, st *SemState) {
 	for len(st.Waiters) > 0 && len(st.Holders) < st.Limit {
 		w := st.Waiters[0]
-		st.Waiters[0] = nil // avoid memory leak
-		st.Waiters = st.Waiters[1:]
+		copy(st.Waiters, st.Waiters[1:])
+		st.Waiters[len(st.Waiters)-1] = nil // avoid memory leak
+		st.Waiters = st.Waiters[:len(st.Waiters)-1]
 		token := newToken()
 		select {
 		case w.Ch <- token:
@@ -1068,6 +1077,11 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 			h, ok := st.Holders[esToken]
 			if ok {
 				if !h.LeaseExpires.IsZero() && !time.Now().Before(h.LeaseExpires) {
+					// Expired: clean up holder and grant to next waiter
+					lm.semConnRemoveOwned(connID, key, esToken)
+					delete(st.Holders, esToken)
+					st.LastActivity = time.Now()
+					lm.semGrantNextWaiterLocked(key, st)
 					lm.mu.Unlock()
 					return "", 0, nil
 				}
@@ -1077,7 +1091,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 				return esToken, leaseSec, nil
 			}
 		}
-		// Slot was lost
+		// Slot was lost (expired and granted to another, or state GC'd)
 		lm.mu.Unlock()
 		return "", 0, nil
 	}

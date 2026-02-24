@@ -42,6 +42,12 @@ func WithLeaseTTL(seconds int) Option {
 // Conn — thin wrapper around net.Conn with a buffered reader
 // ---------------------------------------------------------------------------
 
+// DefaultDialTimeout is the default timeout for establishing a TCP connection.
+const DefaultDialTimeout = 10 * time.Second
+
+// defaultKeepAlive is the interval between TCP keepalive probes.
+const defaultKeepAlive = 30 * time.Second
+
 // Conn wraps a TCP connection to a dflockd server, providing a buffered reader
 // for line-oriented protocol communication. Conn is safe for concurrent use;
 // a mutex serializes request/response pairs to prevent interleaved I/O.
@@ -52,8 +58,13 @@ type Conn struct {
 }
 
 // Dial connects to a dflockd server at the given address (host:port).
+// Uses DefaultDialTimeout and enables TCP keepalive.
 func Dial(addr string) (*Conn, error) {
-	conn, err := net.Dial("tcp", addr)
+	dialer := &net.Dialer{
+		Timeout:   DefaultDialTimeout,
+		KeepAlive: defaultKeepAlive,
+	}
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -61,8 +72,13 @@ func Dial(addr string) (*Conn, error) {
 }
 
 // DialTLS connects to a dflockd server at the given address using TLS.
+// Uses DefaultDialTimeout and enables TCP keepalive.
 func DialTLS(addr string, cfg *tls.Config) (*Conn, error) {
-	conn, err := tls.Dial("tcp", addr, cfg)
+	dialer := &net.Dialer{
+		Timeout:   DefaultDialTimeout,
+		KeepAlive: defaultKeepAlive,
+	}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -448,6 +464,7 @@ type Lock struct {
 	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
 	TLSConfig      *tls.Config   // if non-nil, connect using TLS
 	AuthToken      string        // if non-empty, authenticate after connecting
+	OnRenewError   func(err error) // optional; called when background lease renewal fails
 
 	mu          sync.Mutex
 	conn        *Conn
@@ -494,8 +511,13 @@ func (l *Lock) opts() []Option {
 	return nil
 }
 
-// connect dials the appropriate shard server.
+// connect dials the appropriate shard server. If there is an existing
+// connection it is closed first to prevent resource leaks.
 func (l *Lock) connect() error {
+	if l.conn != nil {
+		l.conn.Close()
+		l.conn = nil
+	}
 	addr := l.serverAddr()
 	var conn *Conn
 	var err error
@@ -725,6 +747,8 @@ func (l *Lock) Token() string {
 
 // startRenew launches a background goroutine that renews the lease at
 // renewRatio * leaseTTL intervals. Must be called with l.mu held.
+// If renewal fails, the OnRenewError callback is invoked (if set)
+// and the goroutine exits.
 func (l *Lock) startRenew() {
 	l.stopRenew()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -742,6 +766,7 @@ func (l *Lock) startRenew() {
 	key := l.Key
 	token := l.token
 	opts := l.opts()
+	onErr := l.OnRenewError
 
 	go func() {
 		defer close(done)
@@ -763,7 +788,13 @@ func (l *Lock) startRenew() {
 				token = l.token
 				l.mu.Unlock()
 
-				_, _ = Renew(conn, key, token, opts...)
+				_, err := Renew(conn, key, token, opts...)
+				if err != nil {
+					if onErr != nil {
+						onErr(err)
+					}
+					return
+				}
 			}
 		}
 	}()
@@ -785,6 +816,7 @@ type Semaphore struct {
 	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
 	TLSConfig      *tls.Config   // if non-nil, connect using TLS
 	AuthToken      string        // if non-empty, authenticate after connecting
+	OnRenewError   func(err error) // optional; called when background lease renewal fails
 
 	mu          sync.Mutex
 	conn        *Conn
@@ -831,7 +863,13 @@ func (s *Semaphore) opts() []Option {
 	return nil
 }
 
+// connect dials the appropriate shard server. If there is an existing
+// connection it is closed first to prevent resource leaks.
 func (s *Semaphore) connect() error {
+	if s.conn != nil {
+		s.conn.Close()
+		s.conn = nil
+	}
 	addr := s.serverAddr()
 	var conn *Conn
 	var err error
@@ -1048,6 +1086,9 @@ func (s *Semaphore) Token() string {
 	return s.token
 }
 
+// startRenew launches a background goroutine that renews the semaphore lease.
+// If renewal fails, the OnRenewError callback is invoked (if set)
+// and the goroutine exits.
 func (s *Semaphore) startRenew() {
 	s.stopRenew()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1065,6 +1106,7 @@ func (s *Semaphore) startRenew() {
 	key := s.Key
 	token := s.token
 	opts := s.opts()
+	onErr := s.OnRenewError
 
 	go func() {
 		defer close(done)
@@ -1085,7 +1127,13 @@ func (s *Semaphore) startRenew() {
 				token = s.token
 				s.mu.Unlock()
 
-				_, _ = SemRenew(conn, key, token, opts...)
+				_, err := SemRenew(conn, key, token, opts...)
+				if err != nil {
+					if onErr != nil {
+						onErr(err)
+					}
+					return
+				}
 			}
 		}
 	}()

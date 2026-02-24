@@ -151,7 +151,7 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 		conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 	}
 	_, err := conn.Write(data)
-	if err == nil && s.cfg.WriteTimeout > 0 {
+	if s.cfg.WriteTimeout > 0 {
 		conn.SetWriteDeadline(time.Time{})
 	}
 	return err

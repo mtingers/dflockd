@@ -44,7 +44,7 @@ func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, er
 		return "", &ProtocolError{Code: 10, Message: "failed to set deadline"}
 	}
 
-	var buf [MaxLineBytes + 1]byte // +1 to detect overflow
+	var buf [MaxLineBytes]byte
 	n := 0
 	for {
 		b, err := r.ReadByte()
