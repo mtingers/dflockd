@@ -317,8 +317,11 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	if resp == "timeout" {
 		return "", 0, ErrTimeout
 	}
-	if resp == "error" || resp == "error_not_enqueued" {
+	if resp == "error_not_enqueued" {
 		return "", 0, ErrNotQueued
+	}
+	if resp == "error" {
+		return "", 0, ErrServer
 	}
 	return parseOKTokenLease(resp, "wait")
 }
@@ -455,8 +458,11 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	if resp == "timeout" {
 		return "", 0, ErrTimeout
 	}
-	if resp == "error" || resp == "error_not_enqueued" {
+	if resp == "error_not_enqueued" {
 		return "", 0, ErrNotQueued
+	}
+	if resp == "error" {
+		return "", 0, ErrServer
 	}
 	return parseOKTokenLease(resp, "sem_wait")
 }

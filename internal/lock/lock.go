@@ -25,35 +25,35 @@ type connKey struct {
 	Key    string
 }
 
-type Waiter struct {
-	Ch       chan string
-	ConnID   uint64
-	LeaseTTL time.Duration
+type waiter struct {
+	ch       chan string
+	connID   uint64
+	leaseTTL time.Duration
 }
 
 type LockState struct {
 	OwnerToken   string
 	OwnerConnID  uint64
 	LeaseExpires time.Time
-	Waiters      []*Waiter
+	Waiters      []*waiter
 	LastActivity time.Time
 }
 
-type EnqueuedState struct {
-	Waiter   *Waiter
-	Token    string
-	LeaseTTL time.Duration
+type enqueuedState struct {
+	waiter   *waiter
+	token    string
+	leaseTTL time.Duration
 }
 
-type SemHolder struct {
-	ConnID       uint64
-	LeaseExpires time.Time
+type semHolder struct {
+	connID       uint64
+	leaseExpires time.Time
 }
 
 type SemState struct {
 	Limit        int
-	Holders      map[string]*SemHolder // token -> holder
-	Waiters      []*Waiter
+	Holders      map[string]*semHolder // token -> holder
+	Waiters      []*waiter
 	LastActivity time.Time
 }
 
@@ -61,11 +61,11 @@ type LockManager struct {
 	mu           sync.Mutex
 	locks        map[string]*LockState
 	connOwned    map[uint64]map[string]struct{}
-	connEnqueued map[connKey]*EnqueuedState
+	connEnqueued map[connKey]*enqueuedState
 	// Semaphore state
 	sems            map[string]*SemState
 	connSemOwned    map[uint64]map[string]map[string]struct{} // connID -> key -> set of tokens
-	connSemEnqueued map[connKey]*EnqueuedState
+	connSemEnqueued map[connKey]*enqueuedState
 	cfg             *config.Config
 	log             *slog.Logger
 }
@@ -74,10 +74,10 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 	return &LockManager{
 		locks:           make(map[string]*LockState),
 		connOwned:       make(map[uint64]map[string]struct{}),
-		connEnqueued:    make(map[connKey]*EnqueuedState),
+		connEnqueued:    make(map[connKey]*enqueuedState),
 		sems:            make(map[string]*SemState),
 		connSemOwned:    make(map[uint64]map[string]map[string]struct{}),
-		connSemEnqueued: make(map[connKey]*EnqueuedState),
+		connSemEnqueued: make(map[connKey]*enqueuedState),
 		cfg:             cfg,
 		log:             log,
 	}
@@ -96,7 +96,7 @@ func newToken() string {
 
 // removeWaiter removes target from a waiter slice preserving order, reusing
 // the backing array to avoid unnecessary allocation.
-func removeWaiter(waiters []*Waiter, target *Waiter) []*Waiter {
+func removeWaiter(waiters []*waiter, target *waiter) []*waiter {
 	for i, w := range waiters {
 		if w == target {
 			copy(waiters[i:], waiters[i+1:])
@@ -109,13 +109,13 @@ func removeWaiter(waiters []*Waiter, target *Waiter) []*Waiter {
 
 // removeWaitersByConn removes all waiters for a given connID, closing their
 // channels unless already tracked in the closed set.
-func removeWaitersByConn(waiters []*Waiter, connID uint64, closed map[chan string]struct{}) []*Waiter {
+func removeWaitersByConn(waiters []*waiter, connID uint64, closed map[chan string]struct{}) []*waiter {
 	n := 0
 	for _, w := range waiters {
-		if w.ConnID == connID {
-			if _, already := closed[w.Ch]; !already {
-				close(w.Ch)
-				closed[w.Ch] = struct{}{}
+		if w.connID == connID {
+			if _, already := closed[w.ch]; !already {
+				close(w.ch)
+				closed[w.ch] = struct{}{}
 			}
 		} else {
 			waiters[n] = w
@@ -162,12 +162,12 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *LockState) {
 		st.Waiters = st.Waiters[:len(st.Waiters)-1]
 		token := newToken()
 		select {
-		case w.Ch <- token:
+		case w.ch <- token:
 			st.OwnerToken = token
-			st.OwnerConnID = w.ConnID
-			st.LeaseExpires = time.Now().Add(w.LeaseTTL)
+			st.OwnerConnID = w.connID
+			st.LeaseExpires = time.Now().Add(w.leaseTTL)
 			st.LastActivity = time.Now()
-			lm.connAddOwned(w.ConnID, key)
+			lm.connAddOwned(w.connID, key)
 			return
 		default:
 			// Channel closed or full — skip this waiter
@@ -196,10 +196,10 @@ func (lm *LockManager) getOrCreateLocked(key string) (*LockState, error) {
 
 // FIFOAcquire is the single-phase lock acquire (command "l").
 func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64) (string, error) {
-	waiter := &Waiter{
-		Ch:       make(chan string, 1),
-		ConnID:   connID,
-		LeaseTTL: leaseTTL,
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
 	}
 
 	lm.mu.Lock()
@@ -228,7 +228,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		lm.mu.Unlock()
 		return "", ErrMaxWaiters
 	}
-	st.Waiters = append(st.Waiters, waiter)
+	st.Waiters = append(st.Waiters, w)
 	lm.mu.Unlock()
 
 	var timer *time.Timer
@@ -241,7 +241,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	defer timer.Stop()
 
 	select {
-	case token, ok := <-waiter.Ch:
+	case token, ok := <-w.ch:
 		if !ok || token == "" {
 			return "", nil
 		}
@@ -259,7 +259,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		// if the caller cannot deliver it (e.g. server shutdown), the
 		// connection cleanup path will release the lock.
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := lm.locks[key]; s != nil {
 					s.LastActivity = time.Now()
@@ -271,7 +271,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		}
 		if s := lm.locks[key]; s != nil {
 			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, waiter)
+			s.Waiters = removeWaiter(s.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", ctx.Err()
@@ -281,7 +281,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		lm.mu.Lock()
 		// Race check: token may have arrived
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := lm.locks[key]; s != nil {
 					s.LastActivity = time.Now()
@@ -293,7 +293,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		}
 		if s := lm.locks[key]; s != nil {
 			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, waiter)
+			s.Waiters = removeWaiter(s.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", nil
@@ -328,7 +328,7 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 		st.LeaseExpires = time.Now().Add(leaseTTL)
 		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key)
-		lm.connEnqueued[eqKey] = &EnqueuedState{Token: token, LeaseTTL: leaseTTL}
+		lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
 		return "acquired", token, leaseSec, nil
 	}
 
@@ -336,13 +336,13 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
 		return "", "", 0, ErrMaxWaiters
 	}
-	waiter := &Waiter{
-		Ch:       make(chan string, 1),
-		ConnID:   connID,
-		LeaseTTL: leaseTTL,
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
 	}
-	st.Waiters = append(st.Waiters, waiter)
-	lm.connEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}
+	st.Waiters = append(st.Waiters, w)
+	lm.connEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
 	return "queued", "", 0, nil
 }
 
@@ -358,14 +358,14 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		return "", 0, ErrNotEnqueued
 	}
 
-	// Snapshot immutable fields under lock. The EnqueuedState is set once
+	// Snapshot immutable fields under lock. The enqueuedState is set once
 	// during FIFOEnqueue and its fields are not mutated afterward; the only
 	// concurrent operation is CleanupConnection closing the waiter channel,
 	// which is safe to race with a channel receive.
-	leaseTTL := es.LeaseTTL
+	leaseTTL := es.leaseTTL
 	leaseSec := int(leaseTTL / time.Second)
-	esToken := es.Token
-	waiter := es.Waiter
+	esToken := es.token
+	w := es.waiter
 	lm.mu.Unlock()
 
 	// Fast path: already acquired during enqueue
@@ -407,7 +407,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 	defer timer.Stop()
 
 	select {
-	case token, ok := <-waiter.Ch:
+	case token, ok := <-w.ch:
 		if !ok || token == "" {
 			// Channel closed (disconnect cleanup) or empty token
 			lm.mu.Lock()
@@ -428,7 +428,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		lm.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if st := lm.locks[key]; st != nil {
 					st.LeaseExpires = time.Now().Add(leaseTTL)
@@ -441,7 +441,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		}
 		if st := lm.locks[key]; st != nil {
 			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, waiter)
+			st.Waiters = removeWaiter(st.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", 0, ctx.Err()
@@ -451,7 +451,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		delete(lm.connEnqueued, eqKey)
 		// Race check: token may have arrived
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if st := lm.locks[key]; st != nil {
 					st.LeaseExpires = time.Now().Add(leaseTTL)
@@ -465,7 +465,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		// Remove from queue
 		if st := lm.locks[key]; st != nil {
 			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, waiter)
+			st.Waiters = removeWaiter(st.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", 0, nil
@@ -484,7 +484,7 @@ func (lm *LockManager) FIFORelease(key, token string) bool {
 
 	st.LastActivity = time.Now()
 
-	if st.OwnerToken == "" || st.OwnerToken != token {
+	if st.OwnerToken != token {
 		return false
 	}
 
@@ -510,7 +510,7 @@ func (lm *LockManager) FIFORenew(key, token string, leaseTTL time.Duration) (int
 	now := time.Now()
 	st.LastActivity = now
 
-	if st.OwnerToken == "" || st.OwnerToken != token {
+	if st.OwnerToken != token {
 		return 0, false
 	}
 
@@ -562,11 +562,11 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	for _, key := range enqueuedKeys {
 		es := lm.connEnqueued[connKey{ConnID: connID, Key: key}]
 		delete(lm.connEnqueued, connKey{ConnID: connID, Key: key})
-		if es != nil && es.Waiter != nil {
-			close(es.Waiter.Ch)
-			closed[es.Waiter.Ch] = struct{}{}
+		if es != nil && es.waiter != nil {
+			close(es.waiter.ch)
+			closed[es.waiter.ch] = struct{}{}
 			if st := lm.locks[key]; st != nil {
-				st.Waiters = removeWaiter(st.Waiters, es.Waiter)
+				st.Waiters = removeWaiter(st.Waiters, es.waiter)
 			}
 		}
 	}
@@ -616,13 +616,13 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	for _, key := range semEnqueuedKeys {
 		es := lm.connSemEnqueued[connKey{ConnID: connID, Key: key}]
 		delete(lm.connSemEnqueued, connKey{ConnID: connID, Key: key})
-		if es != nil && es.Waiter != nil {
-			if _, already := closed[es.Waiter.Ch]; !already {
-				close(es.Waiter.Ch)
-				closed[es.Waiter.Ch] = struct{}{}
+		if es != nil && es.waiter != nil {
+			if _, already := closed[es.waiter.ch]; !already {
+				close(es.waiter.ch)
+				closed[es.waiter.ch] = struct{}{}
 			}
 			if st := lm.sems[key]; st != nil {
-				st.Waiters = removeWaiter(st.Waiters, es.Waiter)
+				st.Waiters = removeWaiter(st.Waiters, es.waiter)
 			}
 		}
 	}
@@ -644,7 +644,7 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				if !ok {
 					continue
 				}
-				if h.ConnID != connID {
+				if h.connID != connID {
 					continue
 				}
 				lm.log.Warn("disconnect cleanup: releasing sem slot",
@@ -693,13 +693,13 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 			for key, st := range lm.sems {
 				var expired []string
 				for token, h := range st.Holders {
-					if h.LeaseExpires.IsZero() {
+					if h.leaseExpires.IsZero() {
 						continue
 					}
-					if !now.Before(h.LeaseExpires) {
+					if !now.Before(h.leaseExpires) {
 						lm.log.Warn("sem lease expired",
-							"key", key, "conn", h.ConnID)
-						lm.semConnRemoveOwned(h.ConnID, key, token)
+							"key", key, "conn", h.connID)
+						lm.semConnRemoveOwned(h.connID, key, token)
 						expired = append(expired, token)
 					}
 				}
@@ -774,7 +774,7 @@ func (lm *LockManager) semGetOrCreateLocked(key string, limit int) (*SemState, e
 	}
 	st = &SemState{
 		Limit:        limit,
-		Holders:      make(map[string]*SemHolder),
+		Holders:      make(map[string]*semHolder),
 		LastActivity: time.Now(),
 	}
 	lm.sems[key] = st
@@ -826,13 +826,13 @@ func (lm *LockManager) semGrantNextWaiterLocked(key string, st *SemState) {
 		st.Waiters = st.Waiters[:len(st.Waiters)-1]
 		token := newToken()
 		select {
-		case w.Ch <- token:
-			st.Holders[token] = &SemHolder{
-				ConnID:       w.ConnID,
-				LeaseExpires: time.Now().Add(w.LeaseTTL),
+		case w.ch <- token:
+			st.Holders[token] = &semHolder{
+				connID:       w.connID,
+				leaseExpires: time.Now().Add(w.leaseTTL),
 			}
 			st.LastActivity = time.Now()
-			lm.semConnAddOwned(w.ConnID, key, token)
+			lm.semConnAddOwned(w.connID, key, token)
 		default:
 			// Channel closed or full — skip this waiter
 			continue
@@ -846,10 +846,10 @@ func (lm *LockManager) semGrantNextWaiterLocked(key string, st *SemState) {
 
 // SemAcquire is the single-phase semaphore acquire (command "sl").
 func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, error) {
-	waiter := &Waiter{
-		Ch:       make(chan string, 1),
-		ConnID:   connID,
-		LeaseTTL: leaseTTL,
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
 	}
 
 	lm.mu.Lock()
@@ -864,9 +864,9 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	// Fast path: capacity available and no waiters
 	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
 		token := newToken()
-		st.Holders[token] = &SemHolder{
-			ConnID:       connID,
-			LeaseExpires: time.Now().Add(leaseTTL),
+		st.Holders[token] = &semHolder{
+			connID:       connID,
+			leaseExpires: time.Now().Add(leaseTTL),
 		}
 		st.LastActivity = time.Now()
 		lm.semConnAddOwned(connID, key, token)
@@ -879,7 +879,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 		lm.mu.Unlock()
 		return "", ErrMaxWaiters
 	}
-	st.Waiters = append(st.Waiters, waiter)
+	st.Waiters = append(st.Waiters, w)
 	lm.mu.Unlock()
 
 	var timer *time.Timer
@@ -891,7 +891,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	defer timer.Stop()
 
 	select {
-	case token, ok := <-waiter.Ch:
+	case token, ok := <-w.ch:
 		if !ok || token == "" {
 			return "", nil
 		}
@@ -907,7 +907,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 		// Race check: returning a won token is safe — connection
 		// cleanup will release the slot if delivery fails.
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := lm.sems[key]; s != nil {
 					s.LastActivity = time.Now()
@@ -919,7 +919,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 		}
 		if s := lm.sems[key]; s != nil {
 			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, waiter)
+			s.Waiters = removeWaiter(s.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", ctx.Err()
@@ -927,7 +927,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	case <-timer.C:
 		lm.mu.Lock()
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := lm.sems[key]; s != nil {
 					s.LastActivity = time.Now()
@@ -939,7 +939,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 		}
 		if s := lm.sems[key]; s != nil {
 			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, waiter)
+			s.Waiters = removeWaiter(s.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", nil
@@ -963,7 +963,7 @@ func (lm *LockManager) SemRelease(key, token string) bool {
 		return false
 	}
 
-	lm.semConnRemoveOwned(h.ConnID, key, token)
+	lm.semConnRemoveOwned(h.connID, key, token)
 	delete(st.Holders, token)
 	lm.semGrantNextWaiterLocked(key, st)
 	return true
@@ -988,20 +988,20 @@ func (lm *LockManager) SemRenew(key, token string, leaseTTL time.Duration) (int,
 	}
 
 	// If already expired, reject and evict
-	if !h.LeaseExpires.IsZero() && !now.Before(h.LeaseExpires) {
+	if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
 		lm.log.Warn("sem renew rejected (already expired)",
-			"key", key, "conn", h.ConnID)
-		lm.semConnRemoveOwned(h.ConnID, key, token)
+			"key", key, "conn", h.connID)
+		lm.semConnRemoveOwned(h.connID, key, token)
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.semGrantNextWaiterLocked(key, st)
 		return 0, false
 	}
 
-	h.LeaseExpires = now.Add(leaseTTL)
+	h.leaseExpires = now.Add(leaseTTL)
 	st.LastActivity = now
 
-	remaining := int(time.Until(h.LeaseExpires).Seconds())
+	remaining := int(time.Until(h.leaseExpires).Seconds())
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -1030,13 +1030,13 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 	// Fast path: capacity available and no waiters
 	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
 		token := newToken()
-		st.Holders[token] = &SemHolder{
-			ConnID:       connID,
-			LeaseExpires: time.Now().Add(leaseTTL),
+		st.Holders[token] = &semHolder{
+			connID:       connID,
+			leaseExpires: time.Now().Add(leaseTTL),
 		}
 		st.LastActivity = time.Now()
 		lm.semConnAddOwned(connID, key, token)
-		lm.connSemEnqueued[eqKey] = &EnqueuedState{Token: token, LeaseTTL: leaseTTL}
+		lm.connSemEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
 		return "acquired", token, leaseSec, nil
 	}
 
@@ -1044,13 +1044,13 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
 		return "", "", 0, ErrMaxWaiters
 	}
-	waiter := &Waiter{
-		Ch:       make(chan string, 1),
-		ConnID:   connID,
-		LeaseTTL: leaseTTL,
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
 	}
-	st.Waiters = append(st.Waiters, waiter)
-	lm.connSemEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}
+	st.Waiters = append(st.Waiters, w)
+	lm.connSemEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
 	return "queued", "", 0, nil
 }
 
@@ -1066,10 +1066,10 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 	}
 
 	// Snapshot immutable fields under lock (same safety rationale as FIFOWait).
-	leaseTTL := es.LeaseTTL
+	leaseTTL := es.leaseTTL
 	leaseSec := int(leaseTTL / time.Second)
-	esToken := es.Token
-	waiter := es.Waiter
+	esToken := es.token
+	w := es.waiter
 	lm.mu.Unlock()
 
 	// Fast path: already acquired during enqueue
@@ -1080,7 +1080,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		if st != nil {
 			h, ok := st.Holders[esToken]
 			if ok {
-				if !h.LeaseExpires.IsZero() && !time.Now().Before(h.LeaseExpires) {
+				if !h.leaseExpires.IsZero() && !time.Now().Before(h.leaseExpires) {
 					// Expired: clean up holder and grant to next waiter
 					lm.semConnRemoveOwned(connID, key, esToken)
 					delete(st.Holders, esToken)
@@ -1089,7 +1089,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 					lm.mu.Unlock()
 					return "", 0, nil
 				}
-				h.LeaseExpires = time.Now().Add(leaseTTL)
+				h.leaseExpires = time.Now().Add(leaseTTL)
 				st.LastActivity = time.Now()
 				lm.mu.Unlock()
 				return esToken, leaseSec, nil
@@ -1110,7 +1110,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 	defer timer.Stop()
 
 	select {
-	case token, ok := <-waiter.Ch:
+	case token, ok := <-w.ch:
 		if !ok || token == "" {
 			// Channel closed (disconnect cleanup) or empty token
 			lm.mu.Lock()
@@ -1122,7 +1122,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		delete(lm.connSemEnqueued, eqKey)
 		if st := lm.sems[key]; st != nil {
 			if h, ok := st.Holders[token]; ok {
-				h.LeaseExpires = time.Now().Add(leaseTTL)
+				h.leaseExpires = time.Now().Add(leaseTTL)
 			}
 			st.LastActivity = time.Now()
 		}
@@ -1133,11 +1133,11 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		lm.mu.Lock()
 		delete(lm.connSemEnqueued, eqKey)
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if st := lm.sems[key]; st != nil {
 					if h, ok := st.Holders[token]; ok {
-						h.LeaseExpires = time.Now().Add(leaseTTL)
+						h.leaseExpires = time.Now().Add(leaseTTL)
 					}
 					st.LastActivity = time.Now()
 				}
@@ -1148,7 +1148,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		}
 		if st := lm.sems[key]; st != nil {
 			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, waiter)
+			st.Waiters = removeWaiter(st.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", 0, ctx.Err()
@@ -1157,11 +1157,11 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		lm.mu.Lock()
 		delete(lm.connSemEnqueued, eqKey)
 		select {
-		case token, ok := <-waiter.Ch:
+		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if st := lm.sems[key]; st != nil {
 					if h, ok := st.Holders[token]; ok {
-						h.LeaseExpires = time.Now().Add(leaseTTL)
+						h.leaseExpires = time.Now().Add(leaseTTL)
 					}
 					st.LastActivity = time.Now()
 				}
@@ -1172,7 +1172,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		}
 		if st := lm.sems[key]; st != nil {
 			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, waiter)
+			st.Waiters = removeWaiter(st.Waiters, w)
 		}
 		lm.mu.Unlock()
 		return "", 0, nil
@@ -1236,6 +1236,12 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 				LeaseExpiresInS: expiresIn,
 				Waiters:         len(st.Waiters),
 			})
+		} else if len(st.Waiters) > 0 {
+			// No owner but has waiters — report as active (waiters visible).
+			s.Locks = append(s.Locks, LockInfo{
+				Key:     key,
+				Waiters: len(st.Waiters),
+			})
 		} else {
 			s.IdleLocks = append(s.IdleLocks, IdleInfo{
 				Key:   key,
@@ -1250,6 +1256,12 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 				Key:     key,
 				Limit:   st.Limit,
 				Holders: len(st.Holders),
+				Waiters: len(st.Waiters),
+			})
+		} else if len(st.Waiters) > 0 {
+			s.Semaphores = append(s.Semaphores, SemInfo{
+				Key:     key,
+				Limit:   st.Limit,
 				Waiters: len(st.Waiters),
 			})
 		} else {
@@ -1269,9 +1281,9 @@ func (lm *LockManager) ResetForTest() {
 	defer lm.mu.Unlock()
 	lm.locks = make(map[string]*LockState)
 	lm.connOwned = make(map[uint64]map[string]struct{})
-	lm.connEnqueued = make(map[connKey]*EnqueuedState)
+	lm.connEnqueued = make(map[connKey]*enqueuedState)
 	lm.sems = make(map[string]*SemState)
 	lm.connSemOwned = make(map[uint64]map[string]map[string]struct{})
-	lm.connSemEnqueued = make(map[connKey]*EnqueuedState)
+	lm.connSemEnqueued = make(map[connKey]*enqueuedState)
 }
 

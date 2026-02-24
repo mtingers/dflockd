@@ -305,7 +305,7 @@ func TestFIFOEnqueue_Queued(t *testing.T) {
 		t.Fatal("lease should be 0 when queued")
 	}
 	es := lm.connEnqueued[connKey{ConnID: 2, Key: "k1"}]
-	if es == nil || es.Waiter == nil {
+	if es == nil || es.waiter == nil {
 		t.Fatal("should have waiter in connEnqueued")
 	}
 }
@@ -957,7 +957,7 @@ func TestSemRenew_Expired(t *testing.T) {
 	lm := testManager()
 	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	_, ok := lm.SemRenew("s1", tok, 30*time.Second)
@@ -1177,7 +1177,7 @@ func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 		t.Fatal("should acquire")
 	}
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1213,7 +1213,7 @@ func TestSemLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	// Expire holder
 	lm.mu.Lock()
 	for _, h := range lm.sems["s1"].Holders {
-		h.LeaseExpires = time.Now().Add(-1 * time.Second)
+		h.leaseExpires = time.Now().Add(-1 * time.Second)
 	}
 	lm.mu.Unlock()
 
