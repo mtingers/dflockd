@@ -492,7 +492,10 @@ func (lm *LockManager) FIFORelease(key, token string) bool {
 
 	connID := st.OwnerConnID
 	lm.connRemoveOwned(connID, key)
-	delete(lm.connEnqueued, connKey{ConnID: connID, Key: key})
+	eqKey := connKey{ConnID: connID, Key: key}
+	if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+		delete(lm.connEnqueued, eqKey)
+	}
 	st.OwnerToken = ""
 	st.OwnerConnID = 0
 	st.LeaseExpires = time.Time{}
@@ -524,7 +527,10 @@ func (lm *LockManager) FIFORenew(key, token string, leaseTTL time.Duration) (int
 			"key", key, "owner_conn", st.OwnerConnID)
 		connID := st.OwnerConnID
 		lm.connRemoveOwned(connID, key)
-		delete(lm.connEnqueued, connKey{ConnID: connID, Key: key})
+		eqKey := connKey{ConnID: connID, Key: key}
+		if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+			delete(lm.connEnqueued, eqKey)
+		}
 		st.OwnerToken = ""
 		st.OwnerConnID = 0
 		st.LeaseExpires = time.Time{}
@@ -688,7 +694,10 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 					lm.log.Warn("lease expired",
 						"key", key, "owner_conn", st.OwnerConnID)
 					lm.connRemoveOwned(st.OwnerConnID, key)
-					delete(lm.connEnqueued, connKey{ConnID: st.OwnerConnID, Key: key})
+					eqKey := connKey{ConnID: st.OwnerConnID, Key: key}
+					if es, ok := lm.connEnqueued[eqKey]; ok && es.token == st.OwnerToken {
+						delete(lm.connEnqueued, eqKey)
+					}
 					st.OwnerToken = ""
 					st.OwnerConnID = 0
 					st.LeaseExpires = time.Time{}
@@ -707,7 +716,10 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 						lm.log.Warn("sem lease expired",
 							"key", key, "conn", h.connID)
 						lm.semConnRemoveOwned(h.connID, key, token)
-						delete(lm.connSemEnqueued, connKey{ConnID: h.connID, Key: key})
+						semEqKey := connKey{ConnID: h.connID, Key: key}
+						if es, ok := lm.connSemEnqueued[semEqKey]; ok && es.token == token {
+							delete(lm.connSemEnqueued, semEqKey)
+						}
 						expired = append(expired, token)
 					}
 				}
@@ -972,7 +984,10 @@ func (lm *LockManager) SemRelease(key, token string) bool {
 	}
 
 	lm.semConnRemoveOwned(h.connID, key, token)
-	delete(lm.connSemEnqueued, connKey{ConnID: h.connID, Key: key})
+	eqKey := connKey{ConnID: h.connID, Key: key}
+	if es, ok := lm.connSemEnqueued[eqKey]; ok && es.token == token {
+		delete(lm.connSemEnqueued, eqKey)
+	}
 	delete(st.Holders, token)
 	lm.semGrantNextWaiterLocked(key, st)
 	return true
@@ -1001,7 +1016,10 @@ func (lm *LockManager) SemRenew(key, token string, leaseTTL time.Duration) (int,
 		lm.log.Warn("sem renew rejected (already expired)",
 			"key", key, "conn", h.connID)
 		lm.semConnRemoveOwned(h.connID, key, token)
-		delete(lm.connSemEnqueued, connKey{ConnID: h.connID, Key: key})
+		eqKey := connKey{ConnID: h.connID, Key: key}
+		if es, ok := lm.connSemEnqueued[eqKey]; ok && es.token == token {
+			delete(lm.connSemEnqueued, eqKey)
+		}
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.semGrantNextWaiterLocked(key, st)

@@ -1401,3 +1401,75 @@ func TestSemEnqueue_MaxWaiters(t *testing.T) {
 		t.Fatalf("expected ErrMaxWaiters, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression: Release must not clobber a different in-progress enqueue
+// ---------------------------------------------------------------------------
+
+func TestSemRelease_DoesNotClobberEnqueuedState(t *testing.T) {
+	lm := testManager()
+
+	// Phase 1: conn1 acquires slot T1 via two-phase
+	status, tok1, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	if err != nil || status != "acquired" {
+		t.Fatalf("enqueue1: status=%s err=%v", status, err)
+	}
+	got1, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	if err != nil || got1 != tok1 {
+		t.Fatalf("wait1: tok=%s err=%v", got1, err)
+	}
+
+	// Phase 2: conn1 enqueues again for a second slot (T2)
+	status, tok2, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	if err != nil || status != "acquired" {
+		t.Fatalf("enqueue2: status=%s err=%v", status, err)
+	}
+
+	// Release T1 — must NOT destroy the enqueued state for T2
+	if !lm.SemRelease("s1", tok1) {
+		t.Fatal("release T1 should succeed")
+	}
+
+	// SemWait for T2 must still work
+	got2, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	if err != nil {
+		t.Fatalf("wait2 should succeed, got err: %v", err)
+	}
+	if got2 != tok2 {
+		t.Fatalf("wait2 token mismatch: got %s want %s", got2, tok2)
+	}
+}
+
+func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
+	lm := testManager()
+
+	// Conn1 acquires via two-phase
+	status, tok1, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	if err != nil || status != "acquired" {
+		t.Fatalf("enqueue1: status=%s err=%v", status, err)
+	}
+	got1, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	if err != nil || got1 != tok1 {
+		t.Fatalf("wait1: tok=%s err=%v", got1, err)
+	}
+
+	// Conn1 enqueues again (will be queued behind itself — a self-deadlock
+	// scenario, but the data structure must still be consistent)
+	status, _, _, err = lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	if err != nil {
+		t.Fatalf("enqueue2: err=%v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// Release T1 — must NOT destroy the queued enqueue state
+	if !lm.FIFORelease("k1", tok1) {
+		t.Fatal("release should succeed")
+	}
+
+	// The enqueued waiter should still be tracked (it will get granted the lock)
+	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; !ok {
+		t.Fatal("enqueued state for conn1 should still exist")
+	}
+}
