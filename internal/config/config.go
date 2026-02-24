@@ -132,29 +132,61 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 
+	// Track which flags were explicitly set on the command line so they
+	// take precedence over environment variables.  Precedence order:
+	//   CLI flag (explicit) > environment variable > flag default
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+	resolveInt := func(flagName, envKey string, flagVal int) int {
+		if setFlags[flagName] {
+			return flagVal
+		}
+		return envOrInt(envKey, flagVal)
+	}
+	resolveString := func(flagName, envKey string, flagVal string) string {
+		if setFlags[flagName] {
+			return flagVal
+		}
+		return envOrString(envKey, flagVal)
+	}
+	resolveBool := func(flagName, envKey string, flagVal bool) bool {
+		if setFlags[flagName] {
+			return flagVal
+		}
+		return envOrBool(envKey, flagVal)
+	}
+	resolveDuration := func(flagName, envKey string, flagVal int) time.Duration {
+		if setFlags[flagName] {
+			return time.Duration(flagVal) * time.Second
+		}
+		return envOrDuration(envKey, flagVal)
+	}
+
 	authTok, err := loadAuthToken(*authToken, *authTokenFile)
 	if err != nil {
 		return nil, err
 	}
 
 	cfg := &Config{
-		Host:                    envOrString("DFLOCKD_HOST", *host),
-		Port:                    envOrInt("DFLOCKD_PORT", *port),
-		DefaultLeaseTTL:         envOrDuration("DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL),
-		LeaseSweepInterval:      envOrDuration("DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval),
-		GCInterval:              envOrDuration("DFLOCKD_GC_LOOP_SLEEP", *gcInterval),
-		GCMaxIdleTime:           envOrDuration("DFLOCKD_GC_MAX_UNUSED_TIME", *gcMaxIdle),
-		MaxLocks:                envOrInt("DFLOCKD_MAX_LOCKS", *maxLocks),
-		MaxConnections:          envOrInt("DFLOCKD_MAX_CONNECTIONS", *maxConnections),
-		MaxWaiters:              envOrInt("DFLOCKD_MAX_WAITERS", *maxWaiters),
-		ReadTimeout:             envOrDuration("DFLOCKD_READ_TIMEOUT_S", *readTimeout),
-		WriteTimeout:            envOrDuration("DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout),
-		ShutdownTimeout:         envOrDuration("DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout),
-		AutoReleaseOnDisconnect: envOrBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease),
-		TLSCert:                 envOrString("DFLOCKD_TLS_CERT", *tlsCert),
-		TLSKey:                  envOrString("DFLOCKD_TLS_KEY", *tlsKey),
+		Host:                    resolveString("host", "DFLOCKD_HOST", *host),
+		Port:                    resolveInt("port", "DFLOCKD_PORT", *port),
+		DefaultLeaseTTL:         resolveDuration("default-lease-ttl", "DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL),
+		LeaseSweepInterval:      resolveDuration("lease-sweep-interval", "DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval),
+		GCInterval:              resolveDuration("gc-interval", "DFLOCKD_GC_LOOP_SLEEP", *gcInterval),
+		GCMaxIdleTime:           resolveDuration("gc-max-idle", "DFLOCKD_GC_MAX_UNUSED_TIME", *gcMaxIdle),
+		MaxLocks:                resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks),
+		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
+		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
+		ReadTimeout:             resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout),
+		WriteTimeout:            resolveDuration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout),
+		ShutdownTimeout:         resolveDuration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout),
+		AutoReleaseOnDisconnect: resolveBool("auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease),
+		TLSCert:                 resolveString("tls-cert", "DFLOCKD_TLS_CERT", *tlsCert),
+		TLSKey:                  resolveString("tls-key", "DFLOCKD_TLS_KEY", *tlsKey),
 		AuthToken:               authTok,
-		Debug:                   envOrBool("DFLOCKD_DEBUG", *debug),
+		Debug:                   resolveBool("debug", "DFLOCKD_DEBUG", *debug),
 		Version:                 *version,
 	}
 

@@ -183,6 +183,29 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *LockState) {
 	st.LastActivity = time.Now()
 }
 
+// evictExpiredLocked evicts the current owner if their lease has expired and
+// grants the lock to the next waiter (if any). Called opportunistically on
+// acquire paths so callers don't have to wait for the background sweep tick.
+// Must be called with lm.mu held.
+func (lm *LockManager) evictExpiredLocked(key string, st *LockState) {
+	if st.OwnerToken == "" || st.LeaseExpires.IsZero() || time.Now().Before(st.LeaseExpires) {
+		return
+	}
+	lm.log.Warn("evicting expired lease on acquire",
+		"key", key, "owner_conn", st.OwnerConnID)
+	ownerConn := st.OwnerConnID
+	lm.connRemoveOwned(ownerConn, key)
+	eqKey := connKey{ConnID: ownerConn, Key: key}
+	if es, ok := lm.connEnqueued[eqKey]; ok && es.token == st.OwnerToken {
+		delete(lm.connEnqueued, eqKey)
+	}
+	st.OwnerToken = ""
+	st.OwnerConnID = 0
+	st.LeaseExpires = time.Time{}
+	st.LastActivity = time.Now()
+	lm.grantNextWaiterLocked(key, st)
+}
+
 func (lm *LockManager) getOrCreateLocked(key string) (*LockState, error) {
 	st, ok := lm.locks[key]
 	if ok {
@@ -212,6 +235,9 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	}
 
 	st.LastActivity = time.Now()
+
+	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
+	lm.evictExpiredLocked(key, st)
 
 	// Fast path: free and no waiters
 	if st.OwnerToken == "" && len(st.Waiters) == 0 {
@@ -321,6 +347,9 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 
 	st.LastActivity = time.Now()
 	leaseSec := int(leaseTTL / time.Second)
+
+	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
+	lm.evictExpiredLocked(key, st)
 
 	// Fast path: free and no waiters
 	if st.OwnerToken == "" && len(st.Waiters) == 0 {
@@ -860,6 +889,34 @@ func (lm *LockManager) semGrantNextWaiterLocked(key string, st *SemState) {
 	}
 }
 
+// semEvictExpiredLocked evicts any holders whose leases have expired and
+// grants freed slots to waiting callers. Called opportunistically on acquire
+// paths so callers don't have to wait for the background sweep tick.
+// Must be called with lm.mu held.
+func (lm *LockManager) semEvictExpiredLocked(key string, st *SemState) {
+	now := time.Now()
+	var expired []string
+	for token, h := range st.Holders {
+		if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
+			lm.log.Warn("evicting expired sem lease on acquire",
+				"key", key, "conn", h.connID)
+			lm.semConnRemoveOwned(h.connID, key, token)
+			semEqKey := connKey{ConnID: h.connID, Key: key}
+			if es, ok := lm.connSemEnqueued[semEqKey]; ok && es.token == token {
+				delete(lm.connSemEnqueued, semEqKey)
+			}
+			expired = append(expired, token)
+		}
+	}
+	for _, token := range expired {
+		delete(st.Holders, token)
+	}
+	if len(expired) > 0 {
+		st.LastActivity = now
+		lm.semGrantNextWaiterLocked(key, st)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Semaphore public methods
 // ---------------------------------------------------------------------------
@@ -880,6 +937,9 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	}
 
 	st.LastActivity = time.Now()
+
+	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
+	lm.semEvictExpiredLocked(key, st)
 
 	// Fast path: capacity available and no waiters
 	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
@@ -1054,6 +1114,9 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 
 	st.LastActivity = time.Now()
 	leaseSec := int(leaseTTL / time.Second)
+
+	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
+	lm.semEvictExpiredLocked(key, st)
 
 	// Fast path: capacity available and no waiters
 	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
