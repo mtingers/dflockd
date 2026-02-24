@@ -151,7 +151,7 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 		conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 	}
 	_, err := conn.Write(data)
-	if s.cfg.WriteTimeout > 0 {
+	if err == nil && s.cfg.WriteTimeout > 0 {
 		conn.SetWriteDeadline(time.Time{})
 	}
 	return err
@@ -204,8 +204,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 				s.log.Warn("protocol error", "peer", peer, "code", pe.Code, "msg", pe.Message)
 				if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
 					s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
+					break
 				}
-				break
+				// Read-level errors (timeout, line too long) may have
+				// desynchronized the protocol stream — disconnect.
+				// Parse-level errors are safe to continue from because
+				// all three request lines were consumed.
+				if pe.Code == 10 || pe.Code == 12 {
+					break
+				}
+				continue
 			}
 			s.log.Error("read error", "peer", peer, "err", err)
 			break

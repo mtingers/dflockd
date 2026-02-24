@@ -73,6 +73,10 @@ func (c *Conn) Close() error {
 	return c.conn.Close()
 }
 
+// maxResponseBytes is the maximum length of a single server response line.
+// Server responses are short (status + token + lease), so 512 bytes is generous.
+const maxResponseBytes = 512
+
 // sendRecv sends a 3-line protocol command and reads one response line.
 // The mutex ensures that concurrent callers (e.g. a renewal goroutine)
 // cannot interleave their request/response bytes.
@@ -83,11 +87,30 @@ func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 	if _, err := c.conn.Write([]byte(msg)); err != nil {
 		return "", err
 	}
-	line, err := c.reader.ReadString('\n')
-	if err != nil {
-		return "", err
+	return c.readLine()
+}
+
+// readLine reads a single newline-terminated line, enforcing maxResponseBytes
+// to prevent unbounded memory allocation from a malicious server.
+// Must be called with c.mu held.
+func (c *Conn) readLine() (string, error) {
+	var buf [maxResponseBytes + 1]byte
+	n := 0
+	for {
+		b, err := c.reader.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\n' {
+			break
+		}
+		if n >= len(buf) {
+			return "", fmt.Errorf("dflockd: server response too long")
+		}
+		buf[n] = b
+		n++
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return strings.TrimRight(string(buf[:n]), "\r"), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +411,11 @@ type ShardFunc func(key string, numServers int) int
 
 // CRC32Shard returns a shard index using CRC-32 (IEEE). This matches the
 // Python client's zlib.crc32-based stable_hash_shard.
+// Returns 0 if numServers <= 0.
 func CRC32Shard(key string, numServers int) int {
+	if numServers <= 0 {
+		return 0
+	}
 	h := crc32.ChecksumIEEE([]byte(key))
 	return int(h % uint32(numServers))
 }
@@ -530,16 +557,37 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 // Enqueue performs the first phase of two-phase locking. Returns "acquired" or
 // "queued". If acquired, a renewal goroutine is started automatically.
+// The provided context controls cancellation; if cancelled, the connection
+// is closed which unblocks any in-progress server I/O.
 func (l *Lock) Enqueue(ctx context.Context) (string, error) {
+	l.mu.Lock()
+	if err := l.connect(); err != nil {
+		l.mu.Unlock()
+		return "", err
+	}
+	conn := l.conn
+	l.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+
+	status, token, lease, err := Enqueue(conn, l.Key, l.opts()...)
+	close(done)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if err := l.connect(); err != nil {
-		return "", err
-	}
-
-	status, token, lease, err := Enqueue(l.conn, l.Key, l.opts()...)
 	if err != nil {
+		if ctx.Err() != nil {
+			l.conn = nil
+			return "", ctx.Err()
+		}
 		l.conn.Close()
 		l.conn = nil
 		return "", err
@@ -838,16 +886,37 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 }
 
 // Enqueue performs the first phase of two-phase semaphore acquire.
+// The provided context controls cancellation; if cancelled, the connection
+// is closed which unblocks any in-progress server I/O.
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	if err := s.connect(); err != nil {
+		s.mu.Unlock()
+		return "", err
+	}
+	conn := s.conn
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+
+	status, token, lease, err := SemEnqueue(conn, s.Key, s.Limit, s.opts()...)
+	close(done)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.connect(); err != nil {
-		return "", err
-	}
-
-	status, token, lease, err := SemEnqueue(s.conn, s.Key, s.Limit, s.opts()...)
 	if err != nil {
+		if ctx.Err() != nil {
+			s.conn = nil
+			return "", ctx.Err()
+		}
 		s.conn.Close()
 		s.conn = nil
 		return "", err

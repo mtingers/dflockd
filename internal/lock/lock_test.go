@@ -614,11 +614,19 @@ func TestLeaseExpiry_ReleasesLock(t *testing.T) {
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go lm.LeaseExpiryLoop(ctx)
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		lm.LeaseExpiryLoop(ctx)
+	}()
 	time.Sleep(200 * time.Millisecond)
 	cancel()
+	<-loopDone
 
-	if lm.locks["k1"].OwnerToken != "" {
+	lm.mu.Lock()
+	ownerToken := lm.locks["k1"].OwnerToken
+	lm.mu.Unlock()
+	if ownerToken != "" {
 		t.Fatal("owner should be cleared by expiry loop")
 	}
 }
@@ -641,15 +649,23 @@ func TestLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go lm.LeaseExpiryLoop(ctx)
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		lm.LeaseExpiryLoop(ctx)
+	}()
 
 	tok2 := <-done
 	cancel()
+	<-loopDone
 
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired after expiry")
 	}
-	if lm.locks["k1"].OwnerConnID != 2 {
+	lm.mu.Lock()
+	ownerConnID := lm.locks["k1"].OwnerConnID
+	lm.mu.Unlock()
+	if ownerConnID != 2 {
 		t.Fatal("conn2 should own")
 	}
 }
@@ -1164,11 +1180,19 @@ func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go lm.LeaseExpiryLoop(ctx)
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		lm.LeaseExpiryLoop(ctx)
+	}()
 	time.Sleep(200 * time.Millisecond)
 	cancel()
+	<-loopDone
 
-	if len(lm.sems["s1"].Holders) != 0 {
+	lm.mu.Lock()
+	holderCount := len(lm.sems["s1"].Holders)
+	lm.mu.Unlock()
+	if holderCount != 0 {
 		t.Fatal("holder should be evicted by expiry loop")
 	}
 }
@@ -1193,10 +1217,15 @@ func TestSemLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go lm.LeaseExpiryLoop(ctx)
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		lm.LeaseExpiryLoop(ctx)
+	}()
 
 	tok2 := <-done
 	cancel()
+	<-loopDone
 
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired after expiry")

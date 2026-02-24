@@ -2,6 +2,7 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -75,30 +76,31 @@ func envOrDuration(envKey string, flagVal int) time.Duration {
 //  2. --auth-token flag
 //  3. contents of --auth-token-file (trailing whitespace stripped)
 //  4. contents of DFLOCKD_AUTH_TOKEN_FILE env var
-func loadAuthToken(flagToken, flagTokenFile string) string {
+func loadAuthToken(flagToken, flagTokenFile string) (string, error) {
 	// Env var takes highest priority
 	if v := os.Getenv("DFLOCKD_AUTH_TOKEN"); v != "" {
-		return v
+		return v, nil
 	}
 	// Explicit flag value
 	if flagToken != "" {
-		return flagToken
+		return flagToken, nil
 	}
-	// File-based token (flag)
+	// File-based token (flag or env)
 	path := flagTokenFile
 	if path == "" {
 		path = os.Getenv("DFLOCKD_AUTH_TOKEN_FILE")
 	}
 	if path != "" {
 		data, err := os.ReadFile(path)
-		if err == nil {
-			return strings.TrimSpace(string(data))
+		if err != nil {
+			return "", fmt.Errorf("reading auth token file %q: %w", path, err)
 		}
+		return strings.TrimSpace(string(data)), nil
 	}
-	return ""
+	return "", nil
 }
 
-func Load() *Config {
+func Load() (*Config, error) {
 	// CLI flags
 	host := flag.String("host", "127.0.0.1", "Bind address")
 	port := flag.Int("port", 6388, "Bind port")
@@ -121,7 +123,12 @@ func Load() *Config {
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
-	return &Config{
+	authTok, err := loadAuthToken(*authToken, *authTokenFile)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &Config{
 		Host:                    envOrString("DFLOCKD_HOST", *host),
 		Port:                    envOrInt("DFLOCKD_PORT", *port),
 		DefaultLeaseTTL:         envOrDuration("DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL),
@@ -137,8 +144,35 @@ func Load() *Config {
 		AutoReleaseOnDisconnect: envOrBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease),
 		TLSCert:                 envOrString("DFLOCKD_TLS_CERT", *tlsCert),
 		TLSKey:                  envOrString("DFLOCKD_TLS_KEY", *tlsKey),
-		AuthToken:               loadAuthToken(*authToken, *authTokenFile),
+		AuthToken:               authTok,
 		Debug:                   envOrBool("DFLOCKD_DEBUG", *debug),
 		Version:                 *version,
 	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (c *Config) validate() error {
+	if c.MaxLocks <= 0 {
+		return fmt.Errorf("--max-locks must be > 0 (got %d)", c.MaxLocks)
+	}
+	if c.DefaultLeaseTTL <= 0 {
+		return fmt.Errorf("--default-lease-ttl must be > 0")
+	}
+	if c.LeaseSweepInterval <= 0 {
+		return fmt.Errorf("--lease-sweep-interval must be > 0")
+	}
+	if c.GCInterval <= 0 {
+		return fmt.Errorf("--gc-interval must be > 0")
+	}
+	if c.ReadTimeout <= 0 {
+		return fmt.Errorf("--read-timeout must be > 0")
+	}
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("--port must be 0-65535 (got %d)", c.Port)
+	}
+	return nil
 }

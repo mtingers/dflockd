@@ -1256,16 +1256,3 @@ func (lm *LockManager) ResetForTest() {
 	lm.connSemEnqueued = make(map[connKey]*EnqueuedState)
 }
 
-// LocksForTest returns internal lock state (for testing only).
-func (lm *LockManager) LocksForTest() map[string]*LockState {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	return lm.locks
-}
-
-// SemsForTest returns internal semaphore state (for testing only).
-func (lm *LockManager) SemsForTest() map[string]*SemState {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	return lm.sems
-}
