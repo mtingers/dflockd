@@ -426,3 +426,53 @@ func TestReadRequest_SemWaitNegativeTimeout(t *testing.T) {
 		t.Fatalf("expected code 6, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Key validation
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_KeyWithSpace(t *testing.T) {
+	r := makeReader("l", "bad key", "10")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 5 {
+		t.Fatalf("expected code 5 (key whitespace), got %v", err)
+	}
+}
+
+func TestReadRequest_KeyWithTab(t *testing.T) {
+	r := makeReader("l", "bad\tkey", "10")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 5 {
+		t.Fatalf("expected code 5 (key whitespace), got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ReadLine length enforcement
+// ---------------------------------------------------------------------------
+
+func TestReadLine_Oversized(t *testing.T) {
+	// Build a line longer than MaxLineBytes
+	long := strings.Repeat("x", MaxLineBytes+10) + "\n"
+	r := bufio.NewReader(strings.NewReader(long))
+	_, err := ReadLine(r, 5*time.Second, &mockConn{})
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 12 {
+		t.Fatalf("expected code 12 (line too long), got %v", err)
+	}
+}
+
+func TestReadLine_ExactMax(t *testing.T) {
+	// A line of exactly MaxLineBytes should succeed.
+	exact := strings.Repeat("y", MaxLineBytes) + "\n"
+	r := bufio.NewReader(strings.NewReader(exact))
+	line, err := ReadLine(r, 5*time.Second, &mockConn{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(line) != MaxLineBytes {
+		t.Fatalf("expected len %d, got %d", MaxLineBytes, len(line))
+	}
+}

@@ -110,7 +110,7 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.handleConn(conn, connID)
+			s.handleConn(ctx, conn, connID)
 		}()
 	}
 }
@@ -157,13 +157,18 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 	return err
 }
 
-func (s *Server) handleConn(conn net.Conn, connID uint64) {
+func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	peer := conn.RemoteAddr().String()
 	s.log.Debug("client connected", "peer", peer, "conn_id", connID)
 	s.connCount.Add(1)
 	s.conns.Store(conn, struct{}{})
 
+	// Create a per-connection context that is cancelled when the server
+	// shuts down, allowing in-progress lock waits to be interrupted.
+	connCtx, connCancel := context.WithCancel(ctx)
+
 	defer func() {
+		connCancel()
 		s.conns.Delete(conn)
 		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
@@ -180,6 +185,8 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 		if err != nil || req.Cmd != "auth" ||
 			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
 			s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
+			// Small delay to slow down brute-force attempts.
+			time.Sleep(100 * time.Millisecond)
 			return
 		}
 		s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
@@ -204,7 +211,7 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 			break
 		}
 
-		ack := s.handleRequest(req, connID)
+		ack := s.handleRequest(connCtx, req, connID)
 		if err := s.writeResponse(conn, protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
 			s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 			break
@@ -212,7 +219,7 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 	}
 }
 
-func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.Ack {
+func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
 
 	switch req.Cmd {
@@ -225,7 +232,7 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 		return &protocol.Ack{Status: "ok", Extra: string(data)}
 
 	case "l":
-		tok, err := s.lm.FIFOAcquire(req.Key, req.AcquireTimeout, req.LeaseTTL, connID)
+		tok, err := s.lm.FIFOAcquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
@@ -267,7 +274,7 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
 
 	case "w":
-		tok, lease, err := s.lm.FIFOWait(req.Key, req.AcquireTimeout, connID)
+		tok, lease, err := s.lm.FIFOWait(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error"}
@@ -280,7 +287,7 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
 
 	case "sl":
-		tok, err := s.lm.SemAcquire(req.Key, req.AcquireTimeout, req.LeaseTTL, connID, req.Limit)
+		tok, err := s.lm.SemAcquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, req.Limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
@@ -328,7 +335,7 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
 
 	case "sw":
-		tok, lease, err := s.lm.SemWait(req.Key, req.AcquireTimeout, connID)
+		tok, lease, err := s.lm.SemWait(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error"}
@@ -341,5 +348,6 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
 	}
 
+	s.log.Warn("unknown command in handleRequest", "cmd", req.Cmd, "conn", connID)
 	return &protocol.Ack{Status: "error"}
 }

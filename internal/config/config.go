@@ -29,37 +29,77 @@ type Config struct {
 	AuthToken               string
 }
 
-func envInt(key string, def int) int {
-	v := os.Getenv(key)
+// envOrInt returns the environment variable value parsed as int, or the flag
+// default if the env var is unset or unparseable.
+func envOrInt(envKey string, flagVal int) int {
+	v := os.Getenv(envKey)
 	if v == "" {
-		return def
+		return flagVal
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return flagVal
 	}
 	return n
 }
 
-func envBool(key string, def bool) bool {
-	v := os.Getenv(key)
+// envOrBool returns the environment variable value parsed as bool, or the flag
+// default if the env var is unset.
+func envOrBool(envKey string, flagVal bool) bool {
+	v := os.Getenv(envKey)
 	if v == "" {
-		return def
+		return flagVal
 	}
 	low := strings.ToLower(v)
 	return low == "1" || low == "yes" || low == "true"
 }
 
-func envString(key string, def string) string {
-	v := os.Getenv(key)
+// envOrString returns the environment variable value, or the flag default if
+// the env var is unset.
+func envOrString(envKey string, flagVal string) string {
+	v := os.Getenv(envKey)
 	if v == "" {
-		return def
+		return flagVal
 	}
 	return v
 }
 
+// envOrDuration returns a time.Duration in seconds from the environment
+// variable, or converts the flag default (in seconds) if the env var is unset.
+func envOrDuration(envKey string, flagVal int) time.Duration {
+	return time.Duration(envOrInt(envKey, flagVal)) * time.Second
+}
+
+// loadAuthToken resolves the auth token from (in priority order):
+//  1. DFLOCKD_AUTH_TOKEN env var
+//  2. --auth-token flag
+//  3. contents of --auth-token-file (trailing whitespace stripped)
+//  4. contents of DFLOCKD_AUTH_TOKEN_FILE env var
+func loadAuthToken(flagToken, flagTokenFile string) string {
+	// Env var takes highest priority
+	if v := os.Getenv("DFLOCKD_AUTH_TOKEN"); v != "" {
+		return v
+	}
+	// Explicit flag value
+	if flagToken != "" {
+		return flagToken
+	}
+	// File-based token (flag)
+	path := flagTokenFile
+	if path == "" {
+		path = os.Getenv("DFLOCKD_AUTH_TOKEN_FILE")
+	}
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	return ""
+}
+
 func Load() *Config {
-	// CLI flags (defaults match Python)
+	// CLI flags
 	host := flag.String("host", "127.0.0.1", "Bind address")
 	port := flag.Int("port", 6388, "Bind port")
 	defaultLeaseTTL := flag.Int("default-lease-ttl", 33, "Default lock lease duration (seconds)")
@@ -75,101 +115,30 @@ func Load() *Config {
 	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate PEM file")
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key PEM file")
-	authToken := flag.String("auth-token", "", "Shared secret token for client authentication")
+	authToken := flag.String("auth-token", "", "Shared secret token for client authentication (visible in process list; prefer --auth-token-file)")
+	authTokenFile := flag.String("auth-token-file", "", "Path to file containing the auth token (one line, trailing whitespace stripped)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
-	// Env vars take precedence over CLI flags
-	cfg := &Config{}
-
-	if os.Getenv("DFLOCKD_HOST") != "" {
-		cfg.Host = envString("DFLOCKD_HOST", *host)
-	} else {
-		cfg.Host = *host
+	return &Config{
+		Host:                    envOrString("DFLOCKD_HOST", *host),
+		Port:                    envOrInt("DFLOCKD_PORT", *port),
+		DefaultLeaseTTL:         envOrDuration("DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL),
+		LeaseSweepInterval:      envOrDuration("DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval),
+		GCInterval:              envOrDuration("DFLOCKD_GC_LOOP_SLEEP", *gcInterval),
+		GCMaxIdleTime:           envOrDuration("DFLOCKD_GC_MAX_UNUSED_TIME", *gcMaxIdle),
+		MaxLocks:                envOrInt("DFLOCKD_MAX_LOCKS", *maxLocks),
+		MaxConnections:          envOrInt("DFLOCKD_MAX_CONNECTIONS", *maxConnections),
+		MaxWaiters:              envOrInt("DFLOCKD_MAX_WAITERS", *maxWaiters),
+		ReadTimeout:             envOrDuration("DFLOCKD_READ_TIMEOUT_S", *readTimeout),
+		WriteTimeout:            envOrDuration("DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout),
+		ShutdownTimeout:         envOrDuration("DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout),
+		AutoReleaseOnDisconnect: envOrBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease),
+		TLSCert:                 envOrString("DFLOCKD_TLS_CERT", *tlsCert),
+		TLSKey:                  envOrString("DFLOCKD_TLS_KEY", *tlsKey),
+		AuthToken:               loadAuthToken(*authToken, *authTokenFile),
+		Debug:                   envOrBool("DFLOCKD_DEBUG", *debug),
+		Version:                 *version,
 	}
-	if os.Getenv("DFLOCKD_PORT") != "" {
-		cfg.Port = envInt("DFLOCKD_PORT", *port)
-	} else {
-		cfg.Port = *port
-	}
-	if os.Getenv("DFLOCKD_DEFAULT_LEASE_TTL_S") != "" {
-		cfg.DefaultLeaseTTL = time.Duration(envInt("DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL)) * time.Second
-	} else {
-		cfg.DefaultLeaseTTL = time.Duration(*defaultLeaseTTL) * time.Second
-	}
-	if os.Getenv("DFLOCKD_LEASE_SWEEP_INTERVAL_S") != "" {
-		cfg.LeaseSweepInterval = time.Duration(envInt("DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval)) * time.Second
-	} else {
-		cfg.LeaseSweepInterval = time.Duration(*leaseSweepInterval) * time.Second
-	}
-	if os.Getenv("DFLOCKD_GC_LOOP_SLEEP") != "" {
-		cfg.GCInterval = time.Duration(envInt("DFLOCKD_GC_LOOP_SLEEP", *gcInterval)) * time.Second
-	} else {
-		cfg.GCInterval = time.Duration(*gcInterval) * time.Second
-	}
-	if os.Getenv("DFLOCKD_GC_MAX_UNUSED_TIME") != "" {
-		cfg.GCMaxIdleTime = time.Duration(envInt("DFLOCKD_GC_MAX_UNUSED_TIME", *gcMaxIdle)) * time.Second
-	} else {
-		cfg.GCMaxIdleTime = time.Duration(*gcMaxIdle) * time.Second
-	}
-	if os.Getenv("DFLOCKD_MAX_LOCKS") != "" {
-		cfg.MaxLocks = envInt("DFLOCKD_MAX_LOCKS", *maxLocks)
-	} else {
-		cfg.MaxLocks = *maxLocks
-	}
-	if os.Getenv("DFLOCKD_MAX_CONNECTIONS") != "" {
-		cfg.MaxConnections = envInt("DFLOCKD_MAX_CONNECTIONS", *maxConnections)
-	} else {
-		cfg.MaxConnections = *maxConnections
-	}
-	if os.Getenv("DFLOCKD_MAX_WAITERS") != "" {
-		cfg.MaxWaiters = envInt("DFLOCKD_MAX_WAITERS", *maxWaiters)
-	} else {
-		cfg.MaxWaiters = *maxWaiters
-	}
-	if os.Getenv("DFLOCKD_READ_TIMEOUT_S") != "" {
-		cfg.ReadTimeout = time.Duration(envInt("DFLOCKD_READ_TIMEOUT_S", *readTimeout)) * time.Second
-	} else {
-		cfg.ReadTimeout = time.Duration(*readTimeout) * time.Second
-	}
-	if os.Getenv("DFLOCKD_WRITE_TIMEOUT_S") != "" {
-		cfg.WriteTimeout = time.Duration(envInt("DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout)) * time.Second
-	} else {
-		cfg.WriteTimeout = time.Duration(*writeTimeout) * time.Second
-	}
-	if os.Getenv("DFLOCKD_SHUTDOWN_TIMEOUT_S") != "" {
-		cfg.ShutdownTimeout = time.Duration(envInt("DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout)) * time.Second
-	} else {
-		cfg.ShutdownTimeout = time.Duration(*shutdownTimeout) * time.Second
-	}
-	if os.Getenv("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT") != "" {
-		cfg.AutoReleaseOnDisconnect = envBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)
-	} else {
-		cfg.AutoReleaseOnDisconnect = *autoRelease
-	}
-	if os.Getenv("DFLOCKD_TLS_CERT") != "" {
-		cfg.TLSCert = envString("DFLOCKD_TLS_CERT", *tlsCert)
-	} else {
-		cfg.TLSCert = *tlsCert
-	}
-	if os.Getenv("DFLOCKD_TLS_KEY") != "" {
-		cfg.TLSKey = envString("DFLOCKD_TLS_KEY", *tlsKey)
-	} else {
-		cfg.TLSKey = *tlsKey
-	}
-	if os.Getenv("DFLOCKD_AUTH_TOKEN") != "" {
-		cfg.AuthToken = envString("DFLOCKD_AUTH_TOKEN", *authToken)
-	} else {
-		cfg.AuthToken = *authToken
-	}
-	if os.Getenv("DFLOCKD_DEBUG") != "" {
-		cfg.Debug = envBool("DFLOCKD_DEBUG", *debug)
-	} else {
-		cfg.Debug = *debug
-	}
-
-	cfg.Version = *version
-
-	return cfg
 }

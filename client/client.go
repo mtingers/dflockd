@@ -42,8 +42,10 @@ func WithLeaseTTL(seconds int) Option {
 // ---------------------------------------------------------------------------
 
 // Conn wraps a TCP connection to a dflockd server, providing a buffered reader
-// for line-oriented protocol communication.
+// for line-oriented protocol communication. Conn is safe for concurrent use;
+// a mutex serializes request/response pairs to prevent interleaved I/O.
 type Conn struct {
+	mu     sync.Mutex
 	conn   net.Conn
 	reader *bufio.Reader
 }
@@ -72,7 +74,11 @@ func (c *Conn) Close() error {
 }
 
 // sendRecv sends a 3-line protocol command and reads one response line.
+// The mutex ensures that concurrent callers (e.g. a renewal goroutine)
+// cannot interleave their request/response bytes.
 func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
 	if _, err := c.conn.Write([]byte(msg)); err != nil {
 		return "", err
@@ -477,24 +483,28 @@ func (l *Lock) connect() error {
 // connection is closed which unblocks the server-side wait.
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if err := l.connect(); err != nil {
+		l.mu.Unlock()
 		return false, err
 	}
+	conn := l.conn
+	l.mu.Unlock()
 
 	// If context is cancellable, close the connection on cancel to unblock.
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			l.conn.Close()
+			conn.Close()
 		case <-done:
 		}
 	}()
 
-	token, lease, err := Acquire(l.conn, l.Key, l.acquireTimeout(), l.opts()...)
+	token, lease, err := Acquire(conn, l.Key, l.acquireTimeout(), l.opts()...)
 	close(done)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
@@ -547,23 +557,27 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 // Enqueue returned "queued". Returns false (with nil error) on timeout.
 func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.conn == nil {
+		l.mu.Unlock()
 		return false, ErrNotQueued
 	}
+	conn := l.conn
+	l.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			l.conn.Close()
+			conn.Close()
 		case <-done:
 		}
 	}()
 
-	token, lease, err := Wait(l.conn, l.Key, timeout)
+	token, lease, err := Wait(conn, l.Key, timeout)
 	close(done)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
@@ -593,7 +607,7 @@ func (l *Lock) stopRenew() {
 		done := l.renewDone
 		l.renewDone = nil
 		// Release the mutex while waiting so the goroutine can finish
-		// its in-progress Renew (which also grabs l.mu).
+		// its in-progress Renew (which also grabs l.mu via Conn.sendRecv).
 		l.mu.Unlock()
 		<-done
 		l.mu.Lock()
@@ -661,6 +675,11 @@ func (l *Lock) startRenew() {
 		interval = 1 * time.Second
 	}
 
+	conn := l.conn
+	key := l.Key
+	token := l.token
+	opts := l.opts()
+
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(interval)
@@ -675,12 +694,13 @@ func (l *Lock) startRenew() {
 					l.mu.Unlock()
 					return
 				}
-				conn := l.conn
-				key := l.Key
-				token := l.token
+				// Re-read in case of reconnection (future-proofing).
+				conn = l.conn
+				key = l.Key
+				token = l.token
 				l.mu.Unlock()
 
-				_, _ = Renew(conn, key, token, l.opts()...)
+				_, _ = Renew(conn, key, token, opts...)
 			}
 		}
 	}()
@@ -774,23 +794,27 @@ func (s *Semaphore) connect() error {
 // background lease renewal. Returns false (with nil error) on timeout.
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if err := s.connect(); err != nil {
+		s.mu.Unlock()
 		return false, err
 	}
+	conn := s.conn
+	s.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			s.conn.Close()
+			conn.Close()
 		case <-done:
 		}
 	}()
 
-	token, lease, err := SemAcquire(s.conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
+	token, lease, err := SemAcquire(conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
 	close(done)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
@@ -840,23 +864,27 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 // Wait performs the second phase of two-phase semaphore acquire.
 func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.conn == nil {
+		s.mu.Unlock()
 		return false, ErrNotQueued
 	}
+	conn := s.conn
+	s.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			s.conn.Close()
+			conn.Close()
 		case <-done:
 		}
 	}()
 
-	token, lease, err := SemWait(s.conn, s.Key, timeout)
+	token, lease, err := SemWait(conn, s.Key, timeout)
 	close(done)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
@@ -946,6 +974,11 @@ func (s *Semaphore) startRenew() {
 		interval = 1 * time.Second
 	}
 
+	conn := s.conn
+	key := s.Key
+	token := s.token
+	opts := s.opts()
+
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(interval)
@@ -960,12 +993,12 @@ func (s *Semaphore) startRenew() {
 					s.mu.Unlock()
 					return
 				}
-				conn := s.conn
-				key := s.Key
-				token := s.token
+				conn = s.conn
+				key = s.Key
+				token = s.token
 				s.mu.Unlock()
 
-				_, _ = SemRenew(conn, key, token, s.opts()...)
+				_, _ = SemRenew(conn, key, token, opts...)
 			}
 		}
 	}()

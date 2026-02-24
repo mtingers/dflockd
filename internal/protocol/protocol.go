@@ -36,24 +36,43 @@ type Ack struct {
 	Extra    string
 }
 
+// ReadLine reads a single newline-terminated line from the buffered reader,
+// enforcing MaxLineBytes during the read to prevent memory exhaustion from
+// oversized input.
 func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return "", &ProtocolError{Code: 10, Message: "failed to set deadline"}
 	}
-	line, err := r.ReadString('\n')
-	if err != nil {
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return "", &ProtocolError{Code: 10, Message: "read timeout"}
-		}
-		if line == "" {
+
+	var buf [MaxLineBytes + 1]byte // +1 to detect overflow
+	n := 0
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return "", &ProtocolError{Code: 10, Message: "read timeout"}
+			}
 			return "", &ProtocolError{Code: 11, Message: "client disconnected"}
 		}
-		return "", &ProtocolError{Code: 11, Message: "client disconnected"}
+		if b == '\n' {
+			break
+		}
+		if n >= len(buf) {
+			// Drain the rest of the oversized line before reporting error
+			// to keep the reader in a consistent state.
+			for {
+				c, err := r.ReadByte()
+				if err != nil || c == '\n' {
+					break
+				}
+			}
+			return "", &ProtocolError{Code: 12, Message: "line too long"}
+		}
+		buf[n] = b
+		n++
 	}
-	if len(line) > MaxLineBytes+1 { // +1 for the \n
-		return "", &ProtocolError{Code: 12, Message: "line too long"}
-	}
-	return strings.TrimRight(line, "\r\n"), nil
+	line := string(buf[:n])
+	return strings.TrimRight(line, "\r"), nil
 }
 
 func parseInt(s string, what string) (int, error) {
@@ -62,6 +81,20 @@ func parseInt(s string, what string) (int, error) {
 		return 0, &ProtocolError{Code: 4, Message: fmt.Sprintf("invalid %s: %q", what, s)}
 	}
 	return n, nil
+}
+
+// validateKey rejects keys that are empty or contain whitespace (which would
+// cause protocol-level confusion since the wire format is line-oriented).
+func validateKey(key string) error {
+	if key == "" {
+		return &ProtocolError{Code: 5, Message: "empty key"}
+	}
+	for _, c := range key {
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			return &ProtocolError{Code: 5, Message: "key contains whitespace"}
+		}
+	}
+	return nil
 }
 
 func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultLeaseTTL time.Duration) (*Request, error) {
@@ -89,8 +122,8 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		return nil, &ProtocolError{Code: 3, Message: fmt.Sprintf("invalid cmd %q", cmd)}
 	}
 
-	if key == "" {
-		return nil, &ProtocolError{Code: 5, Message: "empty key"}
+	if err := validateKey(key); err != nil {
+		return nil, err
 	}
 
 	parts := strings.Fields(arg)
