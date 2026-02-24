@@ -642,6 +642,8 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
+			l.conn.Close()
+			l.conn = nil
 			return false, nil
 		}
 		if ctx.Err() != nil {
@@ -970,6 +972,8 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
+			s.conn.Close()
+			s.conn = nil
 			return false, nil
 		}
 		if ctx.Err() != nil {
