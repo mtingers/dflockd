@@ -53,6 +53,7 @@ All settings can be passed as CLI flags or environment variables. Environment va
 | `--tls-cert`                                                       | `DFLOCKD_TLS_CERT`                   | *(unset)* | Path to TLS certificate PEM file       |
 | `--tls-key`                                                        | `DFLOCKD_TLS_KEY`                    | *(unset)* | Path to TLS private key PEM file       |
 | `--auth-token`                                                     | `DFLOCKD_AUTH_TOKEN`                 | *(unset)* | Shared secret for client authentication |
+| `--auth-token-file`                                                | `DFLOCKD_AUTH_TOKEN_FILE`            | *(unset)* | Path to file containing the auth token |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true`    | Release locks on client disconnect     |
 | `--debug`                                                          | `DFLOCKD_DEBUG`                      | `false`   | Enable debug logging                   |
 
@@ -90,7 +91,9 @@ To require token-based authentication, set a shared secret:
 
 ```bash
 ./dflockd --auth-token my-secret-token
-# or
+# or load from a file (avoids leaking the secret in the process list):
+./dflockd --auth-token-file /run/secrets/dflockd-token
+# or via environment variables:
 DFLOCKD_AUTH_TOKEN=my-secret-token ./dflockd
 ```
 

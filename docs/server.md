@@ -34,7 +34,8 @@
 | `--shutdown-timeout` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
 | `--tls-cert` | *(unset)* | Path to TLS certificate PEM file |
 | `--tls-key` | *(unset)* | Path to TLS private key PEM file |
-| `--auth-token` | *(unset)* | Shared secret for client authentication |
+| `--auth-token` | *(unset)* | Shared secret for client authentication (visible in process list; prefer `--auth-token-file`) |
+| `--auth-token-file` | *(unset)* | Path to file containing the auth token (one line, trailing whitespace stripped) |
 | `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
 | `--debug` | `false` | Enable debug logging |
 
@@ -59,6 +60,7 @@ All settings can be configured via environment variables. Environment variables 
 | `DFLOCKD_TLS_CERT` | *(unset)* | Path to TLS certificate PEM file |
 | `DFLOCKD_TLS_KEY` | *(unset)* | Path to TLS private key PEM file |
 | `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for client authentication |
+| `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | Path to file containing the auth token |
 | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects |
 | `DFLOCKD_DEBUG` | *(unset)* | Enable debug logging (`1`, `yes`, or `true`) |
 
@@ -153,12 +155,23 @@ To require token-based authentication, set a shared secret:
 ./dflockd --auth-token my-secret-token
 ```
 
-Or via environment variable:
+Or load the token from a file (avoids leaking the secret in the process list):
+
+```bash
+./dflockd --auth-token-file /run/secrets/dflockd-token
+```
+
+Or via environment variables:
 
 ```bash
 export DFLOCKD_AUTH_TOKEN=my-secret-token
 ./dflockd
+# or
+export DFLOCKD_AUTH_TOKEN_FILE=/run/secrets/dflockd-token
+./dflockd
 ```
+
+Token resolution priority: `DFLOCKD_AUTH_TOKEN` env var > `--auth-token` flag > `--auth-token-file` flag > `DFLOCKD_AUTH_TOKEN_FILE` env var.
 
 When `--auth-token` is set, every new connection must send an `auth` command as its **first** message. If the token matches, the server responds with `ok` and the connection proceeds normally. If the token is wrong or a non-auth command is sent first, the server responds with `error_auth` and closes the connection.
 

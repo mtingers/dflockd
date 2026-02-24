@@ -343,6 +343,7 @@ if errors.Is(err, client.ErrTimeout) {
 |---|---|
 | `ErrTimeout` | The server returned `timeout` (lock/slot not acquired within the deadline) |
 | `ErrMaxLocks` | The server returned `error_max_locks` (server lock+semaphore key limit reached) |
+| `ErrMaxWaiters` | The server returned `error_max_waiters` (waiter queue full for this key) |
 | `ErrServer` | The server returned an unexpected error response |
 | `ErrNotQueued` | A `Wait`/`SemWait` was attempted without a prior `Enqueue`/`SemEnqueue` |
 | `ErrLimitMismatch` | The server returned `error_limit_mismatch` (semaphore limit doesn't match existing key) |

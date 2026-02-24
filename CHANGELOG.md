@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.8.1] - 2026-02-24
+
+### Fixed
+
+- **Client: data races in `Lock` and `Semaphore` types** — multiple fields (`conn`, `token`, `lease`, `cancelRenew`) were accessed without holding the mutex in `Acquire`, `Enqueue`, `Wait`, `Release`, and `Close` methods
+- **Client: `Lock.Wait` and `Semaphore.Wait` connection leak on timeout** — the connection was left open in an ambiguous state after a Wait timeout (enqueue state consumed, no lock held); now properly closed
+- **Client: `Lock.Wait` and `Semaphore.Wait` connection leak on non-timeout errors** — connections were not closed on server errors, only on context cancellation
+- **Client: `Enqueue` and `SemEnqueue` missing `error_max_waiters` handling** — the `error_max_waiters` server response was not parsed, causing a generic `ErrServer` instead of `ErrMaxWaiters`
+- **Client: `ErrMaxWaiters` sentinel error added** — new sentinel for the `error_max_waiters` protocol status, consistent with `ErrMaxLocks` and `ErrLimitMismatch`
+- **Client: `startRenew` goroutine leak** — old renewal goroutines were cancelled but not waited on before starting new ones, risking concurrent renewals; now calls `stopRenew()` which waits for the old goroutine to exit
+- **Client: `readLine` off-by-one buffer overflow** — buffer was `[maxResponseBytes + 1]byte` but the overflow check used `>` instead of `>=`, allowing one extra byte to be written past the intended limit
+- **Server: protocol error recovery disconnect** — read-level errors (timeout, line too long) now disconnect the client since the protocol stream may be desynchronized; parse-level errors continue safely
+- **Server: `handleConn` auth error could ignore `ReadRequest` error** — when the auth read returned an error, the nil `req` was still accessed for `req.Cmd`; now returns `error_auth` on any read failure during auth
+- **Server: concurrent map access in `connOwned` tracking** — lock ownership tracking was not consistently protected by the mutex in all code paths
+- **Config: `GCMaxIdleTime` validation** — negative values for `--gc-max-idle` were silently accepted; now `0` is explicitly allowed (meaning "prune immediately") while the env var override is correctly applied
+- **Config: `WriteTimeout` of 0 handling** — a zero write timeout no longer sets an immediate deadline on writes; it correctly disables write deadlines
+
+### Added
+
+- `--auth-token-file` flag and `DFLOCKD_AUTH_TOKEN_FILE` env var for loading the auth token from a file instead of passing it on the command line (avoids leaking the secret in the process list)
+
+### Documentation
+
+- Added `ErrMaxWaiters` to the client error table
+- Added `--auth-token-file` and `DFLOCKD_AUTH_TOKEN_FILE` to README, server docs, and configuration tables
+- Documented auth token resolution priority order
+
+[v1.8.1]: https://github.com/mtingers/dflockd/releases/tag/v1.8.1
+
 ## [v1.8.0] - 2026-02-24
 
 ### Added
