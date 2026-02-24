@@ -12,6 +12,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
@@ -90,6 +91,11 @@ func (s *Server) Run(ctx context.Context) error {
 				continue
 			}
 		}
+		if max := s.cfg.MaxConnections; max > 0 && s.connCount.Load() >= int64(max) {
+			s.log.Warn("max connections reached, rejecting", "max", max)
+			conn.Close()
+			continue
+		}
 		connID := s.connSeq.Add(1)
 		wg.Add(1)
 		go func() {
@@ -132,6 +138,11 @@ func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error
 				continue
 			}
 		}
+		if max := s.cfg.MaxConnections; max > 0 && s.connCount.Load() >= int64(max) {
+			s.log.Warn("max connections reached, rejecting", "max", max)
+			conn.Close()
+			continue
+		}
 		connID := s.connSeq.Add(1)
 		wg.Add(1)
 		go func() {
@@ -139,6 +150,17 @@ func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error
 			s.handleConn(conn, connID)
 		}()
 	}
+}
+
+func (s *Server) writeResponse(conn net.Conn, data []byte) error {
+	if s.cfg.WriteTimeout > 0 {
+		conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+	}
+	_, err := conn.Write(data)
+	if s.cfg.WriteTimeout > 0 {
+		conn.SetWriteDeadline(time.Time{})
+	}
+	return err
 }
 
 func (s *Server) handleConn(conn net.Conn, connID uint64) {
@@ -161,10 +183,10 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 		req, err := protocol.ReadRequest(reader, s.cfg.ReadTimeout, conn, defaultLeaseTTL)
 		if err != nil || req.Cmd != "auth" ||
 			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
-			conn.Write(protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
+			s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
 			return
 		}
-		conn.Write(protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
+		s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
 	}
 
 	for {
@@ -177,7 +199,7 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 					break
 				}
 				s.log.Warn("protocol error", "peer", peer, "code", pe.Code, "msg", pe.Message)
-				if _, err := conn.Write(protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
+				if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
 				s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 			}
 				break
@@ -187,7 +209,7 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 		}
 
 		ack := s.handleRequest(req, connID)
-		if _, err := conn.Write(protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
+		if err := s.writeResponse(conn, protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
 			s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 			break
 		}
@@ -211,6 +233,9 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
+			}
+			if errors.Is(err, lock.ErrMaxWaiters) {
+				return &protocol.Ack{Status: "error_max_waiters"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}
@@ -238,6 +263,9 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
 			}
+			if errors.Is(err, lock.ErrMaxWaiters) {
+				return &protocol.Ack{Status: "error_max_waiters"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
@@ -263,6 +291,9 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 			}
 			if errors.Is(err, lock.ErrLimitMismatch) {
 				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
+			if errors.Is(err, lock.ErrMaxWaiters) {
+				return &protocol.Ack{Status: "error_max_waiters"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}
@@ -292,6 +323,9 @@ func (s *Server) handleRequest(req *protocol.Request, connID uint64) *protocol.A
 			}
 			if errors.Is(err, lock.ErrLimitMismatch) {
 				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
+			if errors.Is(err, lock.ErrMaxWaiters) {
+				return &protocol.Ack{Status: "error_max_waiters"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}

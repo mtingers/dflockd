@@ -14,6 +14,7 @@ import (
 
 var (
 	ErrMaxLocks      = errors.New("max locks reached")
+	ErrMaxWaiters    = errors.New("max waiters reached")
 	ErrNotEnqueued   = errors.New("not enqueued for this key")
 	ErrLimitMismatch = errors.New("limit mismatch for semaphore key")
 )
@@ -186,6 +187,10 @@ func (lm *LockManager) FIFOAcquire(key string, timeout, leaseTTL time.Duration, 
 	}
 
 	// Slow path: enqueue and wait
+	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
+		lm.mu.Unlock()
+		return "", ErrMaxWaiters
+	}
 	st.Waiters = append(st.Waiters, waiter)
 	lm.mu.Unlock()
 
@@ -268,6 +273,9 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 	}
 
 	// Slow path: create waiter and enqueue
+	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
+		return "", "", 0, ErrMaxWaiters
+	}
 	waiter := &Waiter{
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
@@ -796,6 +804,10 @@ func (lm *LockManager) SemAcquire(key string, timeout, leaseTTL time.Duration, c
 	}
 
 	// Slow path: enqueue and wait
+	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
+		lm.mu.Unlock()
+		return "", ErrMaxWaiters
+	}
 	st.Waiters = append(st.Waiters, waiter)
 	lm.mu.Unlock()
 
@@ -938,6 +950,9 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 	}
 
 	// Slow path: create waiter and enqueue
+	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
+		return "", "", 0, ErrMaxWaiters
+	}
 	waiter := &Waiter{
 		Ch:       make(chan string, 1),
 		ConnID:   connID,

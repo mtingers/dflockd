@@ -1146,3 +1146,121 @@ func TestSemGC_DoesNotPruneHeld(t *testing.T) {
 		t.Fatal("s1 should not be GC'd (still has holders)")
 	}
 }
+
+// ===========================================================================
+// MaxWaiters tests
+// ===========================================================================
+
+func TestFIFOAcquire_MaxWaiters(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// conn1 holds the lock
+	_, err := lm.FIFOAcquire("k1", 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// conn2 enqueues as waiter (fills the queue)
+	done := make(chan struct{})
+	go func() {
+		lm.FIFOAcquire("k1", 5*time.Second, 30*time.Second, 2)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// conn3 should get ErrMaxWaiters
+	_, err = lm.FIFOAcquire("k1", 5*time.Second, 30*time.Second, 3)
+	if err != ErrMaxWaiters {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+
+	// Cleanup: release so goroutine can finish
+	lm.mu.Lock()
+	tok := lm.locks["k1"].OwnerToken
+	lm.mu.Unlock()
+	lm.FIFORelease("k1", tok)
+	<-done
+}
+
+func TestFIFOEnqueue_MaxWaiters(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// conn1 holds the lock
+	lm.FIFOAcquire("k1", 5*time.Second, 30*time.Second, 1)
+
+	// conn2 enqueues (fills queue)
+	status, _, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// conn3 should get ErrMaxWaiters
+	_, _, _, err = lm.FIFOEnqueue("k1", 30*time.Second, 3)
+	if err != ErrMaxWaiters {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}
+
+func TestSemAcquire_MaxWaiters(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// conn1 holds the single slot
+	_, err := lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// conn2 waits (fills queue)
+	done := make(chan struct{})
+	go func() {
+		lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 2, 1)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// conn3 should get ErrMaxWaiters
+	_, err = lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 3, 1)
+	if err != ErrMaxWaiters {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+
+	// Cleanup
+	lm.mu.Lock()
+	var tok string
+	for t := range lm.sems["s1"].Holders {
+		tok = t
+		break
+	}
+	lm.mu.Unlock()
+	lm.SemRelease("s1", tok)
+	<-done
+}
+
+func TestSemEnqueue_MaxWaiters(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// conn1 holds the slot
+	lm.SemAcquire("s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	// conn2 enqueues (fills queue)
+	status, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// conn3 should get ErrMaxWaiters
+	_, _, _, err = lm.SemEnqueue("s1", 30*time.Second, 3, 1)
+	if err != ErrMaxWaiters {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}

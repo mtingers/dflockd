@@ -30,7 +30,7 @@ go build -o dflockd ./cmd/dflockd
 ./dflockd
 ```
 
-The server listens on `0.0.0.0:6388` by default.
+The server listens on `127.0.0.1:6388` by default.
 
 ## Configuration
 
@@ -38,14 +38,17 @@ All settings can be passed as CLI flags or environment variables. Environment va
 
 | Flag                                                               | Env var                              | Default   | Description                            |
 | ------------------------------------------------------------------ | ------------------------------------ | --------- | -------------------------------------- |
-| `--host`                                                           | `DFLOCKD_HOST`                       | `0.0.0.0` | Bind address                           |
+| `--host`                                                           | `DFLOCKD_HOST`                       | `127.0.0.1` | Bind address                           |
 | `--port`                                                           | `DFLOCKD_PORT`                       | `6388`    | Bind port                              |
 | `--default-lease-ttl`                                              | `DFLOCKD_DEFAULT_LEASE_TTL_S`        | `33`      | Default lock lease duration (seconds)  |
 | `--lease-sweep-interval`                                           | `DFLOCKD_LEASE_SWEEP_INTERVAL_S`     | `1`       | Lease expiry check interval (seconds)  |
 | `--gc-interval`                                                    | `DFLOCKD_GC_LOOP_SLEEP`              | `5`       | Lock state GC interval (seconds)       |
 | `--gc-max-idle`                                                    | `DFLOCKD_GC_MAX_UNUSED_TIME`         | `60`      | Idle seconds before pruning lock state |
 | `--max-locks`                                                      | `DFLOCKD_MAX_LOCKS`                  | `1024`    | Maximum number of unique lock keys     |
+| `--max-connections`                                                | `DFLOCKD_MAX_CONNECTIONS`            | `0`       | Maximum concurrent connections (0 = unlimited) |
+| `--max-waiters`                                                    | `DFLOCKD_MAX_WAITERS`                | `0`       | Maximum waiters per lock/semaphore key (0 = unlimited) |
 | `--read-timeout`                                                   | `DFLOCKD_READ_TIMEOUT_S`             | `23`      | Client read timeout (seconds)          |
+| `--write-timeout`                                                  | `DFLOCKD_WRITE_TIMEOUT_S`            | `5`       | Client write timeout (seconds)         |
 | `--tls-cert`                                                       | `DFLOCKD_TLS_CERT`                   | *(unset)* | Path to TLS certificate PEM file       |
 | `--tls-key`                                                        | `DFLOCKD_TLS_KEY`                    | *(unset)* | Path to TLS private key PEM file       |
 | `--auth-token`                                                     | `DFLOCKD_AUTH_TOKEN`                 | *(unset)* | Shared secret for client authentication |
@@ -120,7 +123,7 @@ The wire protocol is identical to the Python server. Each request is 3 newline-t
 l\n<key>\n<timeout_s> [<lease_ttl_s>]\n
 ```
 
-Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error_max_locks\n`
+Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error_max_locks\n` | `error_max_waiters\n`
 
 **Release (`r`)** — release a held lock.
 
@@ -144,7 +147,7 @@ Response: `ok <seconds_remaining>\n` | `error\n`
 e\n<key>\n[<lease_ttl_s>]\n
 ```
 
-Response: `acquired <token> <lease_ttl>\n` | `queued\n` | `error_max_locks\n`
+Response: `acquired <token> <lease_ttl>\n` | `queued\n` | `error_max_locks\n` | `error_max_waiters\n`
 
 **Wait (`w`)** — block until the enqueued lock is granted (two-phase step 2).
 
@@ -160,7 +163,7 @@ Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error\n`
 sl\n<key>\n<timeout_s> <limit> [<lease_ttl_s>]\n
 ```
 
-Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error_max_locks\n` | `error_limit_mismatch\n`
+Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error_max_locks\n` | `error_limit_mismatch\n` | `error_max_waiters\n`
 
 **Semaphore Release (`sr`)** — release a held semaphore slot.
 
@@ -184,7 +187,7 @@ Response: `ok <seconds_remaining>\n` | `error\n`
 se\n<key>\n<limit> [<lease_ttl_s>]\n
 ```
 
-Response: `acquired <token> <lease_ttl>\n` | `queued\n` | `error_max_locks\n` | `error_limit_mismatch\n`
+Response: `acquired <token> <lease_ttl>\n` | `queued\n` | `error_max_locks\n` | `error_limit_mismatch\n` | `error_max_waiters\n`
 
 **Semaphore Wait (`sw`)** — block until the enqueued semaphore slot is granted (two-phase step 2).
 

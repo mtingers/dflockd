@@ -28,6 +28,7 @@ func testConfig() *config.Config {
 		GCMaxIdleTime:           60 * time.Second,
 		MaxLocks:                1024,
 		ReadTimeout:             5 * time.Second,
+		WriteTimeout:            5 * time.Second,
 		AutoReleaseOnDisconnect: true,
 	}
 }
@@ -1319,5 +1320,238 @@ func TestIntegration_Auth_NotRequired(t *testing.T) {
 	parts := strings.Fields(resp)
 	if len(parts) != 3 || parts[0] != "ok" {
 		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+}
+
+// ===========================================================================
+// Max connections integration tests
+// ===========================================================================
+
+func TestIntegration_MaxConnections(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxConnections = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Connect 2 clients
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+
+	// Verify both work
+	resp := connSendCmd(t, conn1, r1, "l", "key1", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("conn1 lock: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn2, r2, "l", "key2", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("conn2 lock: expected ok, got %q", resp)
+	}
+
+	// Give server time to register connections
+	time.Sleep(50 * time.Millisecond)
+
+	// Third connection should be rejected (closed immediately)
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn3.Close()
+	conn3.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	_, err = conn3.Read(buf)
+	if err == nil {
+		t.Fatal("expected conn3 to be closed by server")
+	}
+
+	// Disconnect one client
+	conn1.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// New connection should now succeed
+	conn4, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn4.Close()
+	r4 := bufio.NewReader(conn4)
+	resp = connSendCmd(t, conn4, r4, "l", "key3", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("conn4 lock: expected ok, got %q", resp)
+	}
+}
+
+// ===========================================================================
+// Max waiters integration tests
+// ===========================================================================
+
+func TestIntegration_MaxWaiters_Lock(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxWaiters = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires the lock
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, r1, "l", "mykey", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+
+	// conn2 waits (fills the 1-waiter queue) — do this in background
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	go func() {
+		msg := "l\nmykey\n10\n"
+		conn2.Write([]byte(msg))
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// conn3 tries to wait — should get error_max_waiters
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn3.Close()
+	r3 := bufio.NewReader(conn3)
+	resp = connSendCmd(t, conn3, r3, "l", "mykey", "10")
+	if resp != "error_max_waiters" {
+		t.Fatalf("expected 'error_max_waiters', got %q", resp)
+	}
+}
+
+func TestIntegration_MaxWaiters_Enqueue(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxWaiters = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, r1, "l", "mykey", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+
+	// conn2 enqueues (fills the 1-waiter queue)
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+	resp = connSendCmd(t, conn2, r2, "e", "mykey", "")
+	if resp != "queued" {
+		t.Fatalf("expected 'queued', got %q", resp)
+	}
+
+	// conn3 enqueues — should get error_max_waiters
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn3.Close()
+	r3 := bufio.NewReader(conn3)
+	resp = connSendCmd(t, conn3, r3, "e", "mykey", "")
+	if resp != "error_max_waiters" {
+		t.Fatalf("expected 'error_max_waiters', got %q", resp)
+	}
+}
+
+func TestIntegration_MaxWaiters_Sem(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxWaiters = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires sem slot (limit=1)
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, r1, "sl", "sem1", "10 1")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+
+	// conn2 waits (fills queue)
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	go func() {
+		msg := "sl\nsem1\n10 1\n"
+		conn2.Write([]byte(msg))
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// conn3 should get error_max_waiters
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn3.Close()
+	r3 := bufio.NewReader(conn3)
+	resp = connSendCmd(t, conn3, r3, "sl", "sem1", "10 1")
+	if resp != "error_max_waiters" {
+		t.Fatalf("expected 'error_max_waiters', got %q", resp)
+	}
+}
+
+// ===========================================================================
+// Write timeout integration tests
+// ===========================================================================
+
+func TestIntegration_WriteTimeout(t *testing.T) {
+	// Verify that write timeout doesn't interfere with normal operations
+	cfg := testConfig()
+	cfg.WriteTimeout = 1 * time.Second
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Normal operations should work fine with write timeout set
+	resp := connSendCmd(t, conn, reader, "l", "mykey", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+	token := parts[1]
+
+	resp = connSendCmd(t, conn, reader, "r", "mykey", token)
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
 	}
 }

@@ -16,7 +16,10 @@ type Config struct {
 	GCInterval              time.Duration
 	GCMaxIdleTime           time.Duration
 	MaxLocks                int
+	MaxConnections          int
+	MaxWaiters              int
 	ReadTimeout             time.Duration
+	WriteTimeout            time.Duration
 	AutoReleaseOnDisconnect bool
 	Debug                   bool
 	Version                 bool
@@ -56,14 +59,17 @@ func envString(key string, def string) string {
 
 func Load() *Config {
 	// CLI flags (defaults match Python)
-	host := flag.String("host", "0.0.0.0", "Bind address")
+	host := flag.String("host", "127.0.0.1", "Bind address")
 	port := flag.Int("port", 6388, "Bind port")
 	defaultLeaseTTL := flag.Int("default-lease-ttl", 33, "Default lock lease duration (seconds)")
 	leaseSweepInterval := flag.Int("lease-sweep-interval", 1, "Lease expiry check interval (seconds)")
 	gcInterval := flag.Int("gc-interval", 5, "Lock state GC interval (seconds)")
 	gcMaxIdle := flag.Int("gc-max-idle", 60, "Idle seconds before pruning lock state")
 	maxLocks := flag.Int("max-locks", 1024, "Maximum number of unique lock keys")
+	maxConnections := flag.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
+	maxWaiters := flag.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
 	readTimeout := flag.Int("read-timeout", 23, "Client read timeout (seconds)")
+	writeTimeout := flag.Int("write-timeout", 5, "Client write timeout (seconds)")
 	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate PEM file")
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key PEM file")
@@ -110,10 +116,25 @@ func Load() *Config {
 	} else {
 		cfg.MaxLocks = *maxLocks
 	}
+	if os.Getenv("DFLOCKD_MAX_CONNECTIONS") != "" {
+		cfg.MaxConnections = envInt("DFLOCKD_MAX_CONNECTIONS", *maxConnections)
+	} else {
+		cfg.MaxConnections = *maxConnections
+	}
+	if os.Getenv("DFLOCKD_MAX_WAITERS") != "" {
+		cfg.MaxWaiters = envInt("DFLOCKD_MAX_WAITERS", *maxWaiters)
+	} else {
+		cfg.MaxWaiters = *maxWaiters
+	}
 	if os.Getenv("DFLOCKD_READ_TIMEOUT_S") != "" {
 		cfg.ReadTimeout = time.Duration(envInt("DFLOCKD_READ_TIMEOUT_S", *readTimeout)) * time.Second
 	} else {
 		cfg.ReadTimeout = time.Duration(*readTimeout) * time.Second
+	}
+	if os.Getenv("DFLOCKD_WRITE_TIMEOUT_S") != "" {
+		cfg.WriteTimeout = time.Duration(envInt("DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout)) * time.Second
+	} else {
+		cfg.WriteTimeout = time.Duration(*writeTimeout) * time.Second
 	}
 	if os.Getenv("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT") != "" {
 		cfg.AutoReleaseOnDisconnect = envBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)
