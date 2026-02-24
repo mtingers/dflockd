@@ -30,7 +30,7 @@ type Request struct {
 }
 
 type Ack struct {
-	Status   string // "ok", "acquired", "queued", "error", "error_max_locks", "timeout"
+	Status   string // "ok", "acquired", "queued", "timeout", "error", "error_auth", "error_max_locks", "error_max_waiters", "error_limit_mismatch", "error_not_enqueued", "error_already_enqueued"
 	Token    string
 	LeaseTTL int // seconds; 0 means not set
 	Extra    string

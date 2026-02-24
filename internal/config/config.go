@@ -178,6 +178,12 @@ func (c *Config) validate() error {
 	if c.ReadTimeout <= 0 {
 		return fmt.Errorf("--read-timeout must be > 0")
 	}
+	if c.WriteTimeout < 0 {
+		return fmt.Errorf("--write-timeout must be >= 0 (got %s)", c.WriteTimeout)
+	}
+	if c.ShutdownTimeout < 0 {
+		return fmt.Errorf("--shutdown-timeout must be >= 0 (got %s)", c.ShutdownTimeout)
+	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("--port must be 0-65535 (got %d)", c.Port)
 	}

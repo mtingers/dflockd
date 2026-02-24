@@ -184,6 +184,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 		req, err := protocol.ReadRequest(reader, s.cfg.ReadTimeout, conn, defaultLeaseTTL)
 		if err != nil || req.Cmd != "auth" ||
 			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
+			s.log.Warn("auth failed", "peer", peer, "conn_id", connID)
 			s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
 			// Small delay to slow down brute-force attempts.
 			time.Sleep(100 * time.Millisecond)
@@ -277,6 +278,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
 			}
+			if errors.Is(err, lock.ErrAlreadyEnqueued) {
+				return &protocol.Ack{Status: "error_already_enqueued"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
@@ -337,6 +341,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
+			}
+			if errors.Is(err, lock.ErrAlreadyEnqueued) {
+				return &protocol.Ack{Status: "error_already_enqueued"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}

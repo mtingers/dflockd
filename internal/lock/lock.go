@@ -13,10 +13,11 @@ import (
 )
 
 var (
-	ErrMaxLocks      = errors.New("max locks reached")
-	ErrMaxWaiters    = errors.New("max waiters reached")
-	ErrNotEnqueued   = errors.New("not enqueued for this key")
-	ErrLimitMismatch = errors.New("limit mismatch for semaphore key")
+	ErrMaxLocks        = errors.New("max locks reached")
+	ErrMaxWaiters      = errors.New("max waiters reached")
+	ErrNotEnqueued     = errors.New("not enqueued for this key")
+	ErrAlreadyEnqueued = errors.New("already enqueued for this key")
+	ErrLimitMismatch   = errors.New("limit mismatch for semaphore key")
 )
 
 type connKey struct {
@@ -45,7 +46,6 @@ type EnqueuedState struct {
 }
 
 type SemHolder struct {
-	Token        string
 	ConnID       uint64
 	LeaseExpires time.Time
 }
@@ -200,7 +200,6 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-
 	}
 
 	lm.mu.Lock()
@@ -307,7 +306,7 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 	defer lm.mu.Unlock()
 
 	if _, exists := lm.connEnqueued[eqKey]; exists {
-		return "", "", 0, &alreadyEnqueuedError{}
+		return "", "", 0, ErrAlreadyEnqueued
 	}
 
 	st, err := lm.getOrCreateLocked(key)
@@ -338,24 +337,12 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-
 	}
 	st.Waiters = append(st.Waiters, waiter)
 	lm.connEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}
 	return "queued", "", 0, nil
 }
 
-type alreadyEnqueuedError struct{}
-
-func (e *alreadyEnqueuedError) Error() string {
-	return "already enqueued for this key"
-}
-
-// IsAlreadyEnqueued checks if the error is an already-enqueued error.
-func IsAlreadyEnqueued(err error) bool {
-	var ae *alreadyEnqueuedError
-	return errors.As(err, &ae)
-}
 
 // FIFOWait is phase 2 of two-phase acquire (command "w").
 // Returns (token, leaseTTLSec, err). Empty token means timeout.
@@ -419,8 +406,8 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 
 	select {
 	case token, ok := <-waiter.Ch:
-		if !ok {
-			// Channel closed (disconnect cleanup)
+		if !ok || token == "" {
+			// Channel closed (disconnect cleanup) or empty token
 			lm.mu.Lock()
 			delete(lm.connEnqueued, eqKey)
 			lm.mu.Unlock()
@@ -839,7 +826,6 @@ func (lm *LockManager) semGrantNextWaiterLocked(key string, st *SemState) {
 		select {
 		case w.Ch <- token:
 			st.Holders[token] = &SemHolder{
-				Token:        token,
 				ConnID:       w.ConnID,
 				LeaseExpires: time.Now().Add(w.LeaseTTL),
 			}
@@ -862,7 +848,6 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-
 	}
 
 	lm.mu.Lock()
@@ -878,7 +863,6 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
 		token := newToken()
 		st.Holders[token] = &SemHolder{
-			Token:        token,
 			ConnID:       connID,
 			LeaseExpires: time.Now().Add(leaseTTL),
 		}
@@ -1028,7 +1012,7 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 	defer lm.mu.Unlock()
 
 	if _, exists := lm.connSemEnqueued[eqKey]; exists {
-		return "", "", 0, &alreadyEnqueuedError{}
+		return "", "", 0, ErrAlreadyEnqueued
 	}
 
 	st, err := lm.semGetOrCreateLocked(key, limit)
@@ -1043,7 +1027,6 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
 		token := newToken()
 		st.Holders[token] = &SemHolder{
-			Token:        token,
 			ConnID:       connID,
 			LeaseExpires: time.Now().Add(leaseTTL),
 		}
@@ -1061,7 +1044,6 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-
 	}
 	st.Waiters = append(st.Waiters, waiter)
 	lm.connSemEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}
@@ -1125,7 +1107,8 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 
 	select {
 	case token, ok := <-waiter.Ch:
-		if !ok {
+		if !ok || token == "" {
+			// Channel closed (disconnect cleanup) or empty token
 			lm.mu.Lock()
 			delete(lm.connSemEnqueued, eqKey)
 			lm.mu.Unlock()

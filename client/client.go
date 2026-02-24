@@ -17,13 +17,14 @@ import (
 
 // Sentinel errors returned by protocol operations.
 var (
-	ErrTimeout       = errors.New("dflockd: timeout")
-	ErrMaxLocks      = errors.New("dflockd: max locks reached")
-	ErrMaxWaiters    = errors.New("dflockd: max waiters reached")
-	ErrServer        = errors.New("dflockd: server error")
-	ErrNotQueued     = errors.New("dflockd: not enqueued")
-	ErrLimitMismatch = errors.New("dflockd: limit mismatch")
-	ErrAuth          = errors.New("dflockd: authentication failed")
+	ErrTimeout        = errors.New("dflockd: timeout")
+	ErrMaxLocks       = errors.New("dflockd: max locks reached")
+	ErrMaxWaiters     = errors.New("dflockd: max waiters reached")
+	ErrServer         = errors.New("dflockd: server error")
+	ErrNotQueued      = errors.New("dflockd: not enqueued")
+	ErrAlreadyQueued  = errors.New("dflockd: already enqueued")
+	ErrLimitMismatch  = errors.New("dflockd: limit mismatch")
+	ErrAuth           = errors.New("dflockd: authentication failed")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -157,6 +158,21 @@ func Authenticate(c *Conn, token string) error {
 	return nil
 }
 
+// validateKey checks that a key is non-empty and contains no whitespace.
+// This mirrors the server-side validation and gives immediate feedback
+// instead of a protocol-level rejection.
+func validateKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("dflockd: empty key")
+	}
+	for _, c := range key {
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			return fmt.Errorf("dflockd: key contains whitespace")
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Low-level protocol functions
 // ---------------------------------------------------------------------------
@@ -165,6 +181,9 @@ func Authenticate(c *Conn, token string) error {
 // lock is acquired or acquireTimeout expires. Returns the token, lease TTL in
 // seconds, and any error. Returns ErrTimeout if the server reports a timeout.
 func Acquire(c *Conn, key string, acquireTimeout time.Duration, opts ...Option) (token string, leaseTTL int, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -183,6 +202,9 @@ func Acquire(c *Conn, key string, acquireTimeout time.Duration, opts ...Option) 
 
 // Release sends a release ("r") command for the given key and token.
 func Release(c *Conn, key, token string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("r", key, token)
 	if err != nil {
 		return err
@@ -195,6 +217,9 @@ func Release(c *Conn, key, token string) error {
 
 // Renew sends a renew ("n") command and returns the remaining lease seconds.
 func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -223,6 +248,9 @@ func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error
 // Enqueue sends an enqueue ("e") command. Returns the status ("acquired" or
 // "queued"), and if acquired, the token and lease TTL.
 func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTTL int, err error) {
+	if err := validateKey(key); err != nil {
+		return "", "", 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -246,6 +274,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	if resp == "error_max_waiters" {
 		return "", "", 0, ErrMaxWaiters
 	}
+	if resp == "error_already_enqueued" {
+		return "", "", 0, ErrAlreadyQueued
+	}
 
 	parts := strings.Fields(resp)
 	if len(parts) == 3 && parts[0] == "acquired" {
@@ -262,6 +293,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 // lock is granted or waitTimeout expires. Returns the token, lease TTL, and
 // any error. Returns ErrTimeout on timeout, ErrNotQueued if not enqueued.
 func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTTL int, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, err
+	}
 	arg := strconv.Itoa(int(waitTimeout.Seconds()))
 	resp, err := c.sendRecv("w", key, arg)
 	if err != nil {
@@ -284,6 +318,9 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 // lease TTL in seconds, and any error. Returns ErrTimeout on timeout,
 // ErrLimitMismatch if the limit doesn't match the existing semaphore.
 func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, opts ...Option) (token string, leaseTTL int, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -302,6 +339,9 @@ func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, op
 
 // SemRelease sends a semaphore release ("sr") command for the given key and token.
 func SemRelease(c *Conn, key, token string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("sr", key, token)
 	if err != nil {
 		return err
@@ -314,6 +354,9 @@ func SemRelease(c *Conn, key, token string) error {
 
 // SemRenew sends a semaphore renew ("sn") command and returns the remaining lease seconds.
 func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -342,6 +385,9 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 // SemEnqueue sends a semaphore enqueue ("se") command. Returns the status
 // ("acquired" or "queued"), and if acquired, the token and lease TTL.
 func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token string, leaseTTL int, err error) {
+	if err := validateKey(key); err != nil {
+		return "", "", 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -368,6 +414,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	if resp == "error_limit_mismatch" {
 		return "", "", 0, ErrLimitMismatch
 	}
+	if resp == "error_already_enqueued" {
+		return "", "", 0, ErrAlreadyQueued
+	}
 
 	parts := strings.Fields(resp)
 	if len(parts) == 3 && parts[0] == "acquired" {
@@ -382,6 +431,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 
 // SemWait sends a semaphore wait ("sw") command after a prior SemEnqueue.
 func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTTL int, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, err
+	}
 	arg := strconv.Itoa(int(waitTimeout.Seconds()))
 	resp, err := c.sendRecv("sw", key, arg)
 	if err != nil {
@@ -555,6 +607,7 @@ func (l *Lock) connect() error {
 // connection is closed which unblocks the server-side wait.
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	l.mu.Lock()
+	l.stopRenew()
 	if err := l.connect(); err != nil {
 		l.mu.Unlock()
 		return false, err
@@ -606,6 +659,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 // is closed which unblocks any in-progress server I/O.
 func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	l.mu.Lock()
+	l.stopRenew()
 	if err := l.connect(); err != nil {
 		l.mu.Unlock()
 		return "", err
@@ -905,6 +959,7 @@ func (s *Semaphore) connect() error {
 // background lease renewal. Returns false (with nil error) on timeout.
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	s.mu.Lock()
+	s.stopRenew()
 	if err := s.connect(); err != nil {
 		s.mu.Unlock()
 		return false, err
@@ -953,6 +1008,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 // is closed which unblocks any in-progress server I/O.
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	s.mu.Lock()
+	s.stopRenew()
 	if err := s.connect(); err != nil {
 		s.mu.Unlock()
 		return "", err

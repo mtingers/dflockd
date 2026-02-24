@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -316,8 +317,8 @@ func TestFIFOEnqueue_DoubleEnqueue(t *testing.T) {
 	if err == nil {
 		t.Fatal("double enqueue should error")
 	}
-	if !IsAlreadyEnqueued(err) {
-		t.Fatalf("expected already-enqueued error, got %v", err)
+	if !errors.Is(err, ErrAlreadyEnqueued) {
+		t.Fatalf("expected ErrAlreadyEnqueued, got %v", err)
 	}
 }
 
@@ -1003,8 +1004,8 @@ func TestSemEnqueue_DoubleEnqueue(t *testing.T) {
 	if err == nil {
 		t.Fatal("double enqueue should error")
 	}
-	if !IsAlreadyEnqueued(err) {
-		t.Fatalf("expected already-enqueued error, got %v", err)
+	if !errors.Is(err, ErrAlreadyEnqueued) {
+		t.Fatalf("expected ErrAlreadyEnqueued, got %v", err)
 	}
 }
 
