@@ -662,8 +662,13 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 			l.conn = nil
 			return false, nil
 		}
-		// If context was cancelled, the conn.Close may have caused an I/O error.
+		// If context was cancelled, the conn.Close in the cancellation
+		// goroutine may have caused this I/O error — but the goroutine
+		// is not guaranteed to have run (select is non-deterministic when
+		// both done and ctx.Done() are ready). Always close to avoid a
+		// leaked FD; double-close on net.Conn is harmless.
 		if ctx.Err() != nil {
+			l.conn.Close()
 			l.conn = nil
 			return false, ctx.Err()
 		}
@@ -719,6 +724,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 
 	if err != nil {
 		if ctx.Err() != nil {
+			l.conn.Close()
 			l.conn = nil
 			return "", ctx.Err()
 		}
@@ -778,6 +784,7 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 			return false, nil
 		}
 		if ctx.Err() != nil {
+			l.conn.Close()
 			l.conn = nil
 			return false, ctx.Err()
 		}
@@ -1047,6 +1054,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		if ctx.Err() != nil {
+			s.conn.Close()
 			s.conn = nil
 			return false, ctx.Err()
 		}
@@ -1099,6 +1107,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 
 	if err != nil {
 		if ctx.Err() != nil {
+			s.conn.Close()
 			s.conn = nil
 			return "", ctx.Err()
 		}
@@ -1157,6 +1166,7 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 			return false, nil
 		}
 		if ctx.Err() != nil {
+			s.conn.Close()
 			s.conn = nil
 			return false, ctx.Err()
 		}
