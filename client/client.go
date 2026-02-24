@@ -674,8 +674,9 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 	// Guard against the cancellation goroutine closing the connection
 	// after the operation succeeded (race between close(done) and ctx.Done()).
+	// Don't attempt Release — the cancellation goroutine may have already
+	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		Release(l.conn, l.Key, token)
 		l.conn.Close()
 		l.conn = nil
 		return false, ctx.Err()
@@ -726,10 +727,9 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Don't attempt Release — the cancellation goroutine may have already
+	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		if status == "acquired" {
-			Release(l.conn, l.Key, token)
-		}
 		l.conn.Close()
 		l.conn = nil
 		return "", ctx.Err()
@@ -786,8 +786,9 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 		return false, err
 	}
 
+	// Don't attempt Release — the cancellation goroutine may have already
+	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		Release(l.conn, l.Key, token)
 		l.conn.Close()
 		l.conn = nil
 		return false, ctx.Err()
@@ -1054,8 +1055,9 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
+	// Don't attempt SemRelease — the cancellation goroutine may have already
+	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		SemRelease(s.conn, s.Key, token)
 		s.conn.Close()
 		s.conn = nil
 		return false, ctx.Err()
@@ -1105,10 +1107,9 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	// Don't attempt SemRelease — the cancellation goroutine may have already
+	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		if status == "acquired" {
-			SemRelease(s.conn, s.Key, token)
-		}
 		s.conn.Close()
 		s.conn = nil
 		return "", ctx.Err()
@@ -1164,8 +1165,9 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 		return false, err
 	}
 
+	// Don't attempt SemRelease — the cancellation goroutine may have already
+	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		SemRelease(s.conn, s.Key, token)
 		s.conn.Close()
 		s.conn = nil
 		return false, ctx.Err()
