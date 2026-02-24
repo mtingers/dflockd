@@ -49,6 +49,7 @@ All settings can be passed as CLI flags or environment variables. Environment va
 | `--max-waiters`                                                    | `DFLOCKD_MAX_WAITERS`                | `0`       | Maximum waiters per lock/semaphore key (0 = unlimited) |
 | `--read-timeout`                                                   | `DFLOCKD_READ_TIMEOUT_S`             | `23`      | Client read timeout (seconds)          |
 | `--write-timeout`                                                  | `DFLOCKD_WRITE_TIMEOUT_S`            | `5`       | Client write timeout (seconds)         |
+| `--shutdown-timeout`                                               | `DFLOCKD_SHUTDOWN_TIMEOUT_S`         | `30`      | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
 | `--tls-cert`                                                       | `DFLOCKD_TLS_CERT`                   | *(unset)* | Path to TLS certificate PEM file       |
 | `--tls-key`                                                        | `DFLOCKD_TLS_KEY`                    | *(unset)* | Path to TLS private key PEM file       |
 | `--auth-token`                                                     | `DFLOCKD_AUTH_TOKEN`                 | *(unset)* | Shared secret for client authentication |

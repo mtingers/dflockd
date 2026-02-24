@@ -1525,6 +1525,118 @@ func TestIntegration_MaxWaiters_Sem(t *testing.T) {
 }
 
 // ===========================================================================
+// Graceful shutdown integration tests
+// ===========================================================================
+
+func TestIntegration_GracefulShutdown_DrainCompletes(t *testing.T) {
+	cfg := testConfig()
+	cfg.ShutdownTimeout = 5 * time.Second
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, ln)
+	}()
+
+	// Connect a client and acquire a lock
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "l", "mykey", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "ok" {
+		t.Fatalf("expected 'ok <token> <lease>', got %q", resp)
+	}
+	token := parts[1]
+
+	// Release the lock and close the connection so drain completes
+	connSendCmd(t, conn, reader, "r", "mykey", token)
+	conn.Close()
+
+	// Cancel context to trigger shutdown
+	cancel()
+
+	// Server should drain and exit cleanly within the timeout
+	select {
+	case <-done:
+		// success
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not shut down within expected time")
+	}
+}
+
+func TestIntegration_GracefulShutdown_ForceClose(t *testing.T) {
+	cfg := testConfig()
+	cfg.ShutdownTimeout = 100 * time.Millisecond
+	cfg.ReadTimeout = 30 * time.Second // long read timeout so client blocks
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, ln)
+	}()
+
+	// conn1 acquires the lock
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, r1, "l", "mykey", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+
+	// conn2 sends a blocking lock request (will wait for conn1's lock)
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	// Write the lock request — it will block waiting for the lock
+	fmt.Fprintf(conn2, "l\nmykey\n30\n")
+
+	// Give the server time to accept both connections
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel context to trigger shutdown
+	cancel()
+
+	// Server should force-close connections and exit within ~shutdown timeout
+	select {
+	case <-done:
+		// success
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not shut down within expected time after force-close")
+	}
+}
+
+// ===========================================================================
 // Write timeout integration tests
 // ===========================================================================
 

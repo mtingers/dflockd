@@ -20,6 +20,7 @@ type Config struct {
 	MaxWaiters              int
 	ReadTimeout             time.Duration
 	WriteTimeout            time.Duration
+	ShutdownTimeout         time.Duration
 	AutoReleaseOnDisconnect bool
 	Debug                   bool
 	Version                 bool
@@ -70,6 +71,7 @@ func Load() *Config {
 	maxWaiters := flag.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
 	readTimeout := flag.Int("read-timeout", 23, "Client read timeout (seconds)")
 	writeTimeout := flag.Int("write-timeout", 5, "Client write timeout (seconds)")
+	shutdownTimeout := flag.Int("shutdown-timeout", 30, "Graceful shutdown drain timeout (seconds, 0 = wait forever)")
 	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate PEM file")
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key PEM file")
@@ -135,6 +137,11 @@ func Load() *Config {
 		cfg.WriteTimeout = time.Duration(envInt("DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout)) * time.Second
 	} else {
 		cfg.WriteTimeout = time.Duration(*writeTimeout) * time.Second
+	}
+	if os.Getenv("DFLOCKD_SHUTDOWN_TIMEOUT_S") != "" {
+		cfg.ShutdownTimeout = time.Duration(envInt("DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout)) * time.Second
+	} else {
+		cfg.ShutdownTimeout = time.Duration(*shutdownTimeout) * time.Second
 	}
 	if os.Getenv("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT") != "" {
 		cfg.AutoReleaseOnDisconnect = envBool("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)

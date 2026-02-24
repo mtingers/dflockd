@@ -31,6 +31,7 @@
 | `--max-waiters` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
 | `--read-timeout` | `23` | Client read timeout (seconds) |
 | `--write-timeout` | `5` | Client write timeout (seconds) |
+| `--shutdown-timeout` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
 | `--tls-cert` | *(unset)* | Path to TLS certificate PEM file |
 | `--tls-key` | *(unset)* | Path to TLS private key PEM file |
 | `--auth-token` | *(unset)* | Shared secret for client authentication |
@@ -54,6 +55,7 @@ All settings can be configured via environment variables. Environment variables 
 | `DFLOCKD_MAX_WAITERS` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
 | `DFLOCKD_WRITE_TIMEOUT_S` | `5` | Client write timeout (seconds) |
+| `DFLOCKD_SHUTDOWN_TIMEOUT_S` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
 | `DFLOCKD_TLS_CERT` | *(unset)* | Path to TLS certificate PEM file |
 | `DFLOCKD_TLS_KEY` | *(unset)* | Path to TLS private key PEM file |
 | `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for client authentication |
@@ -91,6 +93,15 @@ The `read-timeout` controls how long the server waits for a client to send a com
 ### Write timeout
 
 The `write-timeout` controls how long the server waits for a response write to complete. If a client is reading slowly (or not at all), the write will fail after this deadline and the connection is closed. This prevents slow-reading clients from blocking server goroutines indefinitely.
+
+### Shutdown timeout
+
+The `shutdown-timeout` controls the maximum time the server waits for active connections to finish during graceful shutdown (SIGINT/SIGTERM). When the timeout expires, any remaining connections are force-closed.
+
+- **Default (30s)**: suitable for most workloads. Gives clients time to finish in-flight operations.
+- **Shorter timeout** (e.g. 5s): faster shutdown, useful in container orchestration where a SIGKILL follows after a grace period.
+- **Longer timeout** (e.g. 120s): for workloads with long-running lock acquisitions.
+- **0**: wait forever (no deadline). The server blocks until all clients disconnect naturally. This matches pre-1.8.0 behavior.
 
 ### Max connections
 

@@ -25,6 +25,7 @@ type Server struct {
 	log       *slog.Logger
 	connSeq   atomic.Uint64
 	connCount atomic.Int64
+	conns     sync.Map // net.Conn → struct{}
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
@@ -59,7 +60,16 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.log.Info("listening", "addr", addr)
+	return s.serve(ctx, listener)
+}
 
+// RunOnListener starts the server on a pre-existing listener (for testing).
+func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error {
+	s.log.Info("listening", "addr", listener.Addr())
+	return s.serve(ctx, listener)
+}
+
+func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 	var wg sync.WaitGroup
 
 	// Background loops
@@ -84,7 +94,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				wg.Wait()
+				s.drain(&wg)
 				return nil
 			default:
 				s.log.Error("accept error", "err", err)
@@ -105,50 +115,34 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// RunOnListener starts the server on a pre-existing listener (for testing).
-func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error {
-	s.log.Info("listening", "addr", listener.Addr())
+// drain waits for all goroutines to finish, force-closing connections if the
+// shutdown timeout expires.
+func (s *Server) drain(wg *sync.WaitGroup) {
+	s.log.Info("shutting down, draining connections")
 
-	var wg sync.WaitGroup
+	if s.cfg.ShutdownTimeout <= 0 {
+		wg.Wait()
+		return
+	}
 
-	wg.Add(2)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		s.lm.LeaseExpiryLoop(ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		s.lm.GCLoop(ctx)
-	}()
-
-	go func() {
-		<-ctx.Done()
-		listener.Close()
+		wg.Wait()
+		close(done)
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				wg.Wait()
-				return nil
-			default:
-				s.log.Error("accept error", "err", err)
-				continue
+	select {
+	case <-done:
+		return
+	case <-time.After(s.cfg.ShutdownTimeout):
+		s.log.Warn("shutdown timeout reached, force-closing connections")
+		s.conns.Range(func(key, _ any) bool {
+			if c, ok := key.(net.Conn); ok {
+				c.Close()
 			}
-		}
-		if max := s.cfg.MaxConnections; max > 0 && s.connCount.Load() >= int64(max) {
-			s.log.Warn("max connections reached, rejecting", "max", max)
-			conn.Close()
-			continue
-		}
-		connID := s.connSeq.Add(1)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handleConn(conn, connID)
-		}()
+			return true
+		})
+		wg.Wait()
 	}
 }
 
@@ -167,8 +161,10 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 	peer := conn.RemoteAddr().String()
 	s.log.Debug("client connected", "peer", peer, "conn_id", connID)
 	s.connCount.Add(1)
+	s.conns.Store(conn, struct{}{})
 
 	defer func() {
+		s.conns.Delete(conn)
 		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
 		conn.Close()
@@ -200,8 +196,8 @@ func (s *Server) handleConn(conn net.Conn, connID uint64) {
 				}
 				s.log.Warn("protocol error", "peer", peer, "code", pe.Code, "msg", pe.Message)
 				if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
-				s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
-			}
+					s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
+				}
 				break
 			}
 			s.log.Error("read error", "peer", peer, "err", err)

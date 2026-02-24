@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.8.0] - 2026-02-24
+
+### Added
+
+- Graceful shutdown drain with configurable timeout: active connections are given time to finish before being force-closed
+- `--shutdown-timeout` flag and `DFLOCKD_SHUTDOWN_TIMEOUT_S` env var (default: 30 seconds, 0 = wait forever)
+- Connection tracking via `sync.Map` to enable force-close on shutdown deadline
+- Integration tests for graceful shutdown drain and force-close scenarios
+
+### Fixed
+
+- Indentation bug in protocol error write block (`server.go:202-204`)
+
+### Changed
+
+- Extracted shared accept-loop and shutdown logic into private `serve()` method, eliminating duplication between `Run` and `RunOnListener`
+
+[v1.8.0]: https://github.com/mtingers/dflockd/releases/tag/v1.8.0
+
 ## [v1.7.0] - 2026-02-24
 
 ### Added
