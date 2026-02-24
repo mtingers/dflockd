@@ -193,5 +193,8 @@ func (c *Config) validate() error {
 	if c.MaxWaiters < 0 {
 		return fmt.Errorf("--max-waiters must be >= 0 (got %d)", c.MaxWaiters)
 	}
+	if c.GCMaxIdleTime < 0 {
+		return fmt.Errorf("--gc-max-idle must be >= 0 (got %s)", c.GCMaxIdleTime)
+	}
 	return nil
 }

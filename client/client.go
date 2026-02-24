@@ -173,6 +173,19 @@ func validateKey(key string) error {
 	return nil
 }
 
+// secondsCeil converts a duration to whole seconds, rounding up so that
+// sub-second durations are not silently truncated to zero.
+func secondsCeil(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	s := int(d / time.Second)
+	if d%time.Second != 0 {
+		s++
+	}
+	return s
+}
+
 // ---------------------------------------------------------------------------
 // Low-level protocol functions
 // ---------------------------------------------------------------------------
@@ -188,7 +201,7 @@ func Acquire(c *Conn, key string, acquireTimeout time.Duration, opts ...Option) 
 	for _, fn := range opts {
 		fn(&o)
 	}
-	arg := strconv.Itoa(int(acquireTimeout.Seconds()))
+	arg := strconv.Itoa(secondsCeil(acquireTimeout))
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
 	}
@@ -296,7 +309,7 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
-	arg := strconv.Itoa(int(waitTimeout.Seconds()))
+	arg := strconv.Itoa(secondsCeil(waitTimeout))
 	resp, err := c.sendRecv("w", key, arg)
 	if err != nil {
 		return "", 0, err
@@ -325,7 +338,7 @@ func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, op
 	for _, fn := range opts {
 		fn(&o)
 	}
-	arg := strconv.Itoa(int(acquireTimeout.Seconds())) + " " + strconv.Itoa(limit)
+	arg := strconv.Itoa(secondsCeil(acquireTimeout)) + " " + strconv.Itoa(limit)
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
 	}
@@ -434,7 +447,7 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
-	arg := strconv.Itoa(int(waitTimeout.Seconds()))
+	arg := strconv.Itoa(secondsCeil(waitTimeout))
 	resp, err := c.sendRecv("sw", key, arg)
 	if err != nil {
 		return "", 0, err
@@ -702,6 +715,8 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 
 // Wait performs the second phase of two-phase locking. Must be called after
 // Enqueue returned "queued". Returns false (with nil error) on timeout.
+// On timeout the connection is closed; the caller must call Enqueue again
+// to re-enter the queue.
 func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	l.mu.Lock()
 	if l.conn == nil {
@@ -780,6 +795,7 @@ func (l *Lock) Release(ctx context.Context) error {
 	l.conn.Close()
 	l.conn = nil
 	l.token = ""
+	l.lease = 0
 	return err
 }
 
@@ -798,6 +814,7 @@ func (l *Lock) Close() error {
 	err := l.conn.Close()
 	l.conn = nil
 	l.token = ""
+	l.lease = 0
 	return err
 }
 
@@ -1050,6 +1067,8 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 }
 
 // Wait performs the second phase of two-phase semaphore acquire.
+// Returns false (with nil error) on timeout. On timeout the connection is
+// closed; the caller must call Enqueue again to re-enter the queue.
 func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	s.mu.Lock()
 	if s.conn == nil {
@@ -1125,6 +1144,7 @@ func (s *Semaphore) Release(ctx context.Context) error {
 	s.conn.Close()
 	s.conn = nil
 	s.token = ""
+	s.lease = 0
 	return err
 }
 
@@ -1142,6 +1162,7 @@ func (s *Semaphore) Close() error {
 	err := s.conn.Close()
 	s.conn = nil
 	s.token = ""
+	s.lease = 0
 	return err
 }
 

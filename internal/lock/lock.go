@@ -254,7 +254,10 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 
 	case <-ctx.Done():
 		lm.mu.Lock()
-		// Race check: token may have arrived
+		// Race check: token may have arrived between ctx cancellation
+		// and acquiring the mutex. Returning the won token is safe —
+		// if the caller cannot deliver it (e.g. server shutdown), the
+		// connection cleanup path will release the lock.
 		select {
 		case token, ok := <-waiter.Ch:
 			if ok && token != "" {
@@ -342,7 +345,6 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 	lm.connEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}
 	return "queued", "", 0, nil
 }
-
 
 // FIFOWait is phase 2 of two-phase acquire (command "w").
 // Returns (token, leaseTTLSec, err). Empty token means timeout.
@@ -902,6 +904,8 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 
 	case <-ctx.Done():
 		lm.mu.Lock()
+		// Race check: returning a won token is safe — connection
+		// cleanup will release the slot if delivery fails.
 		select {
 		case token, ok := <-waiter.Ch:
 			if ok && token != "" {
