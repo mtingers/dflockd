@@ -107,28 +107,30 @@ func loadAuthToken(flagToken, flagTokenFile string) (string, error) {
 	return "", nil
 }
 
-func Load() (*Config, error) {
-	// CLI flags
-	host := flag.String("host", "127.0.0.1", "Bind address")
-	port := flag.Int("port", 6388, "Bind port")
-	defaultLeaseTTL := flag.Int("default-lease-ttl", 33, "Default lock lease duration (seconds)")
-	leaseSweepInterval := flag.Int("lease-sweep-interval", 1, "Lease expiry check interval (seconds)")
-	gcInterval := flag.Int("gc-interval", 5, "Lock state GC interval (seconds)")
-	gcMaxIdle := flag.Int("gc-max-idle", 60, "Idle seconds before pruning lock state")
-	maxLocks := flag.Int("max-locks", 1024, "Maximum number of unique lock keys")
-	maxConnections := flag.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
-	maxWaiters := flag.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
-	readTimeout := flag.Int("read-timeout", 23, "Client read timeout (seconds)")
-	writeTimeout := flag.Int("write-timeout", 5, "Client write timeout (seconds)")
-	shutdownTimeout := flag.Int("shutdown-timeout", 30, "Graceful shutdown drain timeout (seconds, 0 = wait forever)")
-	autoRelease := flag.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
-	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate PEM file")
-	tlsKey := flag.String("tls-key", "", "Path to TLS private key PEM file")
-	authToken := flag.String("auth-token", "", "Shared secret token for client authentication (visible in process list; prefer --auth-token-file)")
-	authTokenFile := flag.String("auth-token-file", "", "Path to file containing the auth token (one line, trailing whitespace stripped)")
-	debug := flag.Bool("debug", false, "Enable debug logging")
-	version := flag.Bool("version", false, "Print version and exit")
-	flag.Parse()
+func Load(args []string) (*Config, error) {
+	fs := flag.NewFlagSet("dflockd", flag.ContinueOnError)
+	host := fs.String("host", "127.0.0.1", "Bind address")
+	port := fs.Int("port", 6388, "Bind port")
+	defaultLeaseTTL := fs.Int("default-lease-ttl", 33, "Default lock lease duration (seconds)")
+	leaseSweepInterval := fs.Int("lease-sweep-interval", 1, "Lease expiry check interval (seconds)")
+	gcInterval := fs.Int("gc-interval", 5, "Lock state GC interval (seconds)")
+	gcMaxIdle := fs.Int("gc-max-idle", 60, "Idle seconds before pruning lock state")
+	maxLocks := fs.Int("max-locks", 1024, "Maximum number of unique lock keys")
+	maxConnections := fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
+	maxWaiters := fs.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
+	readTimeout := fs.Int("read-timeout", 23, "Client read timeout (seconds)")
+	writeTimeout := fs.Int("write-timeout", 5, "Client write timeout (seconds)")
+	shutdownTimeout := fs.Int("shutdown-timeout", 30, "Graceful shutdown drain timeout (seconds, 0 = wait forever)")
+	autoRelease := fs.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
+	tlsCert := fs.String("tls-cert", "", "Path to TLS certificate PEM file")
+	tlsKey := fs.String("tls-key", "", "Path to TLS private key PEM file")
+	authToken := fs.String("auth-token", "", "Shared secret token for client authentication (visible in process list; prefer --auth-token-file)")
+	authTokenFile := fs.String("auth-token-file", "", "Path to file containing the auth token (one line, trailing whitespace stripped)")
+	debug := fs.Bool("debug", false, "Enable debug logging")
+	version := fs.Bool("version", false, "Print version and exit")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
 
 	authTok, err := loadAuthToken(*authToken, *authTokenFile)
 	if err != nil {

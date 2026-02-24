@@ -17,7 +17,7 @@ import (
 var version = "dev"
 
 func main() {
-	cfg, err := config.Load()
+	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
 		os.Exit(1)

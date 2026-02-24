@@ -249,6 +249,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
 			}
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				s.log.Debug("waiter closed during acquire", "key", req.Key, "conn", connID)
+				return &protocol.Ack{Status: "error"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		if tok == "" {
@@ -294,6 +298,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			if errors.Is(err, lock.ErrLeaseExpired) {
 				return &protocol.Ack{Status: "error_lease_expired"}
 			}
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				s.log.Debug("waiter closed during wait", "key", req.Key, "conn", connID)
+				return &protocol.Ack{Status: "error"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		if tok == "" {
@@ -312,6 +320,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
+			}
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				s.log.Debug("waiter closed during sem acquire", "key", req.Key, "conn", connID)
+				return &protocol.Ack{Status: "error"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}
@@ -360,6 +372,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			}
 			if errors.Is(err, lock.ErrLeaseExpired) {
 				return &protocol.Ack{Status: "error_lease_expired"}
+			}
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				s.log.Debug("waiter closed during sem wait", "key", req.Key, "conn", connID)
+				return &protocol.Ack{Status: "error"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}
