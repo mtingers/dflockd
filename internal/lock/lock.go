@@ -18,6 +18,7 @@ var (
 	ErrNotEnqueued     = errors.New("not enqueued for this key")
 	ErrAlreadyEnqueued = errors.New("already enqueued for this key")
 	ErrLimitMismatch   = errors.New("limit mismatch for semaphore key")
+	ErrLeaseExpired    = errors.New("lease expired before wait")
 )
 
 type connKey struct {
@@ -384,7 +385,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 				st.LastActivity = time.Now()
 				lm.grantNextWaiterLocked(key, st)
 				lm.mu.Unlock()
-				return "", 0, nil
+				return "", 0, ErrLeaseExpired
 			}
 			// Reset lease
 			st.LeaseExpires = time.Now().Add(leaseTTL)
@@ -394,7 +395,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		}
 		// Lock was lost (expired and granted to another, or state GC'd)
 		lm.mu.Unlock()
-		return "", 0, nil
+		return "", 0, ErrLeaseExpired
 	}
 
 	// Slow path: waiter is pending
@@ -1087,7 +1088,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 					st.LastActivity = time.Now()
 					lm.semGrantNextWaiterLocked(key, st)
 					lm.mu.Unlock()
-					return "", 0, nil
+					return "", 0, ErrLeaseExpired
 				}
 				h.leaseExpires = time.Now().Add(leaseTTL)
 				st.LastActivity = time.Now()
@@ -1097,7 +1098,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 		}
 		// Slot was lost (expired and granted to another, or state GC'd)
 		lm.mu.Unlock()
-		return "", 0, nil
+		return "", 0, ErrLeaseExpired
 	}
 
 	// Slow path: waiter is pending

@@ -419,8 +419,8 @@ func TestFIFOWait_FastPathLockLost(t *testing.T) {
 	lm.mu.Unlock()
 
 	tok, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
 	if tok != "" {
 		t.Fatal("expected empty token (lock lost)")

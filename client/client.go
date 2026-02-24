@@ -24,6 +24,7 @@ var (
 	ErrNotQueued      = errors.New("dflockd: not enqueued")
 	ErrAlreadyQueued  = errors.New("dflockd: already enqueued")
 	ErrLimitMismatch  = errors.New("dflockd: limit mismatch")
+	ErrLeaseExpired   = errors.New("dflockd: lease expired")
 	ErrAuth           = errors.New("dflockd: authentication failed")
 )
 
@@ -320,6 +321,9 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	if resp == "error_not_enqueued" {
 		return "", 0, ErrNotQueued
 	}
+	if resp == "error_lease_expired" {
+		return "", 0, ErrLeaseExpired
+	}
 	if resp == "error" {
 		return "", 0, ErrServer
 	}
@@ -460,6 +464,9 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	}
 	if resp == "error_not_enqueued" {
 		return "", 0, ErrNotQueued
+	}
+	if resp == "error_lease_expired" {
+		return "", 0, ErrLeaseExpired
 	}
 	if resp == "error" {
 		return "", 0, ErrServer
@@ -666,6 +673,15 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
+	// Guard against the cancellation goroutine closing the connection
+	// after the operation succeeded (race between close(done) and ctx.Done()).
+	if ctx.Err() != nil {
+		Release(l.conn, l.Key, token)
+		l.conn.Close()
+		l.conn = nil
+		return false, ctx.Err()
+	}
+
 	l.token = token
 	l.lease = lease
 	l.startRenew()
@@ -709,6 +725,15 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		l.conn.Close()
 		l.conn = nil
 		return "", err
+	}
+
+	if ctx.Err() != nil {
+		if status == "acquired" {
+			Release(l.conn, l.Key, token)
+		}
+		l.conn.Close()
+		l.conn = nil
+		return "", ctx.Err()
 	}
 
 	if status == "acquired" {
@@ -760,6 +785,13 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 		l.conn.Close()
 		l.conn = nil
 		return false, err
+	}
+
+	if ctx.Err() != nil {
+		Release(l.conn, l.Key, token)
+		l.conn.Close()
+		l.conn = nil
+		return false, ctx.Err()
 	}
 
 	l.token = token
@@ -1020,6 +1052,13 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
+	if ctx.Err() != nil {
+		SemRelease(s.conn, s.Key, token)
+		s.conn.Close()
+		s.conn = nil
+		return false, ctx.Err()
+	}
+
 	s.token = token
 	s.lease = lease
 	s.startRenew()
@@ -1062,6 +1101,15 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		s.conn.Close()
 		s.conn = nil
 		return "", err
+	}
+
+	if ctx.Err() != nil {
+		if status == "acquired" {
+			SemRelease(s.conn, s.Key, token)
+		}
+		s.conn.Close()
+		s.conn = nil
+		return "", ctx.Err()
 	}
 
 	if status == "acquired" {
@@ -1112,6 +1160,13 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 		s.conn.Close()
 		s.conn = nil
 		return false, err
+	}
+
+	if ctx.Err() != nil {
+		SemRelease(s.conn, s.Key, token)
+		s.conn.Close()
+		s.conn = nil
+		return false, ctx.Err()
 	}
 
 	s.token = token

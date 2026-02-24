@@ -291,6 +291,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}
 			}
+			if errors.Is(err, lock.ErrLeaseExpired) {
+				return &protocol.Ack{Status: "error_lease_expired"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		if tok == "" {
@@ -354,6 +357,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}
+			}
+			if errors.Is(err, lock.ErrLeaseExpired) {
+				return &protocol.Ack{Status: "error_lease_expired"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}
