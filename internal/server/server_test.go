@@ -1667,3 +1667,280 @@ func TestIntegration_WriteTimeout(t *testing.T) {
 		t.Fatalf("expected 'ok', got %q", resp)
 	}
 }
+
+// ===========================================================================
+// Regression tests for unpushed fixes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ErrAlreadyEnqueued / error_already_enqueued protocol response
+// ---------------------------------------------------------------------------
+
+func TestIntegration_EnqueueAlreadyEnqueued(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// First enqueue — should get "acquired" (no contention)
+	resp := connSendCmd(t, conn, reader, "e", "k1", "")
+	parts := strings.Fields(resp)
+	if parts[0] != "acquired" {
+		t.Fatalf("expected acquired, got %q", resp)
+	}
+
+	// Second enqueue on same key from same connection — should get error
+	resp = connSendCmd(t, conn, reader, "e", "k1", "")
+	if resp != "error_already_enqueued" {
+		t.Fatalf("expected error_already_enqueued, got %q", resp)
+	}
+}
+
+func TestIntegration_SemEnqueueAlreadyEnqueued(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "se", "s1", "3")
+	parts := strings.Fields(resp)
+	if parts[0] != "acquired" {
+		t.Fatalf("expected acquired, got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "se", "s1", "3")
+	if resp != "error_already_enqueued" {
+		t.Fatalf("expected error_already_enqueued, got %q", resp)
+	}
+}
+
+func TestIntegration_WaitLeaseExpired(t *testing.T) {
+	cfg := testConfig()
+	cfg.LeaseSweepInterval = 50 * time.Millisecond
+	cleanup, addr, lm := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Enqueue with short lease
+	resp := connSendCmd(t, conn, reader, "e", "k1", "1")
+	parts := strings.Fields(resp)
+	if parts[0] != "acquired" {
+		t.Fatalf("expected acquired, got %q", resp)
+	}
+
+	// Force expire the lease (but don't wait for the sweep to run —
+	// FIFOWait's fast path checks LeaseExpires directly).
+	lm.ResetLeaseForTest("k1")
+
+	// Wait — should get error_lease_expired from the fast-path check.
+	resp = connSendCmd(t, conn, reader, "w", "k1", "1")
+	if resp != "error_lease_expired" {
+		t.Fatalf("expected error_lease_expired, got %q", resp)
+	}
+}
+
+func TestIntegration_DisconnectReleasesLockRegression(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 acquires lock then disconnects
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, reader1, "l", "k1", "10")
+	parts := strings.Fields(resp)
+	if parts[0] != "ok" {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+	conn1.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// conn2 should acquire immediately (timeout=0)
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	resp = connSendCmd(t, conn2, reader2, "l", "k1", "0")
+	parts = strings.Fields(resp)
+	if parts[0] != "ok" {
+		t.Fatalf("expected ok (lock auto-released), got %q", resp)
+	}
+}
+
+func TestIntegration_DisconnectReleasesSemSlot(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, reader1, "sl", "s1", "10 1")
+	parts := strings.Fields(resp)
+	if parts[0] != "ok" {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+	conn1.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	resp = connSendCmd(t, conn2, reader2, "sl", "s1", "0 1")
+	parts = strings.Fields(resp)
+	if parts[0] != "ok" {
+		t.Fatalf("expected ok (slot auto-released), got %q", resp)
+	}
+}
+
+func TestIntegration_WaitWithoutEnqueue(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "w", "k1", "1")
+	if resp != "error_not_enqueued" {
+		t.Fatalf("expected error_not_enqueued, got %q", resp)
+	}
+}
+
+func TestIntegration_SemWaitWithoutEnqueue(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "sw", "s1", "1")
+	if resp != "error_not_enqueued" {
+		t.Fatalf("expected error_not_enqueued, got %q", resp)
+	}
+}
+
+func TestIntegration_SemLimitMismatchRegression(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, resp1 := dialAndSendCmd(t, addr, "sl", "s1", "10 3")
+	defer conn1.Close()
+	if !strings.HasPrefix(resp1, "ok") {
+		t.Fatalf("expected ok, got %q", resp1)
+	}
+
+	conn2, resp2 := dialAndSendCmd(t, addr, "sl", "s1", "10 5")
+	defer conn2.Close()
+	if resp2 != "error_limit_mismatch" {
+		t.Fatalf("expected error_limit_mismatch, got %q", resp2)
+	}
+}
+
+func TestIntegration_MaxWaitersRegression(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxWaiters = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, resp1 := dialAndSendCmd(t, addr, "l", "k1", "10")
+	defer conn1.Close()
+	if !strings.HasPrefix(resp1, "ok") {
+		t.Fatalf("c1: expected ok, got %q", resp1)
+	}
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	resp := connSendCmd(t, conn2, reader2, "e", "k1", "")
+	if resp != "queued" {
+		t.Fatalf("c2: expected queued, got %q", resp)
+	}
+
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn3.Close()
+	reader3 := bufio.NewReader(conn3)
+	resp = connSendCmd(t, conn3, reader3, "e", "k1", "")
+	if resp != "error_max_waiters" {
+		t.Fatalf("c3: expected error_max_waiters, got %q", resp)
+	}
+}
+
+func TestIntegration_StatsResponse(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "l", "stats-key", "10")
+	parts := strings.Fields(resp)
+	if parts[0] != "ok" {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+
+	statsResp := connSendCmd(t, conn, reader, "stats", "_", "_")
+	if !strings.HasPrefix(statsResp, "ok ") {
+		t.Fatalf("expected 'ok {...}', got %q", statsResp)
+	}
+	jsonPart := strings.TrimPrefix(statsResp, "ok ")
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonPart), &result); err != nil {
+		t.Fatalf("stats JSON unmarshal failed: %v", err)
+	}
+	if _, ok := result["connections"]; !ok {
+		t.Fatal("stats should include 'connections' field")
+	}
+	if _, ok := result["locks"]; !ok {
+		t.Fatal("stats should include 'locks' field")
+	}
+}

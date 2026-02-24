@@ -1303,6 +1303,15 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 	return s
 }
 
+// ResetLeaseForTest forces a lock's lease to expire immediately (for testing only).
+func (lm *LockManager) ResetLeaseForTest(key string) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if st, ok := lm.locks[key]; ok {
+		st.LeaseExpires = time.Now().Add(-1 * time.Second)
+	}
+}
+
 // ResetForTest clears all state (for testing only).
 func (lm *LockManager) ResetForTest() {
 	lm.mu.Lock()

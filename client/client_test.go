@@ -730,6 +730,291 @@ func TestCRC32ShardSingleServer(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Client key validation
+// ---------------------------------------------------------------------------
+
+func TestValidateKey_Empty(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.Acquire(c, "", 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestValidateKey_Whitespace(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.Acquire(c, "bad key", 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error for key with space")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context cancellation for Lock.Enqueue + Lock.Wait
+// ---------------------------------------------------------------------------
+
+func TestLockEnqueue_ContextCancel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// l1 holds the lock so l2's Enqueue will need to connect (non-blocking)
+	l1 := &client.Lock{
+		Key:            "eq-cancel",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("l1 acquire failed")
+	}
+	defer l1.Release(context.Background())
+
+	// Enqueue with a normal context — should succeed with "queued"
+	l2 := &client.Lock{
+		Key:     "eq-cancel",
+		Servers: []string{addr},
+	}
+	status, err := l2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// Wait with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := l2.Wait(ctx, 30*time.Second)
+		if err == nil {
+			t.Error("expected error from cancelled context")
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait did not return after context cancellation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore context cancellation
+// ---------------------------------------------------------------------------
+
+func TestSemaphoreAcquire_ContextCancel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s1 := &client.Semaphore{
+		Key:            "sem-cancel",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("s1 acquire failed")
+	}
+	defer s1.Release(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s2 := &client.Semaphore{
+		Key:            "sem-cancel",
+		Limit:          1,
+		AcquireTimeout: 30 * time.Second,
+		Servers:        []string{addr},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := s2.Acquire(ctx)
+		if err == nil {
+			t.Error("expected error from cancelled context")
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Semaphore.Acquire did not return after context cancellation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lock timeout returns false, nil (not an error)
+// ---------------------------------------------------------------------------
+
+func TestLockAcquire_Timeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	l1 := &client.Lock{
+		Key:            "timeout-key",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("l1 acquire failed")
+	}
+	defer l1.Release(context.Background())
+
+	l2 := &client.Lock{
+		Key:            "timeout-key",
+		AcquireTimeout: 1 * time.Millisecond, // very short timeout
+		Servers:        []string{addr},
+	}
+	ok, err = l2.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false on timeout")
+	}
+}
+
+func TestSemaphoreAcquire_Timeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s1 := &client.Semaphore{
+		Key:            "sem-timeout",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("s1 acquire failed")
+	}
+	defer s1.Release(context.Background())
+
+	s2 := &client.Semaphore{
+		Key:            "sem-timeout",
+		Limit:          1,
+		AcquireTimeout: 1 * time.Millisecond, // very short timeout
+		Servers:        []string{addr},
+	}
+	ok, err = s2.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false on timeout")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lock.Close without explicit Release
+// ---------------------------------------------------------------------------
+
+func TestLockClose_NoRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	l := &client.Lock{
+		Key:            "close-key",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("acquire failed")
+	}
+	if l.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// Close without release — should not panic
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if l.Token() != "" {
+		t.Fatal("token should be cleared after Close")
+	}
+
+	// Double close should be safe
+	if err := l.Close(); err != nil {
+		t.Fatalf("double Close failed: %v", err)
+	}
+}
+
+func TestSemaphoreClose_NoRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s := &client.Semaphore{
+		Key:            "close-sem",
+		Limit:          3,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("acquire failed")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if s.Token() != "" {
+		t.Fatal("token should be cleared after Close")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect auto-releases locks (end-to-end)
+// ---------------------------------------------------------------------------
+
+func TestDisconnectAutoRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// c1 acquires a lock and then disconnects
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = client.Acquire(c1, "auto-key", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1.Close() // disconnect without release
+
+	// Give server time to detect disconnect and clean up
+	time.Sleep(200 * time.Millisecond)
+
+	// c2 should be able to acquire immediately
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	token, _, err := client.Acquire(c2, "auto-key", 0)
+	if err != nil {
+		t.Fatalf("expected acquire after disconnect, got %v", err)
+	}
+	if token == "" {
+		t.Fatal("expected non-empty token — auto-release should have freed the lock")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

@@ -1473,3 +1473,516 @@ func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
 		t.Fatal("enqueued state for conn1 should still exist")
 	}
 }
+
+// ===========================================================================
+// Regression tests for unpushed fixes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ErrLeaseExpired in FIFOWait/SemWait fast path
+// ---------------------------------------------------------------------------
+
+func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
+	// When a lock is acquired via enqueue then its lease expires before
+	// FIFOWait is called, FIFOWait must return ErrLeaseExpired and clean
+	// up owner state so the next waiter can proceed.
+	lm := testManager()
+	status, tok, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	if status != "acquired" || tok == "" {
+		t.Fatal("expected acquired")
+	}
+
+	// Manually expire the lease
+	lm.mu.Lock()
+	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	_, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
+	}
+
+	// Owner state must be cleaned up
+	lm.mu.Lock()
+	st := lm.locks["k1"]
+	if st.OwnerToken != "" {
+		t.Fatal("owner should be cleared after expired wait")
+	}
+	if st.OwnerConnID != 0 {
+		t.Fatal("owner conn should be 0")
+	}
+	lm.mu.Unlock()
+
+	// connEnqueued should be cleaned up
+	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; ok {
+		t.Fatal("connEnqueued should be deleted")
+	}
+}
+
+func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
+	// When the fast-path detects expiry, the next waiter should be granted.
+	lm := testManager()
+	lm.FIFOEnqueue("k1", 1*time.Second, 1) // conn1 acquires
+
+	// conn2 enqueues as waiter
+	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+
+	// Expire conn1's lease
+	lm.mu.Lock()
+	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	// conn1's FIFOWait detects expiry and should grant to conn2
+	_, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
+	}
+
+	// conn2 should now be the owner (granted by grantNextWaiterLocked)
+	lm.mu.Lock()
+	st := lm.locks["k1"]
+	ownerConn := st.OwnerConnID
+	lm.mu.Unlock()
+	if ownerConn != 2 {
+		t.Fatalf("expected conn2 to own, got %d", ownerConn)
+	}
+}
+
+func TestSemWait_FastPathLeaseExpired(t *testing.T) {
+	lm := testManager()
+	status, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	if status != "acquired" || tok == "" {
+		t.Fatal("expected acquired")
+	}
+
+	// Manually expire
+	lm.mu.Lock()
+	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	_, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
+	}
+
+	// Holder should be cleaned up
+	lm.mu.Lock()
+	if len(lm.sems["s1"].Holders) != 0 {
+		t.Fatal("expired holder should be removed")
+	}
+	lm.mu.Unlock()
+}
+
+func TestSemWait_FastPathLockLost(t *testing.T) {
+	// If the sem state is GC'd or holder was evicted, SemWait should
+	// return ErrLeaseExpired.
+	lm := testManager()
+	status, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	if status != "acquired" || tok == "" {
+		t.Fatal("expected acquired")
+	}
+
+	// Remove the holder to simulate state loss
+	lm.mu.Lock()
+	delete(lm.sems["s1"].Holders, tok)
+	lm.mu.Unlock()
+
+	_, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ErrWaiterClosed
+// ---------------------------------------------------------------------------
+
+func TestFIFOAcquire_WaiterClosed(t *testing.T) {
+	// When CleanupConnection closes a waiter channel, FIFOAcquire
+	// should return ErrWaiterClosed instead of returning an empty token.
+	lm := testManager()
+	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := lm.FIFOAcquire(bg(), "k1", 30*time.Second, 30*time.Second, 2)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(2) // closes conn2's waiter channel
+	err := <-done
+	if !errors.Is(err, ErrWaiterClosed) {
+		t.Fatalf("expected ErrWaiterClosed, got %v", err)
+	}
+}
+
+func TestFIFOWait_WaiterClosed(t *testing.T) {
+	lm := testManager()
+	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := lm.FIFOWait(bg(), "k1", 30*time.Second, 2)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(2)
+	err := <-done
+	if !errors.Is(err, ErrWaiterClosed) {
+		t.Fatalf("expected ErrWaiterClosed, got %v", err)
+	}
+}
+
+func TestSemAcquire_WaiterClosed(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := lm.SemAcquire(bg(), "s1", 30*time.Second, 30*time.Second, 2, 1)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(2)
+	err := <-done
+	if !errors.Is(err, ErrWaiterClosed) {
+		t.Fatalf("expected ErrWaiterClosed, got %v", err)
+	}
+}
+
+func TestSemWait_WaiterClosed(t *testing.T) {
+	lm := testManager()
+	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := lm.SemWait(bg(), "s1", 30*time.Second, 2)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(2)
+	err := <-done
+	if !errors.Is(err, ErrWaiterClosed) {
+		t.Fatalf("expected ErrWaiterClosed, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// connEnqueued cleanup on release and lease expiry
+// ---------------------------------------------------------------------------
+
+func TestFIFORelease_CleansConnEnqueued(t *testing.T) {
+	// After FIFOEnqueue acquires immediately, FIFORelease must clean
+	// the connEnqueued entry for that token.
+	lm := testManager()
+	_, tok, _, _ := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	eqKey := connKey{ConnID: 1, Key: "k1"}
+
+	if _, ok := lm.connEnqueued[eqKey]; !ok {
+		t.Fatal("connEnqueued should exist before release")
+	}
+
+	lm.FIFORelease("k1", tok)
+
+	if _, ok := lm.connEnqueued[eqKey]; ok {
+		t.Fatal("connEnqueued should be cleaned up after release")
+	}
+}
+
+func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
+	lm := testManager()
+	_, tok, _, _ := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	eqKey := connKey{ConnID: 1, Key: "s1"}
+
+	if _, ok := lm.connSemEnqueued[eqKey]; !ok {
+		t.Fatal("connSemEnqueued should exist before release")
+	}
+
+	lm.SemRelease("s1", tok)
+
+	if _, ok := lm.connSemEnqueued[eqKey]; ok {
+		t.Fatal("connSemEnqueued should be cleaned up after release")
+	}
+}
+
+func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
+	// When renew detects expiry, it must also clean connEnqueued.
+	lm := testManager()
+	_, tok, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	eqKey := connKey{ConnID: 1, Key: "k1"}
+
+	// Manually expire
+	lm.mu.Lock()
+	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	_, ok := lm.FIFORenew("k1", tok, 30*time.Second)
+	if ok {
+		t.Fatal("renew should fail on expired lease")
+	}
+
+	if _, ok := lm.connEnqueued[eqKey]; ok {
+		t.Fatal("connEnqueued should be cleaned up after expired renew")
+	}
+}
+
+func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
+	lm := testManager()
+	_, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	eqKey := connKey{ConnID: 1, Key: "s1"}
+
+	lm.mu.Lock()
+	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	_, ok := lm.SemRenew("s1", tok, 30*time.Second)
+	if ok {
+		t.Fatal("renew should fail on expired lease")
+	}
+
+	if _, ok := lm.connSemEnqueued[eqKey]; ok {
+		t.Fatal("connSemEnqueued should be cleaned up after expired renew")
+	}
+}
+
+func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
+	// The LeaseExpiryLoop should also clean connEnqueued entries.
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+	_, tok, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	eqKey := connKey{ConnID: 1, Key: "k1"}
+
+	if _, ok := lm.connEnqueued[eqKey]; !ok {
+		t.Fatal("connEnqueued should exist")
+	}
+
+	// Expire
+	lm.mu.Lock()
+	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	_ = tok
+	lm.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.LeaseExpiryLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	lm.mu.Lock()
+	_, exists := lm.connEnqueued[eqKey]
+	lm.mu.Unlock()
+	if exists {
+		t.Fatal("connEnqueued should be cleaned up by expiry loop")
+	}
+}
+
+func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+	_, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	eqKey := connKey{ConnID: 1, Key: "s1"}
+
+	lm.mu.Lock()
+	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.LeaseExpiryLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	lm.mu.Lock()
+	_, exists := lm.connSemEnqueued[eqKey]
+	lm.mu.Unlock()
+	if exists {
+		t.Fatal("connSemEnqueued should be cleaned up by expiry loop")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// connOwned cleanup in FIFOWait/SemWait fast path on expiry
+// ---------------------------------------------------------------------------
+
+func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
+	lm := testManager()
+	status, _, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	if status != "acquired" {
+		t.Fatal("expected acquired")
+	}
+
+	// Verify connOwned is set
+	lm.mu.Lock()
+	if _, ok := lm.connOwned[1]; !ok {
+		t.Fatal("connOwned should have conn 1")
+	}
+	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+
+	// connOwned for this key should be cleaned up
+	lm.mu.Lock()
+	if owned, ok := lm.connOwned[1]; ok {
+		if _, hasKey := owned["k1"]; hasKey {
+			t.Fatal("connOwned should not have k1 after expired wait")
+		}
+	}
+	lm.mu.Unlock()
+}
+
+func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
+	lm := testManager()
+	status, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	if status != "acquired" || tok == "" {
+		t.Fatal("expected acquired")
+	}
+
+	lm.mu.Lock()
+	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.mu.Unlock()
+
+	lm.SemWait(bg(), "s1", 5*time.Second, 1)
+
+	lm.mu.Lock()
+	if m, ok := lm.connSemOwned[1]; ok {
+		if tokens, ok := m["s1"]; ok {
+			if _, ok := tokens[tok]; ok {
+				t.Fatal("connSemOwned should not have the expired token")
+			}
+		}
+	}
+	lm.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Stats idle classification
+// ---------------------------------------------------------------------------
+
+func TestStats_IdleClassification(t *testing.T) {
+	lm := testManager()
+
+	// Create an idle lock (acquired then released)
+	tok, _ := lm.FIFOAcquire(bg(), "idle-lock", 5*time.Second, 30*time.Second, 1)
+	lm.FIFORelease("idle-lock", tok)
+
+	// Create an active lock (held)
+	lm.FIFOAcquire(bg(), "active-lock", 5*time.Second, 30*time.Second, 2)
+
+	// Create an idle semaphore
+	semTok, _ := lm.SemAcquire(bg(), "idle-sem", 5*time.Second, 30*time.Second, 3, 3)
+	lm.SemRelease("idle-sem", semTok)
+
+	// Create an active semaphore
+	lm.SemAcquire(bg(), "active-sem", 5*time.Second, 30*time.Second, 4, 3)
+
+	stats := lm.Stats(4)
+
+	// Active locks should be in Locks list
+	foundActive := false
+	for _, l := range stats.Locks {
+		if l.Key == "active-lock" {
+			foundActive = true
+		}
+		if l.Key == "idle-lock" {
+			t.Fatal("idle-lock should not be in active locks")
+		}
+	}
+	if !foundActive {
+		t.Fatal("active-lock should be in locks list")
+	}
+
+	// Idle locks should be in IdleLocks list
+	foundIdle := false
+	for _, l := range stats.IdleLocks {
+		if l.Key == "idle-lock" {
+			foundIdle = true
+		}
+	}
+	if !foundIdle {
+		t.Fatal("idle-lock should be in idle locks list")
+	}
+
+	// Active semaphores should be in Semaphores list
+	foundActiveSem := false
+	for _, s := range stats.Semaphores {
+		if s.Key == "active-sem" {
+			foundActiveSem = true
+		}
+	}
+	if !foundActiveSem {
+		t.Fatal("active-sem should be in semaphores list")
+	}
+
+	// Idle semaphores should be in IdleSemaphores list
+	foundIdleSem := false
+	for _, s := range stats.IdleSemaphores {
+		if s.Key == "idle-sem" {
+			foundIdleSem = true
+		}
+	}
+	if !foundIdleSem {
+		t.Fatal("idle-sem should be in idle semaphores list")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ErrAlreadyEnqueued (sentinel error, not type assertion)
+// ---------------------------------------------------------------------------
+
+func TestFIFOEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
+	lm := testManager()
+	lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	_, _, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	if !errors.Is(err, ErrAlreadyEnqueued) {
+		t.Fatalf("expected errors.Is(err, ErrAlreadyEnqueued), got %v", err)
+	}
+}
+
+func TestSemEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
+	lm := testManager()
+	lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	_, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	if !errors.Is(err, ErrAlreadyEnqueued) {
+		t.Fatalf("expected errors.Is(err, ErrAlreadyEnqueued), got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ResetForTest clears all state
+// ---------------------------------------------------------------------------
+
+func TestResetForTest(t *testing.T) {
+	lm := testManager()
+	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
+	lm.FIFOEnqueue("k2", 30*time.Second, 3)
+	lm.SemEnqueue("s2", 30*time.Second, 4, 3)
+
+	lm.ResetForTest()
+
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if len(lm.locks) != 0 {
+		t.Fatal("locks should be empty")
+	}
+	if len(lm.sems) != 0 {
+		t.Fatal("sems should be empty")
+	}
+	if len(lm.connOwned) != 0 {
+		t.Fatal("connOwned should be empty")
+	}
+	if len(lm.connEnqueued) != 0 {
+		t.Fatal("connEnqueued should be empty")
+	}
+	if len(lm.connSemOwned) != 0 {
+		t.Fatal("connSemOwned should be empty")
+	}
+	if len(lm.connSemEnqueued) != 0 {
+		t.Fatal("connSemEnqueued should be empty")
+	}
+}
