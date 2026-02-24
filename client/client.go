@@ -19,6 +19,7 @@ import (
 var (
 	ErrTimeout       = errors.New("dflockd: timeout")
 	ErrMaxLocks      = errors.New("dflockd: max locks reached")
+	ErrMaxWaiters    = errors.New("dflockd: max waiters reached")
 	ErrServer        = errors.New("dflockd: server error")
 	ErrNotQueued     = errors.New("dflockd: not enqueued")
 	ErrLimitMismatch = errors.New("dflockd: limit mismatch")
@@ -94,7 +95,7 @@ func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 // to prevent unbounded memory allocation from a malicious server.
 // Must be called with c.mu held.
 func (c *Conn) readLine() (string, error) {
-	var buf [maxResponseBytes + 1]byte
+	var buf [maxResponseBytes]byte
 	n := 0
 	for {
 		b, err := c.reader.ReadByte()
@@ -104,7 +105,7 @@ func (c *Conn) readLine() (string, error) {
 		if b == '\n' {
 			break
 		}
-		if n >= len(buf) {
+		if n >= maxResponseBytes {
 			return "", fmt.Errorf("dflockd: server response too long")
 		}
 		buf[n] = b
@@ -215,6 +216,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	}
 	if resp == "error_max_locks" {
 		return "", "", 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", "", 0, ErrMaxWaiters
 	}
 
 	parts := strings.Fields(resp)
@@ -332,6 +336,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	if resp == "error_max_locks" {
 		return "", "", 0, ErrMaxLocks
 	}
+	if resp == "error_max_waiters" {
+		return "", "", 0, ErrMaxWaiters
+	}
 	if resp == "error_limit_mismatch" {
 		return "", "", 0, ErrLimitMismatch
 	}
@@ -374,6 +381,9 @@ func parseSemAcquireResponse(resp string) (string, int, error) {
 	if resp == "error_max_locks" {
 		return "", 0, ErrMaxLocks
 	}
+	if resp == "error_max_waiters" {
+		return "", 0, ErrMaxWaiters
+	}
 	if resp == "error_limit_mismatch" {
 		return "", 0, ErrLimitMismatch
 	}
@@ -386,6 +396,9 @@ func parseAcquireResponse(resp string) (string, int, error) {
 	}
 	if resp == "error_max_locks" {
 		return "", 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", 0, ErrMaxWaiters
 	}
 	return parseOKTokenLease(resp, "acquire")
 }
@@ -635,6 +648,8 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 			l.conn = nil
 			return false, ctx.Err()
 		}
+		l.conn.Close()
+		l.conn = nil
 		return false, err
 	}
 
@@ -663,7 +678,7 @@ func (l *Lock) stopRenew() {
 }
 
 // Release stops the renewal goroutine, releases the lock on the server, and
-// closes the connection.
+// closes the connection. The ctx parameter is reserved for future use.
 func (l *Lock) Release(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -709,9 +724,7 @@ func (l *Lock) Token() string {
 // startRenew launches a background goroutine that renews the lease at
 // renewRatio * leaseTTL intervals. Must be called with l.mu held.
 func (l *Lock) startRenew() {
-	if l.cancelRenew != nil {
-		l.cancelRenew()
-	}
+	l.stopRenew()
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancelRenew = cancel
 
@@ -963,6 +976,8 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 			s.conn = nil
 			return false, ctx.Err()
 		}
+		s.conn.Close()
+		s.conn = nil
 		return false, err
 	}
 
@@ -987,6 +1002,7 @@ func (s *Semaphore) stopRenew() {
 }
 
 // Release stops renewal, releases the semaphore slot, and closes the connection.
+// The ctx parameter is reserved for future use.
 func (s *Semaphore) Release(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1029,9 +1045,7 @@ func (s *Semaphore) Token() string {
 }
 
 func (s *Semaphore) startRenew() {
-	if s.cancelRenew != nil {
-		s.cancelRenew()
-	}
+	s.stopRenew()
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelRenew = cancel
 
