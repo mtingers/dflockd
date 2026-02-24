@@ -95,8 +95,9 @@ func (c *Conn) Close() error {
 }
 
 // maxResponseBytes is the maximum length of a single server response line.
-// Server responses are short (status + token + lease), so 512 bytes is generous.
-const maxResponseBytes = 512
+// Most responses are short (status + token + lease), but the stats command
+// returns JSON that can grow with the number of active locks.
+const maxResponseBytes = 65536
 
 // sendRecv sends a 3-line protocol command and reads one response line.
 // The mutex ensures that concurrent callers (e.g. a renewal goroutine)
@@ -115,8 +116,7 @@ func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 // to prevent unbounded memory allocation from a malicious server.
 // Must be called with c.mu held.
 func (c *Conn) readLine() (string, error) {
-	var buf [maxResponseBytes]byte
-	n := 0
+	var buf []byte
 	for {
 		b, err := c.reader.ReadByte()
 		if err != nil {
@@ -125,7 +125,7 @@ func (c *Conn) readLine() (string, error) {
 		if b == '\n' {
 			break
 		}
-		if n >= maxResponseBytes {
+		if len(buf) >= maxResponseBytes {
 			// Drain the rest of the oversized line to keep the
 			// reader in a consistent state for subsequent reads.
 			for {
@@ -136,10 +136,9 @@ func (c *Conn) readLine() (string, error) {
 			}
 			return "", fmt.Errorf("dflockd: server response too long")
 		}
-		buf[n] = b
-		n++
+		buf = append(buf, b)
 	}
-	return strings.TrimRight(string(buf[:n]), "\r"), nil
+	return strings.TrimRight(string(buf), "\r"), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +908,9 @@ func (l *Lock) startRenew() {
 
 				_, err := Renew(conn, key, token, opts...)
 				if err != nil {
+					if ctx.Err() != nil {
+						return // Deliberately stopped; not a real failure.
+					}
 					if onErr != nil {
 						onErr(err)
 					}
@@ -1278,6 +1280,9 @@ func (s *Semaphore) startRenew() {
 
 				_, err := SemRenew(conn, key, token, opts...)
 				if err != nil {
+					if ctx.Err() != nil {
+						return // Deliberately stopped; not a real failure.
+					}
 					if onErr != nil {
 						onErr(err)
 					}

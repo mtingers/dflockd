@@ -19,6 +19,7 @@ var (
 	ErrAlreadyEnqueued = errors.New("already enqueued for this key")
 	ErrLimitMismatch   = errors.New("limit mismatch for semaphore key")
 	ErrLeaseExpired    = errors.New("lease expired before wait")
+	ErrWaiterClosed    = errors.New("waiter channel closed")
 )
 
 type connKey struct {
@@ -244,7 +245,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
-			return "", nil
+			return "", ErrWaiterClosed
 		}
 		lm.mu.Lock()
 		if s := lm.locks[key]; s != nil {
@@ -410,11 +411,10 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
-			// Channel closed (disconnect cleanup) or empty token
 			lm.mu.Lock()
 			delete(lm.connEnqueued, eqKey)
 			lm.mu.Unlock()
-			return "", 0, nil
+			return "", 0, ErrWaiterClosed
 		}
 		lm.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
@@ -894,7 +894,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
-			return "", nil
+			return "", ErrWaiterClosed
 		}
 		lm.mu.Lock()
 		if s := lm.sems[key]; s != nil {
@@ -1113,11 +1113,10 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
-			// Channel closed (disconnect cleanup) or empty token
 			lm.mu.Lock()
 			delete(lm.connSemEnqueued, eqKey)
 			lm.mu.Unlock()
-			return "", 0, nil
+			return "", 0, ErrWaiterClosed
 		}
 		lm.mu.Lock()
 		delete(lm.connSemEnqueued, eqKey)
