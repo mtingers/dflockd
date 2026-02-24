@@ -28,7 +28,6 @@ type Waiter struct {
 	Ch       chan string
 	ConnID   uint64
 	LeaseTTL time.Duration
-	Enqueued time.Time
 }
 
 type LockState struct {
@@ -86,6 +85,9 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 
 func newToken() string {
 	var b [16]byte
+	// crypto/rand.Read on supported platforms (Linux 3.17+, macOS, Windows)
+	// uses getrandom/getentropy and never returns an error. Panic is
+	// appropriate here as a broken CSPRNG is unrecoverable.
 	if _, err := rand.Read(b[:]); err != nil {
 		panic("crypto/rand failed: " + err.Error())
 	}
@@ -158,7 +160,6 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *LockState) {
 		copy(st.Waiters, st.Waiters[1:])
 		st.Waiters[len(st.Waiters)-1] = nil // avoid memory leak
 		st.Waiters = st.Waiters[:len(st.Waiters)-1]
-		// Try to send token; if channel is closed (cancelled), skip.
 		token := newToken()
 		select {
 		case w.Ch <- token:
@@ -199,7 +200,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-		Enqueued: time.Now(),
+
 	}
 
 	lm.mu.Lock()
@@ -241,7 +242,10 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	defer timer.Stop()
 
 	select {
-	case token := <-waiter.Ch:
+	case token, ok := <-waiter.Ch:
+		if !ok || token == "" {
+			return "", nil
+		}
 		lm.mu.Lock()
 		if s := lm.locks[key]; s != nil {
 			s.LastActivity = time.Now()
@@ -253,12 +257,14 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		lm.mu.Lock()
 		// Race check: token may have arrived
 		select {
-		case token := <-waiter.Ch:
-			if s := lm.locks[key]; s != nil {
-				s.LastActivity = time.Now()
+		case token, ok := <-waiter.Ch:
+			if ok && token != "" {
+				if s := lm.locks[key]; s != nil {
+					s.LastActivity = time.Now()
+				}
+				lm.mu.Unlock()
+				return token, nil
 			}
-			lm.mu.Unlock()
-			return token, nil
 		default:
 		}
 		if s := lm.locks[key]; s != nil {
@@ -273,12 +279,14 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		lm.mu.Lock()
 		// Race check: token may have arrived
 		select {
-		case token := <-waiter.Ch:
-			if s := lm.locks[key]; s != nil {
-				s.LastActivity = time.Now()
+		case token, ok := <-waiter.Ch:
+			if ok && token != "" {
+				if s := lm.locks[key]; s != nil {
+					s.LastActivity = time.Now()
+				}
+				lm.mu.Unlock()
+				return token, nil
 			}
-			lm.mu.Unlock()
-			return token, nil
 		default:
 		}
 		if s := lm.locks[key]; s != nil {
@@ -330,7 +338,7 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-		Enqueued: time.Now(),
+
 	}
 	st.Waiters = append(st.Waiters, waiter)
 	lm.connEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}
@@ -492,6 +500,9 @@ func (lm *LockManager) FIFORelease(key, token string) bool {
 	}
 
 	lm.connRemoveOwned(st.OwnerConnID, key)
+	st.OwnerToken = ""
+	st.OwnerConnID = 0
+	st.LeaseExpires = time.Time{}
 	lm.grantNextWaiterLocked(key, st)
 	return true
 }
@@ -851,7 +862,7 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-		Enqueued: time.Now(),
+
 	}
 
 	lm.mu.Lock()
@@ -894,7 +905,10 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	defer timer.Stop()
 
 	select {
-	case token := <-waiter.Ch:
+	case token, ok := <-waiter.Ch:
+		if !ok || token == "" {
+			return "", nil
+		}
 		lm.mu.Lock()
 		if s := lm.sems[key]; s != nil {
 			s.LastActivity = time.Now()
@@ -905,12 +919,14 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	case <-ctx.Done():
 		lm.mu.Lock()
 		select {
-		case token := <-waiter.Ch:
-			if s := lm.sems[key]; s != nil {
-				s.LastActivity = time.Now()
+		case token, ok := <-waiter.Ch:
+			if ok && token != "" {
+				if s := lm.sems[key]; s != nil {
+					s.LastActivity = time.Now()
+				}
+				lm.mu.Unlock()
+				return token, nil
 			}
-			lm.mu.Unlock()
-			return token, nil
 		default:
 		}
 		if s := lm.sems[key]; s != nil {
@@ -923,12 +939,14 @@ func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leas
 	case <-timer.C:
 		lm.mu.Lock()
 		select {
-		case token := <-waiter.Ch:
-			if s := lm.sems[key]; s != nil {
-				s.LastActivity = time.Now()
+		case token, ok := <-waiter.Ch:
+			if ok && token != "" {
+				if s := lm.sems[key]; s != nil {
+					s.LastActivity = time.Now()
+				}
+				lm.mu.Unlock()
+				return token, nil
 			}
-			lm.mu.Unlock()
-			return token, nil
 		default:
 		}
 		if s := lm.sems[key]; s != nil {
@@ -1043,7 +1061,7 @@ func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uin
 		Ch:       make(chan string, 1),
 		ConnID:   connID,
 		LeaseTTL: leaseTTL,
-		Enqueued: time.Now(),
+
 	}
 	st.Waiters = append(st.Waiters, waiter)
 	lm.connSemEnqueued[eqKey] = &EnqueuedState{Waiter: waiter, LeaseTTL: leaseTTL}

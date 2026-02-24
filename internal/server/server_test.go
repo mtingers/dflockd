@@ -361,10 +361,10 @@ func TestIntegration_WaitNotEnqueued(t *testing.T) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	// Wait without enqueue → error (and server disconnects due to protocol error)
+	// Wait without enqueue → error_not_enqueued
 	resp := connSendCmd(t, conn, reader, "w", "mykey", "10")
-	if resp != "error" {
-		t.Fatalf("expected 'error', got %q", resp)
+	if resp != "error_not_enqueued" {
+		t.Fatalf("expected 'error_not_enqueued', got %q", resp)
 	}
 }
 

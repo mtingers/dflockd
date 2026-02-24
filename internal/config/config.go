@@ -45,14 +45,21 @@ func envOrInt(envKey string, flagVal int) int {
 }
 
 // envOrBool returns the environment variable value parsed as bool, or the flag
-// default if the env var is unset.
+// default if the env var is unset. Recognizes 1/yes/true as true and
+// 0/no/false as false; unrecognized values fall back to the flag default.
 func envOrBool(envKey string, flagVal bool) bool {
 	v := os.Getenv(envKey)
 	if v == "" {
 		return flagVal
 	}
-	low := strings.ToLower(v)
-	return low == "1" || low == "yes" || low == "true"
+	switch strings.ToLower(v) {
+	case "1", "yes", "true":
+		return true
+	case "0", "no", "false":
+		return false
+	default:
+		return flagVal
+	}
 }
 
 // envOrString returns the environment variable value, or the flag default if
@@ -173,6 +180,12 @@ func (c *Config) validate() error {
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("--port must be 0-65535 (got %d)", c.Port)
+	}
+	if c.MaxConnections < 0 {
+		return fmt.Errorf("--max-connections must be >= 0 (got %d)", c.MaxConnections)
+	}
+	if c.MaxWaiters < 0 {
+		return fmt.Errorf("--max-waiters must be >= 0 (got %d)", c.MaxWaiters)
 	}
 	return nil
 }

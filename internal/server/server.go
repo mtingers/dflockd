@@ -285,7 +285,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 		tok, lease, err := s.lm.FIFOWait(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
-				return &protocol.Ack{Status: "error"}
+				return &protocol.Ack{Status: "error_not_enqueued"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}
@@ -346,7 +346,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 		tok, lease, err := s.lm.SemWait(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
-				return &protocol.Ack{Status: "error"}
+				return &protocol.Ack{Status: "error_not_enqueued"}
 			}
 			return &protocol.Ack{Status: "error"}
 		}

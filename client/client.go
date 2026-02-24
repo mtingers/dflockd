@@ -85,7 +85,9 @@ func DialTLS(addr string, cfg *tls.Config) (*Conn, error) {
 	return &Conn{conn: conn, reader: bufio.NewReader(conn)}, nil
 }
 
-// Close closes the underlying TCP connection.
+// Close closes the underlying TCP connection. It is safe to call
+// concurrently with sendRecv; the underlying net.Conn.Close is
+// goroutine-safe and will unblock any pending I/O.
 func (c *Conn) Close() error {
 	return c.conn.Close()
 }
@@ -122,6 +124,14 @@ func (c *Conn) readLine() (string, error) {
 			break
 		}
 		if n >= maxResponseBytes {
+			// Drain the rest of the oversized line to keep the
+			// reader in a consistent state for subsequent reads.
+			for {
+				d, err := c.reader.ReadByte()
+				if err != nil || d == '\n' {
+					break
+				}
+			}
 			return "", fmt.Errorf("dflockd: server response too long")
 		}
 		buf[n] = b
@@ -260,7 +270,7 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	if resp == "timeout" {
 		return "", 0, ErrTimeout
 	}
-	if resp == "error" {
+	if resp == "error" || resp == "error_not_enqueued" {
 		return "", 0, ErrNotQueued
 	}
 	return parseOKTokenLease(resp, "wait")
@@ -380,7 +390,7 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	if resp == "timeout" {
 		return "", 0, ErrTimeout
 	}
-	if resp == "error" {
+	if resp == "error" || resp == "error_not_enqueued" {
 		return "", 0, ErrNotQueued
 	}
 	return parseOKTokenLease(resp, "sem_wait")
@@ -684,7 +694,8 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 }
 
 // stopRenew cancels the renewal goroutine and waits for it to exit.
-// Must be called with l.mu held; temporarily releases the lock to wait.
+// Must be called with l.mu held; temporarily releases the mutex so
+// the renewal goroutine can complete its tick (which grabs l.mu).
 func (l *Lock) stopRenew() {
 	if l.cancelRenew != nil {
 		l.cancelRenew()
@@ -693,8 +704,6 @@ func (l *Lock) stopRenew() {
 	if l.renewDone != nil {
 		done := l.renewDone
 		l.renewDone = nil
-		// Release the mutex while waiting so the goroutine can finish
-		// its in-progress Renew (which also grabs l.mu via Conn.sendRecv).
 		l.mu.Unlock()
 		<-done
 		l.mu.Lock()
@@ -757,7 +766,8 @@ func (l *Lock) startRenew() {
 	done := make(chan struct{})
 	l.renewDone = done
 
-	interval := time.Duration(float64(l.lease)*l.renewRatio()) * time.Second
+	leaseDur := time.Duration(l.lease) * time.Second
+	interval := time.Duration(float64(leaseDur) * l.renewRatio())
 	if interval < 1*time.Second {
 		interval = 1 * time.Second
 	}
@@ -1097,7 +1107,8 @@ func (s *Semaphore) startRenew() {
 	done := make(chan struct{})
 	s.renewDone = done
 
-	interval := time.Duration(float64(s.lease)*s.renewRatio()) * time.Second
+	leaseDur := time.Duration(s.lease) * time.Second
+	interval := time.Duration(float64(leaseDur) * s.renewRatio())
 	if interval < 1*time.Second {
 		interval = 1 * time.Second
 	}
