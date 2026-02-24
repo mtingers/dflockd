@@ -395,6 +395,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 			return esToken, leaseSec, nil
 		}
 		// Lock was lost (expired and granted to another, or state GC'd)
+		lm.connRemoveOwned(connID, key)
 		lm.mu.Unlock()
 		return "", 0, ErrLeaseExpired
 	}
@@ -1097,6 +1098,7 @@ func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Dur
 			}
 		}
 		// Slot was lost (expired and granted to another, or state GC'd)
+		lm.semConnRemoveOwned(connID, key, esToken)
 		lm.mu.Unlock()
 		return "", 0, ErrLeaseExpired
 	}

@@ -19,7 +19,7 @@ func testConfig() *config.Config {
 		DefaultLeaseTTL:         5 * time.Second,
 		LeaseSweepInterval:      100 * time.Millisecond,
 		GCInterval:              100 * time.Millisecond,
-		GCMaxIdleTime:           0,
+		GCMaxIdleTime:           60 * time.Second,
 		MaxLocks:                1024,
 		ReadTimeout:             5 * time.Second,
 		AutoReleaseOnDisconnect: true,
