@@ -2332,13 +2332,15 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 						maxFence = h.fence
 					}
 				}
-				s.RWLocks = append(s.RWLocks, RWLockInfo{
-					Key:     key,
-					Readers: readers,
-					Writer:  hasWriter,
-					Fence:   maxFence,
-					Waiters: nw,
-				})
+				if readers > 0 || hasWriter || nw > 0 {
+					s.RWLocks = append(s.RWLocks, RWLockInfo{
+						Key:     key,
+						Readers: readers,
+						Writer:  hasWriter,
+						Fence:   maxFence,
+						Waiters: nw,
+					})
+				}
 			} else if st.Limit == 1 {
 				if len(st.Holders) > 0 {
 					var ownerConn uint64
