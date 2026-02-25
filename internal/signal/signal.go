@@ -64,9 +64,17 @@ func MatchPattern(pattern, channel string) bool {
 }
 
 // Listen registers a listener for a pattern.
+// Duplicate subscriptions (same connID + pattern) are ignored.
 func (m *Manager) Listen(pattern string, listener *Listener) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Check for duplicate subscription
+	for _, e := range m.connListeners[listener.ConnID] {
+		if e.pattern == pattern {
+			return // already subscribed
+		}
+	}
 
 	wild := isWildPattern(pattern)
 	if wild {

@@ -737,14 +737,15 @@ func (sc *SignalConn) readLoop() {
 }
 
 // sendCmd sends a command and waits for the response (from respCh).
+// The mutex is held across both write and response read to prevent
+// concurrent callers from cross-matching responses.
 func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
 	sc.conn.mu.Lock()
+	defer sc.conn.mu.Unlock()
 	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
 	if _, err := sc.conn.conn.Write([]byte(msg)); err != nil {
-		sc.conn.mu.Unlock()
 		return "", err
 	}
-	sc.conn.mu.Unlock()
 
 	select {
 	case resp, ok := <-sc.respCh:

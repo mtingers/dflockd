@@ -2088,6 +2088,30 @@ func TestIntegration_KVSetGetDel(t *testing.T) {
 	}
 }
 
+func TestIntegration_KVSetNumericValue(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// A purely-numeric value should be stored as-is, not parsed as TTL
+	resp := connSendCmd(t, conn, reader, "kset", "mykey", "42")
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "kget", "mykey", "")
+	if resp != "ok 42" {
+		t.Fatalf("expected 'ok 42', got %q", resp)
+	}
+}
+
 func TestIntegration_KVSetWithTTL(t *testing.T) {
 	cfg := testConfig()
 	cleanup, addr, _ := startServer(t, cfg)

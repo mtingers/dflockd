@@ -404,16 +404,14 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "kset":
 		value := req.Value
 		ttl := 0
-		// Parse optional TTL: last space-separated token is TTL if it parses as int >= 0
+		// Parse optional TTL: last space-separated token is TTL if it parses
+		// as int >= 0 AND stripping it does not leave the value empty.
 		if idx := strings.LastIndex(value, " "); idx >= 0 {
 			candidate := value[idx+1:]
-			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 {
+			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 && idx > 0 {
 				ttl = n
 				value = value[:idx]
 			}
-		}
-		if value == "" {
-			return &protocol.Ack{Status: "error"}
 		}
 		if err := s.lm.KVSet(req.Key, value, ttl); err != nil {
 			if errors.Is(err, lock.ErrMaxKeys) {
