@@ -46,6 +46,24 @@ func isWildPattern(pattern string) bool {
 	return strings.Contains(pattern, "*") || strings.Contains(pattern, ">")
 }
 
+// validatePattern checks that ">" only appears as the final token and
+// that "*" only appears as a whole token (not as a substring like "c*").
+func validatePattern(pattern string) error {
+	tokens := strings.Split(pattern, ".")
+	for i, t := range tokens {
+		if t == ">" && i != len(tokens)-1 {
+			return fmt.Errorf("'>' must be the last token in pattern")
+		}
+		if strings.Contains(t, "*") && t != "*" {
+			return fmt.Errorf("'*' must be an entire dot-separated token, got %q", t)
+		}
+		if strings.Contains(t, ">") && t != ">" {
+			return fmt.Errorf("'>' must be an entire dot-separated token, got %q", t)
+		}
+	}
+	return nil
+}
+
 // matchPattern checks if a literal key matches a pattern.
 func matchPattern(pattern, key string) bool {
 	patTokens := strings.Split(pattern, ".")
@@ -66,6 +84,10 @@ func matchPattern(pattern, key string) bool {
 
 // Watch registers a watcher. Duplicate (connID, pattern) is ignored.
 func (m *Manager) Watch(w *Watcher) error {
+	if err := validatePattern(w.Pattern); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

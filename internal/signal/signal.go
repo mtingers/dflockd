@@ -64,12 +64,19 @@ func isWildPattern(pattern string) bool {
 	return strings.Contains(pattern, "*") || strings.Contains(pattern, ">")
 }
 
-// validatePattern checks that ">" only appears as the final token.
+// validatePattern checks that ">" only appears as the final token and
+// that "*" only appears as a whole token (not as a substring like "c*").
 func validatePattern(pattern string) error {
 	tokens := strings.Split(pattern, ".")
 	for i, t := range tokens {
 		if t == ">" && i != len(tokens)-1 {
 			return fmt.Errorf("'>' must be the last token in pattern")
+		}
+		if strings.Contains(t, "*") && t != "*" {
+			return fmt.Errorf("'*' must be an entire dot-separated token, got %q", t)
+		}
+		if strings.Contains(t, ">") && t != ">" {
+			return fmt.Errorf("'>' must be an entire dot-separated token, got %q", t)
 		}
 	}
 	return nil
@@ -256,9 +263,6 @@ func deliverToGroup(qg *queueGroup, msg []byte, delivered map[uint64]struct{}) b
 	for i := 0; i < n; i++ {
 		idx := int((start + uint64(i)) % uint64(n))
 		mem := qg.members[idx]
-		if _, already := delivered[mem.ConnID]; already {
-			continue
-		}
 		select {
 		case mem.WriteCh <- msg:
 		default:

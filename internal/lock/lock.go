@@ -341,6 +341,7 @@ func (lm *LockManager) grantNextLocked(key string, st *ResourceState) {
 // evictExpiredLocked evicts any holders whose leases have expired and grants
 // freed slots to waiting callers. Must be called with the shard lock AND connMu held.
 func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
+	sh := lm.shardFor(key)
 	now := time.Now()
 	var expired []string
 	for token, h := range st.Holders {
@@ -352,6 +353,19 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 			if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 				delete(lm.connEnqueued, eqKey)
 			}
+			// Clean up leader watcher for the expired holder.
+			if watchers, wok := sh.leaderWatchers[key]; wok {
+				delete(watchers, h.connID)
+				if len(watchers) == 0 {
+					delete(sh.leaderWatchers, key)
+				}
+			}
+			if keys, kok := lm.connLeaderKeys[h.connID]; kok {
+				delete(keys, key)
+				if len(keys) == 0 {
+					delete(lm.connLeaderKeys, h.connID)
+				}
+			}
 			expired = append(expired, token)
 		}
 	}
@@ -360,7 +374,7 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 	}
 	if len(expired) > 0 {
 		st.LastActivity = now
-		lm.grantNextWaiterLocked(key, st)
+		lm.grantNextLocked(key, st)
 	}
 }
 
@@ -1167,7 +1181,7 @@ func (lm *LockManager) LPop(key string) (string, bool) {
 	ls.Items[0] = "" // allow GC of the string
 	ls.Items = ls.Items[1:]
 	ls.LastActivity = time.Now()
-	if len(ls.Items) == 0 {
+	if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
 		delete(sh.lists, key)
 		lm.keyTotal.Add(-1)
 	}
@@ -1188,7 +1202,7 @@ func (lm *LockManager) RPop(key string) (string, bool) {
 	ls.Items[last] = "" // allow GC of the string
 	ls.Items = ls.Items[:last]
 	ls.LastActivity = time.Now()
-	if len(ls.Items) == 0 {
+	if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
 		delete(sh.lists, key)
 		lm.keyTotal.Add(-1)
 	}
@@ -1798,6 +1812,7 @@ func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *b
 // RegisterLeaderWatcher registers a connection to receive leader change notifications.
 func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh chan []byte, cancelConn func()) {
 	sh := lm.shardFor(key)
+	lm.connMu.Lock()
 	sh.mu.Lock()
 	watchers, ok := sh.leaderWatchers[key]
 	if !ok {
@@ -1805,22 +1820,21 @@ func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh 
 		sh.leaderWatchers[key] = watchers
 	}
 	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
-	sh.mu.Unlock()
-
-	lm.connMu.Lock()
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {
 		keys = make(map[string]struct{})
 		lm.connLeaderKeys[connID] = keys
 	}
 	keys[key] = struct{}{}
+	sh.mu.Unlock()
 	lm.connMu.Unlock()
 }
 
 // RegisterAndNotifyLeader atomically registers a watcher and notifies
-// observers of a leader change, all under the shard lock.
+// observers of a leader change.
 func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uint64, writeCh chan []byte, cancelConn func()) {
 	sh := lm.shardFor(key)
+	lm.connMu.Lock()
 	sh.mu.Lock()
 	watchers, ok := sh.leaderWatchers[key]
 	if !ok {
@@ -1839,21 +1853,20 @@ func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uin
 			lw.cancelConn()
 		}
 	}
-	sh.mu.Unlock()
-
-	lm.connMu.Lock()
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {
 		keys = make(map[string]struct{})
 		lm.connLeaderKeys[connID] = keys
 	}
 	keys[key] = struct{}{}
+	sh.mu.Unlock()
 	lm.connMu.Unlock()
 }
 
 // UnregisterLeaderWatcher removes a leader change watcher.
 func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
 	sh := lm.shardFor(key)
+	lm.connMu.Lock()
 	sh.mu.Lock()
 	if watchers, ok := sh.leaderWatchers[key]; ok {
 		delete(watchers, connID)
@@ -1861,15 +1874,13 @@ func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
 			delete(sh.leaderWatchers, key)
 		}
 	}
-	sh.mu.Unlock()
-
-	lm.connMu.Lock()
 	if keys, ok := lm.connLeaderKeys[connID]; ok {
 		delete(keys, key)
 		if len(keys) == 0 {
 			delete(lm.connLeaderKeys, connID)
 		}
 	}
+	sh.mu.Unlock()
 	lm.connMu.Unlock()
 }
 
@@ -1931,6 +1942,107 @@ func (lm *LockManager) LeaderHolder(key string) uint64 {
 		return h.connID
 	}
 	return 0
+}
+
+// ResignLeader atomically releases the lock, unregisters the leader watcher,
+// and sends "resigned" notification followed by any failover notification.
+func (lm *LockManager) ResignLeader(key, token string, connID uint64) bool {
+	sh := lm.shardFor(key)
+
+	lm.connMu.Lock()
+	sh.mu.Lock()
+
+	st := sh.resources[key]
+	if st == nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		return false
+	}
+
+	st.LastActivity = time.Now()
+
+	h, ok := st.Holders[token]
+	if !ok {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		return false
+	}
+
+	// 1. Release the lock.
+	lm.connRemoveOwned(h.connID, key, token)
+	eqKey := connKey{ConnID: h.connID, Key: key}
+	if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+		delete(lm.connEnqueued, eqKey)
+	}
+	delete(st.Holders, token)
+
+	// 2. Unregister the resigning connection's leader watcher.
+	if watchers, ok := sh.leaderWatchers[key]; ok {
+		delete(watchers, connID)
+		if len(watchers) == 0 {
+			delete(sh.leaderWatchers, key)
+		}
+	}
+	if keys, ok := lm.connLeaderKeys[connID]; ok {
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(lm.connLeaderKeys, connID)
+		}
+	}
+
+	// 3. Notify "resigned" before granting to next waiter.
+	if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
+		msg := []byte(fmt.Sprintf("leader resigned %s\n", key))
+		for _, lw := range watchers {
+			select {
+			case lw.ch <- msg:
+			default:
+				lw.cancelConn()
+			}
+		}
+	}
+
+	// 4. Grant next waiter (may trigger "failover" notification via grantNextWaiterLocked).
+	lm.grantNextLocked(key, st)
+
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
+	return true
+}
+
+// RegisterLeaderWatcherWithStatus atomically registers a watcher and returns
+// the current leader's connID (0 if none). This avoids a TOCTOU race
+// between registering and checking for an existing leader.
+func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64, writeCh chan []byte, cancelConn func()) uint64 {
+	sh := lm.shardFor(key)
+	lm.connMu.Lock()
+	sh.mu.Lock()
+
+	watchers, ok := sh.leaderWatchers[key]
+	if !ok {
+		watchers = make(map[uint64]*leaderWatcher)
+		sh.leaderWatchers[key] = watchers
+	}
+	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+
+	keys := lm.connLeaderKeys[connID]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		lm.connLeaderKeys[connID] = keys
+	}
+	keys[key] = struct{}{}
+
+	var holderConn uint64
+	if st, ok := sh.resources[key]; ok {
+		for _, h := range st.Holders {
+			holderConn = h.connID
+			break
+		}
+	}
+
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
+	return holderConn
 }
 
 // ---------------------------------------------------------------------------
@@ -2519,10 +2631,13 @@ func (lm *LockManager) ResetForTest() {
 		lm.shards[i].counters = make(map[string]*counterState)
 		lm.shards[i].kvStore = make(map[string]*kvEntry)
 		lm.shards[i].lists = make(map[string]*listState)
+		lm.shards[i].barriers = make(map[string]*barrierState)
+		lm.shards[i].leaderWatchers = make(map[string]map[uint64]*leaderWatcher)
 		lm.shards[i].mu.Unlock()
 	}
 	lm.connOwned = make(map[uint64]map[string]map[string]struct{})
 	lm.connEnqueued = make(map[connKey]*enqueuedState)
+	lm.connLeaderKeys = make(map[uint64]map[string]struct{})
 	lm.resourceTotal.Store(0)
 	lm.keyTotal.Store(0)
 }

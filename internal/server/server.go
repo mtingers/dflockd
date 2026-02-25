@@ -578,6 +578,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
+		s.wm.Notify("rl", req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "wl":
@@ -588,10 +589,12 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
+		s.wm.Notify("wl", req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "rr", "wr":
 		if s.lm.RWRelease(req.Key, req.Token) {
+			s.wm.Notify(req.Cmd, req.Key)
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
@@ -608,12 +611,18 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if err != nil {
 			return rwAcquireError(err)
 		}
+		if status == "acquired" {
+			s.wm.Notify("re", req.Key)
+		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
 	case "we":
 		status, tok, lease, fence, err := s.lm.RWEnqueue(req.Key, 'w', req.LeaseTTL, connID)
 		if err != nil {
 			return rwAcquireError(err)
+		}
+		if status == "acquired" {
+			s.wm.Notify("we", req.Key)
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
@@ -635,6 +644,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
+		s.wm.Notify(req.Cmd, req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease, Fence: fence}
 
 	// --- Watch/Notify ---
@@ -697,17 +707,14 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "resign":
-		if s.lm.Release(req.Key, req.Token) {
-			s.lm.UnregisterLeaderWatcher(req.Key, connID)
-			s.lm.NotifyLeaderChange(req.Key, "resigned", connID)
+		if s.lm.ResignLeader(req.Key, req.Token, connID) {
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
 
 	case "observe":
-		s.lm.RegisterLeaderWatcher(req.Key, connID, cs.writeCh, cs.cancelConn)
-		// Send current leader status so observer doesn't miss existing leader.
-		if holderConn := s.lm.LeaderHolder(req.Key); holderConn > 0 {
+		holderConn := s.lm.RegisterLeaderWatcherWithStatus(req.Key, connID, cs.writeCh, cs.cancelConn)
+		if holderConn > 0 {
 			msg := []byte(fmt.Sprintf("leader elected %s\n", req.Key))
 			select {
 			case cs.writeCh <- msg:

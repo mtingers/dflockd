@@ -538,30 +538,32 @@ func TestQueueGroup_MixedGroupAndIndividual(t *testing.T) {
 }
 
 // 16. DedupWithIndividual — connID in group + non-grouped, receives once, group advances
-func TestQueueGroup_DedupWithIndividual(t *testing.T) {
+func TestQueueGroup_IndependentFromNonGrouped(t *testing.T) {
 	m := NewManager()
 	ch := make(chan []byte, 16)
-	// Same connID, same WriteCh — registered as both non-grouped and grouped
+	// Same connID, same WriteCh — registered as both non-grouped and grouped.
+	// Groups deliver independently from non-grouped subscriptions, so the
+	// connection should receive 2 messages: one from the individual subscription
+	// and one from the queue group.
 	individual := &Listener{ConnID: 1, Pattern: "ch", WriteCh: ch}
 	grouped := &Listener{ConnID: 1, Pattern: "ch", Group: "g1", WriteCh: ch}
 	m.Listen(individual)
 	m.Listen(grouped)
 
-	n := m.Signal("ch", "payload")
-	// ConnID 1 already delivered via non-grouped, so the group delivery is skipped.
-	// Only 1 unique connection delivered.
-	if n != 1 {
-		t.Fatalf("Signal returned %d, want 1", n)
-	}
+	m.Signal("ch", "payload")
 
-	// Should have exactly one message on the channel
+	// Should have two messages: one from non-grouped, one from the group.
 	_, ok := recvWithin(ch, timeout)
 	if !ok {
-		t.Fatal("expected one message")
+		t.Fatal("expected first message (non-grouped)")
+	}
+	_, ok = recvWithin(ch, timeout)
+	if !ok {
+		t.Fatal("expected second message (group)")
 	}
 	_, ok = recvWithin(ch, timeout)
 	if ok {
-		t.Fatal("got duplicate message; dedup failed")
+		t.Fatal("got unexpected third message")
 	}
 }
 

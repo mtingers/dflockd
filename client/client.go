@@ -709,6 +709,9 @@ func KVGet(c *Conn, key string) (string, error) {
 	if resp == "nil" {
 		return "", ErrNotFound
 	}
+	if resp == "ok" {
+		return "", nil
+	}
 	if strings.HasPrefix(resp, "ok ") {
 		return resp[3:], nil
 	}
@@ -743,6 +746,9 @@ func KVCAS(c *Conn, key, oldValue, newValue string, ttlSeconds int) (bool, error
 	}
 	if strings.Contains(oldValue, "\t") {
 		return false, fmt.Errorf("dflockd: oldValue contains tab")
+	}
+	if strings.Contains(newValue, "\t") {
+		return false, fmt.Errorf("dflockd: newValue contains tab")
 	}
 	if strings.ContainsAny(oldValue, "\n\r") {
 		return false, fmt.Errorf("dflockd: oldValue contains newline")
@@ -1827,6 +1833,10 @@ func (s *Semaphore) startRenew() {
 					if ctx.Err() != nil {
 						return // Deliberately stopped; not a real failure.
 					}
+					// Clear token to prevent stale semaphore usage.
+					s.mu.Lock()
+					s.token = ""
+					s.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
 					}
@@ -2602,6 +2612,10 @@ func (rw *RWLock) startRenew(cmd string) {
 					if ctx.Err() != nil {
 						return
 					}
+					// Clear token to prevent stale lock usage.
+					rw.mu.Lock()
+					rw.token = ""
+					rw.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
 					}
@@ -2888,6 +2902,9 @@ func (lc *LeaderConn) Elect(key string, timeout time.Duration, opts ...Option) (
 
 // Resign gives up leadership for the given key.
 func (lc *LeaderConn) Resign(key, token string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := lc.sendCmd("resign", key, token)
 	if err != nil {
 		return err
@@ -2900,6 +2917,9 @@ func (lc *LeaderConn) Resign(key, token string) error {
 
 // Renew renews the leader lease. Returns the remaining seconds and fence.
 func (lc *LeaderConn) Renew(key, token string, opts ...Option) (int, uint64, error) {
+	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -3199,6 +3219,7 @@ func (e *Election) startRenew() {
 	token := e.token
 	opts := e.opts()
 	onErr := e.OnRenewError
+	onResigned := e.OnResigned
 
 	go func() {
 		defer close(done)
@@ -3232,8 +3253,8 @@ func (e *Election) startRenew() {
 					if onErr != nil {
 						onErr(err)
 					}
-					if e.OnResigned != nil {
-						e.OnResigned()
+					if onResigned != nil {
+						go onResigned()
 					}
 					return
 				}
