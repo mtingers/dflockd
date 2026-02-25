@@ -33,10 +33,16 @@ type waiter struct {
 	leaseTTL time.Duration
 }
 
-type LockState struct {
-	OwnerToken   string
-	OwnerConnID  uint64
-	LeaseExpires time.Time
+type holder struct {
+	connID       uint64
+	leaseExpires time.Time
+}
+
+// ResourceState is the unified state for both locks (Limit==1) and
+// semaphores (Limit>1). A lock is simply a semaphore with Limit 1.
+type ResourceState struct {
+	Limit        int
+	Holders      map[string]*holder // token → holder
 	Waiters      []*waiter
 	LastActivity time.Time
 }
@@ -47,41 +53,22 @@ type enqueuedState struct {
 	leaseTTL time.Duration
 }
 
-type semHolder struct {
-	connID       uint64
-	leaseExpires time.Time
-}
-
-type SemState struct {
-	Limit        int
-	Holders      map[string]*semHolder // token -> holder
-	Waiters      []*waiter
-	LastActivity time.Time
-}
-
 type LockManager struct {
 	mu           sync.Mutex
-	locks        map[string]*LockState
-	connOwned    map[uint64]map[string]struct{}
+	resources    map[string]*ResourceState
+	connOwned    map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
 	connEnqueued map[connKey]*enqueuedState
-	// Semaphore state
-	sems            map[string]*SemState
-	connSemOwned    map[uint64]map[string]map[string]struct{} // connID -> key -> set of tokens
-	connSemEnqueued map[connKey]*enqueuedState
-	cfg             *config.Config
-	log             *slog.Logger
+	cfg          *config.Config
+	log          *slog.Logger
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 	return &LockManager{
-		locks:           make(map[string]*LockState),
-		connOwned:       make(map[uint64]map[string]struct{}),
-		connEnqueued:    make(map[connKey]*enqueuedState),
-		sems:            make(map[string]*SemState),
-		connSemOwned:    make(map[uint64]map[string]map[string]struct{}),
-		connSemEnqueued: make(map[connKey]*enqueuedState),
-		cfg:             cfg,
-		log:             log,
+		resources:    make(map[string]*ResourceState),
+		connOwned:    make(map[uint64]map[string]map[string]struct{}),
+		connEnqueued: make(map[connKey]*enqueuedState),
+		cfg:          cfg,
+		log:          log,
 	}
 }
 
@@ -131,33 +118,51 @@ func removeWaitersByConn(waiters []*waiter, connID uint64, closed map[chan strin
 	return waiters[:n]
 }
 
-func (lm *LockManager) connAddOwned(connID uint64, key string) {
-	s, ok := lm.connOwned[connID]
+// ---------------------------------------------------------------------------
+// Internal helpers (must be called with lm.mu held)
+// ---------------------------------------------------------------------------
+
+func (lm *LockManager) connAddOwned(connID uint64, key, token string) {
+	m, ok := lm.connOwned[connID]
 	if !ok {
-		s = make(map[string]struct{})
-		lm.connOwned[connID] = s
+		m = make(map[string]map[string]struct{})
+		lm.connOwned[connID] = m
 	}
-	s[key] = struct{}{}
+	tokens, ok := m[key]
+	if !ok {
+		tokens = make(map[string]struct{})
+		m[key] = tokens
+	}
+	tokens[token] = struct{}{}
 }
 
-func (lm *LockManager) connRemoveOwned(connID uint64, key string) {
+func (lm *LockManager) connRemoveOwned(connID uint64, key, token string) {
 	if connID == 0 {
 		return
 	}
-	s, ok := lm.connOwned[connID]
+	m, ok := lm.connOwned[connID]
 	if !ok {
 		return
 	}
-	delete(s, key)
-	if len(s) == 0 {
+	tokens, ok := m[key]
+	if !ok {
+		return
+	}
+	delete(tokens, token)
+	if len(tokens) == 0 {
+		delete(m, key)
+	}
+	if len(m) == 0 {
 		delete(lm.connOwned, connID)
 	}
 }
 
-// grantNextWaiterLocked grants the lock to the next waiter in FIFO order.
+// grantNextWaiterLocked grants slots to FIFO waiters while capacity is
+// available. For locks (Limit==1) this grants at most one waiter; for
+// semaphores it grants up to Limit - len(Holders) waiters.
 // Must be called with lm.mu held.
-func (lm *LockManager) grantNextWaiterLocked(key string, st *LockState) {
-	for len(st.Waiters) > 0 {
+func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
+	for len(st.Waiters) > 0 && len(st.Holders) < st.Limit {
 		w := st.Waiters[0]
 		copy(st.Waiters, st.Waiters[1:])
 		st.Waiters[len(st.Waiters)-1] = nil // avoid memory leak
@@ -165,62 +170,73 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *LockState) {
 		token := newToken()
 		select {
 		case w.ch <- token:
-			st.OwnerToken = token
-			st.OwnerConnID = w.connID
-			st.LeaseExpires = time.Now().Add(w.leaseTTL)
+			st.Holders[token] = &holder{
+				connID:       w.connID,
+				leaseExpires: time.Now().Add(w.leaseTTL),
+			}
 			st.LastActivity = time.Now()
-			lm.connAddOwned(w.connID, key)
-			return
+			lm.connAddOwned(w.connID, key, token)
 		default:
 			// Channel closed or full — skip this waiter
 			continue
 		}
 	}
-	// No waiters: unlock
-	st.OwnerToken = ""
-	st.OwnerConnID = 0
-	st.LeaseExpires = time.Time{}
-	st.LastActivity = time.Now()
 }
 
-// evictExpiredLocked evicts the current owner if their lease has expired and
-// grants the lock to the next waiter (if any). Called opportunistically on
-// acquire paths so callers don't have to wait for the background sweep tick.
+// evictExpiredLocked evicts any holders whose leases have expired and grants
+// freed slots to waiting callers. Called opportunistically on acquire paths
+// so callers don't have to wait for the background sweep tick.
 // Must be called with lm.mu held.
-func (lm *LockManager) evictExpiredLocked(key string, st *LockState) {
-	if st.OwnerToken == "" || st.LeaseExpires.IsZero() || time.Now().Before(st.LeaseExpires) {
-		return
+func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
+	now := time.Now()
+	var expired []string
+	for token, h := range st.Holders {
+		if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
+			lm.log.Warn("evicting expired lease on acquire",
+				"key", key, "conn", h.connID)
+			lm.connRemoveOwned(h.connID, key, token)
+			eqKey := connKey{ConnID: h.connID, Key: key}
+			if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+				delete(lm.connEnqueued, eqKey)
+			}
+			expired = append(expired, token)
+		}
 	}
-	lm.log.Warn("evicting expired lease on acquire",
-		"key", key, "owner_conn", st.OwnerConnID)
-	ownerConn := st.OwnerConnID
-	lm.connRemoveOwned(ownerConn, key)
-	eqKey := connKey{ConnID: ownerConn, Key: key}
-	if es, ok := lm.connEnqueued[eqKey]; ok && es.token == st.OwnerToken {
-		delete(lm.connEnqueued, eqKey)
+	for _, token := range expired {
+		delete(st.Holders, token)
 	}
-	st.OwnerToken = ""
-	st.OwnerConnID = 0
-	st.LeaseExpires = time.Time{}
-	st.LastActivity = time.Now()
-	lm.grantNextWaiterLocked(key, st)
+	if len(expired) > 0 {
+		st.LastActivity = now
+		lm.grantNextWaiterLocked(key, st)
+	}
 }
 
-func (lm *LockManager) getOrCreateLocked(key string) (*LockState, error) {
-	st, ok := lm.locks[key]
+func (lm *LockManager) getOrCreateLocked(key string, limit int) (*ResourceState, error) {
+	st, ok := lm.resources[key]
 	if ok {
+		if st.Limit != limit {
+			return nil, ErrLimitMismatch
+		}
 		return st, nil
 	}
-	if len(lm.locks)+len(lm.sems) >= lm.cfg.MaxLocks {
+	if len(lm.resources) >= lm.cfg.MaxLocks {
 		return nil, ErrMaxLocks
 	}
-	st = &LockState{LastActivity: time.Now()}
-	lm.locks[key] = st
+	st = &ResourceState{
+		Limit:        limit,
+		Holders:      make(map[string]*holder),
+		LastActivity: time.Now(),
+	}
+	lm.resources[key] = st
 	return st, nil
 }
 
-// FIFOAcquire is the single-phase lock acquire (command "l").
-func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64) (string, error) {
+// ---------------------------------------------------------------------------
+// Public methods — unified for both locks (limit=1) and semaphores (limit>1)
+// ---------------------------------------------------------------------------
+
+// Acquire is the single-phase acquire (commands "l" and "sl").
+func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, error) {
 	w := &waiter{
 		ch:       make(chan string, 1),
 		connID:   connID,
@@ -228,7 +244,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	}
 
 	lm.mu.Lock()
-	st, err := lm.getOrCreateLocked(key)
+	st, err := lm.getOrCreateLocked(key, limit)
 	if err != nil {
 		lm.mu.Unlock()
 		return "", err
@@ -239,14 +255,15 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
 	lm.evictExpiredLocked(key, st)
 
-	// Fast path: free and no waiters
-	if st.OwnerToken == "" && len(st.Waiters) == 0 {
+	// Fast path: capacity available and no waiters
+	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
 		token := newToken()
-		st.OwnerToken = token
-		st.OwnerConnID = connID
-		st.LeaseExpires = time.Now().Add(leaseTTL)
+		st.Holders[token] = &holder{
+			connID:       connID,
+			leaseExpires: time.Now().Add(leaseTTL),
+		}
 		st.LastActivity = time.Now()
-		lm.connAddOwned(connID, key)
+		lm.connAddOwned(connID, key, token)
 		lm.mu.Unlock()
 		return token, nil
 	}
@@ -274,7 +291,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 			return "", ErrWaiterClosed
 		}
 		lm.mu.Lock()
-		if s := lm.locks[key]; s != nil {
+		if s := lm.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 		}
 		lm.mu.Unlock()
@@ -289,7 +306,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := lm.locks[key]; s != nil {
+				if s := lm.resources[key]; s != nil {
 					s.LastActivity = time.Now()
 				}
 				lm.mu.Unlock()
@@ -297,7 +314,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 			}
 		default:
 		}
-		if s := lm.locks[key]; s != nil {
+		if s := lm.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			s.Waiters = removeWaiter(s.Waiters, w)
 		}
@@ -311,7 +328,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := lm.locks[key]; s != nil {
+				if s := lm.resources[key]; s != nil {
 					s.LastActivity = time.Now()
 				}
 				lm.mu.Unlock()
@@ -319,7 +336,7 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 			}
 		default:
 		}
-		if s := lm.locks[key]; s != nil {
+		if s := lm.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			s.Waiters = removeWaiter(s.Waiters, w)
 		}
@@ -328,9 +345,9 @@ func (lm *LockManager) FIFOAcquire(ctx context.Context, key string, timeout, lea
 	}
 }
 
-// FIFOEnqueue is phase 1 of two-phase acquire (command "e").
+// Enqueue is phase 1 of two-phase acquire (commands "e" and "se").
 // Returns (status, token, leaseTTLSec, err).
-func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID uint64) (string, string, int, error) {
+func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64, limit int) (string, string, int, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
 
 	lm.mu.Lock()
@@ -340,7 +357,7 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 		return "", "", 0, ErrAlreadyEnqueued
 	}
 
-	st, err := lm.getOrCreateLocked(key)
+	st, err := lm.getOrCreateLocked(key, limit)
 	if err != nil {
 		return "", "", 0, err
 	}
@@ -351,14 +368,15 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
 	lm.evictExpiredLocked(key, st)
 
-	// Fast path: free and no waiters
-	if st.OwnerToken == "" && len(st.Waiters) == 0 {
+	// Fast path: capacity available and no waiters
+	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
 		token := newToken()
-		st.OwnerToken = token
-		st.OwnerConnID = connID
-		st.LeaseExpires = time.Now().Add(leaseTTL)
+		st.Holders[token] = &holder{
+			connID:       connID,
+			leaseExpires: time.Now().Add(leaseTTL),
+		}
 		st.LastActivity = time.Now()
-		lm.connAddOwned(connID, key)
+		lm.connAddOwned(connID, key, token)
 		lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
 		return "acquired", token, leaseSec, nil
 	}
@@ -377,9 +395,9 @@ func (lm *LockManager) FIFOEnqueue(key string, leaseTTL time.Duration, connID ui
 	return "queued", "", 0, nil
 }
 
-// FIFOWait is phase 2 of two-phase acquire (command "w").
+// Wait is phase 2 of two-phase acquire (commands "w" and "sw").
 // Returns (token, leaseTTLSec, err). Empty token means timeout.
-func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, error) {
+func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
 
 	lm.mu.Lock()
@@ -390,7 +408,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 	}
 
 	// Snapshot immutable fields under lock. The enqueuedState is set once
-	// during FIFOEnqueue and its fields are not mutated afterward; the only
+	// during Enqueue and its fields are not mutated afterward; the only
 	// concurrent operation is CleanupConnection closing the waiter channel,
 	// which is safe to race with a channel receive.
 	leaseTTL := es.leaseTTL
@@ -403,28 +421,29 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 	if esToken != "" {
 		lm.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
-		st := lm.locks[key]
-		if st != nil && st.OwnerToken == esToken {
-			// Verify lock still held (lease may have expired)
-			if !st.LeaseExpires.IsZero() && !time.Now().Before(st.LeaseExpires) {
-				// Expired: clean up owner state and grant to next waiter
-				lm.connRemoveOwned(connID, key)
-				st.OwnerToken = ""
-				st.OwnerConnID = 0
-				st.LeaseExpires = time.Time{}
+		st := lm.resources[key]
+		if st != nil {
+			h, hOK := st.Holders[esToken]
+			if hOK {
+				// Verify still held (lease may have expired)
+				if !h.leaseExpires.IsZero() && !time.Now().Before(h.leaseExpires) {
+					// Expired: clean up holder and grant to next waiter
+					lm.connRemoveOwned(connID, key, esToken)
+					delete(st.Holders, esToken)
+					st.LastActivity = time.Now()
+					lm.grantNextWaiterLocked(key, st)
+					lm.mu.Unlock()
+					return "", 0, ErrLeaseExpired
+				}
+				// Reset lease
+				h.leaseExpires = time.Now().Add(leaseTTL)
 				st.LastActivity = time.Now()
-				lm.grantNextWaiterLocked(key, st)
 				lm.mu.Unlock()
-				return "", 0, ErrLeaseExpired
+				return esToken, leaseSec, nil
 			}
-			// Reset lease
-			st.LeaseExpires = time.Now().Add(leaseTTL)
-			st.LastActivity = time.Now()
-			lm.mu.Unlock()
-			return esToken, leaseSec, nil
 		}
-		// Lock was lost (expired and granted to another, or state GC'd)
-		lm.connRemoveOwned(connID, key)
+		// Slot was lost (expired and granted to another, or state GC'd)
+		lm.connRemoveOwned(connID, key, esToken)
 		lm.mu.Unlock()
 		return "", 0, ErrLeaseExpired
 	}
@@ -448,8 +467,10 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		}
 		lm.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
-		if st := lm.locks[key]; st != nil {
-			st.LeaseExpires = time.Now().Add(leaseTTL)
+		if st := lm.resources[key]; st != nil {
+			if h, hOK := st.Holders[token]; hOK {
+				h.leaseExpires = time.Now().Add(leaseTTL)
+			}
 			st.LastActivity = time.Now()
 		}
 		lm.mu.Unlock()
@@ -461,8 +482,10 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if st := lm.locks[key]; st != nil {
-					st.LeaseExpires = time.Now().Add(leaseTTL)
+				if st := lm.resources[key]; st != nil {
+					if h, hOK := st.Holders[token]; hOK {
+						h.leaseExpires = time.Now().Add(leaseTTL)
+					}
 					st.LastActivity = time.Now()
 				}
 				lm.mu.Unlock()
@@ -470,7 +493,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 			}
 		default:
 		}
-		if st := lm.locks[key]; st != nil {
+		if st := lm.resources[key]; st != nil {
 			st.LastActivity = time.Now()
 			st.Waiters = removeWaiter(st.Waiters, w)
 		}
@@ -484,8 +507,10 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if st := lm.locks[key]; st != nil {
-					st.LeaseExpires = time.Now().Add(leaseTTL)
+				if st := lm.resources[key]; st != nil {
+					if h, hOK := st.Holders[token]; hOK {
+						h.leaseExpires = time.Now().Add(leaseTTL)
+					}
 					st.LastActivity = time.Now()
 				}
 				lm.mu.Unlock()
@@ -494,7 +519,7 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 		default:
 		}
 		// Remove from queue
-		if st := lm.locks[key]; st != nil {
+		if st := lm.resources[key]; st != nil {
 			st.LastActivity = time.Now()
 			st.Waiters = removeWaiter(st.Waiters, w)
 		}
@@ -503,42 +528,40 @@ func (lm *LockManager) FIFOWait(ctx context.Context, key string, timeout time.Du
 	}
 }
 
-// FIFORelease releases a lock if the token matches (command "r").
-func (lm *LockManager) FIFORelease(key, token string) bool {
+// Release releases one held slot if the token matches (commands "r" and "sr").
+func (lm *LockManager) Release(key, token string) bool {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	st := lm.locks[key]
+	st := lm.resources[key]
 	if st == nil {
 		return false
 	}
 
 	st.LastActivity = time.Now()
 
-	if st.OwnerToken != token {
+	h, ok := st.Holders[token]
+	if !ok {
 		return false
 	}
 
-	connID := st.OwnerConnID
-	lm.connRemoveOwned(connID, key)
-	eqKey := connKey{ConnID: connID, Key: key}
+	lm.connRemoveOwned(h.connID, key, token)
+	eqKey := connKey{ConnID: h.connID, Key: key}
 	if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 		delete(lm.connEnqueued, eqKey)
 	}
-	st.OwnerToken = ""
-	st.OwnerConnID = 0
-	st.LeaseExpires = time.Time{}
+	delete(st.Holders, token)
 	lm.grantNextWaiterLocked(key, st)
 	return true
 }
 
-// FIFORenew renews the lease if the token matches (command "n").
+// Renew renews the lease if the token matches (commands "n" and "sn").
 // Returns (remaining seconds, ok).
-func (lm *LockManager) FIFORenew(key, token string, leaseTTL time.Duration) (int, bool) {
+func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bool) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	st := lm.locks[key]
+	st := lm.resources[key]
 	if st == nil {
 		return 0, false
 	}
@@ -546,30 +569,28 @@ func (lm *LockManager) FIFORenew(key, token string, leaseTTL time.Duration) (int
 	now := time.Now()
 	st.LastActivity = now
 
-	if st.OwnerToken != token {
+	h, ok := st.Holders[token]
+	if !ok {
 		return 0, false
 	}
 
 	// If already expired, reject and evict
-	if !st.LeaseExpires.IsZero() && !now.Before(st.LeaseExpires) {
+	if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
 		lm.log.Warn("renew rejected (already expired)",
-			"key", key, "owner_conn", st.OwnerConnID)
-		connID := st.OwnerConnID
-		lm.connRemoveOwned(connID, key)
-		eqKey := connKey{ConnID: connID, Key: key}
+			"key", key, "conn", h.connID)
+		lm.connRemoveOwned(h.connID, key, token)
+		eqKey := connKey{ConnID: h.connID, Key: key}
 		if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 			delete(lm.connEnqueued, eqKey)
 		}
-		st.OwnerToken = ""
-		st.OwnerConnID = 0
-		st.LeaseExpires = time.Time{}
+		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.grantNextWaiterLocked(key, st)
 		return 0, false
 	}
 
 	// Reset lease
-	st.LeaseExpires = now.Add(leaseTTL)
+	h.leaseExpires = now.Add(leaseTTL)
 	st.LastActivity = now
 
 	remaining := int(leaseTTL.Seconds())
@@ -579,9 +600,13 @@ func (lm *LockManager) FIFORenew(key, token string, leaseTTL time.Duration) (int
 	return remaining, true
 }
 
+// ---------------------------------------------------------------------------
+// Connection cleanup
+// ---------------------------------------------------------------------------
+
 // CleanupConnection cleans up all state for a disconnected connection.
 // All channel closes are tracked in a set to prevent double-close panics
-// in case a waiter appears in both the enqueued map and the lock's waiter
+// in case a waiter appears in both the enqueued map and the resource's waiter
 // queue (which happens during two-phase acquire).
 func (lm *LockManager) CleanupConnection(connID uint64) {
 	if !lm.cfg.AutoReleaseOnDisconnect {
@@ -604,79 +629,25 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 		es := lm.connEnqueued[connKey{ConnID: connID, Key: key}]
 		delete(lm.connEnqueued, connKey{ConnID: connID, Key: key})
 		if es != nil && es.waiter != nil {
-			close(es.waiter.ch)
-			closed[es.waiter.ch] = struct{}{}
-			if st := lm.locks[key]; st != nil {
-				st.Waiters = removeWaiter(st.Waiters, es.waiter)
-			}
-		}
-	}
-
-	// Cancel pending waiters from l command path
-	for _, st := range lm.locks {
-		st.Waiters = removeWaitersByConn(st.Waiters, connID, closed)
-	}
-
-	// Release owned locks
-	if owned, ok := lm.connOwned[connID]; ok {
-		keys := make([]string, 0, len(owned))
-		for k := range owned {
-			keys = append(keys, k)
-		}
-		for _, key := range keys {
-			st := lm.locks[key]
-			if st == nil {
-				lm.connRemoveOwned(connID, key)
-				continue
-			}
-			if st.OwnerConnID != connID {
-				lm.connRemoveOwned(connID, key)
-				continue
-			}
-			lm.log.Warn("disconnect cleanup: releasing",
-				"key", key, "conn_id", connID)
-			lm.connRemoveOwned(connID, key)
-			st.OwnerToken = ""
-			st.OwnerConnID = 0
-			st.LeaseExpires = time.Time{}
-			st.LastActivity = time.Now()
-			lm.grantNextWaiterLocked(key, st)
-		}
-	}
-	delete(lm.connOwned, connID)
-
-	// --- Semaphore cleanup ---
-
-	// Clean up two-phase semaphore enqueued state
-	var semEnqueuedKeys []string
-	for ck := range lm.connSemEnqueued {
-		if ck.ConnID == connID {
-			semEnqueuedKeys = append(semEnqueuedKeys, ck.Key)
-		}
-	}
-	for _, key := range semEnqueuedKeys {
-		es := lm.connSemEnqueued[connKey{ConnID: connID, Key: key}]
-		delete(lm.connSemEnqueued, connKey{ConnID: connID, Key: key})
-		if es != nil && es.waiter != nil {
 			if _, already := closed[es.waiter.ch]; !already {
 				close(es.waiter.ch)
 				closed[es.waiter.ch] = struct{}{}
 			}
-			if st := lm.sems[key]; st != nil {
+			if st := lm.resources[key]; st != nil {
 				st.Waiters = removeWaiter(st.Waiters, es.waiter)
 			}
 		}
 	}
 
-	// Cancel pending semaphore waiters from sl command path
-	for _, st := range lm.sems {
+	// Cancel pending waiters from single-phase acquire path
+	for _, st := range lm.resources {
 		st.Waiters = removeWaitersByConn(st.Waiters, connID, closed)
 	}
 
-	// Release owned semaphore slots
-	if owned, ok := lm.connSemOwned[connID]; ok {
+	// Release owned slots
+	if owned, ok := lm.connOwned[connID]; ok {
 		for key, tokens := range owned {
-			st := lm.sems[key]
+			st := lm.resources[key]
 			if st == nil {
 				continue
 			}
@@ -688,16 +659,20 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				if h.connID != connID {
 					continue
 				}
-				lm.log.Warn("disconnect cleanup: releasing sem slot",
+				lm.log.Warn("disconnect cleanup: releasing",
 					"key", key, "conn_id", connID)
 				delete(st.Holders, token)
 			}
 			st.LastActivity = time.Now()
-			lm.semGrantNextWaiterLocked(key, st)
+			lm.grantNextWaiterLocked(key, st)
 		}
 	}
-	delete(lm.connSemOwned, connID)
+	delete(lm.connOwned, connID)
 }
+
+// ---------------------------------------------------------------------------
+// Background loops
+// ---------------------------------------------------------------------------
 
 // LeaseExpiryLoop runs the lease expiry background loop.
 func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
@@ -712,42 +687,19 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 		case <-ticker.C:
 			lm.mu.Lock()
 			now := time.Now()
-			for key, st := range lm.locks {
-				if st.OwnerToken == "" {
-					continue
-				}
-				if st.LeaseExpires.IsZero() {
-					continue
-				}
-				if !now.Before(st.LeaseExpires) {
-					lm.log.Warn("lease expired",
-						"key", key, "owner_conn", st.OwnerConnID)
-					lm.connRemoveOwned(st.OwnerConnID, key)
-					eqKey := connKey{ConnID: st.OwnerConnID, Key: key}
-					if es, ok := lm.connEnqueued[eqKey]; ok && es.token == st.OwnerToken {
-						delete(lm.connEnqueued, eqKey)
-					}
-					st.OwnerToken = ""
-					st.OwnerConnID = 0
-					st.LeaseExpires = time.Time{}
-					st.LastActivity = now
-					lm.grantNextWaiterLocked(key, st)
-				}
-			}
-			// Expire individual semaphore holder leases
-			for key, st := range lm.sems {
+			for key, st := range lm.resources {
 				var expired []string
 				for token, h := range st.Holders {
 					if h.leaseExpires.IsZero() {
 						continue
 					}
 					if !now.Before(h.leaseExpires) {
-						lm.log.Warn("sem lease expired",
+						lm.log.Warn("lease expired",
 							"key", key, "conn", h.connID)
-						lm.semConnRemoveOwned(h.connID, key, token)
-						semEqKey := connKey{ConnID: h.connID, Key: key}
-						if es, ok := lm.connSemEnqueued[semEqKey]; ok && es.token == token {
-							delete(lm.connSemEnqueued, semEqKey)
+						lm.connRemoveOwned(h.connID, key, token)
+						eqKey := connKey{ConnID: h.connID, Key: key}
+						if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+							delete(lm.connEnqueued, eqKey)
 						}
 						expired = append(expired, token)
 					}
@@ -757,7 +709,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 				}
 				if len(expired) > 0 {
 					st.LastActivity = now
-					lm.semGrantNextWaiterLocked(key, st)
+					lm.grantNextWaiterLocked(key, st)
 				}
 			}
 			lm.mu.Unlock()
@@ -779,494 +731,18 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 			lm.mu.Lock()
 			now := time.Now()
 			var expired []string
-			for key, st := range lm.locks {
+			for key, st := range lm.resources {
 				idle := now.Sub(st.LastActivity)
-				if idle > lm.cfg.GCMaxIdleTime && st.OwnerToken == "" && len(st.Waiters) == 0 {
+				if idle > lm.cfg.GCMaxIdleTime && len(st.Holders) == 0 && len(st.Waiters) == 0 {
 					expired = append(expired, key)
 				}
 			}
 			for _, key := range expired {
-				lm.log.Debug("GC: pruning unused lock state", "key", key)
-				delete(lm.locks, key)
-			}
-			// Prune idle semaphore state
-			var semExpired []string
-			for key, st := range lm.sems {
-				idle := now.Sub(st.LastActivity)
-				if idle > lm.cfg.GCMaxIdleTime && len(st.Holders) == 0 && len(st.Waiters) == 0 {
-					semExpired = append(semExpired, key)
-				}
-			}
-			for _, key := range semExpired {
-				lm.log.Debug("GC: pruning unused sem state", "key", key)
-				delete(lm.sems, key)
+				lm.log.Debug("GC: pruning unused state", "key", key)
+				delete(lm.resources, key)
 			}
 			lm.mu.Unlock()
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore helpers
-// ---------------------------------------------------------------------------
-
-func (lm *LockManager) semGetOrCreateLocked(key string, limit int) (*SemState, error) {
-	st, ok := lm.sems[key]
-	if ok {
-		if st.Limit != limit {
-			return nil, ErrLimitMismatch
-		}
-		return st, nil
-	}
-	if len(lm.locks)+len(lm.sems) >= lm.cfg.MaxLocks {
-		return nil, ErrMaxLocks
-	}
-	st = &SemState{
-		Limit:        limit,
-		Holders:      make(map[string]*semHolder),
-		LastActivity: time.Now(),
-	}
-	lm.sems[key] = st
-	return st, nil
-}
-
-func (lm *LockManager) semConnAddOwned(connID uint64, key, token string) {
-	m, ok := lm.connSemOwned[connID]
-	if !ok {
-		m = make(map[string]map[string]struct{})
-		lm.connSemOwned[connID] = m
-	}
-	tokens, ok := m[key]
-	if !ok {
-		tokens = make(map[string]struct{})
-		m[key] = tokens
-	}
-	tokens[token] = struct{}{}
-}
-
-func (lm *LockManager) semConnRemoveOwned(connID uint64, key, token string) {
-	if connID == 0 {
-		return
-	}
-	m, ok := lm.connSemOwned[connID]
-	if !ok {
-		return
-	}
-	tokens, ok := m[key]
-	if !ok {
-		return
-	}
-	delete(tokens, token)
-	if len(tokens) == 0 {
-		delete(m, key)
-	}
-	if len(m) == 0 {
-		delete(lm.connSemOwned, connID)
-	}
-}
-
-// semGrantNextWaiterLocked grants slots to FIFO waiters while capacity is available.
-// Must be called with lm.mu held.
-func (lm *LockManager) semGrantNextWaiterLocked(key string, st *SemState) {
-	for len(st.Waiters) > 0 && len(st.Holders) < st.Limit {
-		w := st.Waiters[0]
-		copy(st.Waiters, st.Waiters[1:])
-		st.Waiters[len(st.Waiters)-1] = nil // avoid memory leak
-		st.Waiters = st.Waiters[:len(st.Waiters)-1]
-		token := newToken()
-		select {
-		case w.ch <- token:
-			st.Holders[token] = &semHolder{
-				connID:       w.connID,
-				leaseExpires: time.Now().Add(w.leaseTTL),
-			}
-			st.LastActivity = time.Now()
-			lm.semConnAddOwned(w.connID, key, token)
-		default:
-			// Channel closed or full — skip this waiter
-			continue
-		}
-	}
-}
-
-// semEvictExpiredLocked evicts any holders whose leases have expired and
-// grants freed slots to waiting callers. Called opportunistically on acquire
-// paths so callers don't have to wait for the background sweep tick.
-// Must be called with lm.mu held.
-func (lm *LockManager) semEvictExpiredLocked(key string, st *SemState) {
-	now := time.Now()
-	var expired []string
-	for token, h := range st.Holders {
-		if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
-			lm.log.Warn("evicting expired sem lease on acquire",
-				"key", key, "conn", h.connID)
-			lm.semConnRemoveOwned(h.connID, key, token)
-			semEqKey := connKey{ConnID: h.connID, Key: key}
-			if es, ok := lm.connSemEnqueued[semEqKey]; ok && es.token == token {
-				delete(lm.connSemEnqueued, semEqKey)
-			}
-			expired = append(expired, token)
-		}
-	}
-	for _, token := range expired {
-		delete(st.Holders, token)
-	}
-	if len(expired) > 0 {
-		st.LastActivity = now
-		lm.semGrantNextWaiterLocked(key, st)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore public methods
-// ---------------------------------------------------------------------------
-
-// SemAcquire is the single-phase semaphore acquire (command "sl").
-func (lm *LockManager) SemAcquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, error) {
-	w := &waiter{
-		ch:       make(chan string, 1),
-		connID:   connID,
-		leaseTTL: leaseTTL,
-	}
-
-	lm.mu.Lock()
-	st, err := lm.semGetOrCreateLocked(key, limit)
-	if err != nil {
-		lm.mu.Unlock()
-		return "", err
-	}
-
-	st.LastActivity = time.Now()
-
-	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
-	lm.semEvictExpiredLocked(key, st)
-
-	// Fast path: capacity available and no waiters
-	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
-		token := newToken()
-		st.Holders[token] = &semHolder{
-			connID:       connID,
-			leaseExpires: time.Now().Add(leaseTTL),
-		}
-		st.LastActivity = time.Now()
-		lm.semConnAddOwned(connID, key, token)
-		lm.mu.Unlock()
-		return token, nil
-	}
-
-	// Slow path: enqueue and wait
-	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
-		lm.mu.Unlock()
-		return "", ErrMaxWaiters
-	}
-	st.Waiters = append(st.Waiters, w)
-	lm.mu.Unlock()
-
-	var timer *time.Timer
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-	} else {
-		timer = time.NewTimer(0)
-	}
-	defer timer.Stop()
-
-	select {
-	case token, ok := <-w.ch:
-		if !ok || token == "" {
-			return "", ErrWaiterClosed
-		}
-		lm.mu.Lock()
-		if s := lm.sems[key]; s != nil {
-			s.LastActivity = time.Now()
-		}
-		lm.mu.Unlock()
-		return token, nil
-
-	case <-ctx.Done():
-		lm.mu.Lock()
-		// Race check: returning a won token is safe — connection
-		// cleanup will release the slot if delivery fails.
-		select {
-		case token, ok := <-w.ch:
-			if ok && token != "" {
-				if s := lm.sems[key]; s != nil {
-					s.LastActivity = time.Now()
-				}
-				lm.mu.Unlock()
-				return token, nil
-			}
-		default:
-		}
-		if s := lm.sems[key]; s != nil {
-			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, w)
-		}
-		lm.mu.Unlock()
-		return "", ctx.Err()
-
-	case <-timer.C:
-		lm.mu.Lock()
-		select {
-		case token, ok := <-w.ch:
-			if ok && token != "" {
-				if s := lm.sems[key]; s != nil {
-					s.LastActivity = time.Now()
-				}
-				lm.mu.Unlock()
-				return token, nil
-			}
-		default:
-		}
-		if s := lm.sems[key]; s != nil {
-			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, w)
-		}
-		lm.mu.Unlock()
-		return "", nil
-	}
-}
-
-// SemRelease releases one semaphore slot (command "sr").
-func (lm *LockManager) SemRelease(key, token string) bool {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-
-	st := lm.sems[key]
-	if st == nil {
-		return false
-	}
-
-	st.LastActivity = time.Now()
-
-	h, ok := st.Holders[token]
-	if !ok {
-		return false
-	}
-
-	lm.semConnRemoveOwned(h.connID, key, token)
-	eqKey := connKey{ConnID: h.connID, Key: key}
-	if es, ok := lm.connSemEnqueued[eqKey]; ok && es.token == token {
-		delete(lm.connSemEnqueued, eqKey)
-	}
-	delete(st.Holders, token)
-	lm.semGrantNextWaiterLocked(key, st)
-	return true
-}
-
-// SemRenew renews a semaphore slot's lease (command "sn").
-func (lm *LockManager) SemRenew(key, token string, leaseTTL time.Duration) (int, bool) {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-
-	st := lm.sems[key]
-	if st == nil {
-		return 0, false
-	}
-
-	now := time.Now()
-	st.LastActivity = now
-
-	h, ok := st.Holders[token]
-	if !ok {
-		return 0, false
-	}
-
-	// If already expired, reject and evict
-	if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
-		lm.log.Warn("sem renew rejected (already expired)",
-			"key", key, "conn", h.connID)
-		lm.semConnRemoveOwned(h.connID, key, token)
-		eqKey := connKey{ConnID: h.connID, Key: key}
-		if es, ok := lm.connSemEnqueued[eqKey]; ok && es.token == token {
-			delete(lm.connSemEnqueued, eqKey)
-		}
-		delete(st.Holders, token)
-		st.LastActivity = now
-		lm.semGrantNextWaiterLocked(key, st)
-		return 0, false
-	}
-
-	h.leaseExpires = now.Add(leaseTTL)
-	st.LastActivity = now
-
-	remaining := int(leaseTTL.Seconds())
-	if remaining < 0 {
-		remaining = 0
-	}
-	return remaining, true
-}
-
-// SemEnqueue is phase 1 of two-phase semaphore acquire (command "se").
-func (lm *LockManager) SemEnqueue(key string, leaseTTL time.Duration, connID uint64, limit int) (string, string, int, error) {
-	eqKey := connKey{ConnID: connID, Key: key}
-
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-
-	if _, exists := lm.connSemEnqueued[eqKey]; exists {
-		return "", "", 0, ErrAlreadyEnqueued
-	}
-
-	st, err := lm.semGetOrCreateLocked(key, limit)
-	if err != nil {
-		return "", "", 0, err
-	}
-
-	st.LastActivity = time.Now()
-	leaseSec := int(leaseTTL / time.Second)
-
-	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
-	lm.semEvictExpiredLocked(key, st)
-
-	// Fast path: capacity available and no waiters
-	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
-		token := newToken()
-		st.Holders[token] = &semHolder{
-			connID:       connID,
-			leaseExpires: time.Now().Add(leaseTTL),
-		}
-		st.LastActivity = time.Now()
-		lm.semConnAddOwned(connID, key, token)
-		lm.connSemEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
-		return "acquired", token, leaseSec, nil
-	}
-
-	// Slow path: create waiter and enqueue
-	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
-		return "", "", 0, ErrMaxWaiters
-	}
-	w := &waiter{
-		ch:       make(chan string, 1),
-		connID:   connID,
-		leaseTTL: leaseTTL,
-	}
-	st.Waiters = append(st.Waiters, w)
-	lm.connSemEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
-	return "queued", "", 0, nil
-}
-
-// SemWait is phase 2 of two-phase semaphore acquire (command "sw").
-func (lm *LockManager) SemWait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, error) {
-	eqKey := connKey{ConnID: connID, Key: key}
-
-	lm.mu.Lock()
-	es, ok := lm.connSemEnqueued[eqKey]
-	if !ok {
-		lm.mu.Unlock()
-		return "", 0, ErrNotEnqueued
-	}
-
-	// Snapshot immutable fields under lock (same safety rationale as FIFOWait).
-	leaseTTL := es.leaseTTL
-	leaseSec := int(leaseTTL / time.Second)
-	esToken := es.token
-	w := es.waiter
-	lm.mu.Unlock()
-
-	// Fast path: already acquired during enqueue
-	if esToken != "" {
-		lm.mu.Lock()
-		delete(lm.connSemEnqueued, eqKey)
-		st := lm.sems[key]
-		if st != nil {
-			h, ok := st.Holders[esToken]
-			if ok {
-				if !h.leaseExpires.IsZero() && !time.Now().Before(h.leaseExpires) {
-					// Expired: clean up holder and grant to next waiter
-					lm.semConnRemoveOwned(connID, key, esToken)
-					delete(st.Holders, esToken)
-					st.LastActivity = time.Now()
-					lm.semGrantNextWaiterLocked(key, st)
-					lm.mu.Unlock()
-					return "", 0, ErrLeaseExpired
-				}
-				h.leaseExpires = time.Now().Add(leaseTTL)
-				st.LastActivity = time.Now()
-				lm.mu.Unlock()
-				return esToken, leaseSec, nil
-			}
-		}
-		// Slot was lost (expired and granted to another, or state GC'd)
-		lm.semConnRemoveOwned(connID, key, esToken)
-		lm.mu.Unlock()
-		return "", 0, ErrLeaseExpired
-	}
-
-	// Slow path: waiter is pending
-	var timer *time.Timer
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-	} else {
-		timer = time.NewTimer(0)
-	}
-	defer timer.Stop()
-
-	select {
-	case token, ok := <-w.ch:
-		if !ok || token == "" {
-			lm.mu.Lock()
-			delete(lm.connSemEnqueued, eqKey)
-			lm.mu.Unlock()
-			return "", 0, ErrWaiterClosed
-		}
-		lm.mu.Lock()
-		delete(lm.connSemEnqueued, eqKey)
-		if st := lm.sems[key]; st != nil {
-			if h, ok := st.Holders[token]; ok {
-				h.leaseExpires = time.Now().Add(leaseTTL)
-			}
-			st.LastActivity = time.Now()
-		}
-		lm.mu.Unlock()
-		return token, leaseSec, nil
-
-	case <-ctx.Done():
-		lm.mu.Lock()
-		delete(lm.connSemEnqueued, eqKey)
-		select {
-		case token, ok := <-w.ch:
-			if ok && token != "" {
-				if st := lm.sems[key]; st != nil {
-					if h, ok := st.Holders[token]; ok {
-						h.leaseExpires = time.Now().Add(leaseTTL)
-					}
-					st.LastActivity = time.Now()
-				}
-				lm.mu.Unlock()
-				return token, leaseSec, nil
-			}
-		default:
-		}
-		if st := lm.sems[key]; st != nil {
-			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, w)
-		}
-		lm.mu.Unlock()
-		return "", 0, ctx.Err()
-
-	case <-timer.C:
-		lm.mu.Lock()
-		delete(lm.connSemEnqueued, eqKey)
-		select {
-		case token, ok := <-w.ch:
-			if ok && token != "" {
-				if st := lm.sems[key]; st != nil {
-					if h, ok := st.Holders[token]; ok {
-						h.leaseExpires = time.Now().Add(leaseTTL)
-					}
-					st.LastActivity = time.Now()
-				}
-				lm.mu.Unlock()
-				return token, leaseSec, nil
-			}
-		default:
-		}
-		if st := lm.sems[key]; st != nil {
-			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, w)
-		}
-		lm.mu.Unlock()
-		return "", 0, nil
 	}
 }
 
@@ -1302,6 +778,8 @@ type Stats struct {
 }
 
 // Stats returns a snapshot of the current lock manager state.
+// Locks (Limit==1) and semaphores (Limit>1) are reported separately
+// for backward compatibility.
 func (lm *LockManager) Stats(connections int64) *Stats {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
@@ -1315,63 +793,76 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		IdleSemaphores: []IdleInfo{},
 	}
 
-	for key, st := range lm.locks {
-		if st.OwnerToken != "" {
-			expiresIn := st.LeaseExpires.Sub(now).Seconds()
-			if expiresIn < 0 {
-				expiresIn = 0
+	for key, st := range lm.resources {
+		if st.Limit == 1 {
+			// Report as a lock
+			if len(st.Holders) > 0 {
+				// Exactly one holder for a lock
+				var ownerConn uint64
+				var expires float64
+				for _, h := range st.Holders {
+					ownerConn = h.connID
+					expires = h.leaseExpires.Sub(now).Seconds()
+					if expires < 0 {
+						expires = 0
+					}
+				}
+				s.Locks = append(s.Locks, LockInfo{
+					Key:             key,
+					OwnerConnID:     ownerConn,
+					LeaseExpiresInS: expires,
+					Waiters:         len(st.Waiters),
+				})
+			} else if len(st.Waiters) > 0 {
+				s.Locks = append(s.Locks, LockInfo{
+					Key:     key,
+					Waiters: len(st.Waiters),
+				})
+			} else {
+				s.IdleLocks = append(s.IdleLocks, IdleInfo{
+					Key:   key,
+					IdleS: now.Sub(st.LastActivity).Seconds(),
+				})
 			}
-			s.Locks = append(s.Locks, LockInfo{
-				Key:             key,
-				OwnerConnID:     st.OwnerConnID,
-				LeaseExpiresInS: expiresIn,
-				Waiters:         len(st.Waiters),
-			})
-		} else if len(st.Waiters) > 0 {
-			// No owner but has waiters — report as active (waiters visible).
-			s.Locks = append(s.Locks, LockInfo{
-				Key:     key,
-				Waiters: len(st.Waiters),
-			})
 		} else {
-			s.IdleLocks = append(s.IdleLocks, IdleInfo{
-				Key:   key,
-				IdleS: now.Sub(st.LastActivity).Seconds(),
-			})
-		}
-	}
-
-	for key, st := range lm.sems {
-		if len(st.Holders) > 0 {
-			s.Semaphores = append(s.Semaphores, SemInfo{
-				Key:     key,
-				Limit:   st.Limit,
-				Holders: len(st.Holders),
-				Waiters: len(st.Waiters),
-			})
-		} else if len(st.Waiters) > 0 {
-			s.Semaphores = append(s.Semaphores, SemInfo{
-				Key:     key,
-				Limit:   st.Limit,
-				Waiters: len(st.Waiters),
-			})
-		} else {
-			s.IdleSemaphores = append(s.IdleSemaphores, IdleInfo{
-				Key:   key,
-				IdleS: now.Sub(st.LastActivity).Seconds(),
-			})
+			// Report as a semaphore
+			if len(st.Holders) > 0 {
+				s.Semaphores = append(s.Semaphores, SemInfo{
+					Key:     key,
+					Limit:   st.Limit,
+					Holders: len(st.Holders),
+					Waiters: len(st.Waiters),
+				})
+			} else if len(st.Waiters) > 0 {
+				s.Semaphores = append(s.Semaphores, SemInfo{
+					Key:     key,
+					Limit:   st.Limit,
+					Waiters: len(st.Waiters),
+				})
+			} else {
+				s.IdleSemaphores = append(s.IdleSemaphores, IdleInfo{
+					Key:   key,
+					IdleS: now.Sub(st.LastActivity).Seconds(),
+				})
+			}
 		}
 	}
 
 	return s
 }
 
-// ResetLeaseForTest forces a lock's lease to expire immediately (for testing only).
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+// ResetLeaseForTest forces all holders of a key to expire immediately (for testing only).
 func (lm *LockManager) ResetLeaseForTest(key string) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
-	if st, ok := lm.locks[key]; ok {
-		st.LeaseExpires = time.Now().Add(-1 * time.Second)
+	if st, ok := lm.resources[key]; ok {
+		for _, h := range st.Holders {
+			h.leaseExpires = time.Now().Add(-1 * time.Second)
+		}
 	}
 }
 
@@ -1379,11 +870,7 @@ func (lm *LockManager) ResetLeaseForTest(key string) {
 func (lm *LockManager) ResetForTest() {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
-	lm.locks = make(map[string]*LockState)
-	lm.connOwned = make(map[uint64]map[string]struct{})
+	lm.resources = make(map[string]*ResourceState)
+	lm.connOwned = make(map[uint64]map[string]map[string]struct{})
 	lm.connEnqueued = make(map[connKey]*enqueuedState)
-	lm.sems = make(map[string]*SemState)
-	lm.connSemOwned = make(map[uint64]map[string]map[string]struct{})
-	lm.connSemEnqueued = make(map[connKey]*enqueuedState)
 }
-

@@ -225,20 +225,22 @@ go run ./cmd/bench
 
 ### Example output
 
-```
+```bash
+# taken from macbook air m1 benchmark:
 $ go run ./cmd/bench --workers 20 --rounds 100
+
 bench: 20 workers x 100 rounds (key_prefix="bench")
 
   total ops : 2000
-  wall time : 1.234s
-  throughput: 1620.7 ops/s
+  wall time : 0.103s
+  throughput: 19373.0 ops/s
 
-  mean      : 0.617 ms
-  min       : 0.312 ms
-  max       : 4.821 ms
-  p50       : 0.534 ms
-  p99       : 2.105 ms
-  stdev     : 0.298 ms
+  mean      : 1.019 ms
+  min       : 0.116 ms
+  max       : 2.491 ms
+  p50       : 0.882 ms
+  p99       : 2.370 ms
+  stdev     : 0.460 ms
 ```
 
 Each worker uses a unique randomized key so all workers run in parallel without contending. To benchmark contended locks, use the same `--key` value with `--workers 1` and increase `--rounds`.

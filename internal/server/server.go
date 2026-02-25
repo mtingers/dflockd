@@ -240,11 +240,18 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 		}
 		return &protocol.Ack{Status: "ok", Extra: string(data)}
 
-	case "l":
-		tok, err := s.lm.FIFOAcquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID)
+	case "l", "sl":
+		limit := 1
+		if req.Cmd == "sl" {
+			limit = req.Limit
+		}
+		tok, err := s.lm.Acquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
+			}
+			if errors.Is(err, lock.ErrLimitMismatch) {
+				return &protocol.Ack{Status: "error_limit_mismatch"}
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
@@ -260,24 +267,31 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 		}
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
 
-	case "r":
-		if s.lm.FIFORelease(req.Key, req.Token) {
+	case "r", "sr":
+		if s.lm.Release(req.Key, req.Token) {
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
 
-	case "n":
-		remaining, ok := s.lm.FIFORenew(req.Key, req.Token, req.LeaseTTL)
+	case "n", "sn":
+		remaining, ok := s.lm.Renew(req.Key, req.Token, req.LeaseTTL)
 		if !ok {
 			return &protocol.Ack{Status: "error"}
 		}
 		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d", remaining)}
 
-	case "e":
-		status, tok, lease, err := s.lm.FIFOEnqueue(req.Key, req.LeaseTTL, connID)
+	case "e", "se":
+		limit := 1
+		if req.Cmd == "se" {
+			limit = req.Limit
+		}
+		status, tok, lease, err := s.lm.Enqueue(req.Key, req.LeaseTTL, connID, limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
+			}
+			if errors.Is(err, lock.ErrLimitMismatch) {
+				return &protocol.Ack{Status: "error_limit_mismatch"}
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
@@ -289,8 +303,8 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
 
-	case "w":
-		tok, lease, err := s.lm.FIFOWait(ctx, req.Key, req.AcquireTimeout, connID)
+	case "w", "sw":
+		tok, lease, err := s.lm.Wait(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}
@@ -300,81 +314,6 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			}
 			if errors.Is(err, lock.ErrWaiterClosed) {
 				s.log.Debug("waiter closed during wait", "key", req.Key, "conn", connID)
-				return &protocol.Ack{Status: "error"}
-			}
-			return &protocol.Ack{Status: "error"}
-		}
-		if tok == "" {
-			return &protocol.Ack{Status: "timeout"}
-		}
-		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
-
-	case "sl":
-		tok, err := s.lm.SemAcquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, req.Limit)
-		if err != nil {
-			if errors.Is(err, lock.ErrMaxLocks) {
-				return &protocol.Ack{Status: "error_max_locks"}
-			}
-			if errors.Is(err, lock.ErrLimitMismatch) {
-				return &protocol.Ack{Status: "error_limit_mismatch"}
-			}
-			if errors.Is(err, lock.ErrMaxWaiters) {
-				return &protocol.Ack{Status: "error_max_waiters"}
-			}
-			if errors.Is(err, lock.ErrWaiterClosed) {
-				s.log.Debug("waiter closed during sem acquire", "key", req.Key, "conn", connID)
-				return &protocol.Ack{Status: "error"}
-			}
-			return &protocol.Ack{Status: "error"}
-		}
-		if tok == "" {
-			return &protocol.Ack{Status: "timeout"}
-		}
-		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
-
-	case "sr":
-		if s.lm.SemRelease(req.Key, req.Token) {
-			return &protocol.Ack{Status: "ok"}
-		}
-		return &protocol.Ack{Status: "error"}
-
-	case "sn":
-		remaining, ok := s.lm.SemRenew(req.Key, req.Token, req.LeaseTTL)
-		if !ok {
-			return &protocol.Ack{Status: "error"}
-		}
-		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d", remaining)}
-
-	case "se":
-		status, tok, lease, err := s.lm.SemEnqueue(req.Key, req.LeaseTTL, connID, req.Limit)
-		if err != nil {
-			if errors.Is(err, lock.ErrMaxLocks) {
-				return &protocol.Ack{Status: "error_max_locks"}
-			}
-			if errors.Is(err, lock.ErrLimitMismatch) {
-				return &protocol.Ack{Status: "error_limit_mismatch"}
-			}
-			if errors.Is(err, lock.ErrMaxWaiters) {
-				return &protocol.Ack{Status: "error_max_waiters"}
-			}
-			if errors.Is(err, lock.ErrAlreadyEnqueued) {
-				return &protocol.Ack{Status: "error_already_enqueued"}
-			}
-			return &protocol.Ack{Status: "error"}
-		}
-		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
-
-	case "sw":
-		tok, lease, err := s.lm.SemWait(ctx, req.Key, req.AcquireTimeout, connID)
-		if err != nil {
-			if errors.Is(err, lock.ErrNotEnqueued) {
-				return &protocol.Ack{Status: "error_not_enqueued"}
-			}
-			if errors.Is(err, lock.ErrLeaseExpired) {
-				return &protocol.Ack{Status: "error_lease_expired"}
-			}
-			if errors.Is(err, lock.ErrWaiterClosed) {
-				s.log.Debug("waiter closed during sem wait", "key", req.Key, "conn", connID)
 				return &protocol.Ack{Status: "error"}
 			}
 			return &protocol.Ack{Status: "error"}

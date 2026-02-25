@@ -34,35 +34,51 @@ func testManager() *LockManager {
 // bg returns a background context for test calls.
 func bg() context.Context { return context.Background() }
 
+// holderConnID returns the connID of the first (only) holder for a lock resource.
+func holderConnID(st *ResourceState) uint64 {
+	for _, h := range st.Holders {
+		return h.connID
+	}
+	return 0
+}
+
+// holderToken returns the token of the first (only) holder for a lock resource.
+func holderToken(st *ResourceState) string {
+	for tok := range st.Holders {
+		return tok
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // FIFOAcquire
 // ---------------------------------------------------------------------------
 
 func TestFIFOAcquire_Immediate(t *testing.T) {
 	lm := testManager()
-	tok, err := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	tok, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if tok == "" {
 		t.Fatal("expected token")
 	}
-	st := lm.locks["k1"]
-	if st.OwnerToken != tok {
-		t.Fatalf("owner_token mismatch: %s != %s", st.OwnerToken, tok)
+	st := lm.resources["k1"]
+	if _, ok := st.Holders[tok]; !ok {
+		t.Fatalf("token should be in holders")
 	}
-	if st.OwnerConnID != 1 {
-		t.Fatalf("owner_conn_id: got %d want 1", st.OwnerConnID)
+	if holderConnID(st) != 1 {
+		t.Fatalf("owner_conn_id: got %d want 1", holderConnID(st))
 	}
 }
 
 func TestFIFOAcquire_Timeout(t *testing.T) {
 	lm := testManager()
-	_, err := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := lm.FIFOAcquire(bg(), "k1", 0, 30*time.Second, 2)
+	tok, err := lm.Acquire(bg(), "k1", 0, 30*time.Second, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +89,7 @@ func TestFIFOAcquire_Timeout(t *testing.T) {
 
 func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
 	var tok2, tok3 string
 	var mu sync.Mutex
@@ -82,7 +98,7 @@ func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		t, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 2)
+		t, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
 		mu.Lock()
 		tok2 = t
 		mu.Unlock()
@@ -90,14 +106,14 @@ func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		time.Sleep(20 * time.Millisecond) // ensure conn2 enqueues first
-		t, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 3)
+		t, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 3, 1)
 		mu.Lock()
 		tok3 = t
 		mu.Unlock()
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	lm.FIFORelease("k1", tok1)
+	lm.Release("k1", tok1)
 	time.Sleep(50 * time.Millisecond)
 
 	mu.Lock()
@@ -107,11 +123,11 @@ func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
 	}
 	mu.Unlock()
 
-	if lm.locks["k1"].OwnerConnID != 2 {
-		t.Fatalf("expected conn 2 to own, got %d", lm.locks["k1"].OwnerConnID)
+	if holderConnID(lm.resources["k1"]) != 2 {
+		t.Fatalf("expected conn 2 to own, got %d", holderConnID(lm.resources["k1"]))
 	}
 
-	lm.FIFORelease("k1", tok2)
+	lm.Release("k1", tok2)
 	wg.Wait()
 
 	mu.Lock()
@@ -125,11 +141,11 @@ func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
 func TestFIFOAcquire_MaxLocks(t *testing.T) {
 	lm := testManager()
 	lm.cfg.MaxLocks = 1
-	_, err := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = lm.FIFOAcquire(bg(), "k2", 5*time.Second, 30*time.Second, 2)
+	_, err = lm.Acquire(bg(), "k2", 5*time.Second, 30*time.Second, 2, 1)
 	if err != ErrMaxLocks {
 		t.Fatalf("expected ErrMaxLocks, got %v", err)
 	}
@@ -137,7 +153,7 @@ func TestFIFOAcquire_MaxLocks(t *testing.T) {
 
 func TestFIFOAcquire_ContextCancel(t *testing.T) {
 	lm := testManager()
-	_, err := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +162,7 @@ func TestFIFOAcquire_ContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	var acquireErr error
 	go func() {
-		_, acquireErr = lm.FIFOAcquire(ctx, "k1", 30*time.Second, 30*time.Second, 2)
+		_, acquireErr = lm.Acquire(ctx, "k1", 30*time.Second, 30*time.Second, 2, 1)
 		close(done)
 	}()
 
@@ -168,47 +184,47 @@ func TestFIFOAcquire_ContextCancel(t *testing.T) {
 
 func TestFIFORelease_Valid(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	if !lm.FIFORelease("k1", tok) {
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if !lm.Release("k1", tok) {
 		t.Fatal("release should succeed")
 	}
-	if lm.locks["k1"].OwnerToken != "" {
+	if len(lm.resources["k1"].Holders) != 0 {
 		t.Fatal("owner should be cleared")
 	}
 }
 
 func TestFIFORelease_WrongToken(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	if lm.FIFORelease("k1", "wrong") {
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if lm.Release("k1", "wrong") {
 		t.Fatal("release with wrong token should fail")
 	}
 }
 
 func TestFIFORelease_Nonexistent(t *testing.T) {
 	lm := testManager()
-	if lm.FIFORelease("nope", "tok") {
+	if lm.Release("nope", "tok") {
 		t.Fatal("release of nonexistent key should fail")
 	}
 }
 
 func TestFIFORelease_TransfersToWaiter(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 2)
+		tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	lm.FIFORelease("k1", tok1)
+	lm.Release("k1", tok1)
 	tok2 := <-done
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired")
 	}
-	if lm.locks["k1"].OwnerConnID != 2 {
+	if holderConnID(lm.resources["k1"]) != 2 {
 		t.Fatal("conn2 should own the lock")
 	}
 }
@@ -219,8 +235,8 @@ func TestFIFORelease_TransfersToWaiter(t *testing.T) {
 
 func TestFIFORenew_Valid(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	remaining, ok := lm.FIFORenew("k1", tok, 60*time.Second)
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	remaining, ok := lm.Renew("k1", tok, 60*time.Second)
 	if !ok {
 		t.Fatal("renew should succeed")
 	}
@@ -231,8 +247,8 @@ func TestFIFORenew_Valid(t *testing.T) {
 
 func TestFIFORenew_WrongToken(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	_, ok := lm.FIFORenew("k1", "wrong", 30*time.Second)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	_, ok := lm.Renew("k1", "wrong", 30*time.Second)
 	if ok {
 		t.Fatal("renew with wrong token should fail")
 	}
@@ -240,7 +256,7 @@ func TestFIFORenew_WrongToken(t *testing.T) {
 
 func TestFIFORenew_Nonexistent(t *testing.T) {
 	lm := testManager()
-	_, ok := lm.FIFORenew("nope", "tok", 30*time.Second)
+	_, ok := lm.Renew("nope", "tok", 30*time.Second)
 	if ok {
 		t.Fatal("renew of nonexistent key should fail")
 	}
@@ -248,17 +264,17 @@ func TestFIFORenew_Nonexistent(t *testing.T) {
 
 func TestFIFORenew_Expired(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 1*time.Second, 1)
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
 	// Manually expire
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	_, ok := lm.FIFORenew("k1", tok, 30*time.Second)
+	_, ok := lm.Renew("k1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew of expired lease should fail")
 	}
-	if lm.locks["k1"].OwnerToken != "" {
+	if len(lm.resources["k1"].Holders) != 0 {
 		t.Fatal("owner should be cleared after expired renew")
 	}
 }
@@ -269,7 +285,7 @@ func TestFIFORenew_Expired(t *testing.T) {
 
 func TestFIFOEnqueue_Immediate(t *testing.T) {
 	lm := testManager()
-	status, tok, lease, err := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	status, tok, lease, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,9 +305,9 @@ func TestFIFOEnqueue_Immediate(t *testing.T) {
 
 func TestFIFOEnqueue_Queued(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
-	status, tok, lease, err := lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	status, tok, lease, err := lm.Enqueue("k1", 30*time.Second, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,8 +328,8 @@ func TestFIFOEnqueue_Queued(t *testing.T) {
 
 func TestFIFOEnqueue_DoubleEnqueue(t *testing.T) {
 	lm := testManager()
-	lm.FIFOEnqueue("k1", 30*time.Second, 1)
-	_, _, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	lm.Enqueue("k1", 30*time.Second, 1, 1)
+	_, _, _, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if err == nil {
 		t.Fatal("double enqueue should error")
 	}
@@ -325,8 +341,8 @@ func TestFIFOEnqueue_DoubleEnqueue(t *testing.T) {
 func TestFIFOEnqueue_MaxLocks(t *testing.T) {
 	lm := testManager()
 	lm.cfg.MaxLocks = 1
-	lm.FIFOEnqueue("k1", 30*time.Second, 1)
-	_, _, _, err := lm.FIFOEnqueue("k2", 30*time.Second, 2)
+	lm.Enqueue("k1", 30*time.Second, 1, 1)
+	_, _, _, err := lm.Enqueue("k2", 30*time.Second, 2, 1)
 	if err != ErrMaxLocks {
 		t.Fatalf("expected ErrMaxLocks, got %v", err)
 	}
@@ -338,12 +354,12 @@ func TestFIFOEnqueue_MaxLocks(t *testing.T) {
 
 func TestFIFOWait_FastPath(t *testing.T) {
 	lm := testManager()
-	status, token, _, _ := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	status, token, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
 
-	tok, ttl, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	tok, ttl, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,19 +376,19 @@ func TestFIFOWait_FastPath(t *testing.T) {
 
 func TestFIFOWait_QueuedThenWait(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
 	done := make(chan struct{})
 	var gotTok string
 	var gotTTL int
 	go func() {
-		gotTok, gotTTL, _ = lm.FIFOWait(bg(), "k1", 5*time.Second, 2)
+		gotTok, gotTTL, _ = lm.Wait(bg(), "k1", 5*time.Second, 2)
 		close(done)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	lm.FIFORelease("k1", tok1)
+	lm.Release("k1", tok1)
 	<-done
 
 	if gotTok == "" {
@@ -385,10 +401,10 @@ func TestFIFOWait_QueuedThenWait(t *testing.T) {
 
 func TestFIFOWait_Timeout(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
-	tok, _, err := lm.FIFOWait(bg(), "k1", 0, 2)
+	tok, _, err := lm.Wait(bg(), "k1", 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +415,7 @@ func TestFIFOWait_Timeout(t *testing.T) {
 
 func TestFIFOWait_NotEnqueued(t *testing.T) {
 	lm := testManager()
-	_, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if err != ErrNotEnqueued {
 		t.Fatalf("expected ErrNotEnqueued, got %v", err)
 	}
@@ -407,36 +423,35 @@ func TestFIFOWait_NotEnqueued(t *testing.T) {
 
 func TestFIFOWait_FastPathLockLost(t *testing.T) {
 	lm := testManager()
-	status, _, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	status, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
-	// Manually expire + clear owner
+	// Manually expire + clear holder
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
-	lm.locks["k1"].OwnerToken = ""
-	lm.locks["k1"].OwnerConnID = 0
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	delete(lm.resources["k1"].Holders, tok)
 	lm.mu.Unlock()
 
-	tok, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	gotTok, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
-	if tok != "" {
+	if gotTok != "" {
 		t.Fatal("expected empty token (lock lost)")
 	}
 }
 
 func TestFIFOWait_ContextCancel(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	var waitErr error
 	go func() {
-		_, _, waitErr = lm.FIFOWait(ctx, "k1", 30*time.Second, 2)
+		_, _, waitErr = lm.Wait(ctx, "k1", 30*time.Second, 2)
 		close(done)
 	}()
 
@@ -458,50 +473,50 @@ func TestFIFOWait_ContextCancel(t *testing.T) {
 
 func TestTwoPhase_FullCycle(t *testing.T) {
 	lm := testManager()
-	status, token, _, _ := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	status, token, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
 
-	tok, _, _ := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	tok, _, _ := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if tok != token {
 		t.Fatal("token mismatch")
 	}
 
-	if !lm.FIFORelease("k1", tok) {
+	if !lm.Release("k1", tok) {
 		t.Fatal("release should succeed")
 	}
-	if lm.locks["k1"].OwnerToken != "" {
+	if len(lm.resources["k1"].Holders) != 0 {
 		t.Fatal("owner should be cleared")
 	}
 }
 
 func TestTwoPhase_Contention(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
-	status, _, _, _ := lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	status, _, _, _ := lm.Enqueue("k1", 30*time.Second, 2, 1)
 	if status != "queued" {
 		t.Fatal("expected queued")
 	}
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _, _ := lm.FIFOWait(bg(), "k1", 5*time.Second, 2)
+		tok, _, _ := lm.Wait(bg(), "k1", 5*time.Second, 2)
 		done <- tok
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	lm.FIFORelease("k1", tok1)
+	lm.Release("k1", tok1)
 	tok2 := <-done
 
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired")
 	}
-	if lm.locks["k1"].OwnerConnID != 2 {
+	if holderConnID(lm.resources["k1"]) != 2 {
 		t.Fatal("conn2 should own")
 	}
-	lm.FIFORelease("k1", tok2)
+	lm.Release("k1", tok2)
 }
 
 // ---------------------------------------------------------------------------
@@ -510,23 +525,23 @@ func TestTwoPhase_Contention(t *testing.T) {
 
 func TestCleanup_ReleasesOwned(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 100)
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 100, 1)
 	if tok == "" {
 		t.Fatal("should acquire")
 	}
 	lm.CleanupConnection(100)
-	if lm.locks["k1"].OwnerToken != "" {
+	if len(lm.resources["k1"].Holders) != 0 {
 		t.Fatal("owner should be cleared")
 	}
 }
 
 func TestCleanup_CancelsPending(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.FIFOAcquire(bg(), "k1", 10*time.Second, 30*time.Second, 2)
+		tok, _ := lm.Acquire(bg(), "k1", 10*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -540,11 +555,11 @@ func TestCleanup_CancelsPending(t *testing.T) {
 
 func TestCleanup_TransfersToWaiter(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 2)
+		tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -554,15 +569,15 @@ func TestCleanup_TransfersToWaiter(t *testing.T) {
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired after transfer")
 	}
-	if lm.locks["k1"].OwnerConnID != 2 {
+	if holderConnID(lm.resources["k1"]) != 2 {
 		t.Fatal("conn2 should own")
 	}
 }
 
 func TestCleanup_EnqueuedWaiter(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
 	if _, ok := lm.connEnqueued[connKey{ConnID: 2, Key: "k1"}]; !ok {
 		t.Fatal("should be enqueued")
@@ -572,14 +587,14 @@ func TestCleanup_EnqueuedWaiter(t *testing.T) {
 	if _, ok := lm.connEnqueued[connKey{ConnID: 2, Key: "k1"}]; ok {
 		t.Fatal("should be cleaned up")
 	}
-	if len(lm.locks["k1"].Waiters) != 0 {
+	if len(lm.resources["k1"].Waiters) != 0 {
 		t.Fatal("waiter should be removed")
 	}
 }
 
 func TestCleanup_FastPath(t *testing.T) {
 	lm := testManager()
-	status, _, _, _ := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	status, _, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
@@ -588,7 +603,7 @@ func TestCleanup_FastPath(t *testing.T) {
 	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; ok {
 		t.Fatal("should be cleaned up")
 	}
-	if lm.locks["k1"].OwnerToken != "" {
+	if len(lm.resources["k1"].Holders) != 0 {
 		t.Fatal("owner should be cleared")
 	}
 }
@@ -605,13 +620,13 @@ func TestCleanup_Noop(t *testing.T) {
 func TestLeaseExpiry_ReleasesLock(t *testing.T) {
 	lm := testManager()
 	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 1*time.Second, 1)
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
 	if tok == "" {
 		t.Fatal("should acquire")
 	}
 	// Manually expire
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -625,9 +640,9 @@ func TestLeaseExpiry_ReleasesLock(t *testing.T) {
 	<-loopDone
 
 	lm.mu.Lock()
-	ownerToken := lm.locks["k1"].OwnerToken
+	holders := len(lm.resources["k1"].Holders)
 	lm.mu.Unlock()
-	if ownerToken != "" {
+	if holders != 0 {
 		t.Fatal("owner should be cleared by expiry loop")
 	}
 }
@@ -635,18 +650,18 @@ func TestLeaseExpiry_ReleasesLock(t *testing.T) {
 func TestLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	lm := testManager()
 	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 1*time.Second, 1)
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 2)
+		tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
 
 	// Expire
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -664,7 +679,7 @@ func TestLeaseExpiry_TransfersToWaiter(t *testing.T) {
 		t.Fatal("conn2 should have acquired after expiry")
 	}
 	lm.mu.Lock()
-	ownerConnID := lm.locks["k1"].OwnerConnID
+	ownerConnID := holderConnID(lm.resources["k1"])
 	lm.mu.Unlock()
 	if ownerConnID != 2 {
 		t.Fatal("conn2 should own")
@@ -680,11 +695,11 @@ func TestGC_PrunesIdle(t *testing.T) {
 	lm.cfg.GCInterval = 50 * time.Millisecond
 	lm.cfg.GCMaxIdleTime = 0
 
-	tok, _ := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.FIFORelease("k1", tok)
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Release("k1", tok)
 	// Force idle
 	lm.mu.Lock()
-	lm.locks["k1"].LastActivity = time.Now().Add(-100 * time.Second)
+	lm.resources["k1"].LastActivity = time.Now().Add(-100 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -693,7 +708,7 @@ func TestGC_PrunesIdle(t *testing.T) {
 	cancel()
 
 	lm.mu.Lock()
-	_, exists := lm.locks["k1"]
+	_, exists := lm.resources["k1"]
 	lm.mu.Unlock()
 	if exists {
 		t.Fatal("k1 should have been GC'd")
@@ -705,9 +720,9 @@ func TestGC_DoesNotPruneHeld(t *testing.T) {
 	lm.cfg.GCInterval = 50 * time.Millisecond
 	lm.cfg.GCMaxIdleTime = 0
 
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	lm.mu.Lock()
-	lm.locks["k1"].LastActivity = time.Now().Add(-100 * time.Second)
+	lm.resources["k1"].LastActivity = time.Now().Add(-100 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -716,7 +731,7 @@ func TestGC_DoesNotPruneHeld(t *testing.T) {
 	cancel()
 
 	lm.mu.Lock()
-	_, exists := lm.locks["k1"]
+	_, exists := lm.resources["k1"]
 	lm.mu.Unlock()
 	if !exists {
 		t.Fatal("k1 should not be GC'd (still held)")
@@ -733,14 +748,14 @@ func TestGC_DoesNotPruneHeld(t *testing.T) {
 
 func TestSemAcquire_Immediate(t *testing.T) {
 	lm := testManager()
-	tok, err := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	tok, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if tok == "" {
 		t.Fatal("expected token")
 	}
-	st := lm.sems["s1"]
+	st := lm.resources["s1"]
 	if st.Limit != 3 {
 		t.Fatalf("limit: got %d want 3", st.Limit)
 	}
@@ -751,24 +766,24 @@ func TestSemAcquire_Immediate(t *testing.T) {
 
 func TestSemAcquire_MultipleConcurrent(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	tok2, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
-	tok3, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 3)
+	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	tok2, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
+	tok3, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 3)
 	if tok1 == "" || tok2 == "" || tok3 == "" {
 		t.Fatal("all three should acquire immediately")
 	}
-	if len(lm.sems["s1"].Holders) != 3 {
-		t.Fatalf("holders: got %d want 3", len(lm.sems["s1"].Holders))
+	if len(lm.resources["s1"].Holders) != 3 {
+		t.Fatalf("holders: got %d want 3", len(lm.resources["s1"].Holders))
 	}
 }
 
 func TestSemAcquire_AtCapacityTimeout(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 2)
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 2)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 2)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 2)
 
 	// Third should timeout with 0 timeout
-	tok, err := lm.SemAcquire(bg(), "s1", 0, 30*time.Second, 3, 2)
+	tok, err := lm.Acquire(bg(), "s1", 0, 30*time.Second, 3, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -779,7 +794,7 @@ func TestSemAcquire_AtCapacityTimeout(t *testing.T) {
 
 func TestSemAcquire_FIFOOrdering(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
 	var tok2, tok3 string
 	var mu sync.Mutex
@@ -788,7 +803,7 @@ func TestSemAcquire_FIFOOrdering(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		t, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
+		t, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
 		mu.Lock()
 		tok2 = t
 		mu.Unlock()
@@ -796,14 +811,14 @@ func TestSemAcquire_FIFOOrdering(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		time.Sleep(20 * time.Millisecond)
-		t, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 1)
+		t, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 1)
 		mu.Lock()
 		tok3 = t
 		mu.Unlock()
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	lm.SemRelease("s1", tok1)
+	lm.Release("s1", tok1)
 	time.Sleep(50 * time.Millisecond)
 
 	mu.Lock()
@@ -813,7 +828,7 @@ func TestSemAcquire_FIFOOrdering(t *testing.T) {
 	}
 	mu.Unlock()
 
-	lm.SemRelease("s1", tok2)
+	lm.Release("s1", tok2)
 	wg.Wait()
 
 	mu.Lock()
@@ -827,11 +842,11 @@ func TestSemAcquire_FIFOOrdering(t *testing.T) {
 func TestSemAcquire_MaxLocks(t *testing.T) {
 	lm := testManager()
 	lm.cfg.MaxLocks = 1
-	_, err := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = lm.SemAcquire(bg(), "s2", 5*time.Second, 30*time.Second, 2, 3)
+	_, err = lm.Acquire(bg(), "s2", 5*time.Second, 30*time.Second, 2, 3)
 	if err != ErrMaxLocks {
 		t.Fatalf("expected ErrMaxLocks, got %v", err)
 	}
@@ -839,11 +854,11 @@ func TestSemAcquire_MaxLocks(t *testing.T) {
 
 func TestSemAcquire_LimitMismatch(t *testing.T) {
 	lm := testManager()
-	_, err := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 5)
+	_, err = lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 5)
 	if err != ErrLimitMismatch {
 		t.Fatalf("expected ErrLimitMismatch, got %v", err)
 	}
@@ -852,9 +867,9 @@ func TestSemAcquire_LimitMismatch(t *testing.T) {
 func TestSemAcquire_MaxLocksSharedWithLocks(t *testing.T) {
 	lm := testManager()
 	lm.cfg.MaxLocks = 2
-	lm.FIFOAcquire(bg(), "lock1", 5*time.Second, 30*time.Second, 1)
-	lm.SemAcquire(bg(), "sem1", 5*time.Second, 30*time.Second, 2, 3)
-	_, err := lm.SemAcquire(bg(), "sem2", 5*time.Second, 30*time.Second, 3, 3)
+	lm.Acquire(bg(), "lock1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "sem1", 5*time.Second, 30*time.Second, 2, 3)
+	_, err := lm.Acquire(bg(), "sem2", 5*time.Second, 30*time.Second, 3, 3)
 	if err != ErrMaxLocks {
 		t.Fatalf("expected ErrMaxLocks, got %v", err)
 	}
@@ -862,7 +877,7 @@ func TestSemAcquire_MaxLocksSharedWithLocks(t *testing.T) {
 
 func TestSemAcquire_ContextCancel(t *testing.T) {
 	lm := testManager()
-	_, err := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,7 +886,7 @@ func TestSemAcquire_ContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	var acquireErr error
 	go func() {
-		_, acquireErr = lm.SemAcquire(ctx, "s1", 30*time.Second, 30*time.Second, 2, 1)
+		_, acquireErr = lm.Acquire(ctx, "s1", 30*time.Second, 30*time.Second, 2, 1)
 		close(done)
 	}()
 
@@ -893,35 +908,35 @@ func TestSemAcquire_ContextCancel(t *testing.T) {
 
 func TestSemRelease_Valid(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	if !lm.SemRelease("s1", tok) {
+	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	if !lm.Release("s1", tok) {
 		t.Fatal("release should succeed")
 	}
-	if len(lm.sems["s1"].Holders) != 0 {
+	if len(lm.resources["s1"].Holders) != 0 {
 		t.Fatal("holders should be empty")
 	}
 }
 
 func TestSemRelease_WrongToken(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	if lm.SemRelease("s1", "wrong") {
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	if lm.Release("s1", "wrong") {
 		t.Fatal("release with wrong token should fail")
 	}
 }
 
 func TestSemRelease_TransfersToWaiter(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
+		tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	lm.SemRelease("s1", tok1)
+	lm.Release("s1", tok1)
 	tok2 := <-done
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired")
@@ -934,8 +949,8 @@ func TestSemRelease_TransfersToWaiter(t *testing.T) {
 
 func TestSemRenew_Valid(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	remaining, ok := lm.SemRenew("s1", tok, 60*time.Second)
+	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	remaining, ok := lm.Renew("s1", tok, 60*time.Second)
 	if !ok {
 		t.Fatal("renew should succeed")
 	}
@@ -946,8 +961,8 @@ func TestSemRenew_Valid(t *testing.T) {
 
 func TestSemRenew_WrongToken(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	_, ok := lm.SemRenew("s1", "wrong", 30*time.Second)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	_, ok := lm.Renew("s1", "wrong", 30*time.Second)
 	if ok {
 		t.Fatal("renew with wrong token should fail")
 	}
@@ -955,16 +970,16 @@ func TestSemRenew_WrongToken(t *testing.T) {
 
 func TestSemRenew_Expired(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
+	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	_, ok := lm.SemRenew("s1", tok, 30*time.Second)
+	_, ok := lm.Renew("s1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew of expired lease should fail")
 	}
-	if len(lm.sems["s1"].Holders) != 0 {
+	if len(lm.resources["s1"].Holders) != 0 {
 		t.Fatal("expired holder should be removed")
 	}
 }
@@ -975,7 +990,7 @@ func TestSemRenew_Expired(t *testing.T) {
 
 func TestSemEnqueue_Immediate(t *testing.T) {
 	lm := testManager()
-	status, tok, lease, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	status, tok, lease, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -986,9 +1001,9 @@ func TestSemEnqueue_Immediate(t *testing.T) {
 
 func TestSemEnqueue_Queued(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
-	status, tok, lease, err := lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	status, tok, lease, err := lm.Enqueue("s1", 30*time.Second, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -999,8 +1014,8 @@ func TestSemEnqueue_Queued(t *testing.T) {
 
 func TestSemEnqueue_DoubleEnqueue(t *testing.T) {
 	lm := testManager()
-	lm.SemEnqueue("s1", 30*time.Second, 1, 3)
-	_, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	lm.Enqueue("s1", 30*time.Second, 1, 3)
+	_, _, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	if err == nil {
 		t.Fatal("double enqueue should error")
 	}
@@ -1011,8 +1026,8 @@ func TestSemEnqueue_DoubleEnqueue(t *testing.T) {
 
 func TestSemEnqueue_LimitMismatch(t *testing.T) {
 	lm := testManager()
-	lm.SemEnqueue("s1", 30*time.Second, 1, 3)
-	_, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 2, 5)
+	lm.Enqueue("s1", 30*time.Second, 1, 3)
+	_, _, _, err := lm.Enqueue("s1", 30*time.Second, 2, 5)
 	if err != ErrLimitMismatch {
 		t.Fatalf("expected ErrLimitMismatch, got %v", err)
 	}
@@ -1020,12 +1035,12 @@ func TestSemEnqueue_LimitMismatch(t *testing.T) {
 
 func TestSemWait_FastPath(t *testing.T) {
 	lm := testManager()
-	status, token, _, _ := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	status, token, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
 
-	tok, ttl, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	tok, ttl, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1036,18 +1051,18 @@ func TestSemWait_FastPath(t *testing.T) {
 
 func TestSemWait_QueuedThenWait(t *testing.T) {
 	lm := testManager()
-	tok1, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("s1", 30*time.Second, 2, 1)
 
 	done := make(chan struct{})
 	var gotTok string
 	go func() {
-		gotTok, _, _ = lm.SemWait(bg(), "s1", 5*time.Second, 2)
+		gotTok, _, _ = lm.Wait(bg(), "s1", 5*time.Second, 2)
 		close(done)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	lm.SemRelease("s1", tok1)
+	lm.Release("s1", tok1)
 	<-done
 
 	if gotTok == "" {
@@ -1057,10 +1072,10 @@ func TestSemWait_QueuedThenWait(t *testing.T) {
 
 func TestSemWait_Timeout(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("s1", 30*time.Second, 2, 1)
 
-	tok, _, err := lm.SemWait(bg(), "s1", 0, 2)
+	tok, _, err := lm.Wait(bg(), "s1", 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1071,7 +1086,7 @@ func TestSemWait_Timeout(t *testing.T) {
 
 func TestSemWait_NotEnqueued(t *testing.T) {
 	lm := testManager()
-	_, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if err != ErrNotEnqueued {
 		t.Fatalf("expected ErrNotEnqueued, got %v", err)
 	}
@@ -1079,14 +1094,14 @@ func TestSemWait_NotEnqueued(t *testing.T) {
 
 func TestSemWait_ContextCancel(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("s1", 30*time.Second, 2, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	var waitErr error
 	go func() {
-		_, _, waitErr = lm.SemWait(ctx, "s1", 30*time.Second, 2)
+		_, _, waitErr = lm.Wait(ctx, "s1", 30*time.Second, 2)
 		close(done)
 	}()
 
@@ -1108,23 +1123,23 @@ func TestSemWait_ContextCancel(t *testing.T) {
 
 func TestSemCleanup_ReleasesOwned(t *testing.T) {
 	lm := testManager()
-	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 100, 3)
+	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 100, 3)
 	if tok == "" {
 		t.Fatal("should acquire")
 	}
 	lm.CleanupConnection(100)
-	if len(lm.sems["s1"].Holders) != 0 {
+	if len(lm.resources["s1"].Holders) != 0 {
 		t.Fatal("holders should be cleared")
 	}
 }
 
 func TestSemCleanup_CancelsPending(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.SemAcquire(bg(), "s1", 10*time.Second, 30*time.Second, 2, 1)
+		tok, _ := lm.Acquire(bg(), "s1", 10*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1138,11 +1153,11 @@ func TestSemCleanup_CancelsPending(t *testing.T) {
 
 func TestSemCleanup_TransfersToWaiter(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
+		tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1156,11 +1171,11 @@ func TestSemCleanup_TransfersToWaiter(t *testing.T) {
 
 func TestSemCleanup_EnqueuedWaiter(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("s1", 30*time.Second, 2, 1)
 
 	lm.CleanupConnection(2)
-	if len(lm.sems["s1"].Waiters) != 0 {
+	if len(lm.resources["s1"].Waiters) != 0 {
 		t.Fatal("waiter should be removed")
 	}
 }
@@ -1172,12 +1187,12 @@ func TestSemCleanup_EnqueuedWaiter(t *testing.T) {
 func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 	lm := testManager()
 	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
+	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
 	if tok == "" {
 		t.Fatal("should acquire")
 	}
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1191,7 +1206,7 @@ func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 	<-loopDone
 
 	lm.mu.Lock()
-	holderCount := len(lm.sems["s1"].Holders)
+	holderCount := len(lm.resources["s1"].Holders)
 	lm.mu.Unlock()
 	if holderCount != 0 {
 		t.Fatal("holder should be evicted by expiry loop")
@@ -1201,18 +1216,18 @@ func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 func TestSemLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	lm := testManager()
 	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 1)
 
 	done := make(chan string, 1)
 	go func() {
-		tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
+		tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
 		done <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
 
 	// Expire holder
 	lm.mu.Lock()
-	for _, h := range lm.sems["s1"].Holders {
+	for _, h := range lm.resources["s1"].Holders {
 		h.leaseExpires = time.Now().Add(-1 * time.Second)
 	}
 	lm.mu.Unlock()
@@ -1242,10 +1257,10 @@ func TestSemGC_PrunesIdle(t *testing.T) {
 	lm.cfg.GCInterval = 50 * time.Millisecond
 	lm.cfg.GCMaxIdleTime = 0
 
-	tok, _ := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	lm.SemRelease("s1", tok)
+	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	lm.Release("s1", tok)
 	lm.mu.Lock()
-	lm.sems["s1"].LastActivity = time.Now().Add(-100 * time.Second)
+	lm.resources["s1"].LastActivity = time.Now().Add(-100 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1254,7 +1269,7 @@ func TestSemGC_PrunesIdle(t *testing.T) {
 	cancel()
 
 	lm.mu.Lock()
-	_, exists := lm.sems["s1"]
+	_, exists := lm.resources["s1"]
 	lm.mu.Unlock()
 	if exists {
 		t.Fatal("s1 should have been GC'd")
@@ -1266,9 +1281,9 @@ func TestSemGC_DoesNotPruneHeld(t *testing.T) {
 	lm.cfg.GCInterval = 50 * time.Millisecond
 	lm.cfg.GCMaxIdleTime = 0
 
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
 	lm.mu.Lock()
-	lm.sems["s1"].LastActivity = time.Now().Add(-100 * time.Second)
+	lm.resources["s1"].LastActivity = time.Now().Add(-100 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1277,7 +1292,7 @@ func TestSemGC_DoesNotPruneHeld(t *testing.T) {
 	cancel()
 
 	lm.mu.Lock()
-	_, exists := lm.sems["s1"]
+	_, exists := lm.resources["s1"]
 	lm.mu.Unlock()
 	if !exists {
 		t.Fatal("s1 should not be GC'd (still has holders)")
@@ -1293,7 +1308,7 @@ func TestFIFOAcquire_MaxWaiters(t *testing.T) {
 	lm.cfg.MaxWaiters = 1
 
 	// conn1 holds the lock
-	_, err := lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1301,22 +1316,22 @@ func TestFIFOAcquire_MaxWaiters(t *testing.T) {
 	// conn2 enqueues as waiter (fills the queue)
 	done := make(chan struct{})
 	go func() {
-		lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 2)
+		lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
 		close(done)
 	}()
 	time.Sleep(50 * time.Millisecond)
 
 	// conn3 should get ErrMaxWaiters
-	_, err = lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 3)
+	_, err = lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 3, 1)
 	if err != ErrMaxWaiters {
 		t.Fatalf("expected ErrMaxWaiters, got %v", err)
 	}
 
 	// Cleanup: release so goroutine can finish
 	lm.mu.Lock()
-	tok := lm.locks["k1"].OwnerToken
+	tok := holderToken(lm.resources["k1"])
 	lm.mu.Unlock()
-	lm.FIFORelease("k1", tok)
+	lm.Release("k1", tok)
 	<-done
 }
 
@@ -1325,10 +1340,10 @@ func TestFIFOEnqueue_MaxWaiters(t *testing.T) {
 	lm.cfg.MaxWaiters = 1
 
 	// conn1 holds the lock
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
 	// conn2 enqueues (fills queue)
-	status, _, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	status, _, _, err := lm.Enqueue("k1", 30*time.Second, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1337,7 +1352,7 @@ func TestFIFOEnqueue_MaxWaiters(t *testing.T) {
 	}
 
 	// conn3 should get ErrMaxWaiters
-	_, _, _, err = lm.FIFOEnqueue("k1", 30*time.Second, 3)
+	_, _, _, err = lm.Enqueue("k1", 30*time.Second, 3, 1)
 	if err != ErrMaxWaiters {
 		t.Fatalf("expected ErrMaxWaiters, got %v", err)
 	}
@@ -1348,7 +1363,7 @@ func TestSemAcquire_MaxWaiters(t *testing.T) {
 	lm.cfg.MaxWaiters = 1
 
 	// conn1 holds the single slot
-	_, err := lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1356,13 +1371,13 @@ func TestSemAcquire_MaxWaiters(t *testing.T) {
 	// conn2 waits (fills queue)
 	done := make(chan struct{})
 	go func() {
-		lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
+		lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
 		close(done)
 	}()
 	time.Sleep(50 * time.Millisecond)
 
 	// conn3 should get ErrMaxWaiters
-	_, err = lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 1)
+	_, err = lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 1)
 	if err != ErrMaxWaiters {
 		t.Fatalf("expected ErrMaxWaiters, got %v", err)
 	}
@@ -1370,12 +1385,12 @@ func TestSemAcquire_MaxWaiters(t *testing.T) {
 	// Cleanup
 	lm.mu.Lock()
 	var tok string
-	for t := range lm.sems["s1"].Holders {
+	for t := range lm.resources["s1"].Holders {
 		tok = t
 		break
 	}
 	lm.mu.Unlock()
-	lm.SemRelease("s1", tok)
+	lm.Release("s1", tok)
 	<-done
 }
 
@@ -1384,10 +1399,10 @@ func TestSemEnqueue_MaxWaiters(t *testing.T) {
 	lm.cfg.MaxWaiters = 1
 
 	// conn1 holds the slot
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
 	// conn2 enqueues (fills queue)
-	status, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	status, _, _, err := lm.Enqueue("s1", 30*time.Second, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1396,7 +1411,7 @@ func TestSemEnqueue_MaxWaiters(t *testing.T) {
 	}
 
 	// conn3 should get ErrMaxWaiters
-	_, _, _, err = lm.SemEnqueue("s1", 30*time.Second, 3, 1)
+	_, _, _, err = lm.Enqueue("s1", 30*time.Second, 3, 1)
 	if err != ErrMaxWaiters {
 		t.Fatalf("expected ErrMaxWaiters, got %v", err)
 	}
@@ -1410,28 +1425,28 @@ func TestSemRelease_DoesNotClobberEnqueuedState(t *testing.T) {
 	lm := testManager()
 
 	// Phase 1: conn1 acquires slot T1 via two-phase
-	status, tok1, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	status, tok1, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	if err != nil || status != "acquired" {
 		t.Fatalf("enqueue1: status=%s err=%v", status, err)
 	}
-	got1, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	got1, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if err != nil || got1 != tok1 {
 		t.Fatalf("wait1: tok=%s err=%v", got1, err)
 	}
 
 	// Phase 2: conn1 enqueues again for a second slot (T2)
-	status, tok2, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	status, tok2, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	if err != nil || status != "acquired" {
 		t.Fatalf("enqueue2: status=%s err=%v", status, err)
 	}
 
 	// Release T1 — must NOT destroy the enqueued state for T2
-	if !lm.SemRelease("s1", tok1) {
+	if !lm.Release("s1", tok1) {
 		t.Fatal("release T1 should succeed")
 	}
 
 	// SemWait for T2 must still work
-	got2, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	got2, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if err != nil {
 		t.Fatalf("wait2 should succeed, got err: %v", err)
 	}
@@ -1444,18 +1459,18 @@ func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
 	lm := testManager()
 
 	// Conn1 acquires via two-phase
-	status, tok1, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	status, tok1, _, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if err != nil || status != "acquired" {
 		t.Fatalf("enqueue1: status=%s err=%v", status, err)
 	}
-	got1, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	got1, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if err != nil || got1 != tok1 {
 		t.Fatalf("wait1: tok=%s err=%v", got1, err)
 	}
 
 	// Conn1 enqueues again (will be queued behind itself — a self-deadlock
 	// scenario, but the data structure must still be consistent)
-	status, _, _, err = lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	status, _, _, err = lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if err != nil {
 		t.Fatalf("enqueue2: err=%v", err)
 	}
@@ -1464,7 +1479,7 @@ func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
 	}
 
 	// Release T1 — must NOT destroy the queued enqueue state
-	if !lm.FIFORelease("k1", tok1) {
+	if !lm.Release("k1", tok1) {
 		t.Fatal("release should succeed")
 	}
 
@@ -1484,32 +1499,29 @@ func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
 
 func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
 	// When a lock is acquired via enqueue then its lease expires before
-	// FIFOWait is called, FIFOWait must return ErrLeaseExpired and clean
+	// Wait is called, Wait must return ErrLeaseExpired and clean
 	// up owner state so the next waiter can proceed.
 	lm := testManager()
-	status, tok, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	status, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	if status != "acquired" || tok == "" {
 		t.Fatal("expected acquired")
 	}
 
 	// Manually expire the lease
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	_, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
 
 	// Owner state must be cleaned up
 	lm.mu.Lock()
-	st := lm.locks["k1"]
-	if st.OwnerToken != "" {
+	st := lm.resources["k1"]
+	if len(st.Holders) != 0 {
 		t.Fatal("owner should be cleared after expired wait")
-	}
-	if st.OwnerConnID != 0 {
-		t.Fatal("owner conn should be 0")
 	}
 	lm.mu.Unlock()
 
@@ -1522,26 +1534,28 @@ func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
 func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
 	// When the fast-path detects expiry, the next waiter should be granted.
 	lm := testManager()
-	lm.FIFOEnqueue("k1", 1*time.Second, 1) // conn1 acquires
+	lm.Enqueue("k1", 1*time.Second, 1, 1) // conn1 acquires
 
 	// conn2 enqueues as waiter
-	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
 	// Expire conn1's lease
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	for _, h := range lm.resources["k1"].Holders {
+		h.leaseExpires = time.Now().Add(-1 * time.Second)
+	}
 	lm.mu.Unlock()
 
-	// conn1's FIFOWait detects expiry and should grant to conn2
-	_, _, err := lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	// conn1's Wait detects expiry and should grant to conn2
+	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
 
 	// conn2 should now be the owner (granted by grantNextWaiterLocked)
 	lm.mu.Lock()
-	st := lm.locks["k1"]
-	ownerConn := st.OwnerConnID
+	st := lm.resources["k1"]
+	ownerConn := holderConnID(st)
 	lm.mu.Unlock()
 	if ownerConn != 2 {
 		t.Fatalf("expected conn2 to own, got %d", ownerConn)
@@ -1550,44 +1564,44 @@ func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
 
 func TestSemWait_FastPathLeaseExpired(t *testing.T) {
 	lm := testManager()
-	status, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	status, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	if status != "acquired" || tok == "" {
 		t.Fatal("expected acquired")
 	}
 
 	// Manually expire
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	_, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
 
 	// Holder should be cleaned up
 	lm.mu.Lock()
-	if len(lm.sems["s1"].Holders) != 0 {
+	if len(lm.resources["s1"].Holders) != 0 {
 		t.Fatal("expired holder should be removed")
 	}
 	lm.mu.Unlock()
 }
 
 func TestSemWait_FastPathLockLost(t *testing.T) {
-	// If the sem state is GC'd or holder was evicted, SemWait should
+	// If the sem state is GC'd or holder was evicted, Wait should
 	// return ErrLeaseExpired.
 	lm := testManager()
-	status, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	status, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	if status != "acquired" || tok == "" {
 		t.Fatal("expected acquired")
 	}
 
 	// Remove the holder to simulate state loss
 	lm.mu.Lock()
-	delete(lm.sems["s1"].Holders, tok)
+	delete(lm.resources["s1"].Holders, tok)
 	lm.mu.Unlock()
 
-	_, _, err := lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
@@ -1598,14 +1612,14 @@ func TestSemWait_FastPathLockLost(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFIFOAcquire_WaiterClosed(t *testing.T) {
-	// When CleanupConnection closes a waiter channel, FIFOAcquire
+	// When CleanupConnection closes a waiter channel, Acquire
 	// should return ErrWaiterClosed instead of returning an empty token.
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := lm.FIFOAcquire(bg(), "k1", 30*time.Second, 30*time.Second, 2)
+		_, err := lm.Acquire(bg(), "k1", 30*time.Second, 30*time.Second, 2, 1)
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1619,12 +1633,12 @@ func TestFIFOAcquire_WaiterClosed(t *testing.T) {
 
 func TestFIFOWait_WaiterClosed(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.FIFOEnqueue("k1", 30*time.Second, 2)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := lm.FIFOWait(bg(), "k1", 30*time.Second, 2)
+		_, _, err := lm.Wait(bg(), "k1", 30*time.Second, 2)
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1638,11 +1652,11 @@ func TestFIFOWait_WaiterClosed(t *testing.T) {
 
 func TestSemAcquire_WaiterClosed(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := lm.SemAcquire(bg(), "s1", 30*time.Second, 30*time.Second, 2, 1)
+		_, err := lm.Acquire(bg(), "s1", 30*time.Second, 30*time.Second, 2, 1)
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1656,12 +1670,12 @@ func TestSemAcquire_WaiterClosed(t *testing.T) {
 
 func TestSemWait_WaiterClosed(t *testing.T) {
 	lm := testManager()
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.SemEnqueue("s1", 30*time.Second, 2, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("s1", 30*time.Second, 2, 1)
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := lm.SemWait(bg(), "s1", 30*time.Second, 2)
+		_, _, err := lm.Wait(bg(), "s1", 30*time.Second, 2)
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1678,17 +1692,17 @@ func TestSemWait_WaiterClosed(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFIFORelease_CleansConnEnqueued(t *testing.T) {
-	// After FIFOEnqueue acquires immediately, FIFORelease must clean
+	// After Enqueue acquires immediately, Release must clean
 	// the connEnqueued entry for that token.
 	lm := testManager()
-	_, tok, _, _ := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	_, tok, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
 	if _, ok := lm.connEnqueued[eqKey]; !ok {
 		t.Fatal("connEnqueued should exist before release")
 	}
 
-	lm.FIFORelease("k1", tok)
+	lm.Release("k1", tok)
 
 	if _, ok := lm.connEnqueued[eqKey]; ok {
 		t.Fatal("connEnqueued should be cleaned up after release")
@@ -1697,32 +1711,32 @@ func TestFIFORelease_CleansConnEnqueued(t *testing.T) {
 
 func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
 	lm := testManager()
-	_, tok, _, _ := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	_, tok, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
-	if _, ok := lm.connSemEnqueued[eqKey]; !ok {
-		t.Fatal("connSemEnqueued should exist before release")
+	if _, ok := lm.connEnqueued[eqKey]; !ok {
+		t.Fatal("connEnqueued should exist before release")
 	}
 
-	lm.SemRelease("s1", tok)
+	lm.Release("s1", tok)
 
-	if _, ok := lm.connSemEnqueued[eqKey]; ok {
-		t.Fatal("connSemEnqueued should be cleaned up after release")
+	if _, ok := lm.connEnqueued[eqKey]; ok {
+		t.Fatal("connEnqueued should be cleaned up after release")
 	}
 }
 
 func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
 	// When renew detects expiry, it must also clean connEnqueued.
 	lm := testManager()
-	_, tok, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	_, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
 	// Manually expire
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	_, ok := lm.FIFORenew("k1", tok, 30*time.Second)
+	_, ok := lm.Renew("k1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew should fail on expired lease")
 	}
@@ -1734,20 +1748,20 @@ func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
 
 func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
 	lm := testManager()
-	_, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	_, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	_, ok := lm.SemRenew("s1", tok, 30*time.Second)
+	_, ok := lm.Renew("s1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew should fail on expired lease")
 	}
 
-	if _, ok := lm.connSemEnqueued[eqKey]; ok {
-		t.Fatal("connSemEnqueued should be cleaned up after expired renew")
+	if _, ok := lm.connEnqueued[eqKey]; ok {
+		t.Fatal("connEnqueued should be cleaned up after expired renew")
 	}
 }
 
@@ -1755,7 +1769,7 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 	// The LeaseExpiryLoop should also clean connEnqueued entries.
 	lm := testManager()
 	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	_, tok, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	_, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
 	if _, ok := lm.connEnqueued[eqKey]; !ok {
@@ -1764,8 +1778,7 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 
 	// Expire
 	lm.mu.Lock()
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
-	_ = tok
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1784,11 +1797,11 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 	lm := testManager()
 	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	_, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	_, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1797,10 +1810,10 @@ func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 	cancel()
 
 	lm.mu.Lock()
-	_, exists := lm.connSemEnqueued[eqKey]
+	_, exists := lm.connEnqueued[eqKey]
 	lm.mu.Unlock()
 	if exists {
-		t.Fatal("connSemEnqueued should be cleaned up by expiry loop")
+		t.Fatal("connEnqueued should be cleaned up by expiry loop")
 	}
 }
 
@@ -1810,7 +1823,7 @@ func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 
 func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
 	lm := testManager()
-	status, _, _, _ := lm.FIFOEnqueue("k1", 1*time.Second, 1)
+	status, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
@@ -1820,10 +1833,10 @@ func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
 	if _, ok := lm.connOwned[1]; !ok {
 		t.Fatal("connOwned should have conn 1")
 	}
-	lm.locks["k1"].LeaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	lm.FIFOWait(bg(), "k1", 5*time.Second, 1)
+	lm.Wait(bg(), "k1", 5*time.Second, 1)
 
 	// connOwned for this key should be cleaned up
 	lm.mu.Lock()
@@ -1837,22 +1850,22 @@ func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
 
 func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
 	lm := testManager()
-	status, tok, _, _ := lm.SemEnqueue("s1", 1*time.Second, 1, 3)
+	status, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	if status != "acquired" || tok == "" {
 		t.Fatal("expected acquired")
 	}
 
 	lm.mu.Lock()
-	lm.sems["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.mu.Unlock()
 
-	lm.SemWait(bg(), "s1", 5*time.Second, 1)
+	lm.Wait(bg(), "s1", 5*time.Second, 1)
 
 	lm.mu.Lock()
-	if m, ok := lm.connSemOwned[1]; ok {
+	if m, ok := lm.connOwned[1]; ok {
 		if tokens, ok := m["s1"]; ok {
 			if _, ok := tokens[tok]; ok {
-				t.Fatal("connSemOwned should not have the expired token")
+				t.Fatal("connOwned should not have the expired token")
 			}
 		}
 	}
@@ -1867,18 +1880,18 @@ func TestStats_IdleClassification(t *testing.T) {
 	lm := testManager()
 
 	// Create an idle lock (acquired then released)
-	tok, _ := lm.FIFOAcquire(bg(), "idle-lock", 5*time.Second, 30*time.Second, 1)
-	lm.FIFORelease("idle-lock", tok)
+	tok, _ := lm.Acquire(bg(), "idle-lock", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Release("idle-lock", tok)
 
 	// Create an active lock (held)
-	lm.FIFOAcquire(bg(), "active-lock", 5*time.Second, 30*time.Second, 2)
+	lm.Acquire(bg(), "active-lock", 5*time.Second, 30*time.Second, 2, 1)
 
 	// Create an idle semaphore
-	semTok, _ := lm.SemAcquire(bg(), "idle-sem", 5*time.Second, 30*time.Second, 3, 3)
-	lm.SemRelease("idle-sem", semTok)
+	semTok, _ := lm.Acquire(bg(), "idle-sem", 5*time.Second, 30*time.Second, 3, 3)
+	lm.Release("idle-sem", semTok)
 
 	// Create an active semaphore
-	lm.SemAcquire(bg(), "active-sem", 5*time.Second, 30*time.Second, 4, 3)
+	lm.Acquire(bg(), "active-sem", 5*time.Second, 30*time.Second, 4, 3)
 
 	stats := lm.Stats(4)
 
@@ -1936,8 +1949,8 @@ func TestStats_IdleClassification(t *testing.T) {
 
 func TestFIFOEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
 	lm := testManager()
-	lm.FIFOEnqueue("k1", 30*time.Second, 1)
-	_, _, _, err := lm.FIFOEnqueue("k1", 30*time.Second, 1)
+	lm.Enqueue("k1", 30*time.Second, 1, 1)
+	_, _, _, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	if !errors.Is(err, ErrAlreadyEnqueued) {
 		t.Fatalf("expected errors.Is(err, ErrAlreadyEnqueued), got %v", err)
 	}
@@ -1945,8 +1958,8 @@ func TestFIFOEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
 
 func TestSemEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
 	lm := testManager()
-	lm.SemEnqueue("s1", 30*time.Second, 1, 3)
-	_, _, _, err := lm.SemEnqueue("s1", 30*time.Second, 1, 3)
+	lm.Enqueue("s1", 30*time.Second, 1, 3)
+	_, _, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	if !errors.Is(err, ErrAlreadyEnqueued) {
 		t.Fatalf("expected errors.Is(err, ErrAlreadyEnqueued), got %v", err)
 	}
@@ -1958,31 +1971,22 @@ func TestSemEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
 
 func TestResetForTest(t *testing.T) {
 	lm := testManager()
-	lm.FIFOAcquire(bg(), "k1", 5*time.Second, 30*time.Second, 1)
-	lm.SemAcquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
-	lm.FIFOEnqueue("k2", 30*time.Second, 3)
-	lm.SemEnqueue("s2", 30*time.Second, 4, 3)
+	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
+	lm.Enqueue("k2", 30*time.Second, 3, 1)
+	lm.Enqueue("s2", 30*time.Second, 4, 3)
 
 	lm.ResetForTest()
 
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
-	if len(lm.locks) != 0 {
-		t.Fatal("locks should be empty")
-	}
-	if len(lm.sems) != 0 {
-		t.Fatal("sems should be empty")
+	if len(lm.resources) != 0 {
+		t.Fatal("resources should be empty")
 	}
 	if len(lm.connOwned) != 0 {
 		t.Fatal("connOwned should be empty")
 	}
 	if len(lm.connEnqueued) != 0 {
 		t.Fatal("connEnqueued should be empty")
-	}
-	if len(lm.connSemOwned) != 0 {
-		t.Fatal("connSemOwned should be empty")
-	}
-	if len(lm.connSemEnqueued) != 0 {
-		t.Fatal("connSemEnqueued should be empty")
 	}
 }
