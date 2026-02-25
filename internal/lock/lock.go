@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"sync"
@@ -24,6 +25,8 @@ var (
 	ErrWaiterClosed    = errors.New("waiter channel closed")
 	ErrMaxKeys         = errors.New("max keys reached")
 	ErrListFull        = errors.New("list at max length")
+	ErrCASConflict          = errors.New("cas conflict")
+	ErrBarrierCountMismatch = errors.New("barrier count mismatch")
 )
 
 // tokenBuf amortises crypto/rand syscalls by buffering 4096 bytes (256 tokens)
@@ -61,11 +64,14 @@ type waiter struct {
 	ch       chan string
 	connID   uint64
 	leaseTTL time.Duration
+	mode     byte // 0=regular, 'r'=read, 'w'=write
 }
 
 type holder struct {
 	connID       uint64
 	leaseExpires time.Time
+	fence        uint64
+	mode         byte // 0=regular, 'r'=read, 'w'=write
 }
 
 // ResourceState is the unified state for both locks (Limit==1) and
@@ -120,16 +126,37 @@ type kvEntry struct {
 }
 
 type listState struct {
-	Items        []string
+	Items         []string
+	PopWaiters    []*listWaiter
+	PopWaiterHead int
+	LastActivity  time.Time
+}
+
+type barrierParticipant struct {
+	ch     chan struct{} // closed when barrier trips
+	connID uint64
+}
+
+type barrierState struct {
+	Count        int
+	Participants []*barrierParticipant
+	Tripped      bool
 	LastActivity time.Time
 }
 
 type shard struct {
-	mu        sync.Mutex
-	resources map[string]*ResourceState
-	counters  map[string]*counterState
-	kvStore   map[string]*kvEntry
-	lists     map[string]*listState
+	mu             sync.Mutex
+	resources      map[string]*ResourceState
+	counters       map[string]*counterState
+	kvStore        map[string]*kvEntry
+	lists          map[string]*listState
+	barriers       map[string]*barrierState
+	leaderWatchers map[string]map[uint64]chan []byte // key → connID → writeCh
+}
+
+type listWaiter struct {
+	ch     chan string // receives the popped value
+	connID uint64
 }
 
 type LockManager struct {
@@ -142,6 +169,7 @@ type LockManager struct {
 	tokBuf        tokenBuf
 	resourceTotal atomic.Int64 // total resources across all shards
 	keyTotal      atomic.Int64 // total keys across all types (counters+kv+lists)
+	fenceSeq      atomic.Uint64 // global monotonic fencing token counter
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
@@ -157,6 +185,8 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 		lm.shards[i].counters = make(map[string]*counterState)
 		lm.shards[i].kvStore = make(map[string]*kvEntry)
 		lm.shards[i].lists = make(map[string]*listState)
+		lm.shards[i].barriers = make(map[string]*barrierState)
+		lm.shards[i].leaderWatchers = make(map[string]map[uint64]chan []byte)
 	}
 	return lm
 }
@@ -256,25 +286,48 @@ func (lm *LockManager) connRemoveOwned(connID uint64, key, token string) {
 // grantNextWaiterLocked grants slots to FIFO waiters while capacity is
 // available. Must be called with the shard lock AND connMu held.
 func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
+	sh := lm.shardFor(key)
 	for st.WaiterHead < len(st.Waiters) && len(st.Holders) < st.Limit {
 		w := st.Waiters[st.WaiterHead]
 		st.Waiters[st.WaiterHead] = nil // avoid memory leak
 		st.WaiterHead++
 		token := lm.newToken()
+		fence := lm.fenceSeq.Add(1)
 		select {
 		case w.ch <- token:
 			st.Holders[token] = &holder{
 				connID:       w.connID,
 				leaseExpires: time.Now().Add(w.leaseTTL),
+				fence:        fence,
 			}
 			st.LastActivity = time.Now()
 			lm.connAddOwned(w.connID, key, token)
+			// Notify leader watchers on failover grant
+			if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
+				msg := []byte(fmt.Sprintf("leader failover %s\n", key))
+				for _, ch := range watchers {
+					select {
+					case ch <- msg:
+					default:
+					}
+				}
+			}
 		default:
 			// Channel closed or full — skip this waiter
 			continue
 		}
 	}
 	st.compactWaiters()
+}
+
+// grantNextLocked dispatches to the appropriate granter based on resource type.
+// Must be called with shard lock AND connMu held.
+func (lm *LockManager) grantNextLocked(key string, st *ResourceState) {
+	if st.Limit == -1 {
+		lm.grantNextRWWaiterLocked(key, st)
+	} else {
+		lm.grantNextWaiterLocked(key, st)
+	}
 }
 
 // evictExpiredLocked evicts any holders whose leases have expired and grants
@@ -311,7 +364,11 @@ func (lm *LockManager) resourceCount() int {
 func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*ResourceState, error) {
 	st, ok := sh.resources[key]
 	if ok {
-		if st.Limit != limit {
+		// RW lock (limit -1) vs regular lock/semaphore mismatch
+		if (st.Limit == -1) != (limit == -1) {
+			return nil, ErrTypeMismatch
+		}
+		if limit != -1 && st.Limit != limit {
 			return nil, ErrLimitMismatch
 		}
 		return st, nil
@@ -333,8 +390,8 @@ func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*Res
 // Public methods — unified for both locks (limit=1) and semaphores (limit>1)
 // ---------------------------------------------------------------------------
 
-// Acquire is the single-phase acquire (commands "l" and "sl").
-func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, error) {
+// AcquireWithFence is the single-phase acquire that also returns a fencing token.
+func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, uint64, error) {
 	sh := lm.shardFor(key)
 
 	lm.connMu.Lock()
@@ -343,7 +400,7 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 	if err != nil {
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return "", err
+		return "", 0, err
 	}
 
 	st.LastActivity = time.Now()
@@ -354,22 +411,24 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 	// Fast path: capacity available and no waiters — no waiter allocation needed
 	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
 		token := lm.newToken()
+		fence := lm.fenceSeq.Add(1)
 		st.Holders[token] = &holder{
 			connID:       connID,
 			leaseExpires: time.Now().Add(leaseTTL),
+			fence:        fence,
 		}
 		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key, token)
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return token, nil
+		return token, fence, nil
 	}
 
 	// Slow path: allocate waiter and enqueue
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return "", ErrMaxWaiters
+		return "", 0, ErrMaxWaiters
 	}
 	w := &waiter{
 		ch:       make(chan string, 1),
@@ -389,17 +448,28 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 	}
 	defer timer.Stop()
 
+	getFence := func(token string) uint64 {
+		if s := sh.resources[key]; s != nil {
+			if h, ok := s.Holders[token]; ok {
+				return h.fence
+			}
+		}
+		return 0
+	}
+
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
-			return "", ErrWaiterClosed
+			return "", 0, ErrWaiterClosed
 		}
 		sh.mu.Lock()
+		var fence uint64
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
+			fence = getFence(token)
 		}
 		sh.mu.Unlock()
-		return token, nil
+		return token, fence, nil
 
 	case <-ctx.Done():
 		sh.mu.Lock()
@@ -411,8 +481,9 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 				if s := sh.resources[key]; s != nil {
 					s.LastActivity = time.Now()
 				}
+				fence := getFence(token)
 				sh.mu.Unlock()
-				return token, nil
+				return token, fence, nil
 			}
 		default:
 		}
@@ -421,7 +492,7 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 			removeWaiterFromState(s, w)
 		}
 		sh.mu.Unlock()
-		return "", ctx.Err()
+		return "", 0, ctx.Err()
 
 	case <-timer.C:
 		// Timeout — remove from queue
@@ -433,8 +504,9 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 				if s := sh.resources[key]; s != nil {
 					s.LastActivity = time.Now()
 				}
+				fence := getFence(token)
 				sh.mu.Unlock()
-				return token, nil
+				return token, fence, nil
 			}
 		default:
 		}
@@ -443,13 +515,19 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 			removeWaiterFromState(s, w)
 		}
 		sh.mu.Unlock()
-		return "", nil
+		return "", 0, nil
 	}
 }
 
-// Enqueue is phase 1 of two-phase acquire (commands "e" and "se").
-// Returns (status, token, leaseTTLSec, err).
-func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64, limit int) (string, string, int, error) {
+// Acquire is the single-phase acquire (commands "l" and "sl").
+func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, error) {
+	token, _, err := lm.AcquireWithFence(ctx, key, timeout, leaseTTL, connID, limit)
+	return token, err
+}
+
+// EnqueueWithFence is phase 1 of two-phase acquire that also returns a fencing token.
+// Returns (status, token, leaseTTLSec, fence, err).
+func (lm *LockManager) EnqueueWithFence(key string, leaseTTL time.Duration, connID uint64, limit int) (string, string, int, uint64, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
 	sh := lm.shardFor(key)
 
@@ -459,12 +537,12 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 	defer lm.connMu.Unlock()
 
 	if _, exists := lm.connEnqueued[eqKey]; exists {
-		return "", "", 0, ErrAlreadyEnqueued
+		return "", "", 0, 0, ErrAlreadyEnqueued
 	}
 
 	st, err := lm.getOrCreateLocked(sh, key, limit)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", 0, 0, err
 	}
 
 	st.LastActivity = time.Now()
@@ -476,19 +554,21 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 	// Fast path: capacity available and no waiters
 	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
 		token := lm.newToken()
+		fence := lm.fenceSeq.Add(1)
 		st.Holders[token] = &holder{
 			connID:       connID,
 			leaseExpires: time.Now().Add(leaseTTL),
+			fence:        fence,
 		}
 		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key, token)
 		lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
-		return "acquired", token, leaseSec, nil
+		return "acquired", token, leaseSec, fence, nil
 	}
 
 	// Slow path: create waiter and enqueue
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
-		return "", "", 0, ErrMaxWaiters
+		return "", "", 0, 0, ErrMaxWaiters
 	}
 	w := &waiter{
 		ch:       make(chan string, 1),
@@ -497,12 +577,19 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 	}
 	st.Waiters = append(st.Waiters, w)
 	lm.connEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
-	return "queued", "", 0, nil
+	return "queued", "", 0, 0, nil
 }
 
-// Wait is phase 2 of two-phase acquire (commands "w" and "sw").
-// Returns (token, leaseTTLSec, err). Empty token means timeout.
-func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, error) {
+// Enqueue is phase 1 of two-phase acquire (commands "e" and "se").
+// Returns (status, token, leaseTTLSec, err).
+func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64, limit int) (string, string, int, error) {
+	status, token, lease, _, err := lm.EnqueueWithFence(key, leaseTTL, connID, limit)
+	return status, token, lease, err
+}
+
+// WaitWithFence is phase 2 of two-phase acquire that also returns a fencing token.
+// Returns (token, leaseTTLSec, fence, err). Empty token means timeout.
+func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, uint64, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
 	sh := lm.shardFor(key)
 
@@ -510,7 +597,7 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	es, ok := lm.connEnqueued[eqKey]
 	if !ok {
 		lm.connMu.Unlock()
-		return "", 0, ErrNotEnqueued
+		return "", 0, 0, ErrNotEnqueued
 	}
 
 	// Snapshot immutable fields under lock.
@@ -535,24 +622,25 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 					lm.connRemoveOwned(connID, key, esToken)
 					delete(st.Holders, esToken)
 					st.LastActivity = time.Now()
-					lm.grantNextWaiterLocked(key, st)
+					lm.grantNextLocked(key, st)
 					sh.mu.Unlock()
 					lm.connMu.Unlock()
-					return "", 0, ErrLeaseExpired
+					return "", 0, 0, ErrLeaseExpired
 				}
 				// Reset lease
 				h.leaseExpires = time.Now().Add(leaseTTL)
 				st.LastActivity = time.Now()
+				fence := h.fence
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
-				return esToken, leaseSec, nil
+				return esToken, leaseSec, fence, nil
 			}
 		}
 		// Slot was lost (expired and granted to another, or state GC'd)
 		lm.connRemoveOwned(connID, key, esToken)
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return "", 0, ErrLeaseExpired
+		return "", 0, 0, ErrLeaseExpired
 	}
 
 	// Slow path: waiter is pending
@@ -564,26 +652,37 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	}
 	defer timer.Stop()
 
+	getFence := func(token string) uint64 {
+		if st := sh.resources[key]; st != nil {
+			if h, ok := st.Holders[token]; ok {
+				return h.fence
+			}
+		}
+		return 0
+	}
+
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
 			lm.connMu.Lock()
 			delete(lm.connEnqueued, eqKey)
 			lm.connMu.Unlock()
-			return "", 0, ErrWaiterClosed
+			return "", 0, 0, ErrWaiterClosed
 		}
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
+		var fence uint64
 		if st := sh.resources[key]; st != nil {
 			if h, hOK := st.Holders[token]; hOK {
 				h.leaseExpires = time.Now().Add(leaseTTL)
 			}
 			st.LastActivity = time.Now()
+			fence = getFence(token)
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return token, leaseSec, nil
+		return token, leaseSec, fence, nil
 
 	case <-ctx.Done():
 		lm.connMu.Lock()
@@ -598,9 +697,10 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 					}
 					st.LastActivity = time.Now()
 				}
+				fence := getFence(token)
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
-				return token, leaseSec, nil
+				return token, leaseSec, fence, nil
 			}
 		default:
 		}
@@ -610,7 +710,7 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return "", 0, ctx.Err()
+		return "", 0, 0, ctx.Err()
 
 	case <-timer.C:
 		lm.connMu.Lock()
@@ -626,9 +726,10 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 					}
 					st.LastActivity = time.Now()
 				}
+				fence := getFence(token)
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
-				return token, leaseSec, nil
+				return token, leaseSec, fence, nil
 			}
 		default:
 		}
@@ -639,8 +740,15 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return "", 0, nil
+		return "", 0, 0, nil
 	}
+}
+
+// Wait is phase 2 of two-phase acquire (commands "w" and "sw").
+// Returns (token, leaseTTLSec, err). Empty token means timeout.
+func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, error) {
+	token, lease, _, err := lm.WaitWithFence(ctx, key, timeout, connID)
+	return token, lease, err
 }
 
 // Release releases one held slot if the token matches (commands "r" and "sr").
@@ -670,8 +778,57 @@ func (lm *LockManager) Release(key, token string) bool {
 		delete(lm.connEnqueued, eqKey)
 	}
 	delete(st.Holders, token)
-	lm.grantNextWaiterLocked(key, st)
+	lm.grantNextLocked(key, st)
 	return true
+}
+
+// RenewWithFence renews the lease and returns the existing fence (no increment).
+// Returns (remaining seconds, fence, ok).
+func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration) (int, uint64, bool) {
+	sh := lm.shardFor(key)
+
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	defer lm.connMu.Unlock()
+
+	st := sh.resources[key]
+	if st == nil {
+		return 0, 0, false
+	}
+
+	now := time.Now()
+	st.LastActivity = now
+
+	h, ok := st.Holders[token]
+	if !ok {
+		return 0, 0, false
+	}
+
+	// If already expired, reject and evict
+	if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
+		lm.log.Warn("renew rejected (already expired)",
+			"key", key, "conn", h.connID)
+		lm.connRemoveOwned(h.connID, key, token)
+		eqKey := connKey{ConnID: h.connID, Key: key}
+		if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+			delete(lm.connEnqueued, eqKey)
+		}
+		delete(st.Holders, token)
+		st.LastActivity = now
+		lm.grantNextLocked(key, st)
+		return 0, 0, false
+	}
+
+	// Reset lease
+	h.leaseExpires = now.Add(leaseTTL)
+	st.LastActivity = now
+
+	remaining := int(leaseTTL.Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, h.fence, true
 }
 
 // Renew renews the lease if the token matches (commands "n" and "sn").
@@ -708,7 +865,7 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 		}
 		delete(st.Holders, token)
 		st.LastActivity = now
-		lm.grantNextWaiterLocked(key, st)
+		lm.grantNextLocked(key, st)
 		return 0, false
 	}
 
@@ -848,9 +1005,92 @@ func (lm *LockManager) KVDel(key string) {
 	}
 }
 
+// KVCAS performs an atomic compare-and-swap on a KV entry.
+// If oldValue == "" and the key does not exist, it creates the key.
+// Returns (true, nil) on success, (false, nil) on value mismatch.
+func (lm *LockManager) KVCAS(key, oldValue, newValue string, ttlSeconds int) (bool, error) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	entry, ok := sh.kvStore[key]
+	if ok {
+		// Lazy expiry check
+		if !entry.ExpiresAt.IsZero() && !time.Now().Before(entry.ExpiresAt) {
+			delete(sh.kvStore, key)
+			lm.keyTotal.Add(-1)
+			ok = false
+			entry = nil
+		}
+	}
+
+	if !ok {
+		// Key doesn't exist — only succeed if oldValue is empty
+		if oldValue != "" {
+			return false, nil
+		}
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			return false, ErrMaxKeys
+		}
+		entry = &kvEntry{}
+		sh.kvStore[key] = entry
+		lm.keyTotal.Add(1)
+	} else {
+		// Key exists — compare current value
+		if entry.Value != oldValue {
+			return false, nil
+		}
+	}
+
+	entry.Value = newValue
+	entry.LastActivity = time.Now()
+	if ttlSeconds > 0 {
+		entry.ExpiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	} else {
+		entry.ExpiresAt = time.Time{}
+	}
+	return true, nil
+}
+
 // ---------------------------------------------------------------------------
 // Lists/Queues
 // ---------------------------------------------------------------------------
+
+// compactPopWaiters reclaims consumed pop waiter slots.
+func compactPopWaiters(ls *listState) {
+	if ls.PopWaiterHead > len(ls.PopWaiters)/2 {
+		n := copy(ls.PopWaiters, ls.PopWaiters[ls.PopWaiterHead:])
+		for i := n; i < len(ls.PopWaiters); i++ {
+			ls.PopWaiters[i] = nil
+		}
+		ls.PopWaiters = ls.PopWaiters[:n]
+		ls.PopWaiterHead = 0
+	}
+}
+
+// tryHandoffToPopWaiter tries to hand a value directly to a waiting pop consumer.
+// Returns true if the value was handed off (caller should NOT add to list).
+// Must be called with the shard lock held.
+func tryHandoffToPopWaiter(ls *listState, value string) bool {
+	for ls.PopWaiterHead < len(ls.PopWaiters) {
+		w := ls.PopWaiters[ls.PopWaiterHead]
+		ls.PopWaiters[ls.PopWaiterHead] = nil
+		ls.PopWaiterHead++
+		if w == nil {
+			continue
+		}
+		select {
+		case w.ch <- value:
+			compactPopWaiters(ls)
+			return true
+		default:
+			// waiter gone, try next
+			continue
+		}
+	}
+	compactPopWaiters(ls)
+	return false
+}
 
 func (lm *LockManager) LPush(key, value string) (int, error) {
 	sh := lm.shardFor(key)
@@ -865,6 +1105,11 @@ func (lm *LockManager) LPush(key, value string) (int, error) {
 		ls = &listState{LastActivity: time.Now()}
 		sh.lists[key] = ls
 		lm.keyTotal.Add(1)
+	}
+	// Try to hand off to a waiting pop consumer
+	if tryHandoffToPopWaiter(ls, value) {
+		ls.LastActivity = time.Now()
+		return len(ls.Items), nil
 	}
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
@@ -887,6 +1132,11 @@ func (lm *LockManager) RPush(key, value string) (int, error) {
 		ls = &listState{LastActivity: time.Now()}
 		sh.lists[key] = ls
 		lm.keyTotal.Add(1)
+	}
+	// Try to hand off to a waiting pop consumer
+	if tryHandoffToPopWaiter(ls, value) {
+		ls.LastActivity = time.Now()
+		return len(ls.Items), nil
 	}
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
@@ -986,6 +1236,599 @@ func (lm *LockManager) LRange(key string, start, stop int) []string {
 }
 
 // ---------------------------------------------------------------------------
+// Blocking List Pop
+// ---------------------------------------------------------------------------
+
+// BLPop blocks until an item is available at the left of the list, or timeout.
+// Returns ("", nil) on timeout.
+func (lm *LockManager) BLPop(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, error) {
+	return lm.blockingPop(ctx, key, timeout, connID, true)
+}
+
+// BRPop blocks until an item is available at the right of the list, or timeout.
+// Returns ("", nil) on timeout.
+func (lm *LockManager) BRPop(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, error) {
+	return lm.blockingPop(ctx, key, timeout, connID, false)
+}
+
+func (lm *LockManager) blockingPop(ctx context.Context, key string, timeout time.Duration, connID uint64, left bool) (string, error) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+
+	ls, ok := sh.lists[key]
+	if ok && len(ls.Items) > 0 {
+		// Fast path: list has items
+		var val string
+		if left {
+			val = ls.Items[0]
+			ls.Items[0] = ""
+			ls.Items = ls.Items[1:]
+		} else {
+			last := len(ls.Items) - 1
+			val = ls.Items[last]
+			ls.Items[last] = ""
+			ls.Items = ls.Items[:last]
+		}
+		ls.LastActivity = time.Now()
+		if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
+			delete(sh.lists, key)
+			lm.keyTotal.Add(-1)
+		}
+		sh.mu.Unlock()
+		return val, nil
+	}
+
+	// Slow path: list empty or doesn't exist — create waiter
+	if !ok {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			sh.mu.Unlock()
+			return "", ErrMaxKeys
+		}
+		ls = &listState{LastActivity: time.Now()}
+		sh.lists[key] = ls
+		lm.keyTotal.Add(1)
+	}
+
+	w := &listWaiter{
+		ch:     make(chan string, 1),
+		connID: connID,
+	}
+	ls.PopWaiters = append(ls.PopWaiters, w)
+	sh.mu.Unlock()
+
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+	} else {
+		timer = time.NewTimer(0)
+	}
+	defer timer.Stop()
+
+	select {
+	case val, ok := <-w.ch:
+		if !ok {
+			return "", nil // channel closed (disconnect cleanup)
+		}
+		return val, nil
+
+	case <-ctx.Done():
+		sh.mu.Lock()
+		// Race check: value may have arrived
+		select {
+		case val, ok := <-w.ch:
+			if ok {
+				sh.mu.Unlock()
+				return val, nil
+			}
+		default:
+		}
+		lm.removeListWaiter(sh, key, w)
+		sh.mu.Unlock()
+		return "", ctx.Err()
+
+	case <-timer.C:
+		sh.mu.Lock()
+		// Race check
+		select {
+		case val, ok := <-w.ch:
+			if ok {
+				sh.mu.Unlock()
+				return val, nil
+			}
+		default:
+		}
+		lm.removeListWaiter(sh, key, w)
+		sh.mu.Unlock()
+		return "", nil
+	}
+}
+
+// removeListWaiter removes a list waiter and cleans up the list if empty.
+// Must be called with shard lock held.
+func (lm *LockManager) removeListWaiter(sh *shard, key string, target *listWaiter) {
+	ls, ok := sh.lists[key]
+	if !ok {
+		return
+	}
+	for i := ls.PopWaiterHead; i < len(ls.PopWaiters); i++ {
+		if ls.PopWaiters[i] == target {
+			copy(ls.PopWaiters[i:], ls.PopWaiters[i+1:])
+			ls.PopWaiters[len(ls.PopWaiters)-1] = nil
+			ls.PopWaiters = ls.PopWaiters[:len(ls.PopWaiters)-1]
+			break
+		}
+	}
+	// If list is empty and no waiters, clean up
+	if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
+		delete(sh.lists, key)
+		lm.keyTotal.Add(-1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Read-Write Locks
+// ---------------------------------------------------------------------------
+
+var ErrTypeMismatch = errors.New("key type mismatch (regular vs rw)")
+
+// RWAcquire acquires a read or write lock. mode must be 'r' or 'w'.
+func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, timeout, leaseTTL time.Duration, connID uint64) (string, uint64, error) {
+	sh := lm.shardFor(key)
+
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	st, err := lm.getOrCreateLocked(sh, key, -1)
+	if err != nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		return "", 0, err
+	}
+
+	st.LastActivity = time.Now()
+	lm.evictExpiredLocked(key, st)
+
+	// Fast path
+	if st.waiterCount() == 0 {
+		canGrant := false
+		if mode == 'r' {
+			// Grant if no writer holding
+			hasWriter := false
+			for _, h := range st.Holders {
+				if h.mode == 'w' {
+					hasWriter = true
+					break
+				}
+			}
+			canGrant = !hasWriter
+		} else {
+			// Writer: grant only if no holders at all
+			canGrant = len(st.Holders) == 0
+		}
+		if canGrant {
+			token := lm.newToken()
+			fence := lm.fenceSeq.Add(1)
+			st.Holders[token] = &holder{
+				connID:       connID,
+				leaseExpires: time.Now().Add(leaseTTL),
+				fence:        fence,
+				mode:         mode,
+			}
+			st.LastActivity = time.Now()
+			lm.connAddOwned(connID, key, token)
+			sh.mu.Unlock()
+			lm.connMu.Unlock()
+			return token, fence, nil
+		}
+	}
+
+	// Slow path
+	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		return "", 0, ErrMaxWaiters
+	}
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
+		mode:     mode,
+	}
+	st.Waiters = append(st.Waiters, w)
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
+
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+	} else {
+		timer = time.NewTimer(0)
+	}
+	defer timer.Stop()
+
+	getFence := func(token string) uint64 {
+		if s := sh.resources[key]; s != nil {
+			if h, ok := s.Holders[token]; ok {
+				return h.fence
+			}
+		}
+		return 0
+	}
+
+	select {
+	case token, ok := <-w.ch:
+		if !ok || token == "" {
+			return "", 0, ErrWaiterClosed
+		}
+		sh.mu.Lock()
+		var fence uint64
+		if s := sh.resources[key]; s != nil {
+			s.LastActivity = time.Now()
+			fence = getFence(token)
+		}
+		sh.mu.Unlock()
+		return token, fence, nil
+
+	case <-ctx.Done():
+		sh.mu.Lock()
+		select {
+		case token, ok := <-w.ch:
+			if ok && token != "" {
+				if s := sh.resources[key]; s != nil {
+					s.LastActivity = time.Now()
+				}
+				fence := getFence(token)
+				sh.mu.Unlock()
+				return token, fence, nil
+			}
+		default:
+		}
+		if s := sh.resources[key]; s != nil {
+			s.LastActivity = time.Now()
+			removeWaiterFromState(s, w)
+		}
+		sh.mu.Unlock()
+		return "", 0, ctx.Err()
+
+	case <-timer.C:
+		sh.mu.Lock()
+		select {
+		case token, ok := <-w.ch:
+			if ok && token != "" {
+				if s := sh.resources[key]; s != nil {
+					s.LastActivity = time.Now()
+				}
+				fence := getFence(token)
+				sh.mu.Unlock()
+				return token, fence, nil
+			}
+		default:
+		}
+		if s := sh.resources[key]; s != nil {
+			s.LastActivity = time.Now()
+			removeWaiterFromState(s, w)
+		}
+		sh.mu.Unlock()
+		return "", 0, nil
+	}
+}
+
+// RWRelease releases a read or write lock.
+func (lm *LockManager) RWRelease(key, token string) bool {
+	return lm.Release(key, token)
+}
+
+// RWRenew renews a read or write lock lease.
+func (lm *LockManager) RWRenew(key, token string, leaseTTL time.Duration) (int, uint64, bool) {
+	return lm.RenewWithFence(key, token, leaseTTL)
+}
+
+// RWEnqueue is phase 1 of two-phase RW lock acquire.
+func (lm *LockManager) RWEnqueue(key string, mode byte, leaseTTL time.Duration, connID uint64) (string, string, int, uint64, error) {
+	eqKey := connKey{ConnID: connID, Key: key}
+	sh := lm.shardFor(key)
+
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	defer lm.connMu.Unlock()
+
+	if _, exists := lm.connEnqueued[eqKey]; exists {
+		return "", "", 0, 0, ErrAlreadyEnqueued
+	}
+
+	st, err := lm.getOrCreateLocked(sh, key, -1)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+
+	st.LastActivity = time.Now()
+	leaseSec := int(leaseTTL / time.Second)
+	lm.evictExpiredLocked(key, st)
+
+	// Fast path
+	if st.waiterCount() == 0 {
+		canGrant := false
+		if mode == 'r' {
+			hasWriter := false
+			for _, h := range st.Holders {
+				if h.mode == 'w' {
+					hasWriter = true
+					break
+				}
+			}
+			canGrant = !hasWriter
+		} else {
+			canGrant = len(st.Holders) == 0
+		}
+		if canGrant {
+			token := lm.newToken()
+			fence := lm.fenceSeq.Add(1)
+			st.Holders[token] = &holder{
+				connID:       connID,
+				leaseExpires: time.Now().Add(leaseTTL),
+				fence:        fence,
+				mode:         mode,
+			}
+			st.LastActivity = time.Now()
+			lm.connAddOwned(connID, key, token)
+			lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
+			return "acquired", token, leaseSec, fence, nil
+		}
+	}
+
+	// Slow path
+	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
+		return "", "", 0, 0, ErrMaxWaiters
+	}
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
+		mode:     mode,
+	}
+	st.Waiters = append(st.Waiters, w)
+	lm.connEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
+	return "queued", "", 0, 0, nil
+}
+
+// RWWait is phase 2 of two-phase RW lock acquire.
+func (lm *LockManager) RWWait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, uint64, error) {
+	return lm.WaitWithFence(ctx, key, timeout, connID)
+}
+
+// grantNextRWWaiterLocked implements the FIFO fair granting for RW locks.
+// Consecutive readers at the queue head are batch-granted. A writer in the
+// queue blocks all subsequent grants. Must be called with shard lock AND connMu held.
+func (lm *LockManager) grantNextRWWaiterLocked(key string, st *ResourceState) {
+	for st.WaiterHead < len(st.Waiters) {
+		w := st.Waiters[st.WaiterHead]
+		if w.mode == 'w' {
+			// Writer needs exclusive access
+			if len(st.Holders) == 0 {
+				st.Waiters[st.WaiterHead] = nil
+				st.WaiterHead++
+				token := lm.newToken()
+				fence := lm.fenceSeq.Add(1)
+				select {
+				case w.ch <- token:
+					st.Holders[token] = &holder{
+						connID:       w.connID,
+						leaseExpires: time.Now().Add(w.leaseTTL),
+						fence:        fence,
+						mode:         'w',
+					}
+					st.LastActivity = time.Now()
+					lm.connAddOwned(w.connID, key, token)
+				default:
+					continue
+				}
+				break // writer is exclusive, done
+			}
+			break // can't grant writer, holders exist
+		}
+		// Reader
+		hasWriter := false
+		for _, h := range st.Holders {
+			if h.mode == 'w' {
+				hasWriter = true
+				break
+			}
+		}
+		if hasWriter {
+			break // writer active, readers must wait
+		}
+		// Grant reader
+		st.Waiters[st.WaiterHead] = nil
+		st.WaiterHead++
+		token := lm.newToken()
+		fence := lm.fenceSeq.Add(1)
+		select {
+		case w.ch <- token:
+			st.Holders[token] = &holder{
+				connID:       w.connID,
+				leaseExpires: time.Now().Add(w.leaseTTL),
+				fence:        fence,
+				mode:         'r',
+			}
+			st.LastActivity = time.Now()
+			lm.connAddOwned(w.connID, key, token)
+		default:
+			continue
+		}
+		// Continue — batch-grant consecutive readers
+	}
+	st.compactWaiters()
+}
+
+// ---------------------------------------------------------------------------
+// Barriers
+// ---------------------------------------------------------------------------
+
+// BarrierWait blocks until 'count' participants have arrived at the barrier, or
+// the timeout/context expires. Returns true if the barrier tripped, false on timeout.
+func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, timeout time.Duration, connID uint64) (bool, error) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+
+	bs, ok := sh.barriers[key]
+	if ok {
+		if bs.Tripped {
+			sh.mu.Unlock()
+			return true, nil
+		}
+		if bs.Count != count {
+			sh.mu.Unlock()
+			return false, ErrBarrierCountMismatch
+		}
+	} else {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			sh.mu.Unlock()
+			return false, ErrMaxKeys
+		}
+		bs = &barrierState{
+			Count:        count,
+			LastActivity: time.Now(),
+		}
+		sh.barriers[key] = bs
+		lm.keyTotal.Add(1)
+	}
+
+	p := &barrierParticipant{
+		ch:     make(chan struct{}),
+		connID: connID,
+	}
+	bs.Participants = append(bs.Participants, p)
+	bs.LastActivity = time.Now()
+
+	if len(bs.Participants) >= count {
+		// Barrier tripped — close all participant channels
+		for _, pp := range bs.Participants {
+			close(pp.ch)
+		}
+		bs.Tripped = true
+		bs.Participants = nil
+		// Remove the barrier and reclaim the key count
+		delete(sh.barriers, key)
+		lm.keyTotal.Add(-1)
+		sh.mu.Unlock()
+		return true, nil
+	}
+
+	sh.mu.Unlock()
+
+	// Wait for trip, timeout, or context cancel
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+	} else {
+		timer = time.NewTimer(0)
+	}
+	defer timer.Stop()
+
+	select {
+	case <-p.ch:
+		return true, nil
+	case <-ctx.Done():
+		sh.mu.Lock()
+		lm.removeBarrierParticipant(sh, key, p)
+		sh.mu.Unlock()
+		return false, ctx.Err()
+	case <-timer.C:
+		sh.mu.Lock()
+		lm.removeBarrierParticipant(sh, key, p)
+		sh.mu.Unlock()
+		return false, nil
+	}
+}
+
+// removeBarrierParticipant removes a participant from a barrier.
+// Must be called with the shard lock held.
+func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *barrierParticipant) {
+	bs, ok := sh.barriers[key]
+	if !ok {
+		return
+	}
+	for i, p := range bs.Participants {
+		if p == target {
+			bs.Participants = append(bs.Participants[:i], bs.Participants[i+1:]...)
+			break
+		}
+	}
+	if len(bs.Participants) == 0 && !bs.Tripped {
+		delete(sh.barriers, key)
+		lm.keyTotal.Add(-1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Leader Election Watchers
+// ---------------------------------------------------------------------------
+
+// RegisterLeaderWatcher registers a connection to receive leader change notifications.
+func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh chan []byte) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	watchers, ok := sh.leaderWatchers[key]
+	if !ok {
+		watchers = make(map[uint64]chan []byte)
+		sh.leaderWatchers[key] = watchers
+	}
+	watchers[connID] = writeCh
+}
+
+// UnregisterLeaderWatcher removes a leader change watcher.
+func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if watchers, ok := sh.leaderWatchers[key]; ok {
+		delete(watchers, connID)
+		if len(watchers) == 0 {
+			delete(sh.leaderWatchers, key)
+		}
+	}
+}
+
+// UnregisterAllLeaderWatchers removes all leader change watchers for a connection.
+func (lm *LockManager) UnregisterAllLeaderWatchers(connID uint64) {
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		for key, watchers := range sh.leaderWatchers {
+			delete(watchers, connID)
+			if len(watchers) == 0 {
+				delete(sh.leaderWatchers, key)
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
+// NotifyLeaderChange sends a leader change event to all watchers of a key.
+// excludeConnID allows skipping the connection that triggered the event
+// (pass 0 to notify all watchers).
+func (lm *LockManager) NotifyLeaderChange(key, eventType string, excludeConnID uint64) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	watchers, ok := sh.leaderWatchers[key]
+	if !ok {
+		return
+	}
+	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
+	for connID, ch := range watchers {
+		if connID == excludeConnID {
+			continue
+		}
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Connection cleanup
 // ---------------------------------------------------------------------------
 
@@ -1073,11 +1916,38 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				delete(st.Holders, token)
 			}
 			st.LastActivity = time.Now()
-			lm.grantNextWaiterLocked(entry.key, st)
+			lm.grantNextLocked(entry.key, st)
 		}
 		sh.mu.Unlock()
 	}
 	delete(lm.connOwned, connID)
+
+	// Clean up list pop waiters for this connection.
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		for _, ls := range sh.lists {
+			for j := ls.PopWaiterHead; j < len(ls.PopWaiters); j++ {
+				if ls.PopWaiters[j] != nil && ls.PopWaiters[j].connID == connID {
+					close(ls.PopWaiters[j].ch)
+					ls.PopWaiters[j] = nil
+				}
+			}
+		}
+		// Clean up barrier participants for this connection.
+		for key, bs := range sh.barriers {
+			for i := len(bs.Participants) - 1; i >= 0; i-- {
+				if bs.Participants[i].connID == connID {
+					bs.Participants = append(bs.Participants[:i], bs.Participants[i+1:]...)
+				}
+			}
+			if len(bs.Participants) == 0 && !bs.Tripped {
+				delete(sh.barriers, key)
+				lm.keyTotal.Add(-1)
+			}
+		}
+		sh.mu.Unlock()
+	}
 
 	lm.connMu.Unlock()
 }
@@ -1124,7 +1994,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 					}
 					if len(expired) > 0 {
 						st.LastActivity = now
-						lm.grantNextWaiterLocked(key, st)
+						lm.grantNextLocked(key, st)
 					}
 				}
 				// Sweep expired KV entries
@@ -1192,16 +2062,29 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 					delete(sh.kvStore, key)
 					lm.keyTotal.Add(-1)
 				}
-				// GC idle empty lists
+				// GC idle empty lists (skip if active pop waiters)
 				var expiredLists []string
 				for key, ls := range sh.lists {
-					if len(ls.Items) == 0 && now.Sub(ls.LastActivity) > lm.cfg.GCMaxIdleTime {
+					hasWaiters := ls.PopWaiterHead < len(ls.PopWaiters)
+					if len(ls.Items) == 0 && !hasWaiters && now.Sub(ls.LastActivity) > lm.cfg.GCMaxIdleTime {
 						expiredLists = append(expiredLists, key)
 					}
 				}
 				for _, key := range expiredLists {
 					lm.log.Debug("GC: pruning idle list", "key", key)
 					delete(sh.lists, key)
+					lm.keyTotal.Add(-1)
+				}
+				// GC idle empty barriers
+				var expiredBarriers []string
+				for key, bs := range sh.barriers {
+					if len(bs.Participants) == 0 && !bs.Tripped && now.Sub(bs.LastActivity) > lm.cfg.GCMaxIdleTime {
+						expiredBarriers = append(expiredBarriers, key)
+					}
+				}
+				for _, key := range expiredBarriers {
+					lm.log.Debug("GC: pruning idle barrier", "key", key)
+					delete(sh.barriers, key)
 					lm.keyTotal.Add(-1)
 				}
 				sh.mu.Unlock()
@@ -1219,12 +2102,21 @@ type LockInfo struct {
 	OwnerConnID     uint64  `json:"owner_conn_id"`
 	LeaseExpiresInS float64 `json:"lease_expires_in_s"`
 	Waiters         int     `json:"waiters"`
+	Fence           uint64  `json:"fence,omitempty"`
 }
 
 type SemInfo struct {
 	Key     string `json:"key"`
 	Limit   int    `json:"limit"`
 	Holders int    `json:"holders"`
+	Waiters int    `json:"waiters"`
+}
+
+type RWLockInfo struct {
+	Key     string `json:"key"`
+	Readers int    `json:"readers"`
+	Writer  bool   `json:"writer"`
+	Fence   uint64 `json:"fence,omitempty"`
 	Waiters int    `json:"waiters"`
 }
 
@@ -1247,9 +2139,10 @@ type KVInfo struct {
 }
 
 type ListInfo struct {
-	Key   string  `json:"key"`
-	Len   int     `json:"len"`
-	IdleS float64 `json:"idle_s"`
+	Key        string  `json:"key"`
+	Len        int     `json:"len"`
+	PopWaiters int     `json:"pop_waiters,omitempty"`
+	IdleS      float64 `json:"idle_s"`
 }
 
 type SignalChannelInfo struct {
@@ -1258,16 +2151,31 @@ type SignalChannelInfo struct {
 	Listeners int    `json:"listeners"`
 }
 
+type WatchChannelInfo struct {
+	Pattern  string `json:"pattern"`
+	Watchers int    `json:"watchers"`
+}
+
+type BarrierInfo struct {
+	Key          string  `json:"key"`
+	Count        int     `json:"count"`
+	Participants int     `json:"participants"`
+	IdleS        float64 `json:"idle_s"`
+}
+
 type Stats struct {
 	Connections    int64              `json:"connections"`
 	Locks          []LockInfo         `json:"locks"`
 	Semaphores     []SemInfo          `json:"semaphores"`
+	RWLocks        []RWLockInfo       `json:"rw_locks"`
 	IdleLocks      []IdleInfo         `json:"idle_locks"`
 	IdleSemaphores []IdleInfo         `json:"idle_semaphores"`
 	Counters       []CounterInfo      `json:"counters"`
 	KVEntries      []KVInfo           `json:"kv_entries"`
 	Lists          []ListInfo         `json:"lists"`
 	SignalChannels []SignalChannelInfo `json:"signal_channels"`
+	WatchChannels  []WatchChannelInfo `json:"watch_channels"`
+	Barriers       []BarrierInfo      `json:"barriers"`
 }
 
 // Stats returns a snapshot of the current lock manager state.
@@ -1277,11 +2185,13 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		Connections:    connections,
 		Locks:          []LockInfo{},
 		Semaphores:     []SemInfo{},
+		RWLocks:        []RWLockInfo{},
 		IdleLocks:      []IdleInfo{},
 		IdleSemaphores: []IdleInfo{},
 		Counters:       []CounterInfo{},
 		KVEntries:      []KVInfo{},
 		Lists:          []ListInfo{},
+		Barriers:       []BarrierInfo{},
 	}
 
 	for i := range lm.shards {
@@ -1289,22 +2199,47 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		sh.mu.Lock()
 		for key, st := range sh.resources {
 			nw := st.waiterCount()
-			if st.Limit == 1 {
+			if st.Limit == -1 {
+				// RW lock
+				readers := 0
+				hasWriter := false
+				var maxFence uint64
+				for _, h := range st.Holders {
+					if h.mode == 'w' {
+						hasWriter = true
+					} else {
+						readers++
+					}
+					if h.fence > maxFence {
+						maxFence = h.fence
+					}
+				}
+				s.RWLocks = append(s.RWLocks, RWLockInfo{
+					Key:     key,
+					Readers: readers,
+					Writer:  hasWriter,
+					Fence:   maxFence,
+					Waiters: nw,
+				})
+			} else if st.Limit == 1 {
 				if len(st.Holders) > 0 {
 					var ownerConn uint64
 					var expires float64
+					var fence uint64
 					for _, h := range st.Holders {
 						ownerConn = h.connID
 						expires = h.leaseExpires.Sub(now).Seconds()
 						if expires < 0 {
 							expires = 0
 						}
+						fence = h.fence
 					}
 					s.Locks = append(s.Locks, LockInfo{
 						Key:             key,
 						OwnerConnID:     ownerConn,
 						LeaseExpiresInS: expires,
 						Waiters:         nw,
+						Fence:           fence,
 					})
 				} else if nw > 0 {
 					s.Locks = append(s.Locks, LockInfo{
@@ -1363,10 +2298,20 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 			})
 		}
 		for key, ls := range sh.lists {
+			pw := len(ls.PopWaiters) - ls.PopWaiterHead
 			s.Lists = append(s.Lists, ListInfo{
-				Key:   key,
-				Len:   len(ls.Items),
-				IdleS: now.Sub(ls.LastActivity).Seconds(),
+				Key:        key,
+				Len:        len(ls.Items),
+				PopWaiters: pw,
+				IdleS:      now.Sub(ls.LastActivity).Seconds(),
+			})
+		}
+		for key, bs := range sh.barriers {
+			s.Barriers = append(s.Barriers, BarrierInfo{
+				Key:          key,
+				Count:        bs.Count,
+				Participants: len(bs.Participants),
+				IdleS:        now.Sub(bs.LastActivity).Seconds(),
 			})
 		}
 		sh.mu.Unlock()

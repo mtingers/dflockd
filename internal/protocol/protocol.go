@@ -23,8 +23,11 @@ var (
 	respErrorMaxKeys          = []byte("error_max_keys\n")
 	respErrorListFull         = []byte("error_list_full\n")
 	respErrorLeaseExpired     = []byte("error_lease_expired\n")
+	respErrorTypeMismatch     = []byte("error_type_mismatch\n")
 	respNil                   = []byte("nil\n")
 	respQueued                = []byte("queued\n")
+	respCASConflict           = []byte("cas_conflict\n")
+	respErrorBarrierCountMismatch = []byte("error_barrier_count_mismatch\n")
 
 	prefixOK       = []byte("ok ")
 	prefixAcquired = []byte("acquired ")
@@ -50,6 +53,7 @@ type Request struct {
 	Limit          int
 	Delta          int64  // incr, decr, cset
 	Value          string // kset, signal, lpush, rpush
+	OldValue       string // kcas: expected old value
 	Start          int    // lrange
 	Stop           int    // lrange
 	Group          string // listen, unlisten: queue group name
@@ -58,7 +62,8 @@ type Request struct {
 type Ack struct {
 	Status   string // "ok", "acquired", "queued", "timeout", "error", "error_auth", "error_max_locks", "error_max_waiters", "error_limit_mismatch", "error_not_enqueued", "error_already_enqueued"
 	Token    string
-	LeaseTTL int // seconds; 0 means not set
+	LeaseTTL int    // seconds; 0 means not set
+	Fence    uint64 // fencing token; 0 means not set
 	Extra    string
 }
 
@@ -148,9 +153,14 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 	switch cmd {
 	case "l", "r", "n", "e", "w", "sl", "sr", "sn", "se", "sw":
 	case "incr", "decr", "get", "cset":
-	case "kset", "kget", "kdel":
+	case "kset", "kget", "kdel", "kcas":
 	case "listen", "unlisten", "signal":
 	case "lpush", "rpush", "lpop", "rpop", "llen", "lrange":
+	case "blpop", "brpop":
+	case "rl", "rr", "rn", "wl", "wr", "wn", "re", "rw", "we", "ww":
+	case "watch", "unwatch":
+	case "bwait":
+	case "elect", "resign", "observe", "unobserve":
 	case "auth":
 		argStr := strings.TrimSpace(arg)
 		return &Request{Cmd: "auth", Token: argStr}, nil
@@ -470,6 +480,219 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 			return nil, err
 		}
 		return &Request{Cmd: cmd, Key: key, Start: start, Stop: stop}, nil
+
+	// --- Blocking List Pop ---
+
+	case "blpop", "brpop":
+		stripped := strings.TrimSpace(arg)
+		if stripped == "" {
+			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <timeout>"}
+		}
+		timeout, err := parseInt(stripped, "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+		}, nil
+
+	// --- Read-Write Locks ---
+
+	case "rl", "wl":
+		// rl/wl arg: <timeout> [<lease_ttl>]
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <timeout> [<lease_ttl>]"}
+		}
+		timeout, err := parseInt(parts[0], "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		leaseTTL := defaultLeaseTTL
+		if len(parts) == 2 {
+			lt, err := parseInt(parts[1], "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		if leaseTTL <= 0 {
+			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+			LeaseTTL:       leaseTTL,
+		}, nil
+
+	case "rr", "wr":
+		// rr/wr arg: <token>
+		token := strings.TrimSpace(arg)
+		if token == "" {
+			return nil, &ProtocolError{Code: 7, Message: "empty token"}
+		}
+		return &Request{Cmd: cmd, Key: key, Token: token}, nil
+
+	case "rn", "wn":
+		// rn/wn arg: <token> [<lease_ttl>]
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <token> [<lease_ttl>]"}
+		}
+		token := strings.TrimSpace(parts[0])
+		if token == "" {
+			return nil, &ProtocolError{Code: 7, Message: "empty token"}
+		}
+		leaseTTL := defaultLeaseTTL
+		if len(parts) == 2 {
+			lt, err := parseInt(parts[1], "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		if leaseTTL <= 0 {
+			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+		}
+		return &Request{Cmd: cmd, Key: key, Token: token, LeaseTTL: leaseTTL}, nil
+
+	case "re", "we":
+		// re/we arg: [<lease_ttl>]
+		stripped := strings.TrimSpace(arg)
+		leaseTTL := defaultLeaseTTL
+		if stripped != "" {
+			lt, err := parseInt(stripped, "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			if lt <= 0 {
+				return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		return &Request{Cmd: cmd, Key: key, LeaseTTL: leaseTTL}, nil
+
+	case "rw", "ww":
+		// rw/ww arg: <timeout>
+		stripped := strings.TrimSpace(arg)
+		if stripped == "" {
+			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <timeout>"}
+		}
+		timeout, err := parseInt(stripped, "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+		}, nil
+
+	// --- CAS ---
+
+	case "kcas":
+		if arg == "" {
+			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value> <ttl>"}
+		}
+		// Split on tab to separate old_value from new_value+ttl
+		tabIdx := strings.Index(arg, "\t")
+		if tabIdx < 0 {
+			return nil, &ProtocolError{Code: 8, Message: "kcas arg must contain tab separator"}
+		}
+		oldVal := arg[:tabIdx]
+		rest := arg[tabIdx+1:]
+		return &Request{Cmd: cmd, Key: key, OldValue: oldVal, Value: rest}, nil
+
+	// --- Watch/Notify ---
+
+	case "watch":
+		return &Request{Cmd: cmd, Key: key}, nil
+
+	case "unwatch":
+		return &Request{Cmd: cmd, Key: key}, nil
+
+	// --- Barriers ---
+
+	case "bwait":
+		if len(parts) != 2 {
+			return nil, &ProtocolError{Code: 8, Message: "bwait arg must be: <count> <timeout>"}
+		}
+		count, err := parseInt(parts[0], "count")
+		if err != nil {
+			return nil, err
+		}
+		if count <= 0 {
+			return nil, &ProtocolError{Code: 13, Message: "count must be > 0"}
+		}
+		timeout, err := parseInt(parts[1], "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			Limit:          count,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+		}, nil
+
+	// --- Leader Election ---
+
+	case "elect":
+		// elect arg: <timeout> [<lease_ttl>] (same as l)
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, &ProtocolError{Code: 8, Message: "elect arg must be: <timeout> [<lease_ttl>]"}
+		}
+		timeout, err := parseInt(parts[0], "timeout")
+		if err != nil {
+			return nil, err
+		}
+		if timeout < 0 {
+			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
+		}
+		leaseTTL := defaultLeaseTTL
+		if len(parts) == 2 {
+			lt, err := parseInt(parts[1], "lease_ttl")
+			if err != nil {
+				return nil, err
+			}
+			leaseTTL = time.Duration(lt) * time.Second
+		}
+		if leaseTTL <= 0 {
+			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
+		}
+		return &Request{
+			Cmd:            cmd,
+			Key:            key,
+			AcquireTimeout: time.Duration(timeout) * time.Second,
+			LeaseTTL:       leaseTTL,
+		}, nil
+
+	case "resign":
+		// resign arg: <token> (same as r)
+		token := strings.TrimSpace(arg)
+		if token == "" {
+			return nil, &ProtocolError{Code: 7, Message: "empty token"}
+		}
+		return &Request{Cmd: cmd, Key: key, Token: token}, nil
+
+	case "observe":
+		return &Request{Cmd: cmd, Key: key}, nil
+
+	case "unobserve":
+		return &Request{Cmd: cmd, Key: key}, nil
 	}
 
 	return nil, &ProtocolError{Code: 3, Message: fmt.Sprintf("invalid cmd %q", cmd)}
@@ -483,18 +706,20 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			if lease == 0 {
 				lease = defaultLeaseTTLSec
 			}
-			// Build: "<status> <token> <lease>\n" without fmt.Sprintf
+			// Build: "<status> <token> <lease> [<fence>]\n"
 			var prefix []byte
 			if ack.Status == "ok" {
 				prefix = prefixOK
 			} else {
 				prefix = prefixAcquired
 			}
-			buf := make([]byte, 0, len(prefix)+len(ack.Token)+1+10+1) // prefix+token+space+digits+newline
+			buf := make([]byte, 0, len(prefix)+len(ack.Token)+1+10+1+20+1)
 			buf = append(buf, prefix...)
 			buf = append(buf, ack.Token...)
 			buf = append(buf, ' ')
 			buf = strconv.AppendInt(buf, int64(lease), 10)
+			buf = append(buf, ' ')
+			buf = strconv.AppendUint(buf, ack.Fence, 10)
 			buf = append(buf, '\n')
 			return buf
 		}
@@ -539,6 +764,12 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			return respErrorListFull
 		case "error_lease_expired":
 			return respErrorLeaseExpired
+		case "error_type_mismatch":
+			return respErrorTypeMismatch
+		case "cas_conflict":
+			return respCASConflict
+		case "error_barrier_count_mismatch":
+			return respErrorBarrierCountMismatch
 		case "nil":
 			return respNil
 		default:

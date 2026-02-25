@@ -203,7 +203,7 @@ func TestReadRequest_WaitNegativeTimeout(t *testing.T) {
 func TestFormatResponse_OkWithToken(t *testing.T) {
 	ack := &Ack{Status: "ok", Token: "abc", LeaseTTL: 30}
 	got := string(FormatResponse(ack, 33))
-	if got != "ok abc 30\n" {
+	if got != "ok abc 30 0\n" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -211,7 +211,7 @@ func TestFormatResponse_OkWithToken(t *testing.T) {
 func TestFormatResponse_OkDefaultLease(t *testing.T) {
 	ack := &Ack{Status: "ok", Token: "abc"}
 	got := string(FormatResponse(ack, 33))
-	if got != "ok abc 33\n" {
+	if got != "ok abc 33 0\n" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -256,7 +256,23 @@ func TestFormatResponse_ErrorMaxLocks(t *testing.T) {
 func TestFormatResponse_AcquiredWithToken(t *testing.T) {
 	ack := &Ack{Status: "acquired", Token: "abc", LeaseTTL: 30}
 	got := string(FormatResponse(ack, 33))
-	if got != "acquired abc 30\n" {
+	if got != "acquired abc 30 0\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestFormatResponse_OkWithFence(t *testing.T) {
+	ack := &Ack{Status: "ok", Token: "abc", LeaseTTL: 30, Fence: 42}
+	got := string(FormatResponse(ack, 33))
+	if got != "ok abc 30 42\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestFormatResponse_AcquiredWithFence(t *testing.T) {
+	ack := &Ack{Status: "acquired", Token: "xyz", LeaseTTL: 60, Fence: 99}
+	got := string(FormatResponse(ack, 33))
+	if got != "acquired xyz 60 99\n" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -882,5 +898,181 @@ func TestReadRequest_UnlistenWithoutGroup(t *testing.T) {
 	}
 	if req.Group != "" {
 		t.Fatalf("group: got %q, want empty", req.Group)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KCAS
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_KCAS(t *testing.T) {
+	r := makeReader("kcas", "mykey", "old\tnew 60")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "kcas" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.OldValue != "old" {
+		t.Fatalf("old_value: got %q", req.OldValue)
+	}
+	if req.Value != "new 60" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_KCAS_EmptyOld(t *testing.T) {
+	r := makeReader("kcas", "mykey", "\tnew 0")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.OldValue != "" {
+		t.Fatalf("old_value: got %q, want empty", req.OldValue)
+	}
+	if req.Value != "new 0" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_KCAS_NoTab(t *testing.T) {
+	r := makeReader("kcas", "mykey", "no-tab-here")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for missing tab")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Watch/Unwatch
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_Watch(t *testing.T) {
+	r := makeReader("watch", "mykey", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "watch" || req.Key != "mykey" {
+		t.Fatalf("cmd/key: %s/%s", req.Cmd, req.Key)
+	}
+}
+
+func TestReadRequest_Unwatch(t *testing.T) {
+	r := makeReader("unwatch", "mykey", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "unwatch" || req.Key != "mykey" {
+		t.Fatalf("cmd/key: %s/%s", req.Cmd, req.Key)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BWait
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_BWait(t *testing.T) {
+	r := makeReader("bwait", "barrier1", "5 10")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "bwait" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "barrier1" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Limit != 5 {
+		t.Fatalf("count: got %d", req.Limit)
+	}
+	if req.AcquireTimeout != 10*time.Second {
+		t.Fatalf("timeout: got %v", req.AcquireTimeout)
+	}
+}
+
+func TestReadRequest_BWait_BadCount(t *testing.T) {
+	r := makeReader("bwait", "barrier1", "0 10")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for count <= 0")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Elect/Resign/Observe/Unobserve
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_Elect(t *testing.T) {
+	r := makeReader("elect", "leader1", "10 30")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "elect" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.AcquireTimeout != 10*time.Second {
+		t.Fatalf("timeout: got %v", req.AcquireTimeout)
+	}
+	if req.LeaseTTL != 30*time.Second {
+		t.Fatalf("lease: got %v", req.LeaseTTL)
+	}
+}
+
+func TestReadRequest_Resign(t *testing.T) {
+	r := makeReader("resign", "leader1", "abc123")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "resign" || req.Token != "abc123" {
+		t.Fatalf("cmd/token: %s/%s", req.Cmd, req.Token)
+	}
+}
+
+func TestReadRequest_Observe(t *testing.T) {
+	r := makeReader("observe", "leader1", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "observe" || req.Key != "leader1" {
+		t.Fatalf("cmd/key: %s/%s", req.Cmd, req.Key)
+	}
+}
+
+func TestReadRequest_Unobserve(t *testing.T) {
+	r := makeReader("unobserve", "leader1", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "unobserve" || req.Key != "leader1" {
+		t.Fatalf("cmd/key: %s/%s", req.Cmd, req.Key)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FormatResponse — new statuses
+// ---------------------------------------------------------------------------
+
+func TestFormatResponse_CASConflict(t *testing.T) {
+	got := FormatResponse(&Ack{Status: "cas_conflict"}, 33)
+	if string(got) != "cas_conflict\n" {
+		t.Fatalf("got %q", string(got))
+	}
+}
+
+func TestFormatResponse_BarrierCountMismatch(t *testing.T) {
+	got := FormatResponse(&Ack{Status: "error_barrier_count_mismatch"}, 33)
+	if string(got) != "error_barrier_count_mismatch\n" {
+		t.Fatalf("got %q", string(got))
 	}
 }

@@ -19,8 +19,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,6 +83,27 @@ func main() {
 		})
 		runTest("lists", func() error {
 			return testLists(*addr, prefix, *workers, *roundsPerCycle)
+		})
+		runTest("fencing-tokens", func() error {
+			return testFencingTokens(*addr, prefix, *workers, *roundsPerCycle)
+		})
+		runTest("blocking-pop", func() error {
+			return testBlockingPop(*addr, prefix, *workers, *roundsPerCycle)
+		})
+		runTest("rw-locks", func() error {
+			return testRWLocks(*addr, prefix, *workers, *roundsPerCycle)
+		})
+		runTest("cas", func() error {
+			return testCAS(*addr, prefix, *workers, *roundsPerCycle)
+		})
+		runTest("watch", func() error {
+			return testWatch(*addr, prefix, *roundsPerCycle)
+		})
+		runTest("barriers", func() error {
+			return testBarriers(*addr, prefix, *workers, *roundsPerCycle)
+		})
+		runTest("leader-election", func() error {
+			return testLeaderElection(*addr, prefix)
 		})
 
 		// Stats check: after all cleanup, verify nothing leaked.
@@ -701,6 +724,472 @@ func testLists(addr, prefix string, workers, rounds int) error {
 }
 
 // ---------------------------------------------------------------------------
+// Fencing tokens: verify monotonically increasing fences
+// ---------------------------------------------------------------------------
+
+func testFencingTokens(addr, prefix string, workers, rounds int) error {
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+
+	for w := range workers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[id] = fmt.Errorf("dial: %w", err)
+				return
+			}
+			defer c.Close()
+
+			key := fmt.Sprintf("%s_fence_%d", prefix, id)
+			var lastFence uint64
+			for r := range rounds {
+				token, _, fence, err := client.AcquireWithFence(c, key, 5*time.Second, client.WithLeaseTTL(10))
+				if err != nil {
+					errs[id] = fmt.Errorf("acquire round %d: %w", r, err)
+					return
+				}
+				if fence <= lastFence {
+					errs[id] = fmt.Errorf("fence not increasing: round %d: got %d, prev %d", r, fence, lastFence)
+					return
+				}
+				lastFence = fence
+
+				// Renew should return same fence
+				_, renewFence, err := client.RenewWithFence(c, key, token, client.WithLeaseTTL(10))
+				if err != nil {
+					errs[id] = fmt.Errorf("renew round %d: %w", r, err)
+					return
+				}
+				if renewFence != fence {
+					errs[id] = fmt.Errorf("renew fence mismatch: round %d: got %d, want %d", r, renewFence, fence)
+					return
+				}
+
+				if err := client.Release(c, key, token); err != nil {
+					errs[id] = fmt.Errorf("release round %d: %w", r, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Blocking pop: producer/consumer via RPush + BLPop
+// ---------------------------------------------------------------------------
+
+func testBlockingPop(addr, prefix string, workers, rounds int) error {
+	var wg sync.WaitGroup
+	errs := make([]error, workers*2)
+
+	for w := range workers {
+		key := fmt.Sprintf("%s_bpop_%d", prefix, w)
+
+		// Consumer goroutine
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[id*2] = fmt.Errorf("consumer dial: %w", err)
+				return
+			}
+			defer c.Close()
+
+			for r := range rounds {
+				val, err := client.BLPop(c, key, 10*time.Second)
+				if err != nil {
+					errs[id*2] = fmt.Errorf("blpop round %d: %w", r, err)
+					return
+				}
+				want := fmt.Sprintf("item_%d", r)
+				if val != want {
+					errs[id*2] = fmt.Errorf("blpop round %d: got %q, want %q", r, val, want)
+					return
+				}
+			}
+		}(w)
+
+		// Producer goroutine
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Small delay so the consumer is likely blocking
+			time.Sleep(10 * time.Millisecond)
+
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[id*2+1] = fmt.Errorf("producer dial: %w", err)
+				return
+			}
+			defer c.Close()
+
+			for r := range rounds {
+				val := fmt.Sprintf("item_%d", r)
+				_, err := client.RPush(c, key, val)
+				if err != nil {
+					errs[id*2+1] = fmt.Errorf("rpush round %d: %w", r, err)
+					return
+				}
+				// Small delay to let consumer process
+				time.Sleep(time.Duration(rand.IntN(2)) * time.Millisecond)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Read-write locks: concurrent readers + exclusive writers
+// ---------------------------------------------------------------------------
+
+func testRWLocks(addr, prefix string, workers, rounds int) error {
+	key := fmt.Sprintf("%s_rwlock", prefix)
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+
+	for w := range workers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[id] = fmt.Errorf("dial: %w", err)
+				return
+			}
+			defer c.Close()
+
+			for r := range rounds {
+				// Alternate between read and write locks
+				if r%3 == 0 {
+					// Write lock
+					token, _, _, err := client.WLock(c, key, 10*time.Second, client.WithLeaseTTL(10))
+					if err != nil {
+						errs[id] = fmt.Errorf("wlock round %d: %w", r, err)
+						return
+					}
+					time.Sleep(time.Duration(rand.IntN(2)) * time.Millisecond)
+					if err := client.WUnlock(c, key, token); err != nil {
+						errs[id] = fmt.Errorf("wunlock round %d: %w", r, err)
+						return
+					}
+				} else {
+					// Read lock
+					token, _, _, err := client.RLock(c, key, 10*time.Second, client.WithLeaseTTL(10))
+					if err != nil {
+						errs[id] = fmt.Errorf("rlock round %d: %w", r, err)
+						return
+					}
+					time.Sleep(time.Duration(rand.IntN(2)) * time.Millisecond)
+					if err := client.RUnlock(c, key, token); err != nil {
+						errs[id] = fmt.Errorf("runlock round %d: %w", r, err)
+						return
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// CAS: concurrent increment via compare-and-swap loop
+// ---------------------------------------------------------------------------
+
+func testCAS(addr, prefix string, workers, rounds int) error {
+	key := fmt.Sprintf("%s_cas", prefix)
+
+	// Initialize the counter to "0".
+	c0, err := client.Dial(addr)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	if err := client.KVSet(c0, key, "0", 0); err != nil {
+		c0.Close()
+		return fmt.Errorf("initial kset: %w", err)
+	}
+	c0.Close()
+
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+
+	for w := range workers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[id] = fmt.Errorf("dial: %w", err)
+				return
+			}
+			defer c.Close()
+
+			for r := range rounds {
+				// CAS-retry loop: read current value, increment, swap.
+				for attempt := 0; attempt < 1000; attempt++ {
+					cur, err := client.KVGet(c, key)
+					if err != nil {
+						errs[id] = fmt.Errorf("kget round %d: %w", r, err)
+						return
+					}
+					n, err := strconv.Atoi(cur)
+					if err != nil {
+						errs[id] = fmt.Errorf("atoi round %d: %w", r, err)
+						return
+					}
+					ok, err := client.KVCAS(c, key, cur, strconv.Itoa(n+1), 0)
+					if err != nil {
+						errs[id] = fmt.Errorf("kcas round %d: %w", r, err)
+						return
+					}
+					if ok {
+						break
+					}
+					// CAS conflict — retry.
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+
+	// Verify final value.
+	c1, err := client.Dial(addr)
+	if err != nil {
+		return fmt.Errorf("dial verify: %w", err)
+	}
+	defer c1.Close()
+
+	val, err := client.KVGet(c1, key)
+	if err != nil {
+		return fmt.Errorf("final kget: %w", err)
+	}
+	got, err := strconv.Atoi(val)
+	if err != nil {
+		return fmt.Errorf("final atoi: %w", err)
+	}
+	want := workers * rounds
+	if got != want {
+		return fmt.Errorf("cas counter: got %d, want %d", got, want)
+	}
+
+	// Clean up.
+	client.KVDel(c1, key)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Watch: verify push events for KV mutations
+// ---------------------------------------------------------------------------
+
+func testWatch(addr, prefix string, rounds int) error {
+	key := fmt.Sprintf("%s_watch", prefix)
+
+	// Set up watcher.
+	wc, err := client.Dial(addr)
+	if err != nil {
+		return fmt.Errorf("watcher dial: %w", err)
+	}
+	watchConn := client.NewWatchConn(wc)
+	if err := watchConn.Watch(key); err != nil {
+		watchConn.Close()
+		return fmt.Errorf("watch: %w", err)
+	}
+
+	// Writer.
+	ec, err := client.Dial(addr)
+	if err != nil {
+		watchConn.Close()
+		return fmt.Errorf("writer dial: %w", err)
+	}
+	defer ec.Close()
+
+	for r := range rounds {
+		if err := client.KVSet(ec, key, fmt.Sprintf("v%d", r), 0); err != nil {
+			watchConn.Close()
+			return fmt.Errorf("kset round %d: %w", r, err)
+		}
+	}
+
+	// Drain events.
+	count := 0
+	timeout := time.After(5 * time.Second)
+drain:
+	for {
+		select {
+		case ev, ok := <-watchConn.Events():
+			if !ok {
+				break drain
+			}
+			if ev.Type == "kset" && ev.Key == key {
+				count++
+				if count == rounds {
+					break drain
+				}
+			}
+		case <-timeout:
+			break drain
+		}
+	}
+
+	if count != rounds {
+		watchConn.Close()
+		client.KVDel(ec, key)
+		return fmt.Errorf("watch: received %d/%d events", count, rounds)
+	}
+
+	// Clean up.
+	watchConn.Unwatch(key)
+	watchConn.Close()
+	client.KVDel(ec, key)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Barriers: N workers synchronize at a barrier per round
+// ---------------------------------------------------------------------------
+
+func testBarriers(addr, prefix string, workers, rounds int) error {
+	for r := range rounds {
+		key := fmt.Sprintf("%s_barrier_%d", prefix, r)
+		var wg sync.WaitGroup
+		errs := make([]error, workers)
+		var tripped atomic.Int32
+
+		for w := range workers {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				c, err := client.Dial(addr)
+				if err != nil {
+					errs[id] = fmt.Errorf("dial: %w", err)
+					return
+				}
+				defer c.Close()
+
+				ok, err := client.BarrierWait(c, key, workers, 10*time.Second)
+				if err != nil {
+					errs[id] = fmt.Errorf("bwait: %w", err)
+					return
+				}
+				if !ok {
+					errs[id] = fmt.Errorf("barrier timed out")
+					return
+				}
+				tripped.Add(1)
+			}(w)
+		}
+		wg.Wait()
+
+		for _, err := range errs {
+			if err != nil {
+				return fmt.Errorf("round %d: %w", r, err)
+			}
+		}
+
+		if int(tripped.Load()) != workers {
+			return fmt.Errorf("round %d: %d/%d tripped", r, tripped.Load(), workers)
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Leader Election: 3 candidates campaign, verify fence monotonic
+// ---------------------------------------------------------------------------
+
+func testLeaderElection(addr, prefix string) error {
+	key := fmt.Sprintf("%s_elect", prefix)
+	candidates := 3
+	var wg sync.WaitGroup
+	errs := make([]error, candidates)
+
+	// Each candidate will campaign, record fence, then resign.
+	fences := make([]uint64, candidates)
+
+	for i := range candidates {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[id] = fmt.Errorf("dial: %w", err)
+				return
+			}
+			lc := client.NewLeaderConn(c)
+			defer lc.Close()
+
+			token, _, fence, err := lc.Elect(key, 10*time.Second, client.WithLeaseTTL(10))
+			if err != nil {
+				errs[id] = fmt.Errorf("elect: %w", err)
+				return
+			}
+			fences[id] = fence
+
+			// Hold leadership briefly.
+			time.Sleep(time.Duration(rand.IntN(5)) * time.Millisecond)
+
+			if err := lc.Resign(key, token); err != nil {
+				errs[id] = fmt.Errorf("resign: %w", err)
+				return
+			}
+		}(i)
+
+		// Small delay so candidates arrive sequentially (serialized leadership).
+		time.Sleep(20 * time.Millisecond)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+
+	// Verify fences are all non-zero and monotonically increasing.
+	for i, f := range fences {
+		if f == 0 {
+			return fmt.Errorf("candidate %d got fence 0", i)
+		}
+		if i > 0 && fences[i] <= fences[i-1] {
+			return fmt.Errorf("fence not increasing: candidate %d=%d, candidate %d=%d",
+				i-1, fences[i-1], i, fences[i])
+		}
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Stats check: verify no leaked signal listeners or other state from our prefix
 // ---------------------------------------------------------------------------
 
@@ -713,6 +1202,11 @@ type statsResponse struct {
 	Semaphores []struct {
 		Key string `json:"key"`
 	} `json:"semaphores"`
+	RWLocks []struct {
+		Key     string `json:"key"`
+		Readers int    `json:"readers"`
+		Writer  bool   `json:"writer"`
+	} `json:"rw_locks"`
 	IdleLocks []struct {
 		Key string `json:"key"`
 	} `json:"idle_locks"`
@@ -735,6 +1229,15 @@ type statsResponse struct {
 		Key string `json:"key"`
 		Len int    `json:"len"`
 	} `json:"lists"`
+	WatchChannels []struct {
+		Pattern  string `json:"pattern"`
+		Watchers int    `json:"watchers"`
+	} `json:"watch_channels"`
+	Barriers []struct {
+		Key          string `json:"key"`
+		Count        int    `json:"count"`
+		Participants int    `json:"participants"`
+	} `json:"barriers"`
 }
 
 func checkStats(addr, prefix string) error {
@@ -795,6 +1298,27 @@ func checkStats(addr, prefix string) error {
 	for _, l := range stats.Lists {
 		if strings.HasPrefix(l.Key, prefix) && l.Len > 0 {
 			return fmt.Errorf("leaked list: key=%q len=%d", l.Key, l.Len)
+		}
+	}
+
+	// Check for leaked RW locks.
+	for _, rw := range stats.RWLocks {
+		if strings.HasPrefix(rw.Key, prefix) {
+			return fmt.Errorf("leaked rw lock: key=%q readers=%d writer=%v", rw.Key, rw.Readers, rw.Writer)
+		}
+	}
+
+	// Check for leaked watch channels.
+	for _, w := range stats.WatchChannels {
+		if strings.HasPrefix(w.Pattern, prefix) {
+			return fmt.Errorf("leaked watch channel: pattern=%q watchers=%d", w.Pattern, w.Watchers)
+		}
+	}
+
+	// Check for leaked barriers.
+	for _, b := range stats.Barriers {
+		if strings.HasPrefix(b.Key, prefix) {
+			return fmt.Errorf("leaked barrier: key=%q count=%d participants=%d", b.Key, b.Count, b.Participants)
 		}
 	}
 

@@ -2541,3 +2541,745 @@ func TestList_NamespaceIsolation(t *testing.T) {
 		t.Fatal("list namespace broken")
 	}
 }
+
+// ===========================================================================
+// Fencing Token tests
+// ===========================================================================
+
+func TestFencingToken_MonotonicallyIncreases(t *testing.T) {
+	lm := testManager()
+	_, fence1, err := lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fence2, err := lm.AcquireWithFence(bg(), "k2", 5*time.Second, 30*time.Second, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fence3, err := lm.AcquireWithFence(bg(), "k3", 5*time.Second, 30*time.Second, 3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence1 == 0 {
+		t.Fatal("fence1 should be > 0")
+	}
+	if fence2 <= fence1 {
+		t.Fatalf("fence2 (%d) should be > fence1 (%d)", fence2, fence1)
+	}
+	if fence3 <= fence2 {
+		t.Fatalf("fence3 (%d) should be > fence2 (%d)", fence3, fence2)
+	}
+}
+
+func TestFencingToken_SlowPathGrant(t *testing.T) {
+	lm := testManager()
+	tok1, fence1, err := lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence1 == 0 {
+		t.Fatal("fence1 should be > 0")
+	}
+
+	done := make(chan uint64, 1)
+	go func() {
+		_, fence, _ := lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
+		done <- fence
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.Release("k1", tok1)
+	fence2 := <-done
+	if fence2 == 0 {
+		t.Fatal("fence2 should be > 0 (slow path grant)")
+	}
+	if fence2 <= fence1 {
+		t.Fatalf("fence2 (%d) should be > fence1 (%d)", fence2, fence1)
+	}
+}
+
+func TestFencingToken_EnqueueAcquiredFence(t *testing.T) {
+	lm := testManager()
+	status, tok, _, fence, err := lm.EnqueueWithFence("k1", 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "acquired" {
+		t.Fatalf("expected acquired, got %s", status)
+	}
+	if tok == "" {
+		t.Fatal("expected token")
+	}
+	if fence == 0 {
+		t.Fatal("fence should be > 0 on fast-path enqueue")
+	}
+}
+
+func TestFencingToken_WaitWithFence(t *testing.T) {
+	lm := testManager()
+	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Enqueue("k1", 30*time.Second, 2, 1)
+
+	done := make(chan uint64, 1)
+	go func() {
+		_, _, fence, _ := lm.WaitWithFence(bg(), "k1", 5*time.Second, 2)
+		done <- fence
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.Release("k1", tok1)
+	fence := <-done
+	if fence == 0 {
+		t.Fatal("WaitWithFence should return a non-zero fence")
+	}
+}
+
+func TestFencingToken_RenewReturnsFence(t *testing.T) {
+	lm := testManager()
+	tok, fence1, err := lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence1 == 0 {
+		t.Fatal("fence1 should be > 0")
+	}
+
+	_, fence2, ok := lm.RenewWithFence("k1", tok, 60*time.Second)
+	if !ok {
+		t.Fatal("renew should succeed")
+	}
+	if fence2 != fence1 {
+		t.Fatalf("RenewWithFence should return same fence: got %d, want %d", fence2, fence1)
+	}
+}
+
+func TestFencingToken_SemaphoreFence(t *testing.T) {
+	lm := testManager()
+	_, fence1, err := lm.AcquireWithFence(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fence2, err := lm.AcquireWithFence(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fence3, err := lm.AcquireWithFence(bg(), "s1", 5*time.Second, 30*time.Second, 3, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence1 == 0 || fence2 == 0 || fence3 == 0 {
+		t.Fatalf("all fences should be > 0: got %d, %d, %d", fence1, fence2, fence3)
+	}
+	if fence2 <= fence1 || fence3 <= fence2 {
+		t.Fatalf("fences should increase: %d, %d, %d", fence1, fence2, fence3)
+	}
+}
+
+// ===========================================================================
+// Blocking Pop tests
+// ===========================================================================
+
+func TestBLPop_NonEmptyList(t *testing.T) {
+	lm := testManager()
+	lm.RPush("list1", "a")
+	lm.RPush("list1", "b")
+
+	val, err := lm.BLPop(bg(), "list1", 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "a" {
+		t.Fatalf("expected 'a', got %q", val)
+	}
+}
+
+func TestBLPop_EmptyBlocksUntilPush(t *testing.T) {
+	lm := testManager()
+
+	done := make(chan string, 1)
+	go func() {
+		val, _ := lm.BLPop(bg(), "list1", 5*time.Second, 1)
+		done <- val
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.RPush("list1", "hello")
+	val := <-done
+	if val != "hello" {
+		t.Fatalf("expected 'hello', got %q", val)
+	}
+}
+
+func TestBLPop_Timeout(t *testing.T) {
+	lm := testManager()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	val, err := lm.BLPop(ctx, "list1", 1*time.Millisecond, 1)
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "" {
+		t.Fatalf("expected empty string on timeout, got %q", val)
+	}
+}
+
+func TestBRPop_NonEmptyList(t *testing.T) {
+	lm := testManager()
+	lm.LPush("list1", "a")
+	lm.LPush("list1", "b")
+	// List is now [b, a]
+
+	val, err := lm.BRPop(bg(), "list1", 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "a" {
+		t.Fatalf("expected 'a' (rightmost), got %q", val)
+	}
+}
+
+func TestBLPop_MultipleFIFO(t *testing.T) {
+	lm := testManager()
+
+	results := make([]chan string, 3)
+	// Launch goroutines one at a time with sleeps to ensure FIFO ordering
+	for i := 0; i < 3; i++ {
+		results[i] = make(chan string, 1)
+		connID := uint64(i + 1)
+		ch := results[i]
+		go func() {
+			val, _ := lm.BLPop(bg(), "list1", 5*time.Second, connID)
+			ch <- val
+		}()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	lm.RPush("list1", "first")
+	lm.RPush("list1", "second")
+	lm.RPush("list1", "third")
+
+	v1 := <-results[0]
+	v2 := <-results[1]
+	v3 := <-results[2]
+
+	if v1 != "first" {
+		t.Fatalf("popper 1: expected 'first', got %q", v1)
+	}
+	if v2 != "second" {
+		t.Fatalf("popper 2: expected 'second', got %q", v2)
+	}
+	if v3 != "third" {
+		t.Fatalf("popper 3: expected 'third', got %q", v3)
+	}
+}
+
+func TestBLPop_PushHandoff(t *testing.T) {
+	lm := testManager()
+
+	done := make(chan string, 1)
+	go func() {
+		val, _ := lm.BLPop(bg(), "list1", 5*time.Second, 1)
+		done <- val
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.RPush("list1", "direct")
+	val := <-done
+	if val != "direct" {
+		t.Fatalf("expected 'direct', got %q", val)
+	}
+
+	// List should be empty since the value was handed off directly
+	if lm.LLen("list1") != 0 {
+		t.Fatalf("list should be empty after handoff, got len %d", lm.LLen("list1"))
+	}
+}
+
+func TestBLPop_DisconnectCleanup(t *testing.T) {
+	lm := testManager()
+
+	done := make(chan struct{})
+	var gotVal string
+	go func() {
+		gotVal, _ = lm.BLPop(bg(), "list1", 30*time.Second, 42)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	lm.CleanupConnection(42)
+	<-done
+
+	if gotVal != "" {
+		t.Fatalf("expected empty string after disconnect, got %q", gotVal)
+	}
+}
+
+// ===========================================================================
+// Read-Write Lock tests
+// ===========================================================================
+
+func TestRWLock_MultipleReaders(t *testing.T) {
+	lm := testManager()
+	tok1, fence1, err := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok2, fence2, err := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok3, fence3, err := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok1 == "" || tok2 == "" || tok3 == "" {
+		t.Fatal("all readers should acquire simultaneously")
+	}
+	if fence1 == 0 || fence2 == 0 || fence3 == 0 {
+		t.Fatal("all readers should get fences")
+	}
+	lm.LockKeyForTest("rw1")
+	if len(lm.ResourceForTest("rw1").Holders) != 3 {
+		lm.UnlockKeyForTest("rw1")
+		t.Fatalf("expected 3 holders, got %d", len(lm.ResourceForTest("rw1").Holders))
+	}
+	lm.UnlockKeyForTest("rw1")
+}
+
+func TestRWLock_WriterExclusive(t *testing.T) {
+	lm := testManager()
+	_, _, err := lm.RWAcquire(bg(), "rw1", 'w', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tok2, _, err := lm.RWAcquire(bg(), "rw1", 'w', 0, 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok2 != "" {
+		t.Fatal("second writer should timeout")
+	}
+}
+
+func TestRWLock_WriterBlocksReaders(t *testing.T) {
+	lm := testManager()
+	_, _, err := lm.RWAcquire(bg(), "rw1", 'w', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tok2, _, err := lm.RWAcquire(bg(), "rw1", 'r', 0, 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok2 != "" {
+		t.Fatal("reader should timeout when writer holds")
+	}
+}
+
+func TestRWLock_ReadersBlockWriter(t *testing.T) {
+	lm := testManager()
+	_, _, err := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tok2, _, err := lm.RWAcquire(bg(), "rw1", 'w', 0, 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok2 != "" {
+		t.Fatal("writer should timeout when reader holds")
+	}
+}
+
+func TestRWLock_FIFOFairness(t *testing.T) {
+	lm := testManager()
+	// Acquire a read lock
+	tok1, _, err := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueue a writer (conn 2), then a reader (conn 3) as waiters
+	writerDone := make(chan string, 1)
+	go func() {
+		tok, _, _ := lm.RWAcquire(bg(), "rw1", 'w', 5*time.Second, 30*time.Second, 2)
+		writerDone <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	readerDone := make(chan string, 1)
+	go func() {
+		tok, _, _ := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 3)
+		readerDone <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Release the read lock — writer should get granted (not the reader)
+	lm.RWRelease("rw1", tok1)
+
+	writerTok := <-writerDone
+	if writerTok == "" {
+		t.Fatal("writer should have been granted")
+	}
+
+	// Reader should still be waiting (not yet granted)
+	select {
+	case <-readerDone:
+		t.Fatal("reader should not be granted while writer holds")
+	case <-time.After(100 * time.Millisecond):
+		// expected
+	}
+
+	// Release the writer — reader should get granted
+	lm.RWRelease("rw1", writerTok)
+	readerTok := <-readerDone
+	if readerTok == "" {
+		t.Fatal("reader should have been granted after writer release")
+	}
+}
+
+func TestRWLock_BatchGrantReaders(t *testing.T) {
+	lm := testManager()
+	// Hold a write lock
+	tok1, _, err := lm.RWAcquire(bg(), "rw1", 'w', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueue 3 readers
+	results := make([]chan string, 3)
+	for i := 0; i < 3; i++ {
+		results[i] = make(chan string, 1)
+		connID := uint64(i + 2)
+		ch := results[i]
+		go func() {
+			tok, _, _ := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, connID)
+			ch <- tok
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Release write lock — all 3 readers should be granted simultaneously
+	lm.RWRelease("rw1", tok1)
+
+	for i, ch := range results {
+		select {
+		case tok := <-ch:
+			if tok == "" {
+				t.Fatalf("reader %d should have been granted", i+2)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("reader %d timed out waiting for grant", i+2)
+		}
+	}
+
+	// Verify all 3 are holders
+	lm.LockKeyForTest("rw1")
+	if len(lm.ResourceForTest("rw1").Holders) != 3 {
+		lm.UnlockKeyForTest("rw1")
+		t.Fatalf("expected 3 holders, got %d", len(lm.ResourceForTest("rw1").Holders))
+	}
+	lm.UnlockKeyForTest("rw1")
+}
+
+func TestRWLock_TypeMismatch(t *testing.T) {
+	lm := testManager()
+	// Create a regular lock (limit=1)
+	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try RWAcquire on the same key — should get ErrTypeMismatch
+	_, _, err = lm.RWAcquire(bg(), "k1", 'r', 0, 30*time.Second, 2)
+	if err != ErrTypeMismatch {
+		t.Fatalf("expected ErrTypeMismatch, got %v", err)
+	}
+}
+
+func TestRWLock_RenewMode(t *testing.T) {
+	lm := testManager()
+
+	// Acquire read lock and renew
+	tokR, _, err := lm.RWAcquire(bg(), "rw1", 'r', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, ok := lm.RWRenew("rw1", tokR, 60*time.Second)
+	if !ok {
+		t.Fatal("RWRenew on read lock should succeed")
+	}
+
+	// Release and acquire write lock, then renew
+	lm.RWRelease("rw1", tokR)
+
+	tokW, _, err := lm.RWAcquire(bg(), "rw1", 'w', 5*time.Second, 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, ok = lm.RWRenew("rw1", tokW, 60*time.Second)
+	if !ok {
+		t.Fatal("RWRenew on write lock should succeed")
+	}
+}
+
+func TestRWLock_ReleaseAndGrant(t *testing.T) {
+	lm := testManager()
+	// Acquire write lock
+	tokW, _, err := lm.RWAcquire(bg(), "rw1", 'w', 5*time.Second, 30*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueue a reader via RWEnqueue
+	status, _, _, _, err := lm.RWEnqueue("rw1", 'r', 30*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// Start RWWait in goroutine
+	done := make(chan struct{})
+	var gotTok string
+	var gotFence uint64
+	go func() {
+		gotTok, _, gotFence, _ = lm.RWWait(bg(), "rw1", 5*time.Second, 2)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Release write lock — reader should be granted
+	lm.RWRelease("rw1", tokW)
+	<-done
+
+	if gotTok == "" {
+		t.Fatal("reader should have been granted via RWWait")
+	}
+	if gotFence == 0 {
+		t.Fatal("RWWait should return a non-zero fence")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KVCAS
+// ---------------------------------------------------------------------------
+
+func TestKVCAS_CreateIfAbsent(t *testing.T) {
+	lm := testManager()
+	ok, err := lm.KVCAS("k1", "", "hello", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected CAS to succeed for absent key")
+	}
+	val, exists := lm.KVGet("k1")
+	if !exists || val != "hello" {
+		t.Fatalf("expected 'hello', got %q (exists=%v)", val, exists)
+	}
+}
+
+func TestKVCAS_SuccessfulSwap(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "old", 0)
+	ok, err := lm.KVCAS("k1", "old", "new", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected CAS to succeed")
+	}
+	val, exists := lm.KVGet("k1")
+	if !exists || val != "new" {
+		t.Fatalf("expected 'new', got %q", val)
+	}
+}
+
+func TestKVCAS_Conflict(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "actual", 0)
+	ok, err := lm.KVCAS("k1", "wrong", "new", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected CAS to fail on mismatch")
+	}
+	// Value should be unchanged
+	val, _ := lm.KVGet("k1")
+	if val != "actual" {
+		t.Fatalf("expected 'actual', got %q", val)
+	}
+}
+
+func TestKVCAS_ExpiredKey(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "old", 1)
+	time.Sleep(1100 * time.Millisecond)
+	// Expired key — should be treated as absent
+	ok, err := lm.KVCAS("k1", "", "new", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected CAS to succeed on expired key with empty old")
+	}
+}
+
+func TestKVCAS_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+	lm.KVSet("existing", "v", 0)
+
+	// Second key should fail
+	_, err := lm.KVCAS("new_key", "", "val", 0)
+	if !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Barriers
+// ---------------------------------------------------------------------------
+
+func TestBarrier_BasicTrip(t *testing.T) {
+	lm := testManager()
+	var wg sync.WaitGroup
+	results := make([]bool, 3)
+
+	for i := range 3 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ok, err := lm.BarrierWait(bg(), "b1", 3, 5*time.Second, uint64(id+1))
+			if err != nil {
+				t.Errorf("worker %d: %v", id, err)
+				return
+			}
+			results[id] = ok
+		}(i)
+	}
+	wg.Wait()
+
+	for i, ok := range results {
+		if !ok {
+			t.Errorf("worker %d: barrier did not trip", i)
+		}
+	}
+}
+
+func TestBarrier_Timeout(t *testing.T) {
+	lm := testManager()
+	// Only 1 of 3 arrives — should timeout
+	ok, err := lm.BarrierWait(bg(), "b1", 3, 200*time.Millisecond, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected timeout, got trip")
+	}
+}
+
+func TestBarrier_CountMismatch(t *testing.T) {
+	lm := testManager()
+	// First creates with count=3
+	go func() {
+		lm.BarrierWait(bg(), "b1", 3, 2*time.Second, 1)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	// Second tries with count=2 — should error
+	_, err := lm.BarrierWait(bg(), "b1", 2, 200*time.Millisecond, 2)
+	if !errors.Is(err, ErrBarrierCountMismatch) {
+		t.Fatalf("expected ErrBarrierCountMismatch, got %v", err)
+	}
+}
+
+func TestBarrier_DisconnectCleanup(t *testing.T) {
+	lm := testManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lm.BarrierWait(ctx, "b1", 3, 10*time.Second, 1)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// After cleanup, barrier state should be gone (only 1 participant, now cancelled)
+	lm.CleanupConnection(1)
+}
+
+func TestBarrier_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+	lm.KVSet("existing", "v", 0)
+
+	_, err := lm.BarrierWait(bg(), "new_barrier", 2, 200*time.Millisecond, 1)
+	if !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Leader Watchers
+// ---------------------------------------------------------------------------
+
+func TestLeaderWatcher_RegisterNotify(t *testing.T) {
+	lm := testManager()
+	ch := make(chan []byte, 10)
+	lm.RegisterLeaderWatcher("election1", 1, ch)
+	lm.NotifyLeaderChange("election1", "elected", 0)
+
+	select {
+	case msg := <-ch:
+		if string(msg) != "leader elected election1\n" {
+			t.Fatalf("unexpected message: %q", string(msg))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for notification")
+	}
+}
+
+func TestLeaderWatcher_Unregister(t *testing.T) {
+	lm := testManager()
+	ch := make(chan []byte, 10)
+	lm.RegisterLeaderWatcher("election1", 1, ch)
+	lm.UnregisterLeaderWatcher("election1", 1)
+	lm.NotifyLeaderChange("election1", "elected", 0)
+
+	select {
+	case <-ch:
+		t.Fatal("should not receive notification after unregister")
+	case <-time.After(100 * time.Millisecond):
+		// OK
+	}
+}
+
+func TestLeaderWatcher_UnregisterAll(t *testing.T) {
+	lm := testManager()
+	ch := make(chan []byte, 10)
+	lm.RegisterLeaderWatcher("e1", 1, ch)
+	lm.RegisterLeaderWatcher("e2", 1, ch)
+	lm.UnregisterAllLeaderWatchers(1)
+	lm.NotifyLeaderChange("e1", "elected", 0)
+	lm.NotifyLeaderChange("e2", "elected", 0)
+
+	select {
+	case <-ch:
+		t.Fatal("should not receive notification after unregister all")
+	case <-time.After(100 * time.Millisecond):
+		// OK
+	}
+}

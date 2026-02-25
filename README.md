@@ -148,6 +148,30 @@ $ bench: 100 workers x 500 rounds (key_prefix="bench", conns/worker=1)
 
 Each worker uses a unique randomized key, so all workers run in parallel without contending. To benchmark contended locks, use the same `--key` value with `--workers 1` and increase `--rounds`.
 
+## Soak testing
+
+A long-running soak test exercises every feature (locks, semaphores, two-phase locking, counters, KV, KV with TTL, signals, signal queue groups, and lists) in a continuous loop. Each cycle uses a unique key prefix and cleans up after itself, then queries `stats` to verify no state leaked. Useful for detecting memory leaks, goroutine leaks, or correctness issues that only surface over time.
+
+```bash
+go run ./cmd/soak [flags]
+```
+
+| Flag | Default | Description |
+| -------------------- | ----------------- | ------------------------------------ |
+| `--server` | `127.0.0.1:6388` | Server address |
+| `--workers` | `4` | Concurrent workers per feature test |
+| `--rounds-per-cycle` | `20` | Operations per worker per cycle |
+
+Runs until interrupted with Ctrl-C. Fails fast with `FAIL [test-name]: ...` if any check fails.
+
+```bash
+# Light soak
+go run ./cmd/soak --workers 2 --rounds-per-cycle 10
+
+# Heavy soak
+go run ./cmd/soak --workers 16 --rounds-per-cycle 100
+```
+
 ## Tests
 
 ```bash

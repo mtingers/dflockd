@@ -20,6 +20,7 @@ import (
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
 	"github.com/mtingers/dflockd/internal/signal"
+	"github.com/mtingers/dflockd/internal/watch"
 )
 
 type connState struct {
@@ -30,6 +31,7 @@ type connState struct {
 type Server struct {
 	lm        *lock.LockManager
 	sig       *signal.Manager
+	wm        *watch.Manager
 	cfg       *config.Config
 	log       *slog.Logger
 	connSeq   atomic.Uint64
@@ -38,7 +40,7 @@ type Server struct {
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager()}
+	return &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager(), wm: watch.NewManager()}
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -204,6 +206,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	defer func() {
 		connCancel()
 		s.sig.UnlistenAll(connID)
+		s.wm.UnwatchAll(connID)
+		s.lm.UnregisterAllLeaderWatchers(connID)
 		close(writeCh)
 		pushWg.Wait() // wait for push writer to drain before closing conn
 		s.conns.Delete(conn)
@@ -280,6 +284,13 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 				Listeners: si.Listeners,
 			})
 		}
+		watchStats := s.wm.Stats()
+		for _, wi := range watchStats {
+			st.WatchChannels = append(st.WatchChannels, lock.WatchChannelInfo{
+				Pattern:  wi.Pattern,
+				Watchers: wi.Watchers,
+			})
+		}
 		data, err := json.Marshal(st)
 		if err != nil {
 			return &protocol.Ack{Status: "error"}
@@ -291,7 +302,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if req.Cmd == "sl" {
 			limit = req.Limit
 		}
-		tok, err := s.lm.Acquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
+		tok, fence, err := s.lm.AcquireWithFence(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
@@ -311,27 +322,29 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
+		s.wm.Notify("acquire", req.Key)
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "r", "sr":
 		if s.lm.Release(req.Key, req.Token) {
+			s.wm.Notify("release", req.Key)
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
 
 	case "n", "sn":
-		remaining, ok := s.lm.Renew(req.Key, req.Token, req.LeaseTTL)
+		remaining, fence, ok := s.lm.RenewWithFence(req.Key, req.Token, req.LeaseTTL)
 		if !ok {
 			return &protocol.Ack{Status: "error"}
 		}
-		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d", remaining)}
+		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d %d", remaining, fence)}
 
 	case "e", "se":
 		limit := 1
 		if req.Cmd == "se" {
 			limit = req.Limit
 		}
-		status, tok, lease, err := s.lm.Enqueue(req.Key, req.LeaseTTL, connID, limit)
+		status, tok, lease, fence, err := s.lm.EnqueueWithFence(req.Key, req.LeaseTTL, connID, limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
@@ -347,10 +360,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
-		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
+		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
 	case "w", "sw":
-		tok, lease, err := s.lm.Wait(ctx, req.Key, req.AcquireTimeout, connID)
+		tok, lease, fence, err := s.lm.WaitWithFence(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}
@@ -367,7 +380,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease, Fence: fence}
 
 	// --- Phase 1: Atomic Counters ---
 
@@ -379,6 +392,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		s.wm.Notify("incr", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: strconv.FormatInt(val, 10)}
 
 	case "decr":
@@ -389,6 +403,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		s.wm.Notify("decr", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: strconv.FormatInt(val, 10)}
 
 	case "get":
@@ -402,6 +417,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		s.wm.Notify("cset", req.Key)
 		return &protocol.Ack{Status: "ok"}
 
 	// --- Phase 2: KV with TTL ---
@@ -424,6 +440,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		s.wm.Notify("kset", req.Key)
 		return &protocol.Ack{Status: "ok"}
 
 	case "kget":
@@ -435,6 +452,30 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "kdel":
 		s.lm.KVDel(req.Key)
+		s.wm.Notify("kdel", req.Key)
+		return &protocol.Ack{Status: "ok"}
+
+	case "kcas":
+		value := req.Value
+		ttl := 0
+		if idx := strings.LastIndex(value, " "); idx >= 0 {
+			candidate := value[idx+1:]
+			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 {
+				ttl = n
+				value = value[:idx]
+			}
+		}
+		ok, err := s.lm.KVCAS(req.Key, req.OldValue, value, ttl)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if !ok {
+			return &protocol.Ack{Status: "cas_conflict"}
+		}
+		s.wm.Notify("kcas", req.Key)
 		return &protocol.Ack{Status: "ok"}
 
 	// --- Phase 3: Signaling ---
@@ -472,6 +513,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		s.wm.Notify("lpush", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
 
 	case "rpush":
@@ -485,6 +527,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		s.wm.Notify("rpush", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
 
 	case "lpop":
@@ -492,6 +535,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if !ok {
 			return &protocol.Ack{Status: "nil"}
 		}
+		s.wm.Notify("lpop", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: val}
 
 	case "rpop":
@@ -499,6 +543,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if !ok {
 			return &protocol.Ack{Status: "nil"}
 		}
+		s.wm.Notify("rpop", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: val}
 
 	case "llen":
@@ -512,8 +557,201 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			return &protocol.Ack{Status: "error"}
 		}
 		return &protocol.Ack{Status: "ok", Extra: string(data)}
+
+	// --- Blocking List Pop ---
+
+	case "blpop":
+		val, err := s.lm.BLPop(ctx, req.Key, req.AcquireTimeout, connID)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if val == "" {
+			return &protocol.Ack{Status: "nil"}
+		}
+		s.wm.Notify("blpop", req.Key)
+		return &protocol.Ack{Status: "ok", Extra: val}
+
+	case "brpop":
+		val, err := s.lm.BRPop(ctx, req.Key, req.AcquireTimeout, connID)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if val == "" {
+			return &protocol.Ack{Status: "nil"}
+		}
+		s.wm.Notify("brpop", req.Key)
+		return &protocol.Ack{Status: "ok", Extra: val}
+
+	// --- Read-Write Locks ---
+
+	case "rl":
+		tok, fence, err := s.lm.RWAcquire(ctx, req.Key, 'r', req.AcquireTimeout, req.LeaseTTL, connID)
+		if err != nil {
+			return rwAcquireError(err)
+		}
+		if tok == "" {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
+
+	case "wl":
+		tok, fence, err := s.lm.RWAcquire(ctx, req.Key, 'w', req.AcquireTimeout, req.LeaseTTL, connID)
+		if err != nil {
+			return rwAcquireError(err)
+		}
+		if tok == "" {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
+
+	case "rr", "wr":
+		if s.lm.RWRelease(req.Key, req.Token) {
+			return &protocol.Ack{Status: "ok"}
+		}
+		return &protocol.Ack{Status: "error"}
+
+	case "rn", "wn":
+		remaining, fence, ok := s.lm.RWRenew(req.Key, req.Token, req.LeaseTTL)
+		if !ok {
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d %d", remaining, fence)}
+
+	case "re":
+		status, tok, lease, fence, err := s.lm.RWEnqueue(req.Key, 'r', req.LeaseTTL, connID)
+		if err != nil {
+			return rwAcquireError(err)
+		}
+		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
+
+	case "we":
+		status, tok, lease, fence, err := s.lm.RWEnqueue(req.Key, 'w', req.LeaseTTL, connID)
+		if err != nil {
+			return rwAcquireError(err)
+		}
+		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
+
+	case "rw", "ww":
+		tok, lease, fence, err := s.lm.RWWait(ctx, req.Key, req.AcquireTimeout, connID)
+		if err != nil {
+			if errors.Is(err, lock.ErrNotEnqueued) {
+				return &protocol.Ack{Status: "error_not_enqueued"}
+			}
+			if errors.Is(err, lock.ErrLeaseExpired) {
+				return &protocol.Ack{Status: "error_lease_expired"}
+			}
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				s.log.Debug("waiter closed during rw wait", "key", req.Key, "conn", connID)
+				return &protocol.Ack{Status: "error"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if tok == "" {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease, Fence: fence}
+
+	// --- Watch/Notify ---
+
+	case "watch":
+		w := &watch.Watcher{
+			ConnID:  connID,
+			Pattern: req.Key,
+			WriteCh: cs.writeCh,
+		}
+		if err := s.wm.Watch(w); err != nil {
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok"}
+
+	case "unwatch":
+		s.wm.Unwatch(req.Key, connID)
+		return &protocol.Ack{Status: "ok"}
+
+	// --- Barriers ---
+
+	case "bwait":
+		ok, err := s.lm.BarrierWait(ctx, req.Key, req.Limit, req.AcquireTimeout, connID)
+		if err != nil {
+			if errors.Is(err, lock.ErrBarrierCountMismatch) {
+				return &protocol.Ack{Status: "error_barrier_count_mismatch"}
+			}
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if !ok {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		return &protocol.Ack{Status: "ok"}
+
+	// --- Leader Election ---
+
+	case "elect":
+		tok, fence, err := s.lm.AcquireWithFence(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, 1)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxLocks) {
+				return &protocol.Ack{Status: "error_max_locks"}
+			}
+			if errors.Is(err, lock.ErrMaxWaiters) {
+				return &protocol.Ack{Status: "error_max_waiters"}
+			}
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				s.log.Debug("waiter closed during elect", "key", req.Key, "conn", connID)
+				return &protocol.Ack{Status: "error"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		if tok == "" {
+			return &protocol.Ack{Status: "timeout"}
+		}
+		s.lm.RegisterLeaderWatcher(req.Key, connID, cs.writeCh)
+		s.lm.NotifyLeaderChange(req.Key, "elected", connID)
+		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
+
+	case "resign":
+		if s.lm.Release(req.Key, req.Token) {
+			s.lm.UnregisterLeaderWatcher(req.Key, connID)
+			s.lm.NotifyLeaderChange(req.Key, "resigned", connID)
+			return &protocol.Ack{Status: "ok"}
+		}
+		return &protocol.Ack{Status: "error"}
+
+	case "observe":
+		s.lm.RegisterLeaderWatcher(req.Key, connID, cs.writeCh)
+		return &protocol.Ack{Status: "ok"}
+
+	case "unobserve":
+		s.lm.UnregisterLeaderWatcher(req.Key, connID)
+		return &protocol.Ack{Status: "ok"}
 	}
 
 	s.log.Warn("unknown command in handleRequest", "cmd", req.Cmd, "conn", connID)
+	return &protocol.Ack{Status: "error"}
+}
+
+func rwAcquireError(err error) *protocol.Ack {
+	if errors.Is(err, lock.ErrMaxLocks) {
+		return &protocol.Ack{Status: "error_max_locks"}
+	}
+	if errors.Is(err, lock.ErrTypeMismatch) {
+		return &protocol.Ack{Status: "error_type_mismatch"}
+	}
+	if errors.Is(err, lock.ErrMaxWaiters) {
+		return &protocol.Ack{Status: "error_max_waiters"}
+	}
+	if errors.Is(err, lock.ErrAlreadyEnqueued) {
+		return &protocol.Ack{Status: "error_already_enqueued"}
+	}
+	if errors.Is(err, lock.ErrWaiterClosed) {
+		return &protocol.Ack{Status: "error"}
+	}
 	return &protocol.Ack{Status: "error"}
 }

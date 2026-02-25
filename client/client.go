@@ -30,6 +30,8 @@ var (
 	ErrMaxKeys        = errors.New("dflockd: max keys reached")
 	ErrNotFound       = errors.New("dflockd: not found")
 	ErrListFull       = errors.New("dflockd: list full")
+	ErrCASConflict    = errors.New("dflockd: cas conflict")
+	ErrBarrierCountMismatch = errors.New("dflockd: barrier count mismatch")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -259,7 +261,7 @@ func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error
 	}
 
 	parts := strings.Fields(resp)
-	if len(parts) == 2 && parts[0] == "ok" {
+	if (len(parts) == 2 || len(parts) == 3) && parts[0] == "ok" {
 		r, err := strconv.Atoi(parts[1])
 		if err != nil {
 			return 0, fmt.Errorf("%w: renew: bad remaining %q", ErrServer, parts[1])
@@ -303,7 +305,7 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	}
 
 	parts := strings.Fields(resp)
-	if len(parts) == 3 && parts[0] == "acquired" {
+	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
 		ttl, err := strconv.Atoi(parts[2])
 		if err != nil {
 			return "", "", 0, fmt.Errorf("%w: enqueue: bad lease %q", ErrServer, parts[2])
@@ -402,7 +404,7 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 	}
 
 	parts := strings.Fields(resp)
-	if len(parts) == 2 && parts[0] == "ok" {
+	if (len(parts) == 2 || len(parts) == 3) && parts[0] == "ok" {
 		r, err := strconv.Atoi(parts[1])
 		if err != nil {
 			return 0, fmt.Errorf("%w: sem_renew: bad remaining %q", ErrServer, parts[1])
@@ -449,7 +451,7 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	}
 
 	parts := strings.Fields(resp)
-	if len(parts) == 3 && parts[0] == "acquired" {
+	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
 		ttl, err := strconv.Atoi(parts[2])
 		if err != nil {
 			return "", "", 0, fmt.Errorf("%w: sem_enqueue: bad lease %q", ErrServer, parts[2])
@@ -519,7 +521,8 @@ func parseAcquireResponse(resp string) (string, int, error) {
 
 func parseOKTokenLease(resp, cmd string) (string, int, error) {
 	parts := strings.Fields(resp)
-	if len(parts) == 3 && parts[0] == "ok" {
+	// Accept 3 or 4 fields (4th is fence, ignored here)
+	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "ok" {
 		ttl, err := strconv.Atoi(parts[2])
 		if err != nil {
 			return "", 0, fmt.Errorf("%w: %s: bad lease %q", ErrServer, cmd, parts[2])
@@ -527,6 +530,46 @@ func parseOKTokenLease(resp, cmd string) (string, int, error) {
 		return parts[1], ttl, nil
 	}
 	return "", 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
+// parseOKTokenLeaseFence parses "ok <token> <lease> <fence>" or "acquired <token> <lease> <fence>".
+func parseOKTokenLeaseFence(resp, cmd string) (string, int, uint64, error) {
+	parts := strings.Fields(resp)
+	if (len(parts) == 3 || len(parts) == 4) && (parts[0] == "ok" || parts[0] == "acquired") {
+		ttl, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("%w: %s: bad lease %q", ErrServer, cmd, parts[2])
+		}
+		var fence uint64
+		if len(parts) == 4 {
+			fence, err = strconv.ParseUint(parts[3], 10, 64)
+			if err != nil {
+				return "", 0, 0, fmt.Errorf("%w: %s: bad fence %q", ErrServer, cmd, parts[3])
+			}
+		}
+		return parts[1], ttl, fence, nil
+	}
+	return "", 0, 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
+// parseRenewWithFence parses "ok <remaining> <fence>".
+func parseRenewWithFence(resp, cmd string) (int, uint64, error) {
+	parts := strings.Fields(resp)
+	if (len(parts) == 2 || len(parts) == 3) && parts[0] == "ok" {
+		r, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, 0, fmt.Errorf("%w: %s: bad remaining %q", ErrServer, cmd, parts[1])
+		}
+		var fence uint64
+		if len(parts) == 3 {
+			fence, err = strconv.ParseUint(parts[2], 10, 64)
+			if err != nil {
+				return 0, 0, fmt.Errorf("%w: %s: bad fence %q", ErrServer, cmd, parts[2])
+			}
+		}
+		return r, fence, nil
+	}
+	return 0, 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +728,43 @@ func KVDel(c *Conn, key string) error {
 		return fmt.Errorf("%w: kdel: %s", ErrServer, resp)
 	}
 	return nil
+}
+
+// KVCAS performs an atomic compare-and-swap on a key. If oldValue matches the
+// current value, it is replaced with newValue. If the key doesn't exist and
+// oldValue is "", the key is created. Returns (true, nil) on success,
+// (false, nil) on mismatch.
+func KVCAS(c *Conn, key, oldValue, newValue string, ttlSeconds int) (bool, error) {
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
+	if err := validateValue(newValue); err != nil {
+		return false, err
+	}
+	if strings.Contains(oldValue, "\t") {
+		return false, fmt.Errorf("dflockd: oldValue contains tab")
+	}
+	if strings.ContainsAny(oldValue, "\n\r") {
+		return false, fmt.Errorf("dflockd: oldValue contains newline")
+	}
+	if ttlSeconds < 0 {
+		ttlSeconds = 0
+	}
+	arg := oldValue + "\t" + newValue + " " + strconv.Itoa(ttlSeconds)
+	resp, err := c.sendRecv("kcas", key, arg)
+	if err != nil {
+		return false, err
+	}
+	if resp == "ok" {
+		return true, nil
+	}
+	if resp == "cas_conflict" {
+		return false, nil
+	}
+	if resp == "error_max_keys" {
+		return false, ErrMaxKeys
+	}
+	return false, fmt.Errorf("%w: kcas: %s", ErrServer, resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1076,7 @@ type Lock struct {
 	mu          sync.Mutex
 	conn        *Conn
 	token       string
+	fence       uint64
 	lease       int
 	cancelRenew context.CancelFunc
 	renewDone   chan struct{} // closed when the renew goroutine exits
@@ -1390,6 +1471,7 @@ type Semaphore struct {
 	mu          sync.Mutex
 	conn        *Conn
 	token       string
+	fence       uint64
 	lease       int
 	cancelRenew context.CancelFunc
 	renewDone   chan struct{}
@@ -1734,6 +1816,1395 @@ func (s *Semaphore) startRenew() {
 				if err != nil {
 					if ctx.Err() != nil {
 						return // Deliberately stopped; not a real failure.
+					}
+					if onErr != nil {
+						onErr(err)
+					}
+					return
+				}
+			}
+		}
+	}()
+}
+
+// ---------------------------------------------------------------------------
+// WithFence variants — low-level protocol functions
+// ---------------------------------------------------------------------------
+
+var ErrTypeMismatch = errors.New("dflockd: type mismatch")
+
+// AcquireWithFence sends a lock ("l") command and returns the fencing token.
+func AcquireWithFence(c *Conn, key string, acquireTimeout time.Duration, opts ...Option) (token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(secondsCeil(acquireTimeout))
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv("l", key, arg)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_max_locks" {
+		return "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", 0, 0, ErrMaxWaiters
+	}
+	return parseOKTokenLeaseFence(resp, "acquire")
+}
+
+// SemAcquireWithFence sends a semaphore acquire ("sl") command and returns the fencing token.
+func SemAcquireWithFence(c *Conn, key string, acquireTimeout time.Duration, limit int, opts ...Option) (token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(secondsCeil(acquireTimeout)) + " " + strconv.Itoa(limit)
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv("sl", key, arg)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_max_locks" {
+		return "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", 0, 0, ErrMaxWaiters
+	}
+	if resp == "error_limit_mismatch" {
+		return "", 0, 0, ErrLimitMismatch
+	}
+	return parseOKTokenLeaseFence(resp, "sem_acquire")
+}
+
+// EnqueueWithFence sends an enqueue ("e") command and returns the fencing token.
+func EnqueueWithFence(c *Conn, key string, opts ...Option) (status, token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := ""
+	if o.leaseTTL > 0 {
+		arg = strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv("e", key, arg)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	if resp == "queued" {
+		return "queued", "", 0, 0, nil
+	}
+	if resp == "error_max_locks" {
+		return "", "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", "", 0, 0, ErrMaxWaiters
+	}
+	if resp == "error_already_enqueued" {
+		return "", "", 0, 0, ErrAlreadyQueued
+	}
+	parts := strings.Fields(resp)
+	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
+		ttl, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return "", "", 0, 0, fmt.Errorf("%w: enqueue: bad lease %q", ErrServer, parts[2])
+		}
+		var fence uint64
+		if len(parts) == 4 {
+			fence, err = strconv.ParseUint(parts[3], 10, 64)
+			if err != nil {
+				return "", "", 0, 0, fmt.Errorf("%w: enqueue: bad fence %q", ErrServer, parts[3])
+			}
+		}
+		return "acquired", parts[1], ttl, fence, nil
+	}
+	return "", "", 0, 0, fmt.Errorf("%w: enqueue: %s", ErrServer, resp)
+}
+
+// SemEnqueueWithFence sends a semaphore enqueue ("se") and returns the fencing token.
+func SemEnqueueWithFence(c *Conn, key string, limit int, opts ...Option) (status, token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(limit)
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv("se", key, arg)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	if resp == "queued" {
+		return "queued", "", 0, 0, nil
+	}
+	if resp == "error_max_locks" {
+		return "", "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", "", 0, 0, ErrMaxWaiters
+	}
+	if resp == "error_limit_mismatch" {
+		return "", "", 0, 0, ErrLimitMismatch
+	}
+	if resp == "error_already_enqueued" {
+		return "", "", 0, 0, ErrAlreadyQueued
+	}
+	parts := strings.Fields(resp)
+	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
+		ttl, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return "", "", 0, 0, fmt.Errorf("%w: sem_enqueue: bad lease %q", ErrServer, parts[2])
+		}
+		var fence uint64
+		if len(parts) == 4 {
+			fence, err = strconv.ParseUint(parts[3], 10, 64)
+			if err != nil {
+				return "", "", 0, 0, fmt.Errorf("%w: sem_enqueue: bad fence %q", ErrServer, parts[3])
+			}
+		}
+		return "acquired", parts[1], ttl, fence, nil
+	}
+	return "", "", 0, 0, fmt.Errorf("%w: sem_enqueue: %s", ErrServer, resp)
+}
+
+// WaitWithFence sends a wait ("w") command and returns the fencing token.
+func WaitWithFence(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	resp, err := c.sendRecv("w", key, strconv.Itoa(secondsCeil(waitTimeout)))
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_not_enqueued" {
+		return "", 0, 0, ErrNotQueued
+	}
+	if resp == "error_lease_expired" {
+		return "", 0, 0, ErrLeaseExpired
+	}
+	if resp == "error" {
+		return "", 0, 0, ErrServer
+	}
+	return parseOKTokenLeaseFence(resp, "wait")
+}
+
+// SemWaitWithFence sends a semaphore wait ("sw") command and returns the fencing token.
+func SemWaitWithFence(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	resp, err := c.sendRecv("sw", key, strconv.Itoa(secondsCeil(waitTimeout)))
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_not_enqueued" {
+		return "", 0, 0, ErrNotQueued
+	}
+	if resp == "error_lease_expired" {
+		return "", 0, 0, ErrLeaseExpired
+	}
+	if resp == "error" {
+		return "", 0, 0, ErrServer
+	}
+	return parseOKTokenLeaseFence(resp, "sem_wait")
+}
+
+// RenewWithFence sends a renew ("n") command and returns the fencing token.
+func RenewWithFence(c *Conn, key, token string, opts ...Option) (remaining int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := token
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv("n", key, arg)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parseRenewWithFence(resp, "renew")
+}
+
+// SemRenewWithFence sends a semaphore renew ("sn") and returns the fencing token.
+func SemRenewWithFence(c *Conn, key, token string, opts ...Option) (remaining int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := token
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv("sn", key, arg)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parseRenewWithFence(resp, "sem_renew")
+}
+
+// ---------------------------------------------------------------------------
+// Blocking List Pop
+// ---------------------------------------------------------------------------
+
+// BLPop blocks until an item is available at the left of the list, or timeout.
+// Returns ("", nil) on timeout.
+func BLPop(c *Conn, key string, timeout time.Duration) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	resp, err := c.sendRecv("blpop", key, strconv.Itoa(secondsCeil(timeout)))
+	if err != nil {
+		return "", err
+	}
+	if resp == "nil" {
+		return "", nil
+	}
+	if strings.HasPrefix(resp, "ok ") {
+		return resp[3:], nil
+	}
+	if resp == "error_max_keys" {
+		return "", ErrMaxKeys
+	}
+	return "", fmt.Errorf("%w: blpop: %s", ErrServer, resp)
+}
+
+// BRPop blocks until an item is available at the right of the list, or timeout.
+// Returns ("", nil) on timeout.
+func BRPop(c *Conn, key string, timeout time.Duration) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	resp, err := c.sendRecv("brpop", key, strconv.Itoa(secondsCeil(timeout)))
+	if err != nil {
+		return "", err
+	}
+	if resp == "nil" {
+		return "", nil
+	}
+	if strings.HasPrefix(resp, "ok ") {
+		return resp[3:], nil
+	}
+	if resp == "error_max_keys" {
+		return "", ErrMaxKeys
+	}
+	return "", fmt.Errorf("%w: brpop: %s", ErrServer, resp)
+}
+
+// ---------------------------------------------------------------------------
+// Read-Write Lock — low-level protocol functions
+// ---------------------------------------------------------------------------
+
+// RLock sends a read-lock ("rl") command.
+func RLock(c *Conn, key string, timeout time.Duration, opts ...Option) (token string, leaseTTL int, fence uint64, err error) {
+	return rwLock(c, "rl", key, timeout, opts...)
+}
+
+// WLock sends a write-lock ("wl") command.
+func WLock(c *Conn, key string, timeout time.Duration, opts ...Option) (token string, leaseTTL int, fence uint64, err error) {
+	return rwLock(c, "wl", key, timeout, opts...)
+}
+
+func rwLock(c *Conn, cmd, key string, timeout time.Duration, opts ...Option) (string, int, uint64, error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(secondsCeil(timeout))
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv(cmd, key, arg)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_max_locks" {
+		return "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", 0, 0, ErrMaxWaiters
+	}
+	if resp == "error_type_mismatch" {
+		return "", 0, 0, ErrTypeMismatch
+	}
+	return parseOKTokenLeaseFence(resp, cmd)
+}
+
+// RUnlock sends a read-unlock ("rr") command.
+func RUnlock(c *Conn, key, token string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	resp, err := c.sendRecv("rr", key, token)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: rr: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// WUnlock sends a write-unlock ("wr") command.
+func WUnlock(c *Conn, key, token string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	resp, err := c.sendRecv("wr", key, token)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: wr: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// RRenew sends a read-renew ("rn") command.
+func RRenew(c *Conn, key, token string, opts ...Option) (remaining int, fence uint64, err error) {
+	return rwRenew(c, "rn", key, token, opts...)
+}
+
+// WRenew sends a write-renew ("wn") command.
+func WRenew(c *Conn, key, token string, opts ...Option) (remaining int, fence uint64, err error) {
+	return rwRenew(c, "wn", key, token, opts...)
+}
+
+func rwRenew(c *Conn, cmd, key, token string, opts ...Option) (int, uint64, error) {
+	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := token
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv(cmd, key, arg)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parseRenewWithFence(resp, cmd)
+}
+
+// REnqueue sends a read-enqueue ("re") command.
+func REnqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTTL int, fence uint64, err error) {
+	return rwEnqueue(c, "re", key, opts...)
+}
+
+// WEnqueue sends a write-enqueue ("we") command.
+func WEnqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTTL int, fence uint64, err error) {
+	return rwEnqueue(c, "we", key, opts...)
+}
+
+func rwEnqueue(c *Conn, cmd, key string, opts ...Option) (string, string, int, uint64, error) {
+	if err := validateKey(key); err != nil {
+		return "", "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := ""
+	if o.leaseTTL > 0 {
+		arg = strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := c.sendRecv(cmd, key, arg)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	if resp == "queued" {
+		return "queued", "", 0, 0, nil
+	}
+	if resp == "error_max_locks" {
+		return "", "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", "", 0, 0, ErrMaxWaiters
+	}
+	if resp == "error_type_mismatch" {
+		return "", "", 0, 0, ErrTypeMismatch
+	}
+	if resp == "error_already_enqueued" {
+		return "", "", 0, 0, ErrAlreadyQueued
+	}
+	parts := strings.Fields(resp)
+	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
+		ttl, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return "", "", 0, 0, fmt.Errorf("%w: %s: bad lease %q", ErrServer, cmd, parts[2])
+		}
+		var fence uint64
+		if len(parts) == 4 {
+			fence, err = strconv.ParseUint(parts[3], 10, 64)
+			if err != nil {
+				return "", "", 0, 0, fmt.Errorf("%w: %s: bad fence %q", ErrServer, cmd, parts[3])
+			}
+		}
+		return "acquired", parts[1], ttl, fence, nil
+	}
+	return "", "", 0, 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
+// RWait sends a read-wait ("rw") command.
+func RWait(c *Conn, key string, timeout time.Duration) (token string, leaseTTL int, fence uint64, err error) {
+	return rwWait(c, "rw", key, timeout)
+}
+
+// WWait sends a write-wait ("ww") command.
+func WWait(c *Conn, key string, timeout time.Duration) (token string, leaseTTL int, fence uint64, err error) {
+	return rwWait(c, "ww", key, timeout)
+}
+
+func rwWait(c *Conn, cmd, key string, timeout time.Duration) (string, int, uint64, error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	resp, err := c.sendRecv(cmd, key, strconv.Itoa(secondsCeil(timeout)))
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_not_enqueued" {
+		return "", 0, 0, ErrNotQueued
+	}
+	if resp == "error_lease_expired" {
+		return "", 0, 0, ErrLeaseExpired
+	}
+	if resp == "error" {
+		return "", 0, 0, ErrServer
+	}
+	return parseOKTokenLeaseFence(resp, cmd)
+}
+
+// ---------------------------------------------------------------------------
+// RWLock — high-level distributed read-write lock
+// ---------------------------------------------------------------------------
+
+// RWLock provides a high-level interface for acquiring, holding, and releasing
+// a distributed read-write lock with automatic lease renewal.
+type RWLock struct {
+	Key            string
+	AcquireTimeout time.Duration
+	LeaseTTL       int
+	Servers        []string
+	ShardFunc      ShardFunc
+	RenewRatio     float64
+	TLSConfig      *tls.Config
+	AuthToken      string
+	OnRenewError   func(err error)
+
+	mu          sync.Mutex
+	conn        *Conn
+	token       string
+	fence       uint64
+	lease       int
+	cancelRenew context.CancelFunc
+	renewDone   chan struct{}
+}
+
+func (rw *RWLock) shardFunc() ShardFunc {
+	if rw.ShardFunc != nil {
+		return rw.ShardFunc
+	}
+	return CRC32Shard
+}
+
+func (rw *RWLock) acquireTimeout() time.Duration {
+	if rw.AcquireTimeout > 0 {
+		return rw.AcquireTimeout
+	}
+	return 10 * time.Second
+}
+
+func (rw *RWLock) renewRatio() float64 {
+	if rw.RenewRatio > 0 {
+		return rw.RenewRatio
+	}
+	return 0.5
+}
+
+func (rw *RWLock) serverAddr() string {
+	servers := rw.Servers
+	if len(servers) == 0 {
+		servers = []string{"127.0.0.1:6388"}
+	}
+	idx := rw.shardFunc()(rw.Key, len(servers))
+	return servers[idx]
+}
+
+func (rw *RWLock) opts() []Option {
+	if rw.LeaseTTL > 0 {
+		return []Option{WithLeaseTTL(rw.LeaseTTL)}
+	}
+	return nil
+}
+
+func (rw *RWLock) connect() error {
+	if rw.conn != nil {
+		rw.conn.Close()
+		rw.conn = nil
+	}
+	addr := rw.serverAddr()
+	var conn *Conn
+	var err error
+	if rw.TLSConfig != nil {
+		conn, err = DialTLS(addr, rw.TLSConfig)
+	} else {
+		conn, err = Dial(addr)
+	}
+	if err != nil {
+		return err
+	}
+	if rw.AuthToken != "" {
+		if err := Authenticate(conn, rw.AuthToken); err != nil {
+			conn.Close()
+			return err
+		}
+	}
+	rw.conn = conn
+	return nil
+}
+
+// RLock acquires a read lock. Returns false (with nil error) on timeout.
+func (rw *RWLock) RLock(ctx context.Context) (bool, error) {
+	return rw.acquire(ctx, "rl")
+}
+
+// WLock acquires a write lock. Returns false (with nil error) on timeout.
+func (rw *RWLock) WLock(ctx context.Context) (bool, error) {
+	return rw.acquire(ctx, "wl")
+}
+
+func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
+	rw.mu.Lock()
+	rw.stopRenew()
+	if err := rw.connect(); err != nil {
+		rw.mu.Unlock()
+		return false, err
+	}
+	conn := rw.conn
+	rw.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+
+	token, lease, fence, err := rwLock(conn, cmd, rw.Key, rw.acquireTimeout(), rw.opts()...)
+	close(done)
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if err != nil {
+		if errors.Is(err, ErrTimeout) {
+			rw.conn.Close()
+			rw.conn = nil
+			return false, nil
+		}
+		if ctx.Err() != nil {
+			rw.conn.Close()
+			rw.conn = nil
+			return false, ctx.Err()
+		}
+		rw.conn.Close()
+		rw.conn = nil
+		return false, err
+	}
+
+	if ctx.Err() != nil {
+		rw.conn.Close()
+		rw.conn = nil
+		return false, ctx.Err()
+	}
+
+	rw.token = token
+	rw.fence = fence
+	rw.lease = lease
+	rw.startRenew(cmd)
+	return true, nil
+}
+
+// Unlock releases the lock (works for both read and write).
+func (rw *RWLock) Unlock(ctx context.Context) error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	rw.stopRenew()
+
+	if rw.conn == nil {
+		return nil
+	}
+
+	// Use "rr" — works for both since RWRelease just calls Release internally.
+	err := RUnlock(rw.conn, rw.Key, rw.token)
+	rw.conn.Close()
+	rw.conn = nil
+	rw.token = ""
+	rw.fence = 0
+	rw.lease = 0
+	return err
+}
+
+// Close stops renewal and closes the connection.
+func (rw *RWLock) Close() error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	rw.stopRenew()
+
+	if rw.conn == nil {
+		return nil
+	}
+
+	err := rw.conn.Close()
+	rw.conn = nil
+	rw.token = ""
+	rw.fence = 0
+	rw.lease = 0
+	return err
+}
+
+// Token returns the current lock token.
+func (rw *RWLock) Token() string {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.token
+}
+
+// Fence returns the fencing token from the last acquire.
+func (rw *RWLock) Fence() uint64 {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.fence
+}
+
+func (rw *RWLock) stopRenew() {
+	if rw.cancelRenew != nil {
+		rw.cancelRenew()
+		rw.cancelRenew = nil
+	}
+	if rw.renewDone != nil {
+		done := rw.renewDone
+		rw.renewDone = nil
+		rw.mu.Unlock()
+		<-done
+		rw.mu.Lock()
+	}
+}
+
+func (rw *RWLock) startRenew(cmd string) {
+	rw.stopRenew()
+	ctx, cancel := context.WithCancel(context.Background())
+	rw.cancelRenew = cancel
+
+	done := make(chan struct{})
+	rw.renewDone = done
+
+	leaseDur := time.Duration(rw.lease) * time.Second
+	interval := time.Duration(float64(leaseDur) * rw.renewRatio())
+	if interval < 1*time.Second {
+		interval = 1 * time.Second
+	}
+
+	conn := rw.conn
+	key := rw.Key
+	token := rw.token
+	opts := rw.opts()
+	onErr := rw.OnRenewError
+	renewCmd := "rn"
+	if cmd == "wl" {
+		renewCmd = "wn"
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				rw.mu.Lock()
+				if rw.conn == nil || rw.token == "" {
+					rw.mu.Unlock()
+					return
+				}
+				conn = rw.conn
+				key = rw.Key
+				token = rw.token
+				rw.mu.Unlock()
+
+				_, _, err := rwRenew(conn, renewCmd, key, token, opts...)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					if onErr != nil {
+						onErr(err)
+					}
+					return
+				}
+			}
+		}
+	}()
+}
+
+// Fence returns the fencing token from the last Lock.Acquire.
+func (l *Lock) Fence() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fence
+}
+
+// Fence returns the fencing token from the last Semaphore.Acquire.
+func (s *Semaphore) Fence() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fence
+}
+
+// ---------------------------------------------------------------------------
+// Watch/Notify
+// ---------------------------------------------------------------------------
+
+// WatchEvent represents a key change notification.
+type WatchEvent struct {
+	Type string // e.g. "kset", "kdel", "acquire", "release", etc.
+	Key  string
+}
+
+// WatchConn wraps a Conn for watch operations, providing a background
+// reader that separates push watch events from command responses.
+type WatchConn struct {
+	conn    *Conn
+	eventCh chan WatchEvent
+	respCh  chan string
+	done    chan struct{}
+}
+
+// NewWatchConn creates a WatchConn from an existing Conn.
+// The Conn must not be used directly after this call.
+func NewWatchConn(c *Conn) *WatchConn {
+	wc := &WatchConn{
+		conn:    c,
+		eventCh: make(chan WatchEvent, 64),
+		respCh:  make(chan string, 1),
+		done:    make(chan struct{}),
+	}
+	go wc.readLoop()
+	return wc
+}
+
+func (wc *WatchConn) readLoop() {
+	defer close(wc.done)
+	for {
+		line, err := wc.conn.readLine()
+		if err != nil {
+			close(wc.eventCh)
+			return
+		}
+		if strings.HasPrefix(line, "watch ") {
+			// Parse: "watch <event_type> <key>"
+			rest := line[6:]
+			idx := strings.Index(rest, " ")
+			if idx >= 0 {
+				ev := WatchEvent{
+					Type: rest[:idx],
+					Key:  rest[idx+1:],
+				}
+				select {
+				case wc.eventCh <- ev:
+				default:
+				}
+			}
+		} else {
+			wc.respCh <- line
+		}
+	}
+}
+
+func (wc *WatchConn) sendCmd(cmd, key, arg string) (string, error) {
+	wc.conn.mu.Lock()
+	defer wc.conn.mu.Unlock()
+	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
+	if _, err := wc.conn.conn.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	select {
+	case resp, ok := <-wc.respCh:
+		if !ok {
+			return "", fmt.Errorf("dflockd: connection closed")
+		}
+		return resp, nil
+	case <-wc.done:
+		return "", fmt.Errorf("dflockd: connection closed")
+	}
+}
+
+// Watch subscribes to changes on a key or pattern.
+func (wc *WatchConn) Watch(pattern string) error {
+	resp, err := wc.sendCmd("watch", pattern, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: watch: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Unwatch unsubscribes from a key or pattern.
+func (wc *WatchConn) Unwatch(pattern string) error {
+	resp, err := wc.sendCmd("unwatch", pattern, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: unwatch: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Events returns the channel on which watch events are delivered.
+func (wc *WatchConn) Events() <-chan WatchEvent {
+	return wc.eventCh
+}
+
+// Close closes the underlying connection.
+func (wc *WatchConn) Close() error {
+	err := wc.conn.Close()
+	<-wc.done
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Barriers
+// ---------------------------------------------------------------------------
+
+// BarrierWait blocks until 'count' participants arrive at the barrier,
+// or the timeout expires. Returns true if the barrier tripped.
+func BarrierWait(c *Conn, key string, count int, timeout time.Duration) (bool, error) {
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
+	arg := strconv.Itoa(count) + " " + strconv.Itoa(secondsCeil(timeout))
+	resp, err := c.sendRecv("bwait", key, arg)
+	if err != nil {
+		return false, err
+	}
+	if resp == "ok" {
+		return true, nil
+	}
+	if resp == "timeout" {
+		return false, nil
+	}
+	if resp == "error_barrier_count_mismatch" {
+		return false, ErrBarrierCountMismatch
+	}
+	if resp == "error_max_keys" {
+		return false, ErrMaxKeys
+	}
+	return false, fmt.Errorf("%w: bwait: %s", ErrServer, resp)
+}
+
+// ---------------------------------------------------------------------------
+// Leader Election
+// ---------------------------------------------------------------------------
+
+// LeaderEvent represents a leader change notification.
+type LeaderEvent struct {
+	Type string // "elected", "resigned", "failover"
+	Key  string
+}
+
+// LeaderConn wraps a Conn for leader election operations, providing a
+// background reader that separates push leader events from command responses.
+type LeaderConn struct {
+	conn    *Conn
+	eventCh chan LeaderEvent
+	respCh  chan string
+	done    chan struct{}
+}
+
+// NewLeaderConn creates a LeaderConn from an existing Conn.
+// The Conn must not be used directly after this call.
+func NewLeaderConn(c *Conn) *LeaderConn {
+	lc := &LeaderConn{
+		conn:    c,
+		eventCh: make(chan LeaderEvent, 64),
+		respCh:  make(chan string, 1),
+		done:    make(chan struct{}),
+	}
+	go lc.readLoop()
+	return lc
+}
+
+func (lc *LeaderConn) readLoop() {
+	defer close(lc.done)
+	for {
+		line, err := lc.conn.readLine()
+		if err != nil {
+			close(lc.eventCh)
+			return
+		}
+		if strings.HasPrefix(line, "leader ") {
+			// Parse: "leader <event> <key>"
+			rest := line[7:]
+			idx := strings.Index(rest, " ")
+			if idx >= 0 {
+				ev := LeaderEvent{
+					Type: rest[:idx],
+					Key:  rest[idx+1:],
+				}
+				select {
+				case lc.eventCh <- ev:
+				default:
+				}
+			}
+		} else {
+			lc.respCh <- line
+		}
+	}
+}
+
+func (lc *LeaderConn) sendCmd(cmd, key, arg string) (string, error) {
+	lc.conn.mu.Lock()
+	defer lc.conn.mu.Unlock()
+	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
+	if _, err := lc.conn.conn.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	select {
+	case resp, ok := <-lc.respCh:
+		if !ok {
+			return "", fmt.Errorf("dflockd: connection closed")
+		}
+		return resp, nil
+	case <-lc.done:
+		return "", fmt.Errorf("dflockd: connection closed")
+	}
+}
+
+// Elect attempts to become leader for the given key. Returns the token,
+// lease TTL, fence, and any error.
+func (lc *LeaderConn) Elect(key string, timeout time.Duration, opts ...Option) (token string, leaseTTL int, fence uint64, err error) {
+	if err := validateKey(key); err != nil {
+		return "", 0, 0, err
+	}
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := strconv.Itoa(secondsCeil(timeout))
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := lc.sendCmd("elect", key, arg)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if resp == "timeout" {
+		return "", 0, 0, ErrTimeout
+	}
+	if resp == "error_max_locks" {
+		return "", 0, 0, ErrMaxLocks
+	}
+	if resp == "error_max_waiters" {
+		return "", 0, 0, ErrMaxWaiters
+	}
+	return parseOKTokenLeaseFence(resp, "elect")
+}
+
+// Resign gives up leadership for the given key.
+func (lc *LeaderConn) Resign(key, token string) error {
+	resp, err := lc.sendCmd("resign", key, token)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: resign: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Renew renews the leader lease. Returns the remaining seconds and fence.
+func (lc *LeaderConn) Renew(key, token string, opts ...Option) (int, uint64, error) {
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	arg := token
+	if o.leaseTTL > 0 {
+		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	resp, err := lc.sendCmd("n", key, arg)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parseRenewWithFence(resp, "renew")
+}
+
+// Observe subscribes to leader change events for a key.
+func (lc *LeaderConn) Observe(key string) error {
+	resp, err := lc.sendCmd("observe", key, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: observe: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Unobserve unsubscribes from leader change events for a key.
+func (lc *LeaderConn) Unobserve(key string) error {
+	resp, err := lc.sendCmd("unobserve", key, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: unobserve: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Events returns the channel on which leader events are delivered.
+func (lc *LeaderConn) Events() <-chan LeaderEvent {
+	return lc.eventCh
+}
+
+// Close closes the underlying connection.
+func (lc *LeaderConn) Close() error {
+	err := lc.conn.Close()
+	<-lc.done
+	return err
+}
+
+// Election provides a high-level interface for participating in leader election,
+// including automatic lease renewal.
+type Election struct {
+	Key            string
+	AcquireTimeout time.Duration
+	LeaseTTL       int
+	Servers        []string
+	ShardFunc      ShardFunc
+	TLSConfig      *tls.Config
+	AuthToken      string
+	RenewRatio     float64
+	OnElected      func()
+	OnResigned     func()
+	OnRenewError   func(error)
+
+	mu          sync.Mutex
+	lc          *LeaderConn
+	token       string
+	fence       uint64
+	lease       int
+	isLeader    bool
+	cancelRenew context.CancelFunc
+	renewDone   chan struct{}
+}
+
+func (e *Election) shardFunc() ShardFunc {
+	if e.ShardFunc != nil {
+		return e.ShardFunc
+	}
+	return CRC32Shard
+}
+
+func (e *Election) acquireTimeout() time.Duration {
+	if e.AcquireTimeout > 0 {
+		return e.AcquireTimeout
+	}
+	return 10 * time.Second
+}
+
+func (e *Election) renewRatio() float64 {
+	if e.RenewRatio > 0 {
+		return e.RenewRatio
+	}
+	return 0.5
+}
+
+func (e *Election) serverAddr() string {
+	servers := e.Servers
+	if len(servers) == 0 {
+		servers = []string{"127.0.0.1:6388"}
+	}
+	idx := e.shardFunc()(e.Key, len(servers))
+	return servers[idx]
+}
+
+func (e *Election) opts() []Option {
+	if e.LeaseTTL > 0 {
+		return []Option{WithLeaseTTL(e.LeaseTTL)}
+	}
+	return nil
+}
+
+func (e *Election) connect() error {
+	if e.lc != nil {
+		e.lc.Close()
+		e.lc = nil
+	}
+	addr := e.serverAddr()
+	var conn *Conn
+	var err error
+	if e.TLSConfig != nil {
+		conn, err = DialTLS(addr, e.TLSConfig)
+	} else {
+		conn, err = Dial(addr)
+	}
+	if err != nil {
+		return err
+	}
+	if e.AuthToken != "" {
+		if err := Authenticate(conn, e.AuthToken); err != nil {
+			conn.Close()
+			return err
+		}
+	}
+	e.lc = NewLeaderConn(conn)
+	return nil
+}
+
+// Campaign blocks until elected or the context is cancelled.
+// Returns true if elected, false if context was cancelled.
+func (e *Election) Campaign(ctx context.Context) (bool, error) {
+	e.mu.Lock()
+	e.stopRenew()
+	if err := e.connect(); err != nil {
+		e.mu.Unlock()
+		return false, err
+	}
+	lc := e.lc
+	e.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			lc.conn.Close()
+		case <-done:
+		}
+	}()
+
+	token, lease, fence, err := lc.Elect(e.Key, e.acquireTimeout(), e.opts()...)
+	close(done)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err != nil {
+		if errors.Is(err, ErrTimeout) {
+			e.lc.Close()
+			e.lc = nil
+			return false, nil
+		}
+		if ctx.Err() != nil {
+			e.lc.Close()
+			e.lc = nil
+			return false, ctx.Err()
+		}
+		e.lc.Close()
+		e.lc = nil
+		return false, err
+	}
+
+	if ctx.Err() != nil {
+		e.lc.Close()
+		e.lc = nil
+		return false, ctx.Err()
+	}
+
+	e.token = token
+	e.lease = lease
+	e.fence = fence
+	e.isLeader = true
+	e.startRenew()
+
+	if e.OnElected != nil {
+		go e.OnElected()
+	}
+
+	return true, nil
+}
+
+// Resign gives up leadership.
+func (e *Election) Resign(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.stopRenew()
+
+	if e.lc == nil {
+		return nil
+	}
+
+	err := e.lc.Resign(e.Key, e.token)
+	e.isLeader = false
+	e.lc.Close()
+	e.lc = nil
+	e.token = ""
+	e.lease = 0
+
+	if e.OnResigned != nil {
+		go e.OnResigned()
+	}
+
+	return err
+}
+
+// IsLeader returns true if currently elected as leader.
+func (e *Election) IsLeader() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.isLeader
+}
+
+// Token returns the current lock token.
+func (e *Election) Token() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.token
+}
+
+// Fence returns the current fencing token.
+func (e *Election) Fence() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.fence
+}
+
+// Close stops renewal and closes the connection.
+func (e *Election) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.stopRenew()
+
+	if e.lc == nil {
+		return nil
+	}
+
+	err := e.lc.Close()
+	e.lc = nil
+	e.token = ""
+	e.lease = 0
+	e.isLeader = false
+	return err
+}
+
+func (e *Election) stopRenew() {
+	if e.cancelRenew != nil {
+		e.cancelRenew()
+		e.cancelRenew = nil
+	}
+	if e.renewDone != nil {
+		done := e.renewDone
+		e.renewDone = nil
+		e.mu.Unlock()
+		<-done
+		e.mu.Lock()
+	}
+}
+
+func (e *Election) startRenew() {
+	e.stopRenew()
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancelRenew = cancel
+
+	done := make(chan struct{})
+	e.renewDone = done
+
+	leaseDur := time.Duration(e.lease) * time.Second
+	interval := time.Duration(float64(leaseDur) * e.renewRatio())
+	if interval < 1*time.Second {
+		interval = 1 * time.Second
+	}
+
+	lc := e.lc
+	key := e.Key
+	token := e.token
+	opts := e.opts()
+	onErr := e.OnRenewError
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e.mu.Lock()
+				if e.lc == nil || e.token == "" {
+					e.mu.Unlock()
+					return
+				}
+				lc = e.lc
+				key = e.Key
+				token = e.token
+				e.mu.Unlock()
+
+				_, _, err := lc.Renew(key, token, opts...)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
 					}
 					if onErr != nil {
 						onErr(err)
