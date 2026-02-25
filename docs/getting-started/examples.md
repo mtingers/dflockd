@@ -214,33 +214,32 @@ go run ./cmd/bench
 
 ### Flags
 
-| Flag | Default | Description |
-| ----------- | ----------------- | ---------------------------------- |
-| `--workers` | `10` | Number of concurrent goroutines |
-| `--rounds` | `50` | Acquire/release rounds per worker |
-| `--key` | `bench` | Lock key prefix |
-| `--timeout` | `30` | Acquire timeout (seconds) |
-| `--lease` | `10` | Lease TTL (seconds) |
-| `--servers` | `127.0.0.1:6388` | Comma-separated host:port pairs |
+| Flag        | Default          | Description                       |
+| ----------- | ---------------- | --------------------------------- |
+| `--workers` | `10`             | Number of concurrent goroutines   |
+| `--rounds`  | `50`             | Acquire/release rounds per worker |
+| `--key`     | `bench`          | Lock key prefix                   |
+| `--timeout` | `30`             | Acquire timeout (seconds)         |
+| `--lease`   | `10`             | Lease TTL (seconds)               |
+| `--servers` | `127.0.0.1:6388` | Comma-separated host:port pairs   |
 
 ### Example output
 
 ```bash
 # taken from macbook air m1 benchmark:
-$ go run ./cmd/bench --workers 20 --rounds 100
+$ bench: 100 workers x 500 rounds (key_prefix="bench", conns/worker=1)
 
-bench: 20 workers x 100 rounds (key_prefix="bench")
+  total ops : 50000
+  wall time : 0.575s
+  throughput: 86922.7 ops/s
 
-  total ops : 2000
-  wall time : 0.103s
-  throughput: 19373.0 ops/s
+  mean      : 1.116 ms
+  min       : 0.037 ms
+  max       : 21.251 ms
+  p50       : 0.895 ms
+  p99       : 5.112 ms
+  stdev     : 0.942 ms
 
-  mean      : 1.019 ms
-  min       : 0.116 ms
-  max       : 2.491 ms
-  p50       : 0.882 ms
-  p99       : 2.370 ms
-  stdev     : 0.460 ms
 ```
 
 Each worker uses a unique randomized key so all workers run in parallel without contending. To benchmark contended locks, use the same `--key` value with `--workers 1` and increase `--rounds`.
