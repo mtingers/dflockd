@@ -1,14 +1,17 @@
 // Concurrent benchmark: N goroutine workers each acquire/release a shared lock
 // repeatedly and report latency statistics.
 //
+// Each worker dials a persistent TCP connection and uses the low-level
+// Acquire/Release protocol, so the benchmark measures lock latency rather
+// than TCP connection overhead.
+//
 // Usage:
 //
 //	go run ./cmd/bench [--workers 10] [--rounds 50] [--key bench] \
-//	    [--servers host1:port1,host2:port2]
+//	    [--servers host1:port1,host2:port2] [--connections 0]
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"math"
@@ -29,6 +32,7 @@ func main() {
 	timeout := flag.Int("timeout", 30, "acquire timeout in seconds")
 	servers := flag.String("servers", "127.0.0.1:6388", "comma-separated host:port pairs")
 	leaseTTL := flag.Int("lease", 10, "lease TTL in seconds")
+	connections := flag.Int("connections", 0, "connections per worker (0 = 1 persistent conn per worker)")
 	flag.Parse()
 
 	addrs := strings.Split(*servers, ",")
@@ -36,7 +40,14 @@ func main() {
 		addrs[i] = strings.TrimSpace(addrs[i])
 	}
 
-	fmt.Printf("bench: %d workers x %d rounds (key_prefix=%q)\n\n", *workers, *rounds, *key)
+	// connections=0 means 1 persistent conn per worker (default, pooled mode)
+	connsPerWorker := *connections
+	if connsPerWorker <= 0 {
+		connsPerWorker = 1
+	}
+
+	fmt.Printf("bench: %d workers x %d rounds (key_prefix=%q, conns/worker=%d)\n\n",
+		*workers, *rounds, *key, connsPerWorker)
 
 	type result struct {
 		latencies []float64
@@ -53,7 +64,8 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 			workerKey := fmt.Sprintf("%s_%d", *key, rand.IntN(9900000)+100000)
-			lats, err := worker(workerKey, *rounds, *timeout, *leaseTTL, addrs)
+			addr := addrs[id%len(addrs)]
+			lats, err := worker(workerKey, addr, *rounds, *timeout, *leaseTTL, connsPerWorker)
 			results[id] = result{latencies: lats, err: err}
 		}(i)
 	}
@@ -92,24 +104,40 @@ func main() {
 	fmt.Printf("  stdev     : %.3f ms\n", sd*1000)
 }
 
-func worker(key string, rounds, timeoutSec, leaseTTL int, servers []string) ([]float64, error) {
-	latencies := make([]float64, 0, rounds)
-	for range rounds {
-		t0 := time.Now()
-		l := &client.Lock{
-			Key:            key,
-			AcquireTimeout: time.Duration(timeoutSec) * time.Second,
-			LeaseTTL:       leaseTTL,
-			Servers:        servers,
+func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns int) ([]float64, error) {
+	// Open persistent connection(s) up front.
+	conns := make([]*client.Conn, numConns)
+	for i := range conns {
+		c, err := client.Dial(addr)
+		if err != nil {
+			return nil, fmt.Errorf("dial: %w", err)
 		}
-		ok, err := l.Acquire(context.Background())
+		conns[i] = c
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	acquireTimeout := time.Duration(timeoutSec) * time.Second
+	var opts []client.Option
+	if leaseTTL > 0 {
+		opts = append(opts, client.WithLeaseTTL(leaseTTL))
+	}
+
+	latencies := make([]float64, 0, rounds)
+	for i := range rounds {
+		c := conns[i%len(conns)]
+		t0 := time.Now()
+		token, _, err := client.Acquire(c, key, acquireTimeout, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("acquire: %w", err)
 		}
-		if !ok {
+		if token == "" {
 			return nil, fmt.Errorf("acquire timed out")
 		}
-		if err := l.Release(context.Background()); err != nil {
+		if err := client.Release(c, key, token); err != nil {
 			return nil, fmt.Errorf("release: %w", err)
 		}
 		latencies = append(latencies, time.Since(t0).Seconds())

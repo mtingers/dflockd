@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -21,6 +22,32 @@ var (
 	ErrLeaseExpired    = errors.New("lease expired before wait")
 	ErrWaiterClosed    = errors.New("waiter channel closed")
 )
+
+// tokenBuf amortises crypto/rand syscalls by buffering 4096 bytes (256 tokens)
+// and dispensing 16 bytes at a time.
+type tokenBuf struct {
+	mu  sync.Mutex
+	buf [4096]byte
+	pos int // starts at len(buf) to force initial fill
+}
+
+func newTokenBuf() tokenBuf {
+	return tokenBuf{pos: 4096} // force fill on first call
+}
+
+func (tb *tokenBuf) next() string {
+	tb.mu.Lock()
+	if tb.pos+16 > len(tb.buf) {
+		if _, err := rand.Read(tb.buf[:]); err != nil {
+			panic("crypto/rand failed: " + err.Error())
+		}
+		tb.pos = 0
+	}
+	tok := hex.EncodeToString(tb.buf[tb.pos : tb.pos+16])
+	tb.pos += 16
+	tb.mu.Unlock()
+	return tok
+}
 
 type connKey struct {
 	ConnID uint64
@@ -44,7 +71,26 @@ type ResourceState struct {
 	Limit        int
 	Holders      map[string]*holder // token → holder
 	Waiters      []*waiter
+	WaiterHead   int // index of first active waiter
 	LastActivity time.Time
+}
+
+// waiterCount returns the number of active waiters.
+func (rs *ResourceState) waiterCount() int {
+	return len(rs.Waiters) - rs.WaiterHead
+}
+
+// compactWaiters reclaims consumed waiter slots when more than half the slice
+// is dead head space. Must be called with the protecting mutex held.
+func (rs *ResourceState) compactWaiters() {
+	if rs.WaiterHead > len(rs.Waiters)/2 {
+		n := copy(rs.Waiters, rs.Waiters[rs.WaiterHead:])
+		for i := n; i < len(rs.Waiters); i++ {
+			rs.Waiters[i] = nil
+		}
+		rs.Waiters = rs.Waiters[:n]
+		rs.WaiterHead = 0
+	}
 }
 
 type enqueuedState struct {
@@ -53,75 +99,97 @@ type enqueuedState struct {
 	leaseTTL time.Duration
 }
 
+// ---------------------------------------------------------------------------
+// Sharded lock manager
+// ---------------------------------------------------------------------------
+
+const numShards = 64
+
+type shard struct {
+	mu        sync.Mutex
+	resources map[string]*ResourceState
+}
+
 type LockManager struct {
-	mu           sync.Mutex
-	resources    map[string]*ResourceState
+	shards       [numShards]shard
+	connMu       sync.Mutex // protects connOwned and connEnqueued
 	connOwned    map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
 	connEnqueued map[connKey]*enqueuedState
 	cfg          *config.Config
 	log          *slog.Logger
+	tokBuf       tokenBuf
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
-	return &LockManager{
-		resources:    make(map[string]*ResourceState),
+	lm := &LockManager{
 		connOwned:    make(map[uint64]map[string]map[string]struct{}),
 		connEnqueued: make(map[connKey]*enqueuedState),
 		cfg:          cfg,
 		log:          log,
+		tokBuf:       newTokenBuf(),
 	}
+	for i := range lm.shards {
+		lm.shards[i].resources = make(map[string]*ResourceState)
+	}
+	return lm
 }
 
-func newToken() string {
-	var b [16]byte
-	// crypto/rand.Read on supported platforms (Linux 3.17+, macOS, Windows)
-	// uses getrandom/getentropy and never returns an error. Panic is
-	// appropriate here as a broken CSPRNG is unrecoverable.
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("crypto/rand failed: " + err.Error())
-	}
-	return hex.EncodeToString(b[:])
+func shardIndex(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32() % numShards)
 }
 
-// removeWaiter removes target from a waiter slice preserving order, reusing
-// the backing array to avoid unnecessary allocation.
-func removeWaiter(waiters []*waiter, target *waiter) []*waiter {
-	for i, w := range waiters {
-		if w == target {
-			copy(waiters[i:], waiters[i+1:])
-			waiters[len(waiters)-1] = nil // avoid memory leak
-			return waiters[:len(waiters)-1]
+func (lm *LockManager) shardFor(key string) *shard {
+	return &lm.shards[shardIndex(key)]
+}
+
+// newToken generates a token using the LockManager's buffered CSPRNG.
+func (lm *LockManager) newToken() string {
+	return lm.tokBuf.next()
+}
+
+// removeWaiterFromState removes target from the resource state's waiter queue.
+// Searches only from WaiterHead onward. Must be called with the shard lock held.
+func removeWaiterFromState(st *ResourceState, target *waiter) {
+	for i := st.WaiterHead; i < len(st.Waiters); i++ {
+		if st.Waiters[i] == target {
+			copy(st.Waiters[i:], st.Waiters[i+1:])
+			st.Waiters[len(st.Waiters)-1] = nil
+			st.Waiters = st.Waiters[:len(st.Waiters)-1]
+			return
 		}
 	}
-	return waiters
 }
 
-// removeWaitersByConn removes all waiters for a given connID, closing their
-// channels unless already tracked in the closed set.
-func removeWaitersByConn(waiters []*waiter, connID uint64, closed map[chan string]struct{}) []*waiter {
-	n := 0
-	for _, w := range waiters {
+// removeWaitersByConn removes all waiters for a given connID from the
+// resource state, closing their channels unless already tracked in the
+// closed set. Operates on the active portion [WaiterHead:].
+func removeWaitersByConn(st *ResourceState, connID uint64, closed map[chan string]struct{}) {
+	n := st.WaiterHead
+	for i := st.WaiterHead; i < len(st.Waiters); i++ {
+		w := st.Waiters[i]
 		if w.connID == connID {
 			if _, already := closed[w.ch]; !already {
 				close(w.ch)
 				closed[w.ch] = struct{}{}
 			}
 		} else {
-			waiters[n] = w
+			st.Waiters[n] = w
 			n++
 		}
 	}
-	// Clear trailing pointers to avoid memory leak.
-	for i := n; i < len(waiters); i++ {
-		waiters[i] = nil
+	for i := n; i < len(st.Waiters); i++ {
+		st.Waiters[i] = nil
 	}
-	return waiters[:n]
+	st.Waiters = st.Waiters[:n]
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers (must be called with lm.mu held)
+// Internal helpers
 // ---------------------------------------------------------------------------
 
+// connAddOwned adds a token to the connOwned map. Must be called with connMu held.
 func (lm *LockManager) connAddOwned(connID uint64, key, token string) {
 	m, ok := lm.connOwned[connID]
 	if !ok {
@@ -136,6 +204,7 @@ func (lm *LockManager) connAddOwned(connID uint64, key, token string) {
 	tokens[token] = struct{}{}
 }
 
+// connRemoveOwned removes a token from connOwned. Must be called with connMu held.
 func (lm *LockManager) connRemoveOwned(connID uint64, key, token string) {
 	if connID == 0 {
 		return
@@ -158,16 +227,13 @@ func (lm *LockManager) connRemoveOwned(connID uint64, key, token string) {
 }
 
 // grantNextWaiterLocked grants slots to FIFO waiters while capacity is
-// available. For locks (Limit==1) this grants at most one waiter; for
-// semaphores it grants up to Limit - len(Holders) waiters.
-// Must be called with lm.mu held.
+// available. Must be called with the shard lock AND connMu held.
 func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
-	for len(st.Waiters) > 0 && len(st.Holders) < st.Limit {
-		w := st.Waiters[0]
-		copy(st.Waiters, st.Waiters[1:])
-		st.Waiters[len(st.Waiters)-1] = nil // avoid memory leak
-		st.Waiters = st.Waiters[:len(st.Waiters)-1]
-		token := newToken()
+	for st.WaiterHead < len(st.Waiters) && len(st.Holders) < st.Limit {
+		w := st.Waiters[st.WaiterHead]
+		st.Waiters[st.WaiterHead] = nil // avoid memory leak
+		st.WaiterHead++
+		token := lm.newToken()
 		select {
 		case w.ch <- token:
 			st.Holders[token] = &holder{
@@ -181,12 +247,11 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
 			continue
 		}
 	}
+	st.compactWaiters()
 }
 
 // evictExpiredLocked evicts any holders whose leases have expired and grants
-// freed slots to waiting callers. Called opportunistically on acquire paths
-// so callers don't have to wait for the background sweep tick.
-// Must be called with lm.mu held.
+// freed slots to waiting callers. Must be called with the shard lock AND connMu held.
 func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 	now := time.Now()
 	var expired []string
@@ -211,15 +276,25 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 	}
 }
 
-func (lm *LockManager) getOrCreateLocked(key string, limit int) (*ResourceState, error) {
-	st, ok := lm.resources[key]
+// resourceCount returns total number of resources across all shards.
+// Caller must ensure no concurrent modification (or accept approximate count).
+func (lm *LockManager) resourceCount() int {
+	total := 0
+	for i := range lm.shards {
+		total += len(lm.shards[i].resources)
+	}
+	return total
+}
+
+func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*ResourceState, error) {
+	st, ok := sh.resources[key]
 	if ok {
 		if st.Limit != limit {
 			return nil, ErrLimitMismatch
 		}
 		return st, nil
 	}
-	if len(lm.resources) >= lm.cfg.MaxLocks {
+	if lm.resourceCount() >= lm.cfg.MaxLocks {
 		return nil, ErrMaxLocks
 	}
 	st = &ResourceState{
@@ -227,7 +302,7 @@ func (lm *LockManager) getOrCreateLocked(key string, limit int) (*ResourceState,
 		Holders:      make(map[string]*holder),
 		LastActivity: time.Now(),
 	}
-	lm.resources[key] = st
+	sh.resources[key] = st
 	return st, nil
 }
 
@@ -237,16 +312,14 @@ func (lm *LockManager) getOrCreateLocked(key string, limit int) (*ResourceState,
 
 // Acquire is the single-phase acquire (commands "l" and "sl").
 func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTTL time.Duration, connID uint64, limit int) (string, error) {
-	w := &waiter{
-		ch:       make(chan string, 1),
-		connID:   connID,
-		leaseTTL: leaseTTL,
-	}
+	sh := lm.shardFor(key)
 
-	lm.mu.Lock()
-	st, err := lm.getOrCreateLocked(key, limit)
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	st, err := lm.getOrCreateLocked(sh, key, limit)
 	if err != nil {
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", err
 	}
 
@@ -255,26 +328,34 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
 	lm.evictExpiredLocked(key, st)
 
-	// Fast path: capacity available and no waiters
-	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
-		token := newToken()
+	// Fast path: capacity available and no waiters — no waiter allocation needed
+	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
+		token := lm.newToken()
 		st.Holders[token] = &holder{
 			connID:       connID,
 			leaseExpires: time.Now().Add(leaseTTL),
 		}
 		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key, token)
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return token, nil
 	}
 
-	// Slow path: enqueue and wait
-	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
-		lm.mu.Unlock()
+	// Slow path: allocate waiter and enqueue
+	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", ErrMaxWaiters
 	}
+	w := &waiter{
+		ch:       make(chan string, 1),
+		connID:   connID,
+		leaseTTL: leaseTTL,
+	}
 	st.Waiters = append(st.Waiters, w)
-	lm.mu.Unlock()
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
 
 	var timer *time.Timer
 	if timeout > 0 {
@@ -290,57 +371,55 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		if !ok || token == "" {
 			return "", ErrWaiterClosed
 		}
-		lm.mu.Lock()
-		if s := lm.resources[key]; s != nil {
+		sh.mu.Lock()
+		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 		}
-		lm.mu.Unlock()
+		sh.mu.Unlock()
 		return token, nil
 
 	case <-ctx.Done():
-		lm.mu.Lock()
+		sh.mu.Lock()
 		// Race check: token may have arrived between ctx cancellation
-		// and acquiring the mutex. Returning the won token is safe —
-		// if the caller cannot deliver it (e.g. server shutdown), the
-		// connection cleanup path will release the lock.
+		// and acquiring the mutex.
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := lm.resources[key]; s != nil {
+				if s := sh.resources[key]; s != nil {
 					s.LastActivity = time.Now()
 				}
-				lm.mu.Unlock()
+				sh.mu.Unlock()
 				return token, nil
 			}
 		default:
 		}
-		if s := lm.resources[key]; s != nil {
+		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, w)
+			removeWaiterFromState(s, w)
 		}
-		lm.mu.Unlock()
+		sh.mu.Unlock()
 		return "", ctx.Err()
 
 	case <-timer.C:
 		// Timeout — remove from queue
-		lm.mu.Lock()
+		sh.mu.Lock()
 		// Race check: token may have arrived
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := lm.resources[key]; s != nil {
+				if s := sh.resources[key]; s != nil {
 					s.LastActivity = time.Now()
 				}
-				lm.mu.Unlock()
+				sh.mu.Unlock()
 				return token, nil
 			}
 		default:
 		}
-		if s := lm.resources[key]; s != nil {
+		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
-			s.Waiters = removeWaiter(s.Waiters, w)
+			removeWaiterFromState(s, w)
 		}
-		lm.mu.Unlock()
+		sh.mu.Unlock()
 		return "", nil
 	}
 }
@@ -349,15 +428,18 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 // Returns (status, token, leaseTTLSec, err).
 func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64, limit int) (string, string, int, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
+	sh := lm.shardFor(key)
 
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	defer lm.connMu.Unlock()
 
 	if _, exists := lm.connEnqueued[eqKey]; exists {
 		return "", "", 0, ErrAlreadyEnqueued
 	}
 
-	st, err := lm.getOrCreateLocked(key, limit)
+	st, err := lm.getOrCreateLocked(sh, key, limit)
 	if err != nil {
 		return "", "", 0, err
 	}
@@ -369,8 +451,8 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 	lm.evictExpiredLocked(key, st)
 
 	// Fast path: capacity available and no waiters
-	if len(st.Holders) < st.Limit && len(st.Waiters) == 0 {
-		token := newToken()
+	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
+		token := lm.newToken()
 		st.Holders[token] = &holder{
 			connID:       connID,
 			leaseExpires: time.Now().Add(leaseTTL),
@@ -382,7 +464,7 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 	}
 
 	// Slow path: create waiter and enqueue
-	if max := lm.cfg.MaxWaiters; max > 0 && len(st.Waiters) >= max {
+	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
 		return "", "", 0, ErrMaxWaiters
 	}
 	w := &waiter{
@@ -399,29 +481,28 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 // Returns (token, leaseTTLSec, err). Empty token means timeout.
 func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, int, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
+	sh := lm.shardFor(key)
 
-	lm.mu.Lock()
+	lm.connMu.Lock()
 	es, ok := lm.connEnqueued[eqKey]
 	if !ok {
-		lm.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, ErrNotEnqueued
 	}
 
-	// Snapshot immutable fields under lock. The enqueuedState is set once
-	// during Enqueue and its fields are not mutated afterward; the only
-	// concurrent operation is CleanupConnection closing the waiter channel,
-	// which is safe to race with a channel receive.
+	// Snapshot immutable fields under lock.
 	leaseTTL := es.leaseTTL
 	leaseSec := int(leaseTTL / time.Second)
 	esToken := es.token
 	w := es.waiter
-	lm.mu.Unlock()
+	lm.connMu.Unlock()
 
 	// Fast path: already acquired during enqueue
 	if esToken != "" {
-		lm.mu.Lock()
+		lm.connMu.Lock()
+		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
-		st := lm.resources[key]
+		st := sh.resources[key]
 		if st != nil {
 			h, hOK := st.Holders[esToken]
 			if hOK {
@@ -432,19 +513,22 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 					delete(st.Holders, esToken)
 					st.LastActivity = time.Now()
 					lm.grantNextWaiterLocked(key, st)
-					lm.mu.Unlock()
+					sh.mu.Unlock()
+					lm.connMu.Unlock()
 					return "", 0, ErrLeaseExpired
 				}
 				// Reset lease
 				h.leaseExpires = time.Now().Add(leaseTTL)
 				st.LastActivity = time.Now()
-				lm.mu.Unlock()
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return esToken, leaseSec, nil
 			}
 		}
 		// Slot was lost (expired and granted to another, or state GC'd)
 		lm.connRemoveOwned(connID, key, esToken)
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, ErrLeaseExpired
 	}
 
@@ -460,80 +544,92 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	select {
 	case token, ok := <-w.ch:
 		if !ok || token == "" {
-			lm.mu.Lock()
+			lm.connMu.Lock()
 			delete(lm.connEnqueued, eqKey)
-			lm.mu.Unlock()
+			lm.connMu.Unlock()
 			return "", 0, ErrWaiterClosed
 		}
-		lm.mu.Lock()
+		lm.connMu.Lock()
+		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
-		if st := lm.resources[key]; st != nil {
+		if st := sh.resources[key]; st != nil {
 			if h, hOK := st.Holders[token]; hOK {
 				h.leaseExpires = time.Now().Add(leaseTTL)
 			}
 			st.LastActivity = time.Now()
 		}
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return token, leaseSec, nil
 
 	case <-ctx.Done():
-		lm.mu.Lock()
+		lm.connMu.Lock()
+		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if st := lm.resources[key]; st != nil {
+				if st := sh.resources[key]; st != nil {
 					if h, hOK := st.Holders[token]; hOK {
 						h.leaseExpires = time.Now().Add(leaseTTL)
 					}
 					st.LastActivity = time.Now()
 				}
-				lm.mu.Unlock()
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return token, leaseSec, nil
 			}
 		default:
 		}
-		if st := lm.resources[key]; st != nil {
+		if st := sh.resources[key]; st != nil {
 			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, w)
+			removeWaiterFromState(st, w)
 		}
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, ctx.Err()
 
 	case <-timer.C:
-		lm.mu.Lock()
+		lm.connMu.Lock()
+		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
 		// Race check: token may have arrived
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if st := lm.resources[key]; st != nil {
+				if st := sh.resources[key]; st != nil {
 					if h, hOK := st.Holders[token]; hOK {
 						h.leaseExpires = time.Now().Add(leaseTTL)
 					}
 					st.LastActivity = time.Now()
 				}
-				lm.mu.Unlock()
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return token, leaseSec, nil
 			}
 		default:
 		}
 		// Remove from queue
-		if st := lm.resources[key]; st != nil {
+		if st := sh.resources[key]; st != nil {
 			st.LastActivity = time.Now()
-			st.Waiters = removeWaiter(st.Waiters, w)
+			removeWaiterFromState(st, w)
 		}
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, nil
 	}
 }
 
 // Release releases one held slot if the token matches (commands "r" and "sr").
 func (lm *LockManager) Release(key, token string) bool {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
+	sh := lm.shardFor(key)
 
-	st := lm.resources[key]
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	defer lm.connMu.Unlock()
+
+	st := sh.resources[key]
 	if st == nil {
 		return false
 	}
@@ -558,10 +654,14 @@ func (lm *LockManager) Release(key, token string) bool {
 // Renew renews the lease if the token matches (commands "n" and "sn").
 // Returns (remaining seconds, ok).
 func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bool) {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
+	sh := lm.shardFor(key)
 
-	st := lm.resources[key]
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	defer lm.connMu.Unlock()
+
+	st := sh.resources[key]
 	if st == nil {
 		return 0, false
 	}
@@ -605,53 +705,77 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 // ---------------------------------------------------------------------------
 
 // CleanupConnection cleans up all state for a disconnected connection.
-// All channel closes are tracked in a set to prevent double-close panics
-// in case a waiter appears in both the enqueued map and the resource's waiter
-// queue (which happens during two-phase acquire).
 func (lm *LockManager) CleanupConnection(connID uint64) {
 	if !lm.cfg.AutoReleaseOnDisconnect {
 		return
 	}
 
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
+	lm.connMu.Lock()
 
-	closed := make(map[chan string]struct{})
-
-	// Clean up two-phase enqueued state
+	// Snapshot enqueued keys and owned keys+tokens for this connection.
 	var enqueuedKeys []string
 	for ck := range lm.connEnqueued {
 		if ck.ConnID == connID {
 			enqueuedKeys = append(enqueuedKeys, ck.Key)
 		}
 	}
+
+	type ownedEntry struct {
+		key    string
+		tokens map[string]struct{}
+	}
+	var ownedEntries []ownedEntry
+	if owned, ok := lm.connOwned[connID]; ok {
+		for key, tokens := range owned {
+			// Copy the token set
+			cp := make(map[string]struct{}, len(tokens))
+			for t := range tokens {
+				cp[t] = struct{}{}
+			}
+			ownedEntries = append(ownedEntries, ownedEntry{key: key, tokens: cp})
+		}
+	}
+
+	closed := make(map[chan string]struct{})
+
+	// Clean up two-phase enqueued state — group by shard to avoid lock juggling.
 	for _, key := range enqueuedKeys {
-		es := lm.connEnqueued[connKey{ConnID: connID, Key: key}]
-		delete(lm.connEnqueued, connKey{ConnID: connID, Key: key})
+		sh := lm.shardFor(key)
+		sh.mu.Lock()
+		ck := connKey{ConnID: connID, Key: key}
+		es := lm.connEnqueued[ck]
+		delete(lm.connEnqueued, ck)
 		if es != nil && es.waiter != nil {
 			if _, already := closed[es.waiter.ch]; !already {
 				close(es.waiter.ch)
 				closed[es.waiter.ch] = struct{}{}
 			}
-			if st := lm.resources[key]; st != nil {
-				st.Waiters = removeWaiter(st.Waiters, es.waiter)
+			if st := sh.resources[key]; st != nil {
+				removeWaiterFromState(st, es.waiter)
 			}
 		}
+		sh.mu.Unlock()
 	}
 
-	// Cancel pending waiters from single-phase acquire path
-	for _, st := range lm.resources {
-		st.Waiters = removeWaitersByConn(st.Waiters, connID, closed)
+	// Cancel pending waiters from single-phase acquire path.
+	// We must iterate all shards since we don't track which shards
+	// have waiters for a given connID.
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		for _, st := range sh.resources {
+			removeWaitersByConn(st, connID, closed)
+		}
+		sh.mu.Unlock()
 	}
 
-	// Release owned slots
-	if owned, ok := lm.connOwned[connID]; ok {
-		for key, tokens := range owned {
-			st := lm.resources[key]
-			if st == nil {
-				continue
-			}
-			for token := range tokens {
+	// Release owned slots.
+	for _, entry := range ownedEntries {
+		sh := lm.shardFor(entry.key)
+		sh.mu.Lock()
+		st := sh.resources[entry.key]
+		if st != nil {
+			for token := range entry.tokens {
 				h, ok := st.Holders[token]
 				if !ok {
 					continue
@@ -660,14 +784,17 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 					continue
 				}
 				lm.log.Warn("disconnect cleanup: releasing",
-					"key", key, "conn_id", connID)
+					"key", entry.key, "conn_id", connID)
 				delete(st.Holders, token)
 			}
 			st.LastActivity = time.Now()
-			lm.grantNextWaiterLocked(key, st)
+			lm.grantNextWaiterLocked(entry.key, st)
 		}
+		sh.mu.Unlock()
 	}
 	delete(lm.connOwned, connID)
+
+	lm.connMu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -685,34 +812,39 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lm.mu.Lock()
 			now := time.Now()
-			for key, st := range lm.resources {
-				var expired []string
-				for token, h := range st.Holders {
-					if h.leaseExpires.IsZero() {
-						continue
-					}
-					if !now.Before(h.leaseExpires) {
-						lm.log.Warn("lease expired",
-							"key", key, "conn", h.connID)
-						lm.connRemoveOwned(h.connID, key, token)
-						eqKey := connKey{ConnID: h.connID, Key: key}
-						if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
-							delete(lm.connEnqueued, eqKey)
+			for i := range lm.shards {
+				sh := &lm.shards[i]
+				lm.connMu.Lock()
+				sh.mu.Lock()
+				for key, st := range sh.resources {
+					var expired []string
+					for token, h := range st.Holders {
+						if h.leaseExpires.IsZero() {
+							continue
 						}
-						expired = append(expired, token)
+						if !now.Before(h.leaseExpires) {
+							lm.log.Warn("lease expired",
+								"key", key, "conn", h.connID)
+							lm.connRemoveOwned(h.connID, key, token)
+							eqKey := connKey{ConnID: h.connID, Key: key}
+							if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
+								delete(lm.connEnqueued, eqKey)
+							}
+							expired = append(expired, token)
+						}
+					}
+					for _, token := range expired {
+						delete(st.Holders, token)
+					}
+					if len(expired) > 0 {
+						st.LastActivity = now
+						lm.grantNextWaiterLocked(key, st)
 					}
 				}
-				for _, token := range expired {
-					delete(st.Holders, token)
-				}
-				if len(expired) > 0 {
-					st.LastActivity = now
-					lm.grantNextWaiterLocked(key, st)
-				}
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 			}
-			lm.mu.Unlock()
 		}
 	}
 }
@@ -728,20 +860,23 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lm.mu.Lock()
 			now := time.Now()
-			var expired []string
-			for key, st := range lm.resources {
-				idle := now.Sub(st.LastActivity)
-				if idle > lm.cfg.GCMaxIdleTime && len(st.Holders) == 0 && len(st.Waiters) == 0 {
-					expired = append(expired, key)
+			for i := range lm.shards {
+				sh := &lm.shards[i]
+				sh.mu.Lock()
+				var expired []string
+				for key, st := range sh.resources {
+					idle := now.Sub(st.LastActivity)
+					if idle > lm.cfg.GCMaxIdleTime && len(st.Holders) == 0 && st.waiterCount() == 0 {
+						expired = append(expired, key)
+					}
 				}
+				for _, key := range expired {
+					lm.log.Debug("GC: pruning unused state", "key", key)
+					delete(sh.resources, key)
+				}
+				sh.mu.Unlock()
 			}
-			for _, key := range expired {
-				lm.log.Debug("GC: pruning unused state", "key", key)
-				delete(lm.resources, key)
-			}
-			lm.mu.Unlock()
 		}
 	}
 }
@@ -778,12 +913,7 @@ type Stats struct {
 }
 
 // Stats returns a snapshot of the current lock manager state.
-// Locks (Limit==1) and semaphores (Limit>1) are reported separately
-// for backward compatibility.
 func (lm *LockManager) Stats(connections int64) *Stats {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-
 	now := time.Now()
 	s := &Stats{
 		Connections:    connections,
@@ -793,59 +923,62 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		IdleSemaphores: []IdleInfo{},
 	}
 
-	for key, st := range lm.resources {
-		if st.Limit == 1 {
-			// Report as a lock
-			if len(st.Holders) > 0 {
-				// Exactly one holder for a lock
-				var ownerConn uint64
-				var expires float64
-				for _, h := range st.Holders {
-					ownerConn = h.connID
-					expires = h.leaseExpires.Sub(now).Seconds()
-					if expires < 0 {
-						expires = 0
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		for key, st := range sh.resources {
+			nw := st.waiterCount()
+			if st.Limit == 1 {
+				if len(st.Holders) > 0 {
+					var ownerConn uint64
+					var expires float64
+					for _, h := range st.Holders {
+						ownerConn = h.connID
+						expires = h.leaseExpires.Sub(now).Seconds()
+						if expires < 0 {
+							expires = 0
+						}
 					}
+					s.Locks = append(s.Locks, LockInfo{
+						Key:             key,
+						OwnerConnID:     ownerConn,
+						LeaseExpiresInS: expires,
+						Waiters:         nw,
+					})
+				} else if nw > 0 {
+					s.Locks = append(s.Locks, LockInfo{
+						Key:     key,
+						Waiters: nw,
+					})
+				} else {
+					s.IdleLocks = append(s.IdleLocks, IdleInfo{
+						Key:   key,
+						IdleS: now.Sub(st.LastActivity).Seconds(),
+					})
 				}
-				s.Locks = append(s.Locks, LockInfo{
-					Key:             key,
-					OwnerConnID:     ownerConn,
-					LeaseExpiresInS: expires,
-					Waiters:         len(st.Waiters),
-				})
-			} else if len(st.Waiters) > 0 {
-				s.Locks = append(s.Locks, LockInfo{
-					Key:     key,
-					Waiters: len(st.Waiters),
-				})
 			} else {
-				s.IdleLocks = append(s.IdleLocks, IdleInfo{
-					Key:   key,
-					IdleS: now.Sub(st.LastActivity).Seconds(),
-				})
-			}
-		} else {
-			// Report as a semaphore
-			if len(st.Holders) > 0 {
-				s.Semaphores = append(s.Semaphores, SemInfo{
-					Key:     key,
-					Limit:   st.Limit,
-					Holders: len(st.Holders),
-					Waiters: len(st.Waiters),
-				})
-			} else if len(st.Waiters) > 0 {
-				s.Semaphores = append(s.Semaphores, SemInfo{
-					Key:     key,
-					Limit:   st.Limit,
-					Waiters: len(st.Waiters),
-				})
-			} else {
-				s.IdleSemaphores = append(s.IdleSemaphores, IdleInfo{
-					Key:   key,
-					IdleS: now.Sub(st.LastActivity).Seconds(),
-				})
+				if len(st.Holders) > 0 {
+					s.Semaphores = append(s.Semaphores, SemInfo{
+						Key:     key,
+						Limit:   st.Limit,
+						Holders: len(st.Holders),
+						Waiters: nw,
+					})
+				} else if nw > 0 {
+					s.Semaphores = append(s.Semaphores, SemInfo{
+						Key:     key,
+						Limit:   st.Limit,
+						Waiters: nw,
+					})
+				} else {
+					s.IdleSemaphores = append(s.IdleSemaphores, IdleInfo{
+						Key:   key,
+						IdleS: now.Sub(st.LastActivity).Seconds(),
+					})
+				}
 			}
 		}
+		sh.mu.Unlock()
 	}
 
 	return s
@@ -855,11 +988,65 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 // Test helpers
 // ---------------------------------------------------------------------------
 
+// LockKeyForTest locks the shard mutex for the given key (for testing only).
+func (lm *LockManager) LockKeyForTest(key string) { lm.shardFor(key).mu.Lock() }
+
+// UnlockKeyForTest unlocks the shard mutex for the given key (for testing only).
+func (lm *LockManager) UnlockKeyForTest(key string) { lm.shardFor(key).mu.Unlock() }
+
+// ResourceForTest returns the ResourceState for the given key (for testing only).
+// Must be called with the shard lock held (via LockKeyForTest).
+func (lm *LockManager) ResourceForTest(key string) *ResourceState {
+	return lm.shardFor(key).resources[key]
+}
+
+// ConnEnqueuedForTest returns the enqueued state for a given connKey (for testing only).
+func (lm *LockManager) ConnEnqueuedForTest(ck connKey) *enqueuedState {
+	return lm.connEnqueued[ck]
+}
+
+// ConnOwnedForTest returns the owned map for a connID (for testing only).
+func (lm *LockManager) ConnOwnedForTest(connID uint64) map[string]map[string]struct{} {
+	return lm.connOwned[connID]
+}
+
+// ResourceCountForTest returns the total resource count across all shards (for testing only).
+func (lm *LockManager) ResourceCountForTest() int {
+	total := 0
+	for i := range lm.shards {
+		lm.shards[i].mu.Lock()
+		total += len(lm.shards[i].resources)
+		lm.shards[i].mu.Unlock()
+	}
+	return total
+}
+
+// ConnEnqueuedCountForTest returns the number of enqueued entries (for testing only).
+func (lm *LockManager) ConnEnqueuedCountForTest() int {
+	lm.connMu.Lock()
+	defer lm.connMu.Unlock()
+	return len(lm.connEnqueued)
+}
+
+// ConnOwnedCountForTest returns the number of connOwned entries (for testing only).
+func (lm *LockManager) ConnOwnedCountForTest() int {
+	lm.connMu.Lock()
+	defer lm.connMu.Unlock()
+	return len(lm.connOwned)
+}
+
+// LockConnMuForTest locks connMu (for testing only).
+func (lm *LockManager) LockConnMuForTest() { lm.connMu.Lock() }
+
+// UnlockConnMuForTest unlocks connMu (for testing only).
+func (lm *LockManager) UnlockConnMuForTest() { lm.connMu.Unlock() }
+
 // ResetLeaseForTest forces all holders of a key to expire immediately (for testing only).
 func (lm *LockManager) ResetLeaseForTest(key string) {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	if st, ok := lm.resources[key]; ok {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if st, ok := sh.resources[key]; ok {
 		for _, h := range st.Holders {
 			h.leaseExpires = time.Now().Add(-1 * time.Second)
 		}
@@ -868,9 +1055,13 @@ func (lm *LockManager) ResetLeaseForTest(key string) {
 
 // ResetForTest clears all state (for testing only).
 func (lm *LockManager) ResetForTest() {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	lm.resources = make(map[string]*ResourceState)
+	lm.connMu.Lock()
+	defer lm.connMu.Unlock()
+	for i := range lm.shards {
+		lm.shards[i].mu.Lock()
+		lm.shards[i].resources = make(map[string]*ResourceState)
+		lm.shards[i].mu.Unlock()
+	}
 	lm.connOwned = make(map[uint64]map[string]map[string]struct{})
 	lm.connEnqueued = make(map[connKey]*enqueuedState)
 }

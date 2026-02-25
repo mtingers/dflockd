@@ -63,13 +63,17 @@ func TestFIFOAcquire_Immediate(t *testing.T) {
 	if tok == "" {
 		t.Fatal("expected token")
 	}
-	st := lm.resources["k1"]
+	lm.LockKeyForTest("k1")
+	st := lm.ResourceForTest("k1")
 	if _, ok := st.Holders[tok]; !ok {
+		lm.UnlockKeyForTest("k1")
 		t.Fatalf("token should be in holders")
 	}
 	if holderConnID(st) != 1 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatalf("owner_conn_id: got %d want 1", holderConnID(st))
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestFIFOAcquire_Timeout(t *testing.T) {
@@ -123,9 +127,12 @@ func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
 	}
 	mu.Unlock()
 
-	if holderConnID(lm.resources["k1"]) != 2 {
-		t.Fatalf("expected conn 2 to own, got %d", holderConnID(lm.resources["k1"]))
+	lm.LockKeyForTest("k1")
+	if holderConnID(lm.ResourceForTest("k1")) != 2 {
+		lm.UnlockKeyForTest("k1")
+		t.Fatalf("expected conn 2 to own, got %d", holderConnID(lm.ResourceForTest("k1")))
 	}
+	lm.UnlockKeyForTest("k1")
 
 	lm.Release("k1", tok2)
 	wg.Wait()
@@ -188,9 +195,12 @@ func TestFIFORelease_Valid(t *testing.T) {
 	if !lm.Release("k1", tok) {
 		t.Fatal("release should succeed")
 	}
-	if len(lm.resources["k1"].Holders) != 0 {
+	lm.LockKeyForTest("k1")
+	if len(lm.ResourceForTest("k1").Holders) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("owner should be cleared")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestFIFORelease_WrongToken(t *testing.T) {
@@ -224,9 +234,12 @@ func TestFIFORelease_TransfersToWaiter(t *testing.T) {
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired")
 	}
-	if holderConnID(lm.resources["k1"]) != 2 {
+	lm.LockKeyForTest("k1")
+	if holderConnID(lm.ResourceForTest("k1")) != 2 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("conn2 should own the lock")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 // ---------------------------------------------------------------------------
@@ -266,17 +279,20 @@ func TestFIFORenew_Expired(t *testing.T) {
 	lm := testManager()
 	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
 	// Manually expire
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	_, ok := lm.Renew("k1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew of expired lease should fail")
 	}
-	if len(lm.resources["k1"].Holders) != 0 {
+	lm.LockKeyForTest("k1")
+	if len(lm.ResourceForTest("k1").Holders) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("owner should be cleared after expired renew")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +314,12 @@ func TestFIFOEnqueue_Immediate(t *testing.T) {
 	if lease != 30 {
 		t.Fatalf("expected lease 30, got %d", lease)
 	}
-	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("should be in connEnqueued")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestFIFOEnqueue_Queued(t *testing.T) {
@@ -320,10 +339,13 @@ func TestFIFOEnqueue_Queued(t *testing.T) {
 	if lease != 0 {
 		t.Fatal("lease should be 0 when queued")
 	}
-	es := lm.connEnqueued[connKey{ConnID: 2, Key: "k1"}]
+	lm.LockConnMuForTest()
+	es := lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"})
 	if es == nil || es.waiter == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("should have waiter in connEnqueued")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestFIFOEnqueue_DoubleEnqueue(t *testing.T) {
@@ -369,9 +391,12 @@ func TestFIFOWait_FastPath(t *testing.T) {
 	if ttl != 30 {
 		t.Fatalf("expected ttl 30, got %d", ttl)
 	}
-	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("should be removed from connEnqueued")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestFIFOWait_QueuedThenWait(t *testing.T) {
@@ -428,10 +453,10 @@ func TestFIFOWait_FastPathLockLost(t *testing.T) {
 		t.Fatal("expected acquired")
 	}
 	// Manually expire + clear holder
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	delete(lm.resources["k1"].Holders, tok)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	delete(lm.ResourceForTest("k1").Holders, tok)
+	lm.UnlockKeyForTest("k1")
 
 	gotTok, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
@@ -486,9 +511,12 @@ func TestTwoPhase_FullCycle(t *testing.T) {
 	if !lm.Release("k1", tok) {
 		t.Fatal("release should succeed")
 	}
-	if len(lm.resources["k1"].Holders) != 0 {
+	lm.LockKeyForTest("k1")
+	if len(lm.ResourceForTest("k1").Holders) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("owner should be cleared")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestTwoPhase_Contention(t *testing.T) {
@@ -513,9 +541,12 @@ func TestTwoPhase_Contention(t *testing.T) {
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired")
 	}
-	if holderConnID(lm.resources["k1"]) != 2 {
+	lm.LockKeyForTest("k1")
+	if holderConnID(lm.ResourceForTest("k1")) != 2 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("conn2 should own")
 	}
+	lm.UnlockKeyForTest("k1")
 	lm.Release("k1", tok2)
 }
 
@@ -530,9 +561,12 @@ func TestCleanup_ReleasesOwned(t *testing.T) {
 		t.Fatal("should acquire")
 	}
 	lm.CleanupConnection(100)
-	if len(lm.resources["k1"].Holders) != 0 {
+	lm.LockKeyForTest("k1")
+	if len(lm.ResourceForTest("k1").Holders) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("owner should be cleared")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestCleanup_CancelsPending(t *testing.T) {
@@ -569,9 +603,12 @@ func TestCleanup_TransfersToWaiter(t *testing.T) {
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired after transfer")
 	}
-	if holderConnID(lm.resources["k1"]) != 2 {
+	lm.LockKeyForTest("k1")
+	if holderConnID(lm.ResourceForTest("k1")) != 2 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("conn2 should own")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestCleanup_EnqueuedWaiter(t *testing.T) {
@@ -579,17 +616,26 @@ func TestCleanup_EnqueuedWaiter(t *testing.T) {
 	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
-	if _, ok := lm.connEnqueued[connKey{ConnID: 2, Key: "k1"}]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("should be enqueued")
 	}
+	lm.UnlockConnMuForTest()
 
 	lm.CleanupConnection(2)
-	if _, ok := lm.connEnqueued[connKey{ConnID: 2, Key: "k1"}]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("should be cleaned up")
 	}
-	if len(lm.resources["k1"].Waiters) != 0 {
+	lm.UnlockConnMuForTest()
+	lm.LockKeyForTest("k1")
+	if len(lm.ResourceForTest("k1").Waiters) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("waiter should be removed")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestCleanup_FastPath(t *testing.T) {
@@ -600,12 +646,18 @@ func TestCleanup_FastPath(t *testing.T) {
 	}
 
 	lm.CleanupConnection(1)
-	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("should be cleaned up")
 	}
-	if len(lm.resources["k1"].Holders) != 0 {
+	lm.UnlockConnMuForTest()
+	lm.LockKeyForTest("k1")
+	if len(lm.ResourceForTest("k1").Holders) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("owner should be cleared")
 	}
+	lm.UnlockKeyForTest("k1")
 }
 
 func TestCleanup_Noop(t *testing.T) {
@@ -625,9 +677,9 @@ func TestLeaseExpiry_ReleasesLock(t *testing.T) {
 		t.Fatal("should acquire")
 	}
 	// Manually expire
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
@@ -639,9 +691,9 @@ func TestLeaseExpiry_ReleasesLock(t *testing.T) {
 	cancel()
 	<-loopDone
 
-	lm.mu.Lock()
-	holders := len(lm.resources["k1"].Holders)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	holders := len(lm.ResourceForTest("k1").Holders)
+	lm.UnlockKeyForTest("k1")
 	if holders != 0 {
 		t.Fatal("owner should be cleared by expiry loop")
 	}
@@ -660,9 +712,9 @@ func TestLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Expire
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
@@ -678,9 +730,9 @@ func TestLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	if tok2 == "" {
 		t.Fatal("conn2 should have acquired after expiry")
 	}
-	lm.mu.Lock()
-	ownerConnID := holderConnID(lm.resources["k1"])
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	ownerConnID := holderConnID(lm.ResourceForTest("k1"))
+	lm.UnlockKeyForTest("k1")
 	if ownerConnID != 2 {
 		t.Fatal("conn2 should own")
 	}
@@ -698,18 +750,18 @@ func TestGC_PrunesIdle(t *testing.T) {
 	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	lm.Release("k1", tok)
 	// Force idle
-	lm.mu.Lock()
-	lm.resources["k1"].LastActivity = time.Now().Add(-100 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go lm.GCLoop(ctx)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.mu.Lock()
-	_, exists := lm.resources["k1"]
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	exists := lm.ResourceForTest("k1") != nil
+	lm.UnlockKeyForTest("k1")
 	if exists {
 		t.Fatal("k1 should have been GC'd")
 	}
@@ -721,18 +773,18 @@ func TestGC_DoesNotPruneHeld(t *testing.T) {
 	lm.cfg.GCMaxIdleTime = 0
 
 	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.mu.Lock()
-	lm.resources["k1"].LastActivity = time.Now().Add(-100 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go lm.GCLoop(ctx)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.mu.Lock()
-	_, exists := lm.resources["k1"]
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	exists := lm.ResourceForTest("k1") != nil
+	lm.UnlockKeyForTest("k1")
 	if !exists {
 		t.Fatal("k1 should not be GC'd (still held)")
 	}
@@ -755,13 +807,17 @@ func TestSemAcquire_Immediate(t *testing.T) {
 	if tok == "" {
 		t.Fatal("expected token")
 	}
-	st := lm.resources["s1"]
+	lm.LockKeyForTest("s1")
+	st := lm.ResourceForTest("s1")
 	if st.Limit != 3 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatalf("limit: got %d want 3", st.Limit)
 	}
 	if len(st.Holders) != 1 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatalf("holders: got %d want 1", len(st.Holders))
 	}
+	lm.UnlockKeyForTest("s1")
 }
 
 func TestSemAcquire_MultipleConcurrent(t *testing.T) {
@@ -772,9 +828,12 @@ func TestSemAcquire_MultipleConcurrent(t *testing.T) {
 	if tok1 == "" || tok2 == "" || tok3 == "" {
 		t.Fatal("all three should acquire immediately")
 	}
-	if len(lm.resources["s1"].Holders) != 3 {
-		t.Fatalf("holders: got %d want 3", len(lm.resources["s1"].Holders))
+	lm.LockKeyForTest("s1")
+	if len(lm.ResourceForTest("s1").Holders) != 3 {
+		lm.UnlockKeyForTest("s1")
+		t.Fatalf("holders: got %d want 3", len(lm.ResourceForTest("s1").Holders))
 	}
+	lm.UnlockKeyForTest("s1")
 }
 
 func TestSemAcquire_AtCapacityTimeout(t *testing.T) {
@@ -912,9 +971,12 @@ func TestSemRelease_Valid(t *testing.T) {
 	if !lm.Release("s1", tok) {
 		t.Fatal("release should succeed")
 	}
-	if len(lm.resources["s1"].Holders) != 0 {
+	lm.LockKeyForTest("s1")
+	if len(lm.ResourceForTest("s1").Holders) != 0 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatal("holders should be empty")
 	}
+	lm.UnlockKeyForTest("s1")
 }
 
 func TestSemRelease_WrongToken(t *testing.T) {
@@ -971,17 +1033,20 @@ func TestSemRenew_WrongToken(t *testing.T) {
 func TestSemRenew_Expired(t *testing.T) {
 	lm := testManager()
 	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
-	lm.mu.Lock()
-	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	_, ok := lm.Renew("s1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew of expired lease should fail")
 	}
-	if len(lm.resources["s1"].Holders) != 0 {
+	lm.LockKeyForTest("s1")
+	if len(lm.ResourceForTest("s1").Holders) != 0 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatal("expired holder should be removed")
 	}
+	lm.UnlockKeyForTest("s1")
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,9 +1193,12 @@ func TestSemCleanup_ReleasesOwned(t *testing.T) {
 		t.Fatal("should acquire")
 	}
 	lm.CleanupConnection(100)
-	if len(lm.resources["s1"].Holders) != 0 {
+	lm.LockKeyForTest("s1")
+	if len(lm.ResourceForTest("s1").Holders) != 0 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatal("holders should be cleared")
 	}
+	lm.UnlockKeyForTest("s1")
 }
 
 func TestSemCleanup_CancelsPending(t *testing.T) {
@@ -1175,9 +1243,12 @@ func TestSemCleanup_EnqueuedWaiter(t *testing.T) {
 	lm.Enqueue("s1", 30*time.Second, 2, 1)
 
 	lm.CleanupConnection(2)
-	if len(lm.resources["s1"].Waiters) != 0 {
+	lm.LockKeyForTest("s1")
+	if len(lm.ResourceForTest("s1").Waiters) != 0 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatal("waiter should be removed")
 	}
+	lm.UnlockKeyForTest("s1")
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,9 +1262,9 @@ func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 	if tok == "" {
 		t.Fatal("should acquire")
 	}
-	lm.mu.Lock()
-	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
@@ -1205,9 +1276,9 @@ func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
 	cancel()
 	<-loopDone
 
-	lm.mu.Lock()
-	holderCount := len(lm.resources["s1"].Holders)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	holderCount := len(lm.ResourceForTest("s1").Holders)
+	lm.UnlockKeyForTest("s1")
 	if holderCount != 0 {
 		t.Fatal("holder should be evicted by expiry loop")
 	}
@@ -1226,11 +1297,11 @@ func TestSemLeaseExpiry_TransfersToWaiter(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Expire holder
-	lm.mu.Lock()
-	for _, h := range lm.resources["s1"].Holders {
+	lm.LockKeyForTest("s1")
+	for _, h := range lm.ResourceForTest("s1").Holders {
 		h.leaseExpires = time.Now().Add(-1 * time.Second)
 	}
-	lm.mu.Unlock()
+	lm.UnlockKeyForTest("s1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
@@ -1259,18 +1330,18 @@ func TestSemGC_PrunesIdle(t *testing.T) {
 
 	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
 	lm.Release("s1", tok)
-	lm.mu.Lock()
-	lm.resources["s1"].LastActivity = time.Now().Add(-100 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").LastActivity = time.Now().Add(-100 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go lm.GCLoop(ctx)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.mu.Lock()
-	_, exists := lm.resources["s1"]
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	exists := lm.ResourceForTest("s1") != nil
+	lm.UnlockKeyForTest("s1")
 	if exists {
 		t.Fatal("s1 should have been GC'd")
 	}
@@ -1282,18 +1353,18 @@ func TestSemGC_DoesNotPruneHeld(t *testing.T) {
 	lm.cfg.GCMaxIdleTime = 0
 
 	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	lm.mu.Lock()
-	lm.resources["s1"].LastActivity = time.Now().Add(-100 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").LastActivity = time.Now().Add(-100 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go lm.GCLoop(ctx)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.mu.Lock()
-	_, exists := lm.resources["s1"]
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	exists := lm.ResourceForTest("s1") != nil
+	lm.UnlockKeyForTest("s1")
 	if !exists {
 		t.Fatal("s1 should not be GC'd (still has holders)")
 	}
@@ -1328,9 +1399,9 @@ func TestFIFOAcquire_MaxWaiters(t *testing.T) {
 	}
 
 	// Cleanup: release so goroutine can finish
-	lm.mu.Lock()
-	tok := holderToken(lm.resources["k1"])
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	tok := holderToken(lm.ResourceForTest("k1"))
+	lm.UnlockKeyForTest("k1")
 	lm.Release("k1", tok)
 	<-done
 }
@@ -1383,13 +1454,13 @@ func TestSemAcquire_MaxWaiters(t *testing.T) {
 	}
 
 	// Cleanup
-	lm.mu.Lock()
+	lm.LockKeyForTest("s1")
 	var tok string
-	for t := range lm.resources["s1"].Holders {
+	for t := range lm.ResourceForTest("s1").Holders {
 		tok = t
 		break
 	}
-	lm.mu.Unlock()
+	lm.UnlockKeyForTest("s1")
 	lm.Release("s1", tok)
 	<-done
 }
@@ -1484,9 +1555,12 @@ func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
 	}
 
 	// The enqueued waiter should still be tracked (it will get granted the lock)
-	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("enqueued state for conn1 should still exist")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 // ===========================================================================
@@ -1508,9 +1582,9 @@ func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
 	}
 
 	// Manually expire the lease
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
@@ -1518,17 +1592,21 @@ func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
 	}
 
 	// Owner state must be cleaned up
-	lm.mu.Lock()
-	st := lm.resources["k1"]
+	lm.LockKeyForTest("k1")
+	st := lm.ResourceForTest("k1")
 	if len(st.Holders) != 0 {
+		lm.UnlockKeyForTest("k1")
 		t.Fatal("owner should be cleared after expired wait")
 	}
-	lm.mu.Unlock()
+	lm.UnlockKeyForTest("k1")
 
 	// connEnqueued should be cleaned up
-	if _, ok := lm.connEnqueued[connKey{ConnID: 1, Key: "k1"}]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should be deleted")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
@@ -1540,11 +1618,11 @@ func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
 	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
 	// Expire conn1's lease
-	lm.mu.Lock()
-	for _, h := range lm.resources["k1"].Holders {
+	lm.LockKeyForTest("k1")
+	for _, h := range lm.ResourceForTest("k1").Holders {
 		h.leaseExpires = time.Now().Add(-1 * time.Second)
 	}
-	lm.mu.Unlock()
+	lm.UnlockKeyForTest("k1")
 
 	// conn1's Wait detects expiry and should grant to conn2
 	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
@@ -1553,10 +1631,10 @@ func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
 	}
 
 	// conn2 should now be the owner (granted by grantNextWaiterLocked)
-	lm.mu.Lock()
-	st := lm.resources["k1"]
+	lm.LockKeyForTest("k1")
+	st := lm.ResourceForTest("k1")
 	ownerConn := holderConnID(st)
-	lm.mu.Unlock()
+	lm.UnlockKeyForTest("k1")
 	if ownerConn != 2 {
 		t.Fatalf("expected conn2 to own, got %d", ownerConn)
 	}
@@ -1570,9 +1648,9 @@ func TestSemWait_FastPathLeaseExpired(t *testing.T) {
 	}
 
 	// Manually expire
-	lm.mu.Lock()
-	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
@@ -1580,11 +1658,12 @@ func TestSemWait_FastPathLeaseExpired(t *testing.T) {
 	}
 
 	// Holder should be cleaned up
-	lm.mu.Lock()
-	if len(lm.resources["s1"].Holders) != 0 {
+	lm.LockKeyForTest("s1")
+	if len(lm.ResourceForTest("s1").Holders) != 0 {
+		lm.UnlockKeyForTest("s1")
 		t.Fatal("expired holder should be removed")
 	}
-	lm.mu.Unlock()
+	lm.UnlockKeyForTest("s1")
 }
 
 func TestSemWait_FastPathLockLost(t *testing.T) {
@@ -1597,9 +1676,9 @@ func TestSemWait_FastPathLockLost(t *testing.T) {
 	}
 
 	// Remove the holder to simulate state loss
-	lm.mu.Lock()
-	delete(lm.resources["s1"].Holders, tok)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	delete(lm.ResourceForTest("s1").Holders, tok)
+	lm.UnlockKeyForTest("s1")
 
 	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
 	if !errors.Is(err, ErrLeaseExpired) {
@@ -1698,15 +1777,21 @@ func TestFIFORelease_CleansConnEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
-	if _, ok := lm.connEnqueued[eqKey]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should exist before release")
 	}
+	lm.UnlockConnMuForTest()
 
 	lm.Release("k1", tok)
 
-	if _, ok := lm.connEnqueued[eqKey]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should be cleaned up after release")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
@@ -1714,15 +1799,21 @@ func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
-	if _, ok := lm.connEnqueued[eqKey]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should exist before release")
 	}
+	lm.UnlockConnMuForTest()
 
 	lm.Release("s1", tok)
 
-	if _, ok := lm.connEnqueued[eqKey]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should be cleaned up after release")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
@@ -1732,18 +1823,21 @@ func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
 	// Manually expire
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	_, ok := lm.Renew("k1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew should fail on expired lease")
 	}
 
-	if _, ok := lm.connEnqueued[eqKey]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should be cleaned up after expired renew")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
@@ -1751,18 +1845,21 @@ func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
-	lm.mu.Lock()
-	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	_, ok := lm.Renew("s1", tok, 30*time.Second)
 	if ok {
 		t.Fatal("renew should fail on expired lease")
 	}
 
-	if _, ok := lm.connEnqueued[eqKey]; ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) != nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should be cleaned up after expired renew")
 	}
+	lm.UnlockConnMuForTest()
 }
 
 func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
@@ -1772,23 +1869,26 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
-	if _, ok := lm.connEnqueued[eqKey]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnEnqueuedForTest(eqKey) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connEnqueued should exist")
 	}
+	lm.UnlockConnMuForTest()
 
 	// Expire
-	lm.mu.Lock()
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go lm.LeaseExpiryLoop(ctx)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.mu.Lock()
-	_, exists := lm.connEnqueued[eqKey]
-	lm.mu.Unlock()
+	lm.LockConnMuForTest()
+	exists := lm.ConnEnqueuedForTest(eqKey) != nil
+	lm.UnlockConnMuForTest()
 	if exists {
 		t.Fatal("connEnqueued should be cleaned up by expiry loop")
 	}
@@ -1800,18 +1900,18 @@ func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
-	lm.mu.Lock()
-	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go lm.LeaseExpiryLoop(ctx)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.mu.Lock()
-	_, exists := lm.connEnqueued[eqKey]
-	lm.mu.Unlock()
+	lm.LockConnMuForTest()
+	exists := lm.ConnEnqueuedForTest(eqKey) != nil
+	lm.UnlockConnMuForTest()
 	if exists {
 		t.Fatal("connEnqueued should be cleaned up by expiry loop")
 	}
@@ -1829,23 +1929,27 @@ func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
 	}
 
 	// Verify connOwned is set
-	lm.mu.Lock()
-	if _, ok := lm.connOwned[1]; !ok {
+	lm.LockConnMuForTest()
+	if lm.ConnOwnedForTest(1) == nil {
+		lm.UnlockConnMuForTest()
 		t.Fatal("connOwned should have conn 1")
 	}
-	lm.resources["k1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.UnlockConnMuForTest()
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("k1")
 
 	lm.Wait(bg(), "k1", 5*time.Second, 1)
 
 	// connOwned for this key should be cleaned up
-	lm.mu.Lock()
-	if owned, ok := lm.connOwned[1]; ok {
+	lm.LockConnMuForTest()
+	if owned := lm.ConnOwnedForTest(1); owned != nil {
 		if _, hasKey := owned["k1"]; hasKey {
+			lm.UnlockConnMuForTest()
 			t.Fatal("connOwned should not have k1 after expired wait")
 		}
 	}
-	lm.mu.Unlock()
+	lm.UnlockConnMuForTest()
 }
 
 func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
@@ -1855,21 +1959,22 @@ func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
 		t.Fatal("expected acquired")
 	}
 
-	lm.mu.Lock()
-	lm.resources["s1"].Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.mu.Unlock()
+	lm.LockKeyForTest("s1")
+	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("s1")
 
 	lm.Wait(bg(), "s1", 5*time.Second, 1)
 
-	lm.mu.Lock()
-	if m, ok := lm.connOwned[1]; ok {
+	lm.LockConnMuForTest()
+	if m := lm.ConnOwnedForTest(1); m != nil {
 		if tokens, ok := m["s1"]; ok {
 			if _, ok := tokens[tok]; ok {
+				lm.UnlockConnMuForTest()
 				t.Fatal("connOwned should not have the expired token")
 			}
 		}
 	}
-	lm.mu.Unlock()
+	lm.UnlockConnMuForTest()
 }
 
 // ---------------------------------------------------------------------------
@@ -1978,15 +2083,13 @@ func TestResetForTest(t *testing.T) {
 
 	lm.ResetForTest()
 
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	if len(lm.resources) != 0 {
+	if lm.ResourceCountForTest() != 0 {
 		t.Fatal("resources should be empty")
 	}
-	if len(lm.connOwned) != 0 {
+	if lm.ConnOwnedCountForTest() != 0 {
 		t.Fatal("connOwned should be empty")
 	}
-	if len(lm.connEnqueued) != 0 {
+	if lm.ConnEnqueuedCountForTest() != 0 {
 		t.Fatal("connEnqueued should be empty")
 	}
 }

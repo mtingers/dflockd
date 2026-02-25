@@ -9,6 +9,23 @@ import (
 	"time"
 )
 
+// Pre-computed response prefixes to avoid allocations on the hot path.
+var (
+	respOK               = []byte("ok\n")
+	respTimeout          = []byte("timeout\n")
+	respError            = []byte("error\n")
+	respErrorAuth        = []byte("error_auth\n")
+	respErrorMaxLocks    = []byte("error_max_locks\n")
+	respErrorMaxWaiters  = []byte("error_max_waiters\n")
+	respErrorLimitMismatch    = []byte("error_limit_mismatch\n")
+	respErrorNotEnqueued      = []byte("error_not_enqueued\n")
+	respErrorAlreadyEnqueued  = []byte("error_already_enqueued\n")
+	respQueued           = []byte("queued\n")
+
+	prefixOK       = []byte("ok ")
+	prefixAcquired = []byte("acquired ")
+)
+
 const MaxLineBytes = 256
 
 type ProtocolError struct {
@@ -343,19 +360,63 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 	switch ack.Status {
 	case "ok", "acquired":
-		prefix := ack.Status
 		if ack.Token != "" {
 			lease := ack.LeaseTTL
 			if lease == 0 {
 				lease = defaultLeaseTTLSec
 			}
-			return []byte(fmt.Sprintf("%s %s %d\n", prefix, ack.Token, lease))
+			// Build: "<status> <token> <lease>\n" without fmt.Sprintf
+			var prefix []byte
+			if ack.Status == "ok" {
+				prefix = prefixOK
+			} else {
+				prefix = prefixAcquired
+			}
+			buf := make([]byte, 0, len(prefix)+len(ack.Token)+1+10+1) // prefix+token+space+digits+newline
+			buf = append(buf, prefix...)
+			buf = append(buf, ack.Token...)
+			buf = append(buf, ' ')
+			buf = strconv.AppendInt(buf, int64(lease), 10)
+			buf = append(buf, '\n')
+			return buf
 		}
 		if ack.Extra != "" {
-			return []byte(fmt.Sprintf("%s %s\n", prefix, ack.Extra))
+			var prefix []byte
+			if ack.Status == "ok" {
+				prefix = prefixOK
+			} else {
+				prefix = prefixAcquired
+			}
+			buf := make([]byte, 0, len(prefix)+len(ack.Extra)+1)
+			buf = append(buf, prefix...)
+			buf = append(buf, ack.Extra...)
+			buf = append(buf, '\n')
+			return buf
 		}
-		return []byte(prefix + "\n")
+		return respOK // "ok\n" — bare ok is the only case without token/extra
 	default:
-		return []byte(ack.Status + "\n")
+		// Use pre-computed slices for known statuses.
+		switch ack.Status {
+		case "timeout":
+			return respTimeout
+		case "error":
+			return respError
+		case "error_auth":
+			return respErrorAuth
+		case "error_max_locks":
+			return respErrorMaxLocks
+		case "error_max_waiters":
+			return respErrorMaxWaiters
+		case "error_limit_mismatch":
+			return respErrorLimitMismatch
+		case "error_not_enqueued":
+			return respErrorNotEnqueued
+		case "error_already_enqueued":
+			return respErrorAlreadyEnqueued
+		case "queued":
+			return respQueued
+		default:
+			return []byte(ack.Status + "\n")
+		}
 	}
 }
