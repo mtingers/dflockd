@@ -679,6 +679,9 @@ func KVSet(c *Conn, key, value string, ttlSeconds int) error {
 	if err := validateValue(value); err != nil {
 		return err
 	}
+	if strings.Contains(value, "\t") {
+		return fmt.Errorf("dflockd: value contains tab")
+	}
 	if ttlSeconds < 0 {
 		ttlSeconds = 0
 	}
@@ -993,6 +996,9 @@ func LPop(c *Conn, key string) (string, error) {
 	if resp == "nil" {
 		return "", ErrNotFound
 	}
+	if resp == "ok" {
+		return "", nil
+	}
 	if strings.HasPrefix(resp, "ok ") {
 		return resp[3:], nil
 	}
@@ -1010,6 +1016,9 @@ func RPop(c *Conn, key string) (string, error) {
 	}
 	if resp == "nil" {
 		return "", ErrNotFound
+	}
+	if resp == "ok" {
+		return "", nil
 	}
 	if strings.HasPrefix(resp, "ok ") {
 		return resp[3:], nil
@@ -2116,6 +2125,9 @@ func BLPop(c *Conn, key string, timeout time.Duration) (string, error) {
 	if resp == "nil" {
 		return "", nil
 	}
+	if resp == "ok" {
+		return "", nil
+	}
 	if strings.HasPrefix(resp, "ok ") {
 		return resp[3:], nil
 	}
@@ -2136,6 +2148,9 @@ func BRPop(c *Conn, key string, timeout time.Duration) (string, error) {
 		return "", err
 	}
 	if resp == "nil" {
+		return "", nil
+	}
+	if resp == "ok" {
 		return "", nil
 	}
 	if strings.HasPrefix(resp, "ok ") {
@@ -2365,6 +2380,7 @@ type RWLock struct {
 	token       string
 	fence       uint64
 	lease       int
+	mode        string // "rl" or "wl" — tracks acquire mode for correct unlock
 	cancelRenew context.CancelFunc
 	renewDone   chan struct{}
 }
@@ -2492,6 +2508,7 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 	rw.token = token
 	rw.fence = fence
 	rw.lease = lease
+	rw.mode = cmd
 	rw.startRenew(cmd)
 	return true, nil
 }
@@ -2507,13 +2524,18 @@ func (rw *RWLock) Unlock(ctx context.Context) error {
 		return nil
 	}
 
-	// Use "rr" — works for both since RWRelease just calls Release internally.
-	err := RUnlock(rw.conn, rw.Key, rw.token)
+	var err error
+	if rw.mode == "wl" {
+		err = WUnlock(rw.conn, rw.Key, rw.token)
+	} else {
+		err = RUnlock(rw.conn, rw.Key, rw.token)
+	}
 	rw.conn.Close()
 	rw.conn = nil
 	rw.token = ""
 	rw.fence = 0
 	rw.lease = 0
+	rw.mode = ""
 	return err
 }
 

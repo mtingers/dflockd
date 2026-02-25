@@ -254,6 +254,7 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 
 // deliverToGroup delivers a message to one member of a queue group via round-robin.
 // Returns true if a delivery was made. The delivered connID is added to the delivered map.
+// Falls back to the next member if the selected member's buffer is full.
 func deliverToGroup(qg *queueGroup, msg []byte, delivered map[uint64]struct{}) bool {
 	n := len(qg.members)
 	if n == 0 {
@@ -265,24 +266,29 @@ func deliverToGroup(qg *queueGroup, msg []byte, delivered map[uint64]struct{}) b
 		mem := qg.members[idx]
 		select {
 		case mem.WriteCh <- msg:
+			delivered[mem.ConnID] = struct{}{}
+			return true
 		default:
+			// Buffer full — try next member
 		}
-		delivered[mem.ConnID] = struct{}{}
-		return true
 	}
 	return false
 }
 
 // Signal sends a payload to all listeners matching the literal channel.
-// Returns the number of unique connections that received the signal.
+// Returns the number of successful deliveries (including independent group
+// deliveries, so a connection in both a non-grouped and grouped subscription
+// counts as 2).
 func (m *Manager) Signal(channel, payload string) int {
 	msg := []byte(fmt.Sprintf("sig %s %s\n", channel, payload))
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Deduplicate: a connection listening on both exact and wildcard
-	// should only receive the signal once.
+	count := 0
+
+	// Deduplicate non-grouped: a connection listening on both exact and wildcard
+	// should only receive the signal once via non-grouped paths.
 	delivered := make(map[uint64]struct{})
 
 	// 1. Exact non-grouped
@@ -294,13 +300,16 @@ func (m *Manager) Signal(channel, payload string) int {
 				// Buffer full — fire-and-forget drop
 			}
 			delivered[connID] = struct{}{}
+			count++
 		}
 	}
 
-	// 2. Exact grouped — for each group matching channel, deliver to one member
+	// 2. Exact grouped — each group independently delivers to one member
 	if groups, ok := m.exactGroups[channel]; ok {
 		for _, qg := range groups {
-			deliverToGroup(qg, msg, delivered)
+			if deliverToGroup(qg, msg, delivered) {
+				count++
+			}
 		}
 	}
 
@@ -315,17 +324,20 @@ func (m *Manager) Signal(channel, payload string) int {
 			default:
 			}
 			delivered[l.ConnID] = struct{}{}
+			count++
 		}
 	}
 
-	// 4. Wildcard grouped
+	// 4. Wildcard grouped — each group independently delivers to one member
 	for _, wge := range m.wildGroups {
 		if MatchPattern(wge.pattern, channel) {
-			deliverToGroup(wge.qg, msg, delivered)
+			if deliverToGroup(wge.qg, msg, delivered) {
+				count++
+			}
 		}
 	}
 
-	return len(delivered)
+	return count
 }
 
 // UnlistenAll removes all listeners for a given connection.

@@ -1768,6 +1768,12 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 	case <-p.ch:
 		return true, nil
 	case <-ctx.Done():
+		// Re-check: barrier may have tripped concurrently with cancellation.
+		select {
+		case <-p.ch:
+			return true, nil
+		default:
+		}
 		sh.mu.Lock()
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
@@ -2143,11 +2149,25 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	for i := range lm.shards {
 		sh := &lm.shards[i]
 		sh.mu.Lock()
-		for _, ls := range sh.lists {
+		for key, ls := range sh.lists {
 			for j := ls.PopWaiterHead; j < len(ls.PopWaiters); j++ {
 				if ls.PopWaiters[j] != nil && ls.PopWaiters[j].connID == connID {
 					close(ls.PopWaiters[j].ch)
 					ls.PopWaiters[j] = nil
+				}
+			}
+			// Remove the list if it's empty and all pop waiters are gone.
+			if len(ls.Items) == 0 {
+				allNil := true
+				for k := ls.PopWaiterHead; k < len(ls.PopWaiters); k++ {
+					if ls.PopWaiters[k] != nil {
+						allNil = false
+						break
+					}
+				}
+				if allNil {
+					delete(sh.lists, key)
+					lm.keyTotal.Add(-1)
 				}
 			}
 		}

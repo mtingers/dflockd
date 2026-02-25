@@ -360,6 +360,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
+		if status == "acquired" {
+			s.wm.Notify(req.Cmd, req.Key)
+		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
 	case "w", "sw":
@@ -380,6 +383,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
+		s.wm.Notify(req.Cmd, req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease, Fence: fence}
 
 	// --- Phase 1: Atomic Counters ---
@@ -691,6 +695,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
 			}
+			if errors.Is(err, lock.ErrLimitMismatch) {
+				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
 			}
@@ -719,6 +726,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			select {
 			case cs.writeCh <- msg:
 			default:
+				cs.cancelConn()
 			}
 		}
 		return &protocol.Ack{Status: "ok"}

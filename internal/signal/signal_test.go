@@ -674,11 +674,10 @@ func TestQueueGroup_SamePatternDifferentGroups(t *testing.T) {
 	m.Listen(b)
 
 	n := m.Signal("ch", "payload")
-	// ConnID 1 is in both groups. First group delivers to connID 1 (marked delivered).
-	// Second group tries connID 1, finds it already delivered, skips.
-	// So only 1 delivery total.
-	if n != 1 {
-		t.Fatalf("Signal returned %d, want 1 (dedup across groups)", n)
+	// ConnID 1 is in both groups. Each group delivers independently,
+	// so connID 1 receives 2 messages (one per group).
+	if n != 2 {
+		t.Fatalf("Signal returned %d, want 2 (independent group delivery)", n)
 	}
 }
 
