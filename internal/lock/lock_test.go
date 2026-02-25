@@ -3239,7 +3239,7 @@ func TestBarrier_MaxKeys(t *testing.T) {
 func TestLeaderWatcher_RegisterNotify(t *testing.T) {
 	lm := testManager()
 	ch := make(chan []byte, 10)
-	lm.RegisterLeaderWatcher("election1", 1, ch)
+	lm.RegisterLeaderWatcher("election1", 1, ch, func() {})
 	lm.NotifyLeaderChange("election1", "elected", 0)
 
 	select {
@@ -3255,7 +3255,7 @@ func TestLeaderWatcher_RegisterNotify(t *testing.T) {
 func TestLeaderWatcher_Unregister(t *testing.T) {
 	lm := testManager()
 	ch := make(chan []byte, 10)
-	lm.RegisterLeaderWatcher("election1", 1, ch)
+	lm.RegisterLeaderWatcher("election1", 1, ch, func() {})
 	lm.UnregisterLeaderWatcher("election1", 1)
 	lm.NotifyLeaderChange("election1", "elected", 0)
 
@@ -3270,8 +3270,8 @@ func TestLeaderWatcher_Unregister(t *testing.T) {
 func TestLeaderWatcher_UnregisterAll(t *testing.T) {
 	lm := testManager()
 	ch := make(chan []byte, 10)
-	lm.RegisterLeaderWatcher("e1", 1, ch)
-	lm.RegisterLeaderWatcher("e2", 1, ch)
+	lm.RegisterLeaderWatcher("e1", 1, ch, func() {})
+	lm.RegisterLeaderWatcher("e2", 1, ch, func() {})
 	lm.UnregisterAllLeaderWatchers(1)
 	lm.NotifyLeaderChange("e1", "elected", 0)
 	lm.NotifyLeaderChange("e2", "elected", 0)

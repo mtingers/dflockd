@@ -2125,7 +2125,7 @@ func TestIntegration_KVSetWithTTL(t *testing.T) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	resp := connSendCmd(t, conn, reader, "kset", "mykey", "hello 1")
+	resp := connSendCmd(t, conn, reader, "kset", "mykey", "hello\t1")
 	if resp != "ok" {
 		t.Fatalf("expected 'ok', got %q", resp)
 	}
@@ -3043,7 +3043,7 @@ func TestIntegration_KVCAS_Basic(t *testing.T) {
 	defer conn.Close()
 
 	// Create via CAS (empty old value, tab separator)
-	resp := sendCmd(t, conn, "kcas", "mykey", "\thello 0")
+	resp := sendCmd(t, conn, "kcas", "mykey", "\thello\t0")
 	if resp != "ok" {
 		t.Fatalf("expected ok, got %q", resp)
 	}
@@ -3055,7 +3055,7 @@ func TestIntegration_KVCAS_Basic(t *testing.T) {
 	}
 
 	// Swap value
-	resp = sendCmd(t, conn, "kcas", "mykey", "hello\tworld 0")
+	resp = sendCmd(t, conn, "kcas", "mykey", "hello\tworld\t0")
 	if resp != "ok" {
 		t.Fatalf("expected ok, got %q", resp)
 	}
@@ -3075,13 +3075,13 @@ func TestIntegration_KVCAS_Conflict(t *testing.T) {
 	defer conn.Close()
 
 	// Set initial value
-	resp := sendCmd(t, conn, "kset", "mykey", "actual 0")
+	resp := sendCmd(t, conn, "kset", "mykey", "actual\t0")
 	if resp != "ok" {
 		t.Fatalf("expected ok, got %q", resp)
 	}
 
 	// CAS with wrong old value
-	resp = sendCmd(t, conn, "kcas", "mykey", "wrong\tnew 0")
+	resp = sendCmd(t, conn, "kcas", "mykey", "wrong\tnew\t0")
 	if resp != "cas_conflict" {
 		t.Fatalf("expected cas_conflict, got %q", resp)
 	}
@@ -3109,7 +3109,7 @@ func TestIntegration_Watch_KVSet(t *testing.T) {
 	wrConn := dialTest(t, addr)
 	defer wrConn.Close()
 
-	resp = sendCmd(t, wrConn, "kset", "mykey", "hello 0")
+	resp = sendCmd(t, wrConn, "kset", "mykey", "hello\t0")
 	if resp != "ok" {
 		t.Fatalf("expected ok, got %q", resp)
 	}
@@ -3140,7 +3140,7 @@ func TestIntegration_Watch_Disconnect(t *testing.T) {
 	// Writer should not block or error
 	wrConn := dialTest(t, addr)
 	defer wrConn.Close()
-	resp := sendCmd(t, wrConn, "kset", "mykey", "hello 0")
+	resp := sendCmd(t, wrConn, "kset", "mykey", "hello\t0")
 	if resp != "ok" {
 		t.Fatalf("expected ok, got %q", resp)
 	}

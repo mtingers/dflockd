@@ -8,7 +8,7 @@ import (
 func TestWatch_ExactMatch(t *testing.T) {
 	m := NewManager()
 	ch := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
 	m.Notify("kset", "mykey")
 
 	select {
@@ -25,7 +25,7 @@ func TestWatch_ExactMatch(t *testing.T) {
 func TestWatch_Wildcard(t *testing.T) {
 	m := NewManager()
 	ch := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "prefix.*", WriteCh: ch})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "prefix.*", WriteCh: ch, CancelConn: func() {}})
 	m.Notify("kset", "prefix.foo")
 
 	select {
@@ -50,7 +50,7 @@ func TestWatch_Wildcard(t *testing.T) {
 func TestWatch_Unwatch(t *testing.T) {
 	m := NewManager()
 	ch := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
 	m.Unwatch("mykey", 1)
 	m.Notify("kset", "mykey")
 
@@ -64,8 +64,8 @@ func TestWatch_Unwatch(t *testing.T) {
 func TestWatch_UnwatchAll(t *testing.T) {
 	m := NewManager()
 	ch := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "key1", WriteCh: ch})
-	m.Watch(&Watcher{ConnID: 1, Pattern: "key2", WriteCh: ch})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "key1", WriteCh: ch, CancelConn: func() {}})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "key2", WriteCh: ch, CancelConn: func() {}})
 	m.UnwatchAll(1)
 	m.Notify("kset", "key1")
 	m.Notify("kset", "key2")
@@ -80,8 +80,8 @@ func TestWatch_UnwatchAll(t *testing.T) {
 func TestWatch_DuplicateIgnored(t *testing.T) {
 	m := NewManager()
 	ch := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch})
-	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
 	m.Notify("kset", "mykey")
 
 	// Should only receive one notification
@@ -97,8 +97,8 @@ func TestWatch_Stats(t *testing.T) {
 	m := NewManager()
 	ch1 := make(chan []byte, 10)
 	ch2 := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "key1", WriteCh: ch1})
-	m.Watch(&Watcher{ConnID: 2, Pattern: "key1", WriteCh: ch2})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "key1", WriteCh: ch1, CancelConn: func() {}})
+	m.Watch(&Watcher{ConnID: 2, Pattern: "key1", WriteCh: ch2, CancelConn: func() {}})
 
 	stats := m.Stats()
 	if len(stats) != 1 {
@@ -113,8 +113,8 @@ func TestWatch_Dedup(t *testing.T) {
 	// A connection watching both exact and wildcard should receive only once
 	m := NewManager()
 	ch := make(chan []byte, 10)
-	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch})
-	m.Watch(&Watcher{ConnID: 1, Pattern: "*", WriteCh: ch})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
+	m.Watch(&Watcher{ConnID: 1, Pattern: "*", WriteCh: ch, CancelConn: func() {}})
 	m.Notify("kset", "mykey")
 
 	<-ch

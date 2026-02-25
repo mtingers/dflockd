@@ -144,6 +144,11 @@ type barrierState struct {
 	LastActivity time.Time
 }
 
+type leaderWatcher struct {
+	ch         chan []byte
+	cancelConn func() // called when ch is full (slow consumer)
+}
+
 type shard struct {
 	mu             sync.Mutex
 	resources      map[string]*ResourceState
@@ -151,7 +156,7 @@ type shard struct {
 	kvStore        map[string]*kvEntry
 	lists          map[string]*listState
 	barriers       map[string]*barrierState
-	leaderWatchers map[string]map[uint64]chan []byte // key → connID → writeCh
+	leaderWatchers map[string]map[uint64]*leaderWatcher // key → connID → watcher
 }
 
 type listWaiter struct {
@@ -160,25 +165,27 @@ type listWaiter struct {
 }
 
 type LockManager struct {
-	shards        [numShards]shard
-	connMu        sync.Mutex // protects connOwned and connEnqueued
-	connOwned     map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
-	connEnqueued  map[connKey]*enqueuedState
-	cfg           *config.Config
-	log           *slog.Logger
-	tokBuf        tokenBuf
-	resourceTotal atomic.Int64 // total resources across all shards
-	keyTotal      atomic.Int64 // total keys across all types (counters+kv+lists)
-	fenceSeq      atomic.Uint64 // global monotonic fencing token counter
+	shards             [numShards]shard
+	connMu             sync.Mutex // protects connOwned, connEnqueued, connLeaderKeys
+	connOwned          map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
+	connEnqueued       map[connKey]*enqueuedState
+	connLeaderKeys     map[uint64]map[string]struct{} // connID → set of leader-watched keys
+	cfg                *config.Config
+	log                *slog.Logger
+	tokBuf             tokenBuf
+	resourceTotal      atomic.Int64  // total resources across all shards
+	keyTotal           atomic.Int64  // total keys across all types (counters+kv+lists)
+	fenceSeq           atomic.Uint64 // global monotonic fencing token counter
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 	lm := &LockManager{
-		connOwned:    make(map[uint64]map[string]map[string]struct{}),
-		connEnqueued: make(map[connKey]*enqueuedState),
-		cfg:          cfg,
-		log:          log,
-		tokBuf:       newTokenBuf(),
+		connOwned:      make(map[uint64]map[string]map[string]struct{}),
+		connEnqueued:   make(map[connKey]*enqueuedState),
+		connLeaderKeys: make(map[uint64]map[string]struct{}),
+		cfg:            cfg,
+		log:            log,
+		tokBuf:         newTokenBuf(),
 	}
 	for i := range lm.shards {
 		lm.shards[i].resources = make(map[string]*ResourceState)
@@ -186,7 +193,7 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 		lm.shards[i].kvStore = make(map[string]*kvEntry)
 		lm.shards[i].lists = make(map[string]*listState)
 		lm.shards[i].barriers = make(map[string]*barrierState)
-		lm.shards[i].leaderWatchers = make(map[string]map[uint64]chan []byte)
+		lm.shards[i].leaderWatchers = make(map[string]map[uint64]*leaderWatcher)
 	}
 	return lm
 }
@@ -305,10 +312,11 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
 			// Notify leader watchers on failover grant
 			if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
 				msg := []byte(fmt.Sprintf("leader failover %s\n", key))
-				for _, ch := range watchers {
+				for _, lw := range watchers {
 					select {
-					case ch <- msg:
+					case lw.ch <- msg:
 					default:
+						lw.cancelConn()
 					}
 				}
 			}
@@ -1693,6 +1701,14 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		lm.keyTotal.Add(1)
 	}
 
+	// Fix #8: Reject duplicate participation by the same connection.
+	for _, pp := range bs.Participants {
+		if pp.connID == connID {
+			sh.mu.Unlock()
+			return false, fmt.Errorf("duplicate barrier participant: connID=%d", connID)
+		}
+	}
+
 	p := &barrierParticipant{
 		ch:     make(chan struct{}),
 		connID: connID,
@@ -1716,13 +1732,22 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 
 	sh.mu.Unlock()
 
-	// Wait for trip, timeout, or context cancel
-	var timer *time.Timer
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-	} else {
-		timer = time.NewTimer(0)
+	// Wait for trip, timeout, or context cancel.
+	// Fix #7: For timeout <= 0, check if barrier tripped first (non-blocking)
+	// before starting the timer to avoid non-deterministic select.
+	if timeout <= 0 {
+		select {
+		case <-p.ch:
+			return true, nil
+		default:
+		}
+		sh.mu.Lock()
+		lm.removeBarrierParticipant(sh, key, p)
+		sh.mu.Unlock()
+		return false, nil
 	}
+
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
@@ -1734,6 +1759,12 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		sh.mu.Unlock()
 		return false, ctx.Err()
 	case <-timer.C:
+		// Fix #9: Re-check if barrier tripped concurrently with timer.
+		select {
+		case <-p.ch:
+			return true, nil
+		default:
+		}
 		sh.mu.Lock()
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
@@ -1765,37 +1796,94 @@ func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *b
 // ---------------------------------------------------------------------------
 
 // RegisterLeaderWatcher registers a connection to receive leader change notifications.
-func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh chan []byte) {
+func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh chan []byte, cancelConn func()) {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	watchers, ok := sh.leaderWatchers[key]
 	if !ok {
-		watchers = make(map[uint64]chan []byte)
+		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
-	watchers[connID] = writeCh
+	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+	sh.mu.Unlock()
+
+	lm.connMu.Lock()
+	keys := lm.connLeaderKeys[connID]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		lm.connLeaderKeys[connID] = keys
+	}
+	keys[key] = struct{}{}
+	lm.connMu.Unlock()
+}
+
+// RegisterAndNotifyLeader atomically registers a watcher and notifies
+// observers of a leader change, all under the shard lock.
+func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uint64, writeCh chan []byte, cancelConn func()) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	watchers, ok := sh.leaderWatchers[key]
+	if !ok {
+		watchers = make(map[uint64]*leaderWatcher)
+		sh.leaderWatchers[key] = watchers
+	}
+	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
+	for cid, lw := range watchers {
+		if cid == connID {
+			continue
+		}
+		select {
+		case lw.ch <- msg:
+		default:
+			lw.cancelConn()
+		}
+	}
+	sh.mu.Unlock()
+
+	lm.connMu.Lock()
+	keys := lm.connLeaderKeys[connID]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		lm.connLeaderKeys[connID] = keys
+	}
+	keys[key] = struct{}{}
+	lm.connMu.Unlock()
 }
 
 // UnregisterLeaderWatcher removes a leader change watcher.
 func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	if watchers, ok := sh.leaderWatchers[key]; ok {
 		delete(watchers, connID)
 		if len(watchers) == 0 {
 			delete(sh.leaderWatchers, key)
 		}
 	}
+	sh.mu.Unlock()
+
+	lm.connMu.Lock()
+	if keys, ok := lm.connLeaderKeys[connID]; ok {
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(lm.connLeaderKeys, connID)
+		}
+	}
+	lm.connMu.Unlock()
 }
 
 // UnregisterAllLeaderWatchers removes all leader change watchers for a connection.
 func (lm *LockManager) UnregisterAllLeaderWatchers(connID uint64) {
-	for i := range lm.shards {
-		sh := &lm.shards[i]
+	lm.connMu.Lock()
+	keys := lm.connLeaderKeys[connID]
+	delete(lm.connLeaderKeys, connID)
+	lm.connMu.Unlock()
+
+	for key := range keys {
+		sh := lm.shardFor(key)
 		sh.mu.Lock()
-		for key, watchers := range sh.leaderWatchers {
+		if watchers, ok := sh.leaderWatchers[key]; ok {
 			delete(watchers, connID)
 			if len(watchers) == 0 {
 				delete(sh.leaderWatchers, key)
@@ -1807,7 +1895,7 @@ func (lm *LockManager) UnregisterAllLeaderWatchers(connID uint64) {
 
 // NotifyLeaderChange sends a leader change event to all watchers of a key.
 // excludeConnID allows skipping the connection that triggered the event
-// (pass 0 to notify all watchers).
+// (pass 0 to notify all watchers). Disconnects slow consumers.
 func (lm *LockManager) NotifyLeaderChange(key, eventType string, excludeConnID uint64) {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
@@ -1817,15 +1905,32 @@ func (lm *LockManager) NotifyLeaderChange(key, eventType string, excludeConnID u
 		return
 	}
 	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
-	for connID, ch := range watchers {
+	for connID, lw := range watchers {
 		if connID == excludeConnID {
 			continue
 		}
 		select {
-		case ch <- msg:
+		case lw.ch <- msg:
 		default:
+			lw.cancelConn()
 		}
 	}
+}
+
+// LeaderHolder returns the connID of the current leader (lock holder) for a key,
+// or 0 if no one holds the lock.
+func (lm *LockManager) LeaderHolder(key string) uint64 {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st, ok := sh.resources[key]
+	if !ok {
+		return 0
+	}
+	for _, h := range st.Holders {
+		return h.connID
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1985,6 +2090,19 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 							eqKey := connKey{ConnID: h.connID, Key: key}
 							if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 								delete(lm.connEnqueued, eqKey)
+							}
+							// Clean up leader watcher for the expired holder.
+							if watchers, wok := sh.leaderWatchers[key]; wok {
+								delete(watchers, h.connID)
+								if len(watchers) == 0 {
+									delete(sh.leaderWatchers, key)
+								}
+							}
+							if keys, kok := lm.connLeaderKeys[h.connID]; kok {
+								delete(keys, key)
+								if len(keys) == 0 {
+									delete(lm.connLeaderKeys, h.connID)
+								}
 							}
 							expired = append(expired, token)
 						}

@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,8 +23,9 @@ import (
 )
 
 type connState struct {
-	id      uint64
-	writeCh chan []byte
+	id         uint64
+	writeCh    chan []byte
+	cancelConn func() // cancels the connection context (disconnect slow consumer)
 }
 
 type Server struct {
@@ -184,7 +184,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	writeCh := make(chan []byte, 64)
 	var pushWg sync.WaitGroup
 
-	cs := &connState{id: connID, writeCh: writeCh}
+	cs := &connState{id: connID, writeCh: writeCh, cancelConn: connCancel}
 
 	writeResp := func(data []byte) error {
 		writeMu.Lock()
@@ -423,18 +423,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	// --- Phase 2: KV with TTL ---
 
 	case "kset":
-		value := req.Value
-		ttl := 0
-		// TTL is always the last space-separated token. The client always
-		// appends an explicit TTL (0 = no expiry) to avoid ambiguity.
-		if idx := strings.LastIndex(value, " "); idx >= 0 {
-			candidate := value[idx+1:]
-			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 {
-				ttl = n
-				value = value[:idx]
-			}
-		}
-		if err := s.lm.KVSet(req.Key, value, ttl); err != nil {
+		if err := s.lm.KVSet(req.Key, req.Value, req.TTLSeconds); err != nil {
 			if errors.Is(err, lock.ErrMaxKeys) {
 				return &protocol.Ack{Status: "error_max_keys"}
 			}
@@ -456,16 +445,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok"}
 
 	case "kcas":
-		value := req.Value
-		ttl := 0
-		if idx := strings.LastIndex(value, " "); idx >= 0 {
-			candidate := value[idx+1:]
-			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 {
-				ttl = n
-				value = value[:idx]
-			}
-		}
-		ok, err := s.lm.KVCAS(req.Key, req.OldValue, value, ttl)
+		ok, err := s.lm.KVCAS(req.Key, req.OldValue, req.Value, req.TTLSeconds)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxKeys) {
 				return &protocol.Ack{Status: "error_max_keys"}
@@ -661,9 +641,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "watch":
 		w := &watch.Watcher{
-			ConnID:  connID,
-			Pattern: req.Key,
-			WriteCh: cs.writeCh,
+			ConnID:     connID,
+			Pattern:    req.Key,
+			WriteCh:    cs.writeCh,
+			CancelConn: cs.cancelConn,
 		}
 		if err := s.wm.Watch(w); err != nil {
 			return &protocol.Ack{Status: "error"}
@@ -712,8 +693,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		s.lm.RegisterLeaderWatcher(req.Key, connID, cs.writeCh)
-		s.lm.NotifyLeaderChange(req.Key, "elected", connID)
+		s.lm.RegisterAndNotifyLeader(req.Key, "elected", connID, cs.writeCh, cs.cancelConn)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "resign":
@@ -725,7 +705,15 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "error"}
 
 	case "observe":
-		s.lm.RegisterLeaderWatcher(req.Key, connID, cs.writeCh)
+		s.lm.RegisterLeaderWatcher(req.Key, connID, cs.writeCh, cs.cancelConn)
+		// Send current leader status so observer doesn't miss existing leader.
+		if holderConn := s.lm.LeaderHolder(req.Key); holderConn > 0 {
+			msg := []byte(fmt.Sprintf("leader elected %s\n", req.Key))
+			select {
+			case cs.writeCh <- msg:
+			default:
+			}
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	case "unobserve":

@@ -54,6 +54,7 @@ type Request struct {
 	Delta          int64  // incr, decr, cset
 	Value          string // kset, signal, lpush, rpush
 	OldValue       string // kcas: expected old value
+	TTLSeconds     int    // kset, kcas: TTL in seconds (0 = no expiry)
 	Start          int    // lrange
 	Stop           int    // lrange
 	Group          string // listen, unlisten: queue group name
@@ -414,9 +415,22 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 
 	case "kset":
 		if arg == "" {
-			return nil, &ProtocolError{Code: 8, Message: "kset arg must be: <value> [<ttl_s>]"}
+			return nil, &ProtocolError{Code: 8, Message: "kset arg must be: <value>\\t<ttl_s>"}
 		}
-		return &Request{Cmd: cmd, Key: key, Value: arg}, nil
+		// Format: <value>\t<ttl> — tab separates value from TTL to avoid ambiguity
+		// when values end with numbers. If no tab, entire arg is value with TTL=0.
+		req := &Request{Cmd: cmd, Key: key}
+		if tabIdx := strings.LastIndex(arg, "\t"); tabIdx >= 0 {
+			req.Value = arg[:tabIdx]
+			if n, err := strconv.Atoi(arg[tabIdx+1:]); err == nil && n >= 0 {
+				req.TTLSeconds = n
+			} else {
+				return nil, &ProtocolError{Code: 8, Message: "kset: invalid TTL after tab"}
+			}
+		} else {
+			req.Value = arg
+		}
+		return req, nil
 
 	case "kget":
 		return &Request{Cmd: cmd, Key: key}, nil
@@ -602,16 +616,23 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 
 	case "kcas":
 		if arg == "" {
-			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value> <ttl>"}
+			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value>\\t<ttl>"}
 		}
-		// Split on tab to separate old_value from new_value+ttl
-		tabIdx := strings.Index(arg, "\t")
-		if tabIdx < 0 {
-			return nil, &ProtocolError{Code: 8, Message: "kcas arg must contain tab separator"}
+		// Format: <old_value>\t<new_value>\t<ttl> — tab-separated.
+		// Two tabs required: old_value, new_value, TTL.
+		parts := strings.Split(arg, "\t")
+		if len(parts) < 2 {
+			return nil, &ProtocolError{Code: 8, Message: "kcas arg must contain tab separators"}
 		}
-		oldVal := arg[:tabIdx]
-		rest := arg[tabIdx+1:]
-		return &Request{Cmd: cmd, Key: key, OldValue: oldVal, Value: rest}, nil
+		req := &Request{Cmd: cmd, Key: key, OldValue: parts[0], Value: parts[1]}
+		if len(parts) >= 3 {
+			if n, err := strconv.Atoi(parts[2]); err == nil && n >= 0 {
+				req.TTLSeconds = n
+			} else {
+				return nil, &ProtocolError{Code: 8, Message: "kcas: invalid TTL"}
+			}
+		}
+		return req, nil
 
 	// --- Watch/Notify ---
 

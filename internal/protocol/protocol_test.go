@@ -576,7 +576,7 @@ func TestReadRequest_IncrBadDelta(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestReadRequest_Kset(t *testing.T) {
-	r := makeReader("kset", "mykey", "hello 60")
+	r := makeReader("kset", "mykey", "hello\t60")
 	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -587,8 +587,11 @@ func TestReadRequest_Kset(t *testing.T) {
 	if req.Key != "mykey" {
 		t.Fatalf("key: got %q", req.Key)
 	}
-	if req.Value != "hello 60" {
+	if req.Value != "hello" {
 		t.Fatalf("value: got %q", req.Value)
+	}
+	if req.TTLSeconds != 60 {
+		t.Fatalf("ttl: got %d", req.TTLSeconds)
 	}
 }
 
@@ -906,7 +909,7 @@ func TestReadRequest_UnlistenWithoutGroup(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestReadRequest_KCAS(t *testing.T) {
-	r := makeReader("kcas", "mykey", "old\tnew 60")
+	r := makeReader("kcas", "mykey", "old\tnew\t60")
 	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -920,13 +923,16 @@ func TestReadRequest_KCAS(t *testing.T) {
 	if req.OldValue != "old" {
 		t.Fatalf("old_value: got %q", req.OldValue)
 	}
-	if req.Value != "new 60" {
+	if req.Value != "new" {
 		t.Fatalf("value: got %q", req.Value)
+	}
+	if req.TTLSeconds != 60 {
+		t.Fatalf("ttl: got %d", req.TTLSeconds)
 	}
 }
 
 func TestReadRequest_KCAS_EmptyOld(t *testing.T) {
-	r := makeReader("kcas", "mykey", "\tnew 0")
+	r := makeReader("kcas", "mykey", "\tnew\t0")
 	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -934,8 +940,11 @@ func TestReadRequest_KCAS_EmptyOld(t *testing.T) {
 	if req.OldValue != "" {
 		t.Fatalf("old_value: got %q, want empty", req.OldValue)
 	}
-	if req.Value != "new 0" {
+	if req.Value != "new" {
 		t.Fatalf("value: got %q", req.Value)
+	}
+	if req.TTLSeconds != 0 {
+		t.Fatalf("ttl: got %d", req.TTLSeconds)
 	}
 }
 

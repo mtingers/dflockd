@@ -8,9 +8,10 @@ import (
 
 // Watcher represents a connection watching for key changes.
 type Watcher struct {
-	ConnID  uint64
-	Pattern string     // exact key or wildcard pattern (*, >)
-	WriteCh chan []byte // reuses connection's push channel
+	ConnID     uint64
+	Pattern    string     // exact key or wildcard pattern (*, >)
+	WriteCh    chan []byte // reuses connection's push channel
+	CancelConn func()     // called when WriteCh is full (slow consumer)
 }
 
 type watcherEntry struct {
@@ -157,6 +158,7 @@ func (m *Manager) UnwatchAll(connID uint64) {
 }
 
 // Notify sends a watch event to all watchers matching the key.
+// Slow consumers (full WriteCh) are disconnected via CancelConn.
 func (m *Manager) Notify(eventType, key string) {
 	msg := []byte(fmt.Sprintf("watch %s %s\n", eventType, key))
 
@@ -173,6 +175,9 @@ func (m *Manager) Notify(eventType, key string) {
 			select {
 			case w.WriteCh <- msg:
 			default:
+				if w.CancelConn != nil {
+					w.CancelConn()
+				}
 			}
 			delivered[connID] = struct{}{}
 		}
@@ -187,6 +192,9 @@ func (m *Manager) Notify(eventType, key string) {
 			select {
 			case w.WriteCh <- msg:
 			default:
+				if w.CancelConn != nil {
+					w.CancelConn()
+				}
 			}
 			delivered[w.ConnID] = struct{}{}
 		}

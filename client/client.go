@@ -682,8 +682,8 @@ func KVSet(c *Conn, key, value string, ttlSeconds int) error {
 	if ttlSeconds < 0 {
 		ttlSeconds = 0
 	}
-	// Always send TTL explicitly to avoid ambiguity with numeric values.
-	arg := value + " " + strconv.Itoa(ttlSeconds)
+	// Tab separates value from TTL to avoid ambiguity with numeric values.
+	arg := value + "\t" + strconv.Itoa(ttlSeconds)
 	resp, err := c.sendRecv("kset", key, arg)
 	if err != nil {
 		return err
@@ -750,7 +750,7 @@ func KVCAS(c *Conn, key, oldValue, newValue string, ttlSeconds int) (bool, error
 	if ttlSeconds < 0 {
 		ttlSeconds = 0
 	}
-	arg := oldValue + "\t" + newValue + " " + strconv.Itoa(ttlSeconds)
+	arg := oldValue + "\t" + newValue + "\t" + strconv.Itoa(ttlSeconds)
 	resp, err := c.sendRecv("kcas", key, arg)
 	if err != nil {
 		return false, err
@@ -811,18 +811,24 @@ func (sc *SignalConn) readLoop() {
 			// Parse: "sig <channel> <payload>"
 			rest := line[4:]
 			idx := strings.Index(rest, " ")
-			if idx >= 0 {
-				sig := Signal{
-					Channel: rest[:idx],
-					Payload: rest[idx+1:],
-				}
-				select {
-				case sc.sigCh <- sig:
-				default:
-				}
+			if idx < 0 {
+				continue // malformed push — drop
+			}
+			sig := Signal{
+				Channel: rest[:idx],
+				Payload: rest[idx+1:],
+			}
+			select {
+			case sc.sigCh <- sig:
+			default:
 			}
 		} else {
-			sc.respCh <- line
+			// Non-blocking send prevents deadlock if an unexpected
+			// extra response arrives when no sendCmd is waiting.
+			select {
+			case sc.respCh <- line:
+			default:
+			}
 		}
 	}
 }
@@ -1440,6 +1446,10 @@ func (l *Lock) startRenew() {
 					if ctx.Err() != nil {
 						return // Deliberately stopped; not a real failure.
 					}
+					// Clear token to prevent stale lock usage.
+					l.mu.Lock()
+					l.token = ""
+					l.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
 					}
@@ -2660,18 +2670,22 @@ func (wc *WatchConn) readLoop() {
 			// Parse: "watch <event_type> <key>"
 			rest := line[6:]
 			idx := strings.Index(rest, " ")
-			if idx >= 0 {
-				ev := WatchEvent{
-					Type: rest[:idx],
-					Key:  rest[idx+1:],
-				}
-				select {
-				case wc.eventCh <- ev:
-				default:
-				}
+			if idx < 0 {
+				continue // malformed push — drop
+			}
+			ev := WatchEvent{
+				Type: rest[:idx],
+				Key:  rest[idx+1:],
+			}
+			select {
+			case wc.eventCh <- ev:
+			default:
 			}
 		} else {
-			wc.respCh <- line
+			select {
+			case wc.respCh <- line:
+			default:
+			}
 		}
 	}
 }
@@ -2804,18 +2818,22 @@ func (lc *LeaderConn) readLoop() {
 			// Parse: "leader <event> <key>"
 			rest := line[7:]
 			idx := strings.Index(rest, " ")
-			if idx >= 0 {
-				ev := LeaderEvent{
-					Type: rest[:idx],
-					Key:  rest[idx+1:],
-				}
-				select {
-				case lc.eventCh <- ev:
-				default:
-				}
+			if idx < 0 {
+				continue // malformed push — drop
+			}
+			ev := LeaderEvent{
+				Type: rest[:idx],
+				Key:  rest[idx+1:],
+			}
+			select {
+			case lc.eventCh <- ev:
+			default:
 			}
 		} else {
-			lc.respCh <- line
+			select {
+			case lc.respCh <- line:
+			default:
+			}
 		}
 	}
 }
@@ -3206,8 +3224,16 @@ func (e *Election) startRenew() {
 					if ctx.Err() != nil {
 						return
 					}
+					// Clear leadership state to prevent split-brain.
+					e.mu.Lock()
+					e.isLeader = false
+					e.token = ""
+					e.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
+					}
+					if e.OnResigned != nil {
+						e.OnResigned()
 					}
 					return
 				}
