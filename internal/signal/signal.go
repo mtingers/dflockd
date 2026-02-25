@@ -4,32 +4,50 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Listener represents a connection listening for signals on a pattern.
 type Listener struct {
 	ConnID  uint64
 	Pattern string
+	Group   string // empty = non-grouped (individual delivery)
 	WriteCh chan []byte
 }
 
 type listenerEntry struct {
 	pattern string
+	group   string // empty = non-grouped
 	isWild  bool
+}
+
+// queueGroup tracks members of a named group for a specific pattern.
+type queueGroup struct {
+	members []*Listener
+	counter atomic.Uint64 // round-robin index, safe under RLock
+}
+
+type wildGroupEntry struct {
+	pattern string
+	group   string
+	qg      *queueGroup
 }
 
 // ChannelInfo holds stats about a signal channel/pattern.
 type ChannelInfo struct {
 	Pattern   string `json:"pattern"`
+	Group     string `json:"group,omitempty"`
 	Listeners int    `json:"listeners"`
 }
 
 // Manager manages signal subscriptions and delivery.
 type Manager struct {
 	mu            sync.RWMutex
-	exact         map[string]map[uint64]*Listener  // channel → connID → listener
-	wildcards     []*Listener                       // checked on every signal
+	exact         map[string]map[uint64]*Listener  // channel → connID → listener (non-grouped)
+	wildcards     []*Listener                       // non-grouped wildcards
 	connListeners map[uint64][]*listenerEntry       // connID → list of registrations
+	exactGroups   map[string]map[string]*queueGroup // channel → groupName → queueGroup
+	wildGroups    []*wildGroupEntry                  // wildcard group entries
 }
 
 // NewManager creates a new signal manager.
@@ -37,6 +55,7 @@ func NewManager() *Manager {
 	return &Manager{
 		exact:         make(map[string]map[uint64]*Listener),
 		connListeners: make(map[uint64][]*listenerEntry),
+		exactGroups:   make(map[string]map[string]*queueGroup),
 	}
 }
 
@@ -75,7 +94,7 @@ func MatchPattern(pattern, channel string) bool {
 }
 
 // Listen registers a listener for the pattern specified in listener.Pattern.
-// Duplicate subscriptions (same connID + pattern) are ignored.
+// Duplicate subscriptions (same connID + pattern + group) are ignored.
 // Returns an error if the pattern is invalid (e.g. ">" not as last token).
 func (m *Manager) Listen(listener *Listener) error {
 	pattern := listener.Pattern
@@ -85,50 +104,128 @@ func (m *Manager) Listen(listener *Listener) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check for duplicate subscription
+	// Check for duplicate subscription (same connID + pattern + group)
 	for _, e := range m.connListeners[listener.ConnID] {
-		if e.pattern == pattern {
+		if e.pattern == pattern && e.group == listener.Group {
 			return nil // already subscribed
 		}
 	}
 
 	wild := isWildPattern(pattern)
-	if wild {
-		m.wildcards = append(m.wildcards, listener)
-	} else {
-		subs, ok := m.exact[pattern]
-		if !ok {
-			subs = make(map[uint64]*Listener)
-			m.exact[pattern] = subs
+	group := listener.Group
+
+	if group == "" {
+		// Non-grouped path (existing behavior)
+		if wild {
+			m.wildcards = append(m.wildcards, listener)
+		} else {
+			subs, ok := m.exact[pattern]
+			if !ok {
+				subs = make(map[uint64]*Listener)
+				m.exact[pattern] = subs
+			}
+			subs[listener.ConnID] = listener
 		}
-		subs[listener.ConnID] = listener
+	} else {
+		// Grouped path
+		if wild {
+			// Find existing wildGroupEntry or create new one
+			var found *queueGroup
+			for _, wge := range m.wildGroups {
+				if wge.pattern == pattern && wge.group == group {
+					found = wge.qg
+					break
+				}
+			}
+			if found == nil {
+				found = &queueGroup{}
+				m.wildGroups = append(m.wildGroups, &wildGroupEntry{
+					pattern: pattern,
+					group:   group,
+					qg:      found,
+				})
+			}
+			found.members = append(found.members, listener)
+		} else {
+			groups, ok := m.exactGroups[pattern]
+			if !ok {
+				groups = make(map[string]*queueGroup)
+				m.exactGroups[pattern] = groups
+			}
+			qg, ok := groups[group]
+			if !ok {
+				qg = &queueGroup{}
+				groups[group] = qg
+			}
+			qg.members = append(qg.members, listener)
+		}
 	}
 
 	m.connListeners[listener.ConnID] = append(m.connListeners[listener.ConnID], &listenerEntry{
 		pattern: pattern,
+		group:   group,
 		isWild:  wild,
 	})
 	return nil
 }
 
-// Unlisten removes a listener for a specific pattern and connID.
-func (m *Manager) Unlisten(pattern string, connID uint64) {
+// Unlisten removes a listener for a specific pattern, connID, and group.
+func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	wild := isWildPattern(pattern)
-	if wild {
-		for i, l := range m.wildcards {
-			if l.ConnID == connID && l.Pattern == pattern {
-				m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
-				break
+
+	if group == "" {
+		// Non-grouped removal
+		if wild {
+			for i, l := range m.wildcards {
+				if l.ConnID == connID && l.Pattern == pattern {
+					m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
+					break
+				}
+			}
+		} else {
+			if subs, ok := m.exact[pattern]; ok {
+				delete(subs, connID)
+				if len(subs) == 0 {
+					delete(m.exact, pattern)
+				}
 			}
 		}
 	} else {
-		if subs, ok := m.exact[pattern]; ok {
-			delete(subs, connID)
-			if len(subs) == 0 {
-				delete(m.exact, pattern)
+		// Grouped removal
+		if wild {
+			for wi, wge := range m.wildGroups {
+				if wge.pattern == pattern && wge.group == group {
+					for mi, mem := range wge.qg.members {
+						if mem.ConnID == connID {
+							wge.qg.members = append(wge.qg.members[:mi], wge.qg.members[mi+1:]...)
+							break
+						}
+					}
+					if len(wge.qg.members) == 0 {
+						m.wildGroups = append(m.wildGroups[:wi], m.wildGroups[wi+1:]...)
+					}
+					break
+				}
+			}
+		} else {
+			if groups, ok := m.exactGroups[pattern]; ok {
+				if qg, ok := groups[group]; ok {
+					for mi, mem := range qg.members {
+						if mem.ConnID == connID {
+							qg.members = append(qg.members[:mi], qg.members[mi+1:]...)
+							break
+						}
+					}
+					if len(qg.members) == 0 {
+						delete(groups, group)
+						if len(groups) == 0 {
+							delete(m.exactGroups, pattern)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -136,7 +233,7 @@ func (m *Manager) Unlisten(pattern string, connID uint64) {
 	// Update reverse index
 	entries := m.connListeners[connID]
 	for i, e := range entries {
-		if e.pattern == pattern {
+		if e.pattern == pattern && e.group == group {
 			entries = append(entries[:i], entries[i+1:]...)
 			break
 		}
@@ -146,6 +243,30 @@ func (m *Manager) Unlisten(pattern string, connID uint64) {
 	} else {
 		m.connListeners[connID] = entries
 	}
+}
+
+// deliverToGroup delivers a message to one member of a queue group via round-robin.
+// Returns true if a delivery was made. The delivered connID is added to the delivered map.
+func deliverToGroup(qg *queueGroup, msg []byte, delivered map[uint64]struct{}) bool {
+	n := len(qg.members)
+	if n == 0 {
+		return false
+	}
+	start := qg.counter.Add(1) - 1
+	for i := 0; i < n; i++ {
+		idx := int((start + uint64(i)) % uint64(n))
+		mem := qg.members[idx]
+		if _, already := delivered[mem.ConnID]; already {
+			continue
+		}
+		select {
+		case mem.WriteCh <- msg:
+		default:
+		}
+		delivered[mem.ConnID] = struct{}{}
+		return true
+	}
+	return false
 }
 
 // Signal sends a payload to all listeners matching the literal channel.
@@ -160,7 +281,7 @@ func (m *Manager) Signal(channel, payload string) int {
 	// should only receive the signal once.
 	delivered := make(map[uint64]struct{})
 
-	// Exact match
+	// 1. Exact non-grouped
 	if subs, ok := m.exact[channel]; ok {
 		for connID, l := range subs {
 			select {
@@ -172,7 +293,14 @@ func (m *Manager) Signal(channel, payload string) int {
 		}
 	}
 
-	// Wildcard match
+	// 2. Exact grouped — for each group matching channel, deliver to one member
+	if groups, ok := m.exactGroups[channel]; ok {
+		for _, qg := range groups {
+			deliverToGroup(qg, msg, delivered)
+		}
+	}
+
+	// 3. Wildcard non-grouped
 	for _, l := range m.wildcards {
 		if _, already := delivered[l.ConnID]; already {
 			continue
@@ -186,6 +314,13 @@ func (m *Manager) Signal(channel, payload string) int {
 		}
 	}
 
+	// 4. Wildcard grouped
+	for _, wge := range m.wildGroups {
+		if MatchPattern(wge.pattern, channel) {
+			deliverToGroup(wge.qg, msg, delivered)
+		}
+	}
+
 	return len(delivered)
 }
 
@@ -196,18 +331,56 @@ func (m *Manager) UnlistenAll(connID uint64) {
 
 	entries := m.connListeners[connID]
 	for _, e := range entries {
-		if e.isWild {
-			for i, l := range m.wildcards {
-				if l.ConnID == connID && l.Pattern == e.pattern {
-					m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
-					break
+		if e.group == "" {
+			// Non-grouped
+			if e.isWild {
+				for i, l := range m.wildcards {
+					if l.ConnID == connID && l.Pattern == e.pattern {
+						m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
+						break
+					}
+				}
+			} else {
+				if subs, ok := m.exact[e.pattern]; ok {
+					delete(subs, connID)
+					if len(subs) == 0 {
+						delete(m.exact, e.pattern)
+					}
 				}
 			}
 		} else {
-			if subs, ok := m.exact[e.pattern]; ok {
-				delete(subs, connID)
-				if len(subs) == 0 {
-					delete(m.exact, e.pattern)
+			// Grouped
+			if e.isWild {
+				for wi, wge := range m.wildGroups {
+					if wge.pattern == e.pattern && wge.group == e.group {
+						for mi, mem := range wge.qg.members {
+							if mem.ConnID == connID {
+								wge.qg.members = append(wge.qg.members[:mi], wge.qg.members[mi+1:]...)
+								break
+							}
+						}
+						if len(wge.qg.members) == 0 {
+							m.wildGroups = append(m.wildGroups[:wi], m.wildGroups[wi+1:]...)
+						}
+						break
+					}
+				}
+			} else {
+				if groups, ok := m.exactGroups[e.pattern]; ok {
+					if qg, ok := groups[e.group]; ok {
+						for mi, mem := range qg.members {
+							if mem.ConnID == connID {
+								qg.members = append(qg.members[:mi], qg.members[mi+1:]...)
+								break
+							}
+						}
+						if len(qg.members) == 0 {
+							delete(groups, e.group)
+							if len(groups) == 0 {
+								delete(m.exactGroups, e.pattern)
+							}
+						}
+					}
 				}
 			}
 		}
@@ -222,7 +395,7 @@ func (m *Manager) Stats() []ChannelInfo {
 
 	result := []ChannelInfo{}
 
-	// Count exact listeners per channel
+	// Non-grouped exact listeners per channel
 	for ch, subs := range m.exact {
 		result = append(result, ChannelInfo{
 			Pattern:   ch,
@@ -230,7 +403,7 @@ func (m *Manager) Stats() []ChannelInfo {
 		})
 	}
 
-	// Count wildcard listeners per pattern
+	// Non-grouped wildcard listeners per pattern
 	wildCounts := make(map[string]int)
 	for _, l := range m.wildcards {
 		wildCounts[l.Pattern]++
@@ -239,6 +412,26 @@ func (m *Manager) Stats() []ChannelInfo {
 		result = append(result, ChannelInfo{
 			Pattern:   pat,
 			Listeners: count,
+		})
+	}
+
+	// Grouped exact listeners
+	for ch, groups := range m.exactGroups {
+		for groupName, qg := range groups {
+			result = append(result, ChannelInfo{
+				Pattern:   ch,
+				Group:     groupName,
+				Listeners: len(qg.members),
+			})
+		}
+	}
+
+	// Grouped wildcard listeners
+	for _, wge := range m.wildGroups {
+		result = append(result, ChannelInfo{
+			Pattern:   wge.pattern,
+			Group:     wge.group,
+			Listeners: len(wge.qg.members),
 		})
 	}
 

@@ -235,7 +235,7 @@ func TestUnlistenExact(t *testing.T) {
 		t.Fatal("expected message before unlisten")
 	}
 
-	m.Unlisten("ch", 1)
+	m.Unlisten("ch", 1, "")
 
 	n = m.Signal("ch", "after")
 	if n != 0 {
@@ -265,7 +265,7 @@ func TestUnlistenWildcard(t *testing.T) {
 		t.Fatal("expected message before unlisten")
 	}
 
-	m.Unlisten("ch.*", 1)
+	m.Unlisten("ch.*", 1, "")
 
 	n = m.Signal("ch.a", "after")
 	if n != 0 {
@@ -372,7 +372,7 @@ func TestSignalReturnsCount(t *testing.T) {
 	// "c*" is treated as a wildcard (contains *), but MatchPattern("c*","ch")
 	// would split on '.' giving tokens ["c*"] vs ["ch"]. "c*" != "*" and != "ch",
 	// so it won't match. Use a proper dotted wildcard instead.
-	m.Unlisten("c*", 2)
+	m.Unlisten("c*", 2, "")
 
 	l2b := makeListener(2, "*")
 	m.Listen(l2b)
@@ -430,7 +430,7 @@ func TestStats(t *testing.T) {
 	}
 
 	// After removing one exact listener, count should update.
-	m.Unlisten("exact.ch", 1)
+	m.Unlisten("exact.ch", 1, "")
 	stats = m.Stats()
 	lookup = make(map[string]int, len(stats))
 	for _, ci := range stats {
@@ -441,7 +441,7 @@ func TestStats(t *testing.T) {
 	}
 
 	// After removing all exact listeners, the pattern should disappear.
-	m.Unlisten("exact.ch", 2)
+	m.Unlisten("exact.ch", 2, "")
 	stats = m.Stats()
 	lookup = make(map[string]int, len(stats))
 	for _, ci := range stats {
@@ -449,5 +449,344 @@ func TestStats(t *testing.T) {
 	}
 	if _, ok := lookup["exact.ch"]; ok {
 		t.Error("exact.ch should be absent after all listeners removed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Queue Group Tests
+// ---------------------------------------------------------------------------
+
+func makeGroupListener(connID uint64, pattern, group string) *Listener {
+	return &Listener{
+		ConnID:  connID,
+		Pattern: pattern,
+		Group:   group,
+		WriteCh: make(chan []byte, 16),
+	}
+}
+
+// 14. BasicRoundRobin — 2 grouped listeners, signal twice, each gets one
+func TestQueueGroup_BasicRoundRobin(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "tasks.email", "workers")
+	b := makeGroupListener(2, "tasks.email", "workers")
+	m.Listen(a)
+	m.Listen(b)
+
+	n := m.Signal("tasks.email", "job1")
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1", n)
+	}
+
+	n = m.Signal("tasks.email", "job2")
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1", n)
+	}
+
+	// Each should have received exactly one message
+	msgA, okA := recvWithin(a.WriteCh, timeout)
+	msgB, okB := recvWithin(b.WriteCh, timeout)
+	if !okA || !okB {
+		t.Fatalf("expected both to receive one message: A=%v B=%v", okA, okB)
+	}
+	// Should not receive a second message
+	_, extraA := recvWithin(a.WriteCh, timeout)
+	_, extraB := recvWithin(b.WriteCh, timeout)
+	if extraA || extraB {
+		t.Fatal("one listener got more than one message")
+	}
+	_ = msgA
+	_ = msgB
+}
+
+// 15. MixedGroupAndIndividual — A,B grouped + C different group + D non-grouped = 3 deliveries
+func TestQueueGroup_MixedGroupAndIndividual(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "tasks.email", "worker-pool")
+	b := makeGroupListener(2, "tasks.email", "worker-pool")
+	c := makeGroupListener(3, "tasks.email", "audit-logger")
+	d := makeListener(4, "tasks.email")
+	m.Listen(a)
+	m.Listen(b)
+	m.Listen(c)
+	m.Listen(d)
+
+	n := m.Signal("tasks.email", "payload")
+	// D (individual) + one of A/B (round-robin) + C (audit group) = 3
+	if n != 3 {
+		t.Fatalf("Signal returned %d, want 3", n)
+	}
+
+	// D should always receive
+	_, okD := recvWithin(d.WriteCh, timeout)
+	if !okD {
+		t.Fatal("non-grouped listener D did not receive")
+	}
+
+	// C should always receive (only member of audit-logger group)
+	_, okC := recvWithin(c.WriteCh, timeout)
+	if !okC {
+		t.Fatal("audit-logger group member C did not receive")
+	}
+
+	// Exactly one of A or B should receive
+	_, okA := recvWithin(a.WriteCh, timeout)
+	_, okB := recvWithin(b.WriteCh, timeout)
+	if okA == okB {
+		t.Fatalf("expected exactly one of A/B to receive: A=%v B=%v", okA, okB)
+	}
+}
+
+// 16. DedupWithIndividual — connID in group + non-grouped, receives once, group advances
+func TestQueueGroup_DedupWithIndividual(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 16)
+	// Same connID, same WriteCh — registered as both non-grouped and grouped
+	individual := &Listener{ConnID: 1, Pattern: "ch", WriteCh: ch}
+	grouped := &Listener{ConnID: 1, Pattern: "ch", Group: "g1", WriteCh: ch}
+	m.Listen(individual)
+	m.Listen(grouped)
+
+	n := m.Signal("ch", "payload")
+	// ConnID 1 already delivered via non-grouped, so the group delivery is skipped.
+	// Only 1 unique connection delivered.
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1", n)
+	}
+
+	// Should have exactly one message on the channel
+	_, ok := recvWithin(ch, timeout)
+	if !ok {
+		t.Fatal("expected one message")
+	}
+	_, ok = recvWithin(ch, timeout)
+	if ok {
+		t.Fatal("got duplicate message; dedup failed")
+	}
+}
+
+// 17. WildcardGroup — grouped wildcard listeners, only one receives
+func TestQueueGroup_Wildcard(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "tasks.*", "workers")
+	b := makeGroupListener(2, "tasks.*", "workers")
+	m.Listen(a)
+	m.Listen(b)
+
+	n := m.Signal("tasks.email", "job1")
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1", n)
+	}
+
+	_, okA := recvWithin(a.WriteCh, timeout)
+	_, okB := recvWithin(b.WriteCh, timeout)
+	if okA == okB {
+		t.Fatalf("expected exactly one of A/B: A=%v B=%v", okA, okB)
+	}
+}
+
+// 18. Unlisten — remove one grouped member, remaining gets all signals
+func TestQueueGroup_Unlisten(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	b := makeGroupListener(2, "ch", "g1")
+	m.Listen(a)
+	m.Listen(b)
+
+	m.Unlisten("ch", 1, "g1")
+
+	// Only B remains in group
+	n := m.Signal("ch", "payload")
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1", n)
+	}
+	_, ok := recvWithin(b.WriteCh, timeout)
+	if !ok {
+		t.Fatal("remaining member B did not receive")
+	}
+	_, ok = recvWithin(a.WriteCh, timeout)
+	if ok {
+		t.Fatal("removed member A should not receive")
+	}
+}
+
+// 19. UnlistenAll — cleanup removes grouped registrations
+func TestQueueGroup_UnlistenAll(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	b := makeGroupListener(1, "wild.*", "g2")
+	m.Listen(a)
+	m.Listen(b)
+
+	m.UnlistenAll(1)
+
+	if n := m.Signal("ch", "x"); n != 0 {
+		t.Errorf("exact grouped: Signal returned %d, want 0", n)
+	}
+	if n := m.Signal("wild.a", "x"); n != 0 {
+		t.Errorf("wild grouped: Signal returned %d, want 0", n)
+	}
+}
+
+// 20. MultipleGroups — two groups on same pattern, one delivery per group
+func TestQueueGroup_MultipleGroups(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	b := makeGroupListener(2, "ch", "g1")
+	c := makeGroupListener(3, "ch", "g2")
+	d := makeGroupListener(4, "ch", "g2")
+	m.Listen(a)
+	m.Listen(b)
+	m.Listen(c)
+	m.Listen(d)
+
+	n := m.Signal("ch", "payload")
+	// One from g1 + one from g2 = 2
+	if n != 2 {
+		t.Fatalf("Signal returned %d, want 2", n)
+	}
+}
+
+// 21. DuplicateSubscription — same connID+pattern+group ignored
+func TestQueueGroup_DuplicateSubscription(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	m.Listen(a)
+
+	// Duplicate
+	a2 := makeGroupListener(1, "ch", "g1")
+	m.Listen(a2)
+
+	n := m.Signal("ch", "payload")
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1 (duplicate should be ignored)", n)
+	}
+}
+
+// 22. SamePatternDifferentGroups — same connID, same pattern, two groups = both registered
+func TestQueueGroup_SamePatternDifferentGroups(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	b := makeGroupListener(1, "ch", "g2")
+	m.Listen(a)
+	m.Listen(b)
+
+	n := m.Signal("ch", "payload")
+	// ConnID 1 is in both groups. First group delivers to connID 1 (marked delivered).
+	// Second group tries connID 1, finds it already delivered, skips.
+	// So only 1 delivery total.
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1 (dedup across groups)", n)
+	}
+}
+
+// 23. Stats — group info in stats output
+func TestQueueGroup_Stats(t *testing.T) {
+	m := NewManager()
+	m.Listen(makeGroupListener(1, "ch", "g1"))
+	m.Listen(makeGroupListener(2, "ch", "g1"))
+	m.Listen(makeGroupListener(3, "ch", "g2"))
+	m.Listen(makeListener(4, "ch"))
+
+	stats := m.Stats()
+	// Should have: ch (non-grouped, 1 listener), ch/g1 (2), ch/g2 (1)
+	type key struct {
+		pattern string
+		group   string
+	}
+	lookup := make(map[key]int)
+	for _, ci := range stats {
+		lookup[key{ci.Pattern, ci.Group}] = ci.Listeners
+	}
+
+	if got := lookup[key{"ch", ""}]; got != 1 {
+		t.Errorf("non-grouped ch: got %d, want 1", got)
+	}
+	if got := lookup[key{"ch", "g1"}]; got != 2 {
+		t.Errorf("ch/g1: got %d, want 2", got)
+	}
+	if got := lookup[key{"ch", "g2"}]; got != 1 {
+		t.Errorf("ch/g2: got %d, want 1", got)
+	}
+}
+
+// 24. RoundRobinDistribution — 99 signals to 3 members, 33 each
+func TestQueueGroup_RoundRobinDistribution(t *testing.T) {
+	m := NewManager()
+	const total = 99
+	listeners := make([]*Listener, 3)
+	for i := range listeners {
+		listeners[i] = &Listener{
+			ConnID:  uint64(i + 1),
+			Pattern: "ch",
+			Group:   "workers",
+			WriteCh: make(chan []byte, total), // large enough to not drop
+		}
+		m.Listen(listeners[i])
+	}
+
+	for i := 0; i < total; i++ {
+		m.Signal("ch", "job")
+	}
+
+	counts := make([]int, 3)
+	for i, l := range listeners {
+		for {
+			_, ok := recvWithin(l.WriteCh, timeout)
+			if !ok {
+				break
+			}
+			counts[i]++
+		}
+	}
+
+	for i, c := range counts {
+		if c != total/3 {
+			t.Errorf("listener %d got %d, want %d", i, c, total/3)
+		}
+	}
+}
+
+// 25. EmptyGroupBackwardCompat — empty group = non-grouped
+func TestQueueGroup_EmptyGroupBackwardCompat(t *testing.T) {
+	m := NewManager()
+	l := makeGroupListener(1, "ch", "")
+	m.Listen(l)
+
+	n := m.Signal("ch", "payload")
+	if n != 1 {
+		t.Fatalf("Signal returned %d, want 1", n)
+	}
+	_, ok := recvWithin(l.WriteCh, timeout)
+	if !ok {
+		t.Fatal("expected message")
+	}
+}
+
+// 26. WildcardMixedGroupAndIndividual — non-grouped wild + grouped wild
+func TestQueueGroup_WildcardMixedGroupAndIndividual(t *testing.T) {
+	m := NewManager()
+	individual := makeListener(1, "tasks.*")
+	groupA := makeGroupListener(2, "tasks.*", "workers")
+	groupB := makeGroupListener(3, "tasks.*", "workers")
+	m.Listen(individual)
+	m.Listen(groupA)
+	m.Listen(groupB)
+
+	n := m.Signal("tasks.email", "job")
+	// individual + one of groupA/groupB = 2
+	if n != 2 {
+		t.Fatalf("Signal returned %d, want 2", n)
+	}
+
+	_, okInd := recvWithin(individual.WriteCh, timeout)
+	if !okInd {
+		t.Fatal("individual listener did not receive")
+	}
+
+	_, okA := recvWithin(groupA.WriteCh, timeout)
+	_, okB := recvWithin(groupB.WriteCh, timeout)
+	if okA == okB {
+		t.Fatalf("expected exactly one of A/B: A=%v B=%v", okA, okB)
 	}
 }

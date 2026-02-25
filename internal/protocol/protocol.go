@@ -52,6 +52,7 @@ type Request struct {
 	Value          string // kset, signal, lpush, rpush
 	Start          int    // lrange
 	Stop           int    // lrange
+	Group          string // listen, unlisten: queue group name
 }
 
 type Ack struct {
@@ -416,10 +417,12 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 	// --- Phase 3: Signaling ---
 
 	case "listen":
-		return &Request{Cmd: cmd, Key: key}, nil
+		group := strings.TrimSpace(arg)
+		return &Request{Cmd: cmd, Key: key, Group: group}, nil
 
 	case "unlisten":
-		return &Request{Cmd: cmd, Key: key}, nil
+		group := strings.TrimSpace(arg)
+		return &Request{Cmd: cmd, Key: key, Group: group}, nil
 
 	case "signal":
 		if arg == "" {

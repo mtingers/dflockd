@@ -276,6 +276,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		for _, si := range sigStats {
 			st.SignalChannels = append(st.SignalChannels, lock.SignalChannelInfo{
 				Pattern:   si.Pattern,
+				Group:     si.Group,
 				Listeners: si.Listeners,
 			})
 		}
@@ -442,6 +443,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		listener := &signal.Listener{
 			ConnID:  connID,
 			Pattern: req.Key,
+			Group:   req.Group,
 			WriteCh: cs.writeCh,
 		}
 		if err := s.sig.Listen(listener); err != nil {
@@ -450,7 +452,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok"}
 
 	case "unlisten":
-		s.sig.Unlisten(req.Key, connID)
+		s.sig.Unlisten(req.Key, connID, req.Group)
 		return &protocol.Ack{Status: "ok"}
 
 	case "signal":

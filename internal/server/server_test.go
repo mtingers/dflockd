@@ -2325,6 +2325,163 @@ func TestIntegration_Signal_MixedCommands(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Queue Group Integration Tests
+// ---------------------------------------------------------------------------
+
+func TestIntegration_QueueGroup_Basic(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Two listeners in the same group
+	lc1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc1.Close()
+	lr1 := bufio.NewReader(lc1)
+
+	lc2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc2.Close()
+	lr2 := bufio.NewReader(lc2)
+
+	// Subscribe both to "ch" in group "workers"
+	resp := connSendCmd(t, lc1, lr1, "listen", "ch", "workers")
+	if resp != "ok" {
+		t.Fatalf("listen1: %s", resp)
+	}
+	resp = connSendCmd(t, lc2, lr2, "listen", "ch", "workers")
+	if resp != "ok" {
+		t.Fatalf("listen2: %s", resp)
+	}
+
+	// Emitter
+	ec, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+	er := bufio.NewReader(ec)
+
+	// Signal should deliver to exactly 1
+	resp = connSendCmd(t, ec, er, "signal", "ch", "job1")
+	if resp != "ok 1" {
+		t.Fatalf("expected 'ok 1', got %q", resp)
+	}
+}
+
+func TestIntegration_QueueGroup_WithIndividual(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Grouped listener
+	lc1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc1.Close()
+	lr1 := bufio.NewReader(lc1)
+
+	resp := connSendCmd(t, lc1, lr1, "listen", "ch", "workers")
+	if resp != "ok" {
+		t.Fatalf("listen grouped: %s", resp)
+	}
+
+	// Non-grouped listener
+	lc2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc2.Close()
+	lr2 := bufio.NewReader(lc2)
+
+	resp = connSendCmd(t, lc2, lr2, "listen", "ch", "")
+	if resp != "ok" {
+		t.Fatalf("listen individual: %s", resp)
+	}
+
+	// Emitter
+	ec, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+	er := bufio.NewReader(ec)
+
+	// individual + 1 from group = 2
+	resp = connSendCmd(t, ec, er, "signal", "ch", "payload")
+	if resp != "ok 2" {
+		t.Fatalf("expected 'ok 2', got %q", resp)
+	}
+}
+
+func TestIntegration_QueueGroup_DisconnectCleanup(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Connect, listen in group, then disconnect
+	lc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lr := bufio.NewReader(lc)
+	connSendCmd(t, lc, lr, "listen", "ch", "workers")
+	lc.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	ec, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+	er := bufio.NewReader(ec)
+
+	resp := connSendCmd(t, ec, er, "signal", "ch", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("expected 'ok 0' after disconnect cleanup, got %q", resp)
+	}
+}
+
+func TestIntegration_QueueGroup_Unlisten(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	lc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	lr := bufio.NewReader(lc)
+
+	connSendCmd(t, lc, lr, "listen", "ch", "workers")
+
+	// Unlisten with matching group
+	resp := connSendCmd(t, lc, lr, "unlisten", "ch", "workers")
+	if resp != "ok" {
+		t.Fatalf("unlisten: %s", resp)
+	}
+
+	ec, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+	er := bufio.NewReader(ec)
+
+	resp = connSendCmd(t, ec, er, "signal", "ch", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("expected 'ok 0' after unlisten, got %q", resp)
+	}
+}
+
 // ===========================================================================
 // Phase 4: List Integration Tests
 // ===========================================================================

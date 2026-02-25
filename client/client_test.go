@@ -1593,6 +1593,152 @@ func TestClient_SignalConn_MultipleChannels(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Queue Group Client Tests
+// ---------------------------------------------------------------------------
+
+func TestClient_QueueGroup_Delivery(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Two listeners in same group
+	lc1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc1 := client.NewSignalConn(lc1)
+	defer sc1.Close()
+
+	lc2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc2 := client.NewSignalConn(lc2)
+	defer sc2.Close()
+
+	if err := sc1.Listen("ch", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc2.Listen("ch", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emit
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	n, err := client.Emit(ec, "ch", "job1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 receiver, got %d", n)
+	}
+
+	// Exactly one should receive
+	var got int
+	select {
+	case <-sc1.Signals():
+		got++
+	case <-time.After(2 * time.Second):
+	}
+	select {
+	case <-sc2.Signals():
+		got++
+	case <-time.After(200 * time.Millisecond):
+	}
+	if got != 1 {
+		t.Fatalf("expected exactly 1 delivery, got %d", got)
+	}
+}
+
+func TestClient_QueueGroup_RoundRobin(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	lc1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc1 := client.NewSignalConn(lc1)
+	defer sc1.Close()
+
+	lc2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc2 := client.NewSignalConn(lc2)
+	defer sc2.Close()
+
+	sc1.Listen("ch", client.WithGroup("workers"))
+	sc2.Listen("ch", client.WithGroup("workers"))
+
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	// Send two signals — each member should get one
+	client.Emit(ec, "ch", "job1")
+	client.Emit(ec, "ch", "job2")
+
+	var count1, count2 int
+	for i := 0; i < 2; i++ {
+		select {
+		case <-sc1.Signals():
+			count1++
+		case <-sc2.Signals():
+			count2++
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for signal")
+		}
+	}
+	if count1 != 1 || count2 != 1 {
+		t.Fatalf("expected 1/1 distribution, got %d/%d", count1, count2)
+	}
+}
+
+func TestClient_QueueGroup_BackwardCompat(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	lc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(lc)
+	defer sc.Close()
+
+	// Listen without WithGroup (backward compatible)
+	if err := sc.Listen("ch"); err != nil {
+		t.Fatal(err)
+	}
+
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	n, err := client.Emit(ec, "ch", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1, got %d", n)
+	}
+
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "ch" || sig.Payload != "hello" {
+			t.Fatalf("unexpected signal: %+v", sig)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout")
+	}
+}
+
 // ===========================================================================
 // Phase 4: List Client Tests
 // ===========================================================================

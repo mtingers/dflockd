@@ -1254,6 +1254,7 @@ type ListInfo struct {
 
 type SignalChannelInfo struct {
 	Pattern   string `json:"pattern"`
+	Group     string `json:"group,omitempty"`
 	Listeners int    `json:"listeners"`
 }
 

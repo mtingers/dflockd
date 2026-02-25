@@ -769,9 +769,26 @@ func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
 	}
 }
 
+// ListenOption configures optional parameters for Listen/Unlisten.
+type ListenOption func(*listenOptions)
+
+type listenOptions struct {
+	group string
+}
+
+// WithGroup sets the queue group name for a Listen or Unlisten call.
+// Within a group, only one member receives each signal via round-robin.
+func WithGroup(group string) ListenOption {
+	return func(o *listenOptions) { o.group = group }
+}
+
 // Listen subscribes to a pattern (supports * and > wildcards).
-func (sc *SignalConn) Listen(pattern string) error {
-	resp, err := sc.sendCmd("listen", pattern, "")
+func (sc *SignalConn) Listen(pattern string, opts ...ListenOption) error {
+	var lo listenOptions
+	for _, o := range opts {
+		o(&lo)
+	}
+	resp, err := sc.sendCmd("listen", pattern, lo.group)
 	if err != nil {
 		return err
 	}
@@ -782,8 +799,12 @@ func (sc *SignalConn) Listen(pattern string) error {
 }
 
 // Unlisten unsubscribes from a pattern.
-func (sc *SignalConn) Unlisten(pattern string) error {
-	resp, err := sc.sendCmd("unlisten", pattern, "")
+func (sc *SignalConn) Unlisten(pattern string, opts ...ListenOption) error {
+	var lo listenOptions
+	for _, o := range opts {
+		o(&lo)
+	}
+	resp, err := sc.sendCmd("unlisten", pattern, lo.group)
 	if err != nil {
 		return err
 	}

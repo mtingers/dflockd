@@ -827,3 +827,60 @@ func TestFormatResponse_ErrorListFull(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Queue Group protocol parsing
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_ListenWithGroup(t *testing.T) {
+	r := makeReader("listen", "alerts.*", "worker-pool")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "listen" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "alerts.*" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Group != "worker-pool" {
+		t.Fatalf("group: got %q, want %q", req.Group, "worker-pool")
+	}
+}
+
+func TestReadRequest_ListenWithoutGroup(t *testing.T) {
+	r := makeReader("listen", "alerts.*", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Group != "" {
+		t.Fatalf("group: got %q, want empty", req.Group)
+	}
+}
+
+func TestReadRequest_UnlistenWithGroup(t *testing.T) {
+	r := makeReader("unlisten", "alerts.*", "worker-pool")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "unlisten" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Group != "worker-pool" {
+		t.Fatalf("group: got %q, want %q", req.Group, "worker-pool")
+	}
+}
+
+func TestReadRequest_UnlistenWithoutGroup(t *testing.T) {
+	r := makeReader("unlisten", "alerts.*", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Group != "" {
+		t.Fatalf("group: got %q, want empty", req.Group)
+	}
+}
