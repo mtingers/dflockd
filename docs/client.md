@@ -375,3 +375,81 @@ The shard function signature is:
 ```go
 type ShardFunc func(key string, numServers int) int
 ```
+
+## Signals
+
+The `SignalConn` type wraps a `Conn` for pub/sub signal operations, with a background reader that separates push notifications from command responses.
+
+### Creating a SignalConn
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+sc := client.NewSignalConn(c)
+defer sc.Close()
+```
+
+### Subscribing (fan-out)
+
+```go
+// Every signal on "alerts.*" is delivered to this listener
+if err := sc.Listen("alerts.*"); err != nil {
+    log.Fatal(err)
+}
+```
+
+### Subscribing with queue groups
+
+Queue groups enable work distribution: within a named group, only **one** member receives each signal via round-robin. Different groups each get one delivery. Non-grouped listeners still receive every signal individually.
+
+```go
+// Only one member of "workers" receives each signal on "tasks.email"
+if err := sc.Listen("tasks.email", client.WithGroup("workers")); err != nil {
+    log.Fatal(err)
+}
+```
+
+```
+                    Signal on "tasks.email"
+                             │
+         ┌───────────────────┼───────────────────┐
+         ▼                   ▼                   ▼
+    D (no group)    group "workers"      group "audit"
+    receives all     [A, B] → one        [C] → C gets
+                     gets it (r.r.)      every signal
+```
+
+**Example:** A,B in group `worker-pool`, C in group `audit-logger`, D non-grouped, all on `tasks.email`. Each signal delivers to: D + one of A/B + C = **3 deliveries**.
+
+| Function | Description |
+|---|---|
+| `WithGroup(name)` | Join a named queue group for round-robin delivery |
+
+### Receiving signals
+
+```go
+for sig := range sc.Signals() {
+    fmt.Printf("channel=%s payload=%s\n", sig.Channel, sig.Payload)
+}
+```
+
+### Emitting
+
+```go
+// From a SignalConn (emitter doesn't need to be in a group)
+n, err := sc.Emit("tasks.email", `{"to":"user@example.com"}`)
+fmt.Printf("delivered to %d receivers\n", n)
+
+// From a regular Conn (no listener needed)
+n, err := client.Emit(c, "tasks.email", `{"to":"user@example.com"}`)
+```
+
+### Unsubscribing
+
+```go
+// Must match the group used in Listen (or omit for non-grouped)
+sc.Unlisten("alerts.*")
+sc.Unlisten("tasks.email", client.WithGroup("workers"))
+```

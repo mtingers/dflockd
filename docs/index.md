@@ -12,6 +12,7 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 - **Go client library** — high-level `Lock` type with automatic renewal and sharding, plus low-level protocol API
 - **Runtime stats** — query active connections, held locks, semaphores, and idle entries via the `stats` command
 - **Built-in benchmarking** — `cmd/bench` measures lock throughput and latency under concurrent load
+- **Pub/sub signals with queue groups** — fire-and-forget signals with wildcard patterns; optional queue groups for unicast round-robin delivery (task queues) alongside fan-out (audit logging)
 - **Simple wire protocol** — line-based UTF-8 over TCP, easy to integrate from any language
 
 ## Quick example

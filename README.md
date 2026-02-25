@@ -248,7 +248,31 @@ stats\n_\n\n
 
 Response: `ok <json>\n`
 
-The JSON payload includes `connections`, `locks`, `semaphores`, `idle_locks`, and `idle_semaphores`. Key and arg lines are read but ignored.
+The JSON payload includes `connections`, `locks`, `semaphores`, `idle_locks`, `idle_semaphores`, and `signal_channels`. Key and arg lines are read but ignored.
+
+**Listen (`listen`)** — subscribe to a signal pattern. Optionally join a queue group for round-robin delivery.
+
+```
+listen\n<pattern>\n[<group>]\n
+```
+
+Response: `ok\n` | `error\n`
+
+**Unlisten (`unlisten`)** — unsubscribe from a signal pattern.
+
+```
+unlisten\n<pattern>\n[<group>]\n
+```
+
+Response: `ok\n`
+
+**Signal (`signal`)** — emit a signal on a literal channel (no wildcards).
+
+```
+signal\n<channel>\n<payload>\n
+```
+
+Response: `ok <receiver_count>\n` | `error\n`
 
 ### Example session with netcat
 
@@ -298,6 +322,55 @@ sr
 worker-pool
 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
 ok
+```
+
+### Signal example
+
+```bash
+# Terminal 1: listener subscribes to alerts.*
+$ nc localhost 6388
+listen
+alerts.*
+
+ok
+# (signals arrive as push lines)
+# sig alerts.fire building-7!
+```
+
+```bash
+# Terminal 2: emitter
+$ nc localhost 6388
+signal
+alerts.fire
+building-7!
+ok 1
+```
+
+### Queue group example
+
+Queue groups enable work distribution: within a group, only one member receives each signal (round-robin).
+
+```bash
+# Terminal 1: Worker A in group "workers"
+$ nc localhost 6388
+listen
+tasks.email
+workers
+ok
+
+# Terminal 2: Worker B in group "workers"
+$ nc localhost 6388
+listen
+tasks.email
+workers
+ok
+
+# Terminal 3: Emit — only one of A/B receives each signal
+$ nc localhost 6388
+signal
+tasks.email
+job1
+ok 1
 ```
 
 ### Stats example

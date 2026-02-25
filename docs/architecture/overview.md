@@ -86,6 +86,41 @@ When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), the server p
 
 If disabled, locks from disconnected clients are only freed when their lease expires.
 
+## Signal system
+
+The signal manager (`internal/signal`) provides a pub/sub signaling layer with optional queue groups for work distribution.
+
+### Data structures
+
+```
+Manager
+├── exact         map[channel] → map[connID] → *Listener     (non-grouped)
+├── wildcards     []*Listener                                  (non-grouped)
+├── exactGroups   map[channel] → map[groupName] → *queueGroup (grouped)
+├── wildGroups    []*wildGroupEntry                            (grouped)
+└── connListeners map[connID] → []*listenerEntry              (reverse index)
+```
+
+### Queue groups
+
+Queue groups enable unicast delivery: within a named group, only **one** member receives each signal via atomic round-robin. Different groups each get one delivery. Non-grouped listeners still receive individually.
+
+```
+Signal on "tasks.email"
+         │
+         ├──► D (non-grouped)          → receives
+         ├──► group "worker-pool" [A,B] → one of A/B receives (round-robin)
+         └──► group "audit" [C]         → C receives
+                                          ─────────
+                                          3 deliveries total
+```
+
+The round-robin counter uses `atomic.Uint64` for lock-free increment under `RLock`, so signal dispatch never takes a write lock. Deduplication ensures a connection appearing in multiple paths receives at most one copy.
+
+### Disconnect cleanup
+
+When a connection closes, `UnlistenAll(connID)` iterates the connection's reverse index and removes it from all non-grouped and grouped structures. Empty queue groups and wildcard entries are pruned inline.
+
 ## Concurrency model
 
 Lock state is distributed across 64 shards, keyed by `fnv32(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map, so operations on different keys rarely contend. A separate `connMu` mutex protects connection-level tracking (`connOwned`, `connEnqueued`).

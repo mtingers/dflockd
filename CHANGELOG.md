@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Signal queue groups** — optional unicast delivery for signal listeners via named queue groups
+  - Within a group, only one member receives each signal via atomic round-robin (`sync/atomic.Uint64`)
+  - Different groups each get one delivery; non-grouped listeners still receive every signal individually
+  - Enables work distribution patterns (task queues) alongside fan-out (audit logging)
+- **Protocol: `listen` and `unlisten` group parameter** — the arg line (previously empty) now optionally carries a queue group name; backward-compatible (empty = non-grouped)
+- **Client: `WithGroup` option** — `ListenOption` type with `WithGroup(name)` for `SignalConn.Listen()` and `SignalConn.Unlisten()`; existing callers are unaffected (variadic options)
+- **Stats: `group` field** — `signal_channels` entries in stats output now include an optional `group` field identifying the queue group
+- 13 new signal unit tests (round-robin, mixed group/individual, dedup, wildcard groups, unlisten, distribution, backward compat)
+- 4 new protocol parser tests (listen/unlisten with and without group)
+- 4 new server integration tests (queue group basic, with individual, disconnect cleanup, unlisten)
+- 3 new client tests (queue group delivery, round-robin, backward compat)
+
 ## [v1.10.0] - 2026-02-24
 
 ### Changed

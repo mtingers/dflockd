@@ -269,6 +269,133 @@ sn
 - Success: `ok <seconds_remaining>\n`
 - Token mismatch, unknown key, or already expired: `error\n`
 
+## Signal Commands
+
+dflockd includes a pub/sub signaling system. Listeners subscribe to patterns (supporting `*` and `>` wildcards) and receive push notifications when signals are emitted on matching channels. Signals are fire-and-forget: if a listener's buffer is full, the message is silently dropped.
+
+### Listen (`listen`)
+
+Subscribe to a signal pattern. Optionally join a **queue group** — within a group, only one member receives each signal via round-robin, enabling work distribution patterns (task queues) alongside fan-out (audit logging).
+
+**Request:**
+```
+listen
+<pattern>
+[<group>]
+```
+
+The 3rd line is an optional queue group name. If empty, the listener receives every matching signal individually (fan-out). If set, the listener joins the named group for round-robin delivery.
+
+**Response:**
+
+- Success: `ok\n`
+- Invalid pattern: `error\n`
+
+**Examples:**
+
+```
+listen
+alerts.*
+
+```
+Subscribe to all `alerts.*` channels (fan-out, no group).
+
+```
+listen
+tasks.email
+worker-pool
+```
+Subscribe to `tasks.email` in the `worker-pool` queue group. Only one member of `worker-pool` receives each signal.
+
+### Unlisten (`unlisten`)
+
+Unsubscribe from a signal pattern. Must specify the same group used in the corresponding `listen` (or empty for non-grouped).
+
+**Request:**
+```
+unlisten
+<pattern>
+[<group>]
+```
+
+**Response:**
+
+- Success: `ok\n`
+
+### Signal (`signal`)
+
+Emit a signal on a literal channel (no wildcards allowed). Returns the number of unique connections that received the signal.
+
+**Request:**
+```
+signal
+<channel>
+<payload>
+```
+
+**Response:**
+
+- Success: `ok <receiver_count>\n`
+- Wildcard in channel: `error\n`
+- Empty payload: `error\n`
+
+**Example:**
+```
+signal
+tasks.email
+{"to":"user@example.com"}
+```
+→ `ok 3`
+
+### Queue Group Delivery
+
+When a signal is emitted, the server delivers it as follows:
+
+```
+Signal arrives on channel "tasks.email"
+         │
+         ▼
+┌─────────────────────────────────────────────────────┐
+│ 1. Exact non-grouped listeners                      │
+│    → deliver to ALL, record in delivered set         │
+├─────────────────────────────────────────────────────┤
+│ 2. Exact grouped listeners                          │
+│    → for each group: deliver to ONE (round-robin)   │
+├─────────────────────────────────────────────────────┤
+│ 3. Wildcard non-grouped listeners                   │
+│    → deliver to ALL matching, skip already-delivered │
+├─────────────────────────────────────────────────────┤
+│ 4. Wildcard grouped listeners                       │
+│    → for each matching group: deliver to ONE (r.r.)  │
+└─────────────────────────────────────────────────────┘
+         │
+         ▼
+  Return count of unique connections delivered
+```
+
+**Deduplication:** a connection that appears in multiple paths (e.g., both non-grouped and grouped on the same pattern) receives the signal only once.
+
+**Example scenario:**
+
+| Listener | Group | Pattern |
+|----------|-------|---------|
+| A | `worker-pool` | `tasks.email` |
+| B | `worker-pool` | `tasks.email` |
+| C | `audit-logger` | `tasks.email` |
+| D | *(none)* | `tasks.email` |
+
+Signal on `tasks.email` delivers to: **D** (individual) + **one of A/B** (round-robin) + **C** (audit group) = **3 deliveries**.
+
+### Wildcard Patterns
+
+| Pattern | Matches |
+|---------|---------|
+| `alerts.fire` | Exact match only |
+| `alerts.*` | `alerts.fire`, `alerts.flood` (single token) |
+| `alerts.>` | `alerts.fire`, `alerts.fire.critical` (one or more tokens) |
+| `*.*` | Any two-token channel |
+| `>` | Any channel |
+
 ## Stats Command
 
 ### Stats (`stats`)
@@ -308,6 +435,10 @@ The JSON payload contains:
 | `idle_semaphores` | array | Semaphore entries with no holders (awaiting GC) |
 | `idle_semaphores[].key` | string | Semaphore key |
 | `idle_semaphores[].idle_s` | float | Seconds since last activity |
+| `signal_channels` | array | Active signal subscriptions |
+| `signal_channels[].pattern` | string | Signal pattern |
+| `signal_channels[].group` | string | Queue group name (omitted if non-grouped) |
+| `signal_channels[].listeners` | int | Number of listeners |
 
 **Example:**
 ```
@@ -315,7 +446,7 @@ stats
 _
 
 ```
-→ `ok {"connections":2,"locks":[{"key":"my-job","owner_conn_id":3,"lease_expires_in_s":25.4,"waiters":1}],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}`
+→ `ok {"connections":2,"locks":[{"key":"my-job","owner_conn_id":3,"lease_expires_in_s":25.4,"waiters":1}],"semaphores":[],"idle_locks":[],"idle_semaphores":[],"signal_channels":[{"pattern":"tasks.email","listeners":1},{"pattern":"tasks.email","group":"workers","listeners":2}]}`
 
 ## Protocol constraints
 
@@ -334,7 +465,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, or `stats`) |
+| 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, `listen`, `unlisten`, `signal`, `incr`, `decr`, `get`, `cset`, `kset`, `kget`, `kdel`, `lpush`, `rpush`, `lpop`, `rpop`, `llen`, `lrange`, or `stats`) |
 | 4 | Invalid integer in argument |
 | 5 | Empty key |
 | 6 | Negative timeout |

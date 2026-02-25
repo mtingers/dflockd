@@ -197,5 +197,6 @@ The response includes:
 - **locks** — held locks with key, owner connection ID, seconds until lease expires, and waiter count
 - **semaphores** — semaphores with at least one holder, showing key, limit, holder count, and waiter count
 - **idle_locks** / **idle_semaphores** — entries with no owner/holders (cached state awaiting GC), with seconds since last activity
+- **signal_channels** — active signal subscriptions with pattern, optional queue group name, and listener count
 
 See [Wire Protocol](architecture/protocol.md#stats-stats) for the full JSON schema.

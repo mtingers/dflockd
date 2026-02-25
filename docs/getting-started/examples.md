@@ -198,6 +198,65 @@ func main() {
 }
 ```
 
+### Pub/sub signals
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+sc := client.NewSignalConn(c)
+defer sc.Close()
+
+// Subscribe to all alert channels
+sc.Listen("alerts.*")
+
+// Receive signals
+go func() {
+    for sig := range sc.Signals() {
+        fmt.Printf("[%s] %s\n", sig.Channel, sig.Payload)
+    }
+}()
+
+// Emit from another connection
+ec, _ := client.Dial("127.0.0.1:6388")
+defer ec.Close()
+n, _ := client.Emit(ec, "alerts.fire", "building-7!")
+fmt.Printf("delivered to %d listeners\n", n)
+```
+
+### Queue groups (work distribution)
+
+Queue groups enable task-queue patterns alongside fan-out. Within a group, only one member receives each signal via round-robin.
+
+```go
+// Worker 1
+sc1 := client.NewSignalConn(c1)
+sc1.Listen("tasks.email", client.WithGroup("workers"))
+
+// Worker 2
+sc2 := client.NewSignalConn(c2)
+sc2.Listen("tasks.email", client.WithGroup("workers"))
+
+// Audit logger (different group — gets every signal)
+scAudit := client.NewSignalConn(cAudit)
+scAudit.Listen("tasks.email", client.WithGroup("audit"))
+
+// Each signal delivers to: one of sc1/sc2 (round-robin) + scAudit = 2
+client.Emit(emitter, "tasks.email", `{"to":"user@example.com"}`)
+```
+
+```
+               emit("tasks.email", payload)
+                         │
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+  group "workers"   group "audit"    (non-grouped
+   [W1, W2]          [Audit]         listeners get
+   one receives      always gets     every signal)
+   (round-robin)     every signal
+```
+
 ## Benchmarking
 
 dflockd ships with a built-in benchmark tool (`cmd/bench`) that measures lock acquire/release latency and throughput under concurrent load. Each worker goroutine dials a persistent TCP connection and reuses it for all rounds, so the benchmark measures lock latency rather than TCP connection overhead.
@@ -419,4 +478,66 @@ read -r response <&3
 echo "release: $response"
 
 exec 3>&-
+```
+
+## Signal examples (TCP)
+
+### Basic pub/sub
+
+```bash
+# Terminal 1: Listener
+nc localhost 6388
+listen
+alerts.*
+
+# Response: ok
+
+# (Wait for signals — they arrive as push lines: "sig alerts.fire hot")
+```
+
+```bash
+# Terminal 2: Emitter
+printf 'signal\nalerts.fire\nhot\n' | nc localhost 6388
+# Response: ok 1
+```
+
+Terminal 1 receives: `sig alerts.fire hot`
+
+### Queue group
+
+```bash
+# Terminal 1: Worker A (in group "workers")
+nc localhost 6388
+listen
+tasks.email
+workers
+# Response: ok
+```
+
+```bash
+# Terminal 2: Worker B (in group "workers")
+nc localhost 6388
+listen
+tasks.email
+workers
+# Response: ok
+```
+
+```bash
+# Terminal 3: Emit signals
+printf 'signal\ntasks.email\njob1\n' | nc localhost 6388
+# Response: ok 1   (only one of A/B receives)
+
+printf 'signal\ntasks.email\njob2\n' | nc localhost 6388
+# Response: ok 1   (the other one receives — round-robin)
+```
+
+### Mixed queue groups and individual listeners
+
+```bash
+# Worker A,B in "workers" group, C non-grouped — all on "tasks.email"
+# Each signal delivers to: C (always) + one of A/B (round-robin) = 2
+
+printf 'signal\ntasks.email\njob1\n' | nc localhost 6388
+# Response: ok 2
 ```
