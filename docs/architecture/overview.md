@@ -88,4 +88,8 @@ If disabled, locks from disconnected clients are only freed when their lease exp
 
 ## Concurrency model
 
-All lock state mutations are serialized through a single `sync.Mutex` (`mu`) in the `LockManager`. This ensures consistency without complex fine-grained locking. Each client connection is handled in its own goroutine, and the mutex is held only for the duration of state mutations, keeping throughput high for the I/O-bound workload.
+Lock state is distributed across 64 shards, keyed by `fnv32(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map, so operations on different keys rarely contend. A separate `connMu` mutex protects connection-level tracking (`connOwned`, `connEnqueued`).
+
+**Lock ordering protocol:** `connMu` is always acquired before any shard lock. Two shard locks are never held simultaneously. This prevents deadlocks while allowing high concurrency across keys.
+
+Each client connection is handled in its own goroutine. On the fast path (uncontended acquire), only the relevant shard lock and `connMu` are held briefly. Background loops (lease expiry, GC) iterate shards sequentially, locking one at a time.

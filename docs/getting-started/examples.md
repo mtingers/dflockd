@@ -200,7 +200,7 @@ func main() {
 
 ## Benchmarking
 
-dflockd ships with a built-in benchmark tool (`cmd/bench`) that measures lock acquire/release latency and throughput under concurrent load.
+dflockd ships with a built-in benchmark tool (`cmd/bench`) that measures lock acquire/release latency and throughput under concurrent load. Each worker goroutine dials a persistent TCP connection and reuses it for all rounds, so the benchmark measures lock latency rather than TCP connection overhead.
 
 ### Quick start
 
@@ -214,14 +214,15 @@ go run ./cmd/bench
 
 ### Flags
 
-| Flag        | Default          | Description                       |
-| ----------- | ---------------- | --------------------------------- |
-| `--workers` | `10`             | Number of concurrent goroutines   |
-| `--rounds`  | `50`             | Acquire/release rounds per worker |
-| `--key`     | `bench`          | Lock key prefix                   |
-| `--timeout` | `30`             | Acquire timeout (seconds)         |
-| `--lease`   | `10`             | Lease TTL (seconds)               |
-| `--servers` | `127.0.0.1:6388` | Comma-separated host:port pairs   |
+| Flag            | Default          | Description                                          |
+| --------------- | ---------------- | ---------------------------------------------------- |
+| `--workers`     | `10`             | Number of concurrent goroutines                      |
+| `--rounds`      | `50`             | Acquire/release rounds per worker                    |
+| `--key`         | `bench`          | Lock key prefix                                      |
+| `--timeout`     | `30`             | Acquire timeout (seconds)                            |
+| `--lease`       | `10`             | Lease TTL (seconds)                                  |
+| `--servers`     | `127.0.0.1:6388` | Comma-separated host:port pairs                      |
+| `--connections` | `0`              | Persistent connections per worker (0 = 1 per worker) |
 
 ### Example output
 

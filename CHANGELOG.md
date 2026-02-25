@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.10.0] - 2026-02-24
+
+### Changed
+
+- **Server: 64-shard lock manager** — replaced single `sync.Mutex` with 64 `fnv32`-keyed shards and a separate `connMu` for connection tracking, reducing contention under concurrent load
+- **Server: buffered CSPRNG token generation** — token generation now buffers 4096 bytes (256 tokens) per `crypto/rand` syscall, amortising syscall overhead by 256×
+- **Server: pre-formatted protocol responses** — common response status lines (`ok`, `timeout`, `error_*`, `queued`) are pre-computed `[]byte` constants; dynamic responses use `strconv.AppendInt` instead of `fmt.Sprintf`
+- **Server: O(1) waiter queue grant** — replaced O(n) `copy` on every waiter grant with a `WaiterHead` index; the slice is compacted when more than half is consumed
+- **Server: deferred waiter allocation** — `Acquire` no longer allocates a waiter struct on the fast path when capacity is immediately available
+- **Benchmark: persistent connections** — `cmd/bench` now uses `client.Dial` once per worker goroutine and calls the low-level `Acquire`/`Release` API, measuring lock latency instead of TCP connection overhead
+- **Benchmark: `--connections` flag** — optional flag to control the number of persistent connections per worker (default: 1)
+
+[v1.10.0]: https://github.com/mtingers/dflockd/releases/tag/v1.10.0
+
 ## [v1.9.0] - 2026-02-24
 
 ### Added
