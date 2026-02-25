@@ -109,6 +109,43 @@ l := &client.Lock{
 
 Use together with TLS to protect the token in transit.
 
+## Benchmarking
+
+A built-in benchmark tool measures lock acquire/release latency and throughput under concurrent load:
+
+```bash
+go run ./cmd/bench [flags]
+```
+
+| Flag | Default | Description |
+| ----------- | ----------------- | ---------------------------------- |
+| `--workers` | `10` | Number of concurrent goroutines |
+| `--rounds` | `50` | Acquire/release rounds per worker |
+| `--key` | `bench` | Lock key prefix |
+| `--timeout` | `30` | Acquire timeout (seconds) |
+| `--lease` | `10` | Lease TTL (seconds) |
+| `--servers` | `127.0.0.1:6388` | Comma-separated host:port pairs |
+
+Example:
+
+```bash
+$ go run ./cmd/bench --workers 20 --rounds 100
+bench: 20 workers x 100 rounds (key_prefix="bench")
+
+  total ops : 2000
+  wall time : 1.234s
+  throughput: 1620.7 ops/s
+
+  mean      : 0.617 ms
+  min       : 0.312 ms
+  max       : 4.821 ms
+  p50       : 0.534 ms
+  p99       : 2.105 ms
+  stdev     : 0.298 ms
+```
+
+Each worker uses a unique randomized key, so all workers run in parallel without contending. To benchmark contended locks, use the same `--key` value with `--workers 1` and increase `--rounds`.
+
 ## Tests
 
 ```bash
