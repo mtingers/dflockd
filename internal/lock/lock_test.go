@@ -2093,3 +2093,451 @@ func TestResetForTest(t *testing.T) {
 		t.Fatal("connEnqueued should be empty")
 	}
 }
+
+// ===========================================================================
+// Phase 1: Atomic Counters
+// ===========================================================================
+
+func TestIncr_Basic(t *testing.T) {
+	lm := testManager()
+	val, err := lm.Incr("c1", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 5 {
+		t.Fatalf("expected 5, got %d", val)
+	}
+}
+
+func TestIncr_Multiple(t *testing.T) {
+	lm := testManager()
+	lm.Incr("c1", 5)
+	lm.Incr("c1", 3)
+	val, _ := lm.Incr("c1", 2)
+	if val != 10 {
+		t.Fatalf("expected 10, got %d", val)
+	}
+}
+
+func TestDecr_Negative(t *testing.T) {
+	lm := testManager()
+	lm.Incr("c1", 10)
+	val, _ := lm.Decr("c1", 15)
+	if val != -5 {
+		t.Fatalf("expected -5, got %d", val)
+	}
+}
+
+func TestGetCounter_Nonexistent(t *testing.T) {
+	lm := testManager()
+	val := lm.GetCounter("nosuchkey")
+	if val != 0 {
+		t.Fatalf("expected 0, got %d", val)
+	}
+}
+
+func TestSetCounter(t *testing.T) {
+	lm := testManager()
+	if err := lm.SetCounter("c1", 42); err != nil {
+		t.Fatal(err)
+	}
+	val := lm.GetCounter("c1")
+	if val != 42 {
+		t.Fatalf("expected 42, got %d", val)
+	}
+}
+
+func TestCounter_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 2
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	if _, err := lm.Incr("c1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lm.Incr("c2", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lm.Incr("c3", 1); !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+}
+
+func TestCounter_GC_ZeroValue(t *testing.T) {
+	cfg := testConfig()
+	cfg.GCMaxIdleTime = 50 * time.Millisecond
+	cfg.GCInterval = 50 * time.Millisecond
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.Incr("c1", 5)
+	lm.Decr("c1", 5) // value == 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lm.GCLoop(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	if lm.GetCounter("c1") != 0 {
+		t.Fatal("expected counter to be GC'd (value 0)")
+	}
+}
+
+func TestCounter_GC_NonZeroPreserved(t *testing.T) {
+	cfg := testConfig()
+	cfg.GCMaxIdleTime = 50 * time.Millisecond
+	cfg.GCInterval = 50 * time.Millisecond
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.Incr("c1", 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lm.GCLoop(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	val := lm.GetCounter("c1")
+	if val != 10 {
+		t.Fatalf("non-zero counter should be preserved, got %d", val)
+	}
+}
+
+func TestCounter_NamespaceIsolation(t *testing.T) {
+	lm := testManager()
+	// Same key "foo" as lock and counter — should coexist
+	tok, err := lm.Acquire(bg(), "foo", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil || tok == "" {
+		t.Fatal("lock acquire failed")
+	}
+	val, err := lm.Incr("foo", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 42 {
+		t.Fatalf("expected 42, got %d", val)
+	}
+	// Lock should still be held
+	lm.LockKeyForTest("foo")
+	st := lm.ResourceForTest("foo")
+	if st == nil || len(st.Holders) != 1 {
+		lm.UnlockKeyForTest("foo")
+		t.Fatal("lock should still be held")
+	}
+	lm.UnlockKeyForTest("foo")
+}
+
+// ===========================================================================
+// Phase 2: KV Store
+// ===========================================================================
+
+func TestKV_SetGet(t *testing.T) {
+	lm := testManager()
+	if err := lm.KVSet("k1", "hello", 0); err != nil {
+		t.Fatal(err)
+	}
+	val, ok := lm.KVGet("k1")
+	if !ok || val != "hello" {
+		t.Fatalf("expected 'hello', got %q ok=%v", val, ok)
+	}
+}
+
+func TestKV_Nonexistent(t *testing.T) {
+	lm := testManager()
+	_, ok := lm.KVGet("nosuchkey")
+	if ok {
+		t.Fatal("expected not found")
+	}
+}
+
+func TestKV_Delete(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "hello", 0)
+	lm.KVDel("k1")
+	_, ok := lm.KVGet("k1")
+	if ok {
+		t.Fatal("expected not found after delete")
+	}
+}
+
+func TestKV_TTLExpiry_Lazy(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "hello", 1) // 1 second TTL
+	time.Sleep(1100 * time.Millisecond)
+	_, ok := lm.KVGet("k1")
+	if ok {
+		t.Fatal("expected lazy expiry on read")
+	}
+}
+
+func TestKV_TTLExpiry_Sweep(t *testing.T) {
+	cfg := testConfig()
+	cfg.LeaseSweepInterval = 50 * time.Millisecond
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.KVSet("k1", "hello", 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lm.LeaseExpiryLoop(ctx)
+
+	time.Sleep(1200 * time.Millisecond)
+	_, ok := lm.KVGet("k1")
+	if ok {
+		t.Fatal("expected sweep to expire KV entry")
+	}
+}
+
+func TestKV_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 2
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.KVSet("k1", "v1", 0)
+	lm.KVSet("k2", "v2", 0)
+	err := lm.KVSet("k3", "v3", 0)
+	if !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+}
+
+func TestKV_GC_Idle(t *testing.T) {
+	cfg := testConfig()
+	cfg.GCMaxIdleTime = 50 * time.Millisecond
+	cfg.GCInterval = 50 * time.Millisecond
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.KVSet("k1", "hello", 0) // no TTL
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lm.GCLoop(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	_, ok := lm.KVGet("k1")
+	if ok {
+		t.Fatal("expected idle GC to prune no-TTL entry")
+	}
+}
+
+func TestKV_NamespaceIsolation(t *testing.T) {
+	lm := testManager()
+	lm.Incr("foo", 42)
+	lm.KVSet("foo", "bar", 0)
+	val := lm.GetCounter("foo")
+	if val != 42 {
+		t.Fatalf("counter should still be 42, got %d", val)
+	}
+	kv, ok := lm.KVGet("foo")
+	if !ok || kv != "bar" {
+		t.Fatalf("kv should be 'bar', got %q", kv)
+	}
+}
+
+// ===========================================================================
+// Phase 4: Lists/Queues
+// ===========================================================================
+
+func TestList_PushPop_Basic(t *testing.T) {
+	lm := testManager()
+	n, err := lm.RPush("q1", "a")
+	if err != nil || n != 1 {
+		t.Fatalf("rpush: n=%d err=%v", n, err)
+	}
+	n, err = lm.RPush("q1", "b")
+	if err != nil || n != 2 {
+		t.Fatalf("rpush: n=%d err=%v", n, err)
+	}
+	val, ok := lm.LPop("q1")
+	if !ok || val != "a" {
+		t.Fatalf("lpop: got %q ok=%v", val, ok)
+	}
+}
+
+func TestList_FIFO(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+
+	v1, _ := lm.LPop("q1")
+	v2, _ := lm.LPop("q1")
+	v3, _ := lm.LPop("q1")
+	if v1 != "a" || v2 != "b" || v3 != "c" {
+		t.Fatalf("FIFO order wrong: %s %s %s", v1, v2, v3)
+	}
+}
+
+func TestList_LIFO(t *testing.T) {
+	lm := testManager()
+	lm.LPush("q1", "a")
+	lm.LPush("q1", "b")
+	lm.LPush("q1", "c")
+
+	v1, _ := lm.LPop("q1")
+	v2, _ := lm.LPop("q1")
+	v3, _ := lm.LPop("q1")
+	if v1 != "c" || v2 != "b" || v3 != "a" {
+		t.Fatalf("LIFO order wrong: %s %s %s", v1, v2, v3)
+	}
+}
+
+func TestList_EmptyPop(t *testing.T) {
+	lm := testManager()
+	_, ok := lm.LPop("empty")
+	if ok {
+		t.Fatal("expected false for empty pop")
+	}
+	_, ok = lm.RPop("empty")
+	if ok {
+		t.Fatal("expected false for empty rpop")
+	}
+}
+
+func TestList_LLen(t *testing.T) {
+	lm := testManager()
+	if lm.LLen("q1") != 0 {
+		t.Fatal("expected 0 for nonexistent")
+	}
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	if lm.LLen("q1") != 2 {
+		t.Fatalf("expected 2, got %d", lm.LLen("q1"))
+	}
+}
+
+func TestList_LRange_Positive(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+	lm.RPush("q1", "d")
+
+	items := lm.LRange("q1", 1, 2)
+	if len(items) != 2 || items[0] != "b" || items[1] != "c" {
+		t.Fatalf("expected [b c], got %v", items)
+	}
+}
+
+func TestList_LRange_Negative(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+
+	items := lm.LRange("q1", -2, -1)
+	if len(items) != 2 || items[0] != "b" || items[1] != "c" {
+		t.Fatalf("expected [b c], got %v", items)
+	}
+}
+
+func TestList_LRange_OutOfBounds(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+
+	items := lm.LRange("q1", 0, 100)
+	if len(items) != 2 {
+		t.Fatalf("expected 2, got %d", len(items))
+	}
+}
+
+func TestList_LRange_Empty(t *testing.T) {
+	lm := testManager()
+	items := lm.LRange("empty", 0, -1)
+	if len(items) != 0 {
+		t.Fatalf("expected empty, got %v", items)
+	}
+}
+
+func TestList_LRange_FullRange(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+
+	items := lm.LRange("q1", 0, -1)
+	if len(items) != 3 || items[0] != "a" || items[2] != "c" {
+		t.Fatalf("expected [a b c], got %v", items)
+	}
+}
+
+func TestList_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.RPush("q1", "a")
+	_, err := lm.RPush("q2", "b")
+	if !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+}
+
+func TestList_MaxListLength(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxListLength = 2
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	_, err := lm.RPush("q1", "c")
+	if !errors.Is(err, ErrListFull) {
+		t.Fatalf("expected ErrListFull, got %v", err)
+	}
+}
+
+func TestList_AutoDeleteOnPop(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.LPop("q1")
+	if lm.LLen("q1") != 0 {
+		t.Fatal("empty list should be auto-deleted")
+	}
+}
+
+func TestList_GC(t *testing.T) {
+	cfg := testConfig()
+	cfg.GCMaxIdleTime = 50 * time.Millisecond
+	cfg.GCInterval = 50 * time.Millisecond
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	lm.RPush("q1", "a")
+	lm.LPop("q1") // empty now
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lm.GCLoop(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	// The list should have been auto-deleted by pop, so GC is a no-op.
+	// Just verify LLen returns 0
+	if lm.LLen("q1") != 0 {
+		t.Fatal("expected empty")
+	}
+}
+
+func TestList_NamespaceIsolation(t *testing.T) {
+	lm := testManager()
+	lm.Incr("foo", 10)
+	lm.KVSet("foo", "bar", 0)
+	lm.RPush("foo", "item1")
+
+	if lm.GetCounter("foo") != 10 {
+		t.Fatal("counter namespace broken")
+	}
+	kv, ok := lm.KVGet("foo")
+	if !ok || kv != "bar" {
+		t.Fatal("kv namespace broken")
+	}
+	if lm.LLen("foo") != 1 {
+		t.Fatal("list namespace broken")
+	}
+}

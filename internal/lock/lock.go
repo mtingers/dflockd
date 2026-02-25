@@ -21,6 +21,8 @@ var (
 	ErrLimitMismatch   = errors.New("limit mismatch for semaphore key")
 	ErrLeaseExpired    = errors.New("lease expired before wait")
 	ErrWaiterClosed    = errors.New("waiter channel closed")
+	ErrMaxKeys         = errors.New("max keys reached")
+	ErrListFull        = errors.New("list at max length")
 )
 
 // tokenBuf amortises crypto/rand syscalls by buffering 4096 bytes (256 tokens)
@@ -105,9 +107,28 @@ type enqueuedState struct {
 
 const numShards = 64
 
+type counterState struct {
+	Value        int64
+	LastActivity time.Time
+}
+
+type kvEntry struct {
+	Value        string
+	ExpiresAt    time.Time // zero = no expiry
+	LastActivity time.Time
+}
+
+type listState struct {
+	Items        []string
+	LastActivity time.Time
+}
+
 type shard struct {
 	mu        sync.Mutex
 	resources map[string]*ResourceState
+	counters  map[string]*counterState
+	kvStore   map[string]*kvEntry
+	lists     map[string]*listState
 }
 
 type LockManager struct {
@@ -130,6 +151,9 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 	}
 	for i := range lm.shards {
 		lm.shards[i].resources = make(map[string]*ResourceState)
+		lm.shards[i].counters = make(map[string]*counterState)
+		lm.shards[i].kvStore = make(map[string]*kvEntry)
+		lm.shards[i].lists = make(map[string]*listState)
 	}
 	return lm
 }
@@ -701,6 +725,262 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 }
 
 // ---------------------------------------------------------------------------
+// Aggregate key count (across all types)
+// ---------------------------------------------------------------------------
+
+// totalKeyCount returns the total number of keys across all types in all shards.
+// Must be called with the shard lock held for the shard being checked.
+// Approximation: counts all shards without holding all locks simultaneously.
+func (lm *LockManager) totalKeyCount() int {
+	total := 0
+	for i := range lm.shards {
+		total += len(lm.shards[i].resources)
+		total += len(lm.shards[i].counters)
+		total += len(lm.shards[i].kvStore)
+		total += len(lm.shards[i].lists)
+	}
+	return total
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Counters
+// ---------------------------------------------------------------------------
+
+func (lm *LockManager) Incr(key string, delta int64) (int64, error) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	cs, ok := sh.counters[key]
+	if !ok {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			return 0, ErrMaxKeys
+		}
+		cs = &counterState{LastActivity: time.Now()}
+		sh.counters[key] = cs
+	}
+	cs.Value += delta
+	cs.LastActivity = time.Now()
+	return cs.Value, nil
+}
+
+func (lm *LockManager) Decr(key string, delta int64) (int64, error) {
+	return lm.Incr(key, -delta)
+}
+
+func (lm *LockManager) GetCounter(key string) int64 {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	cs, ok := sh.counters[key]
+	if !ok {
+		return 0
+	}
+	cs.LastActivity = time.Now()
+	return cs.Value
+}
+
+func (lm *LockManager) SetCounter(key string, value int64) error {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	cs, ok := sh.counters[key]
+	if !ok {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			return ErrMaxKeys
+		}
+		cs = &counterState{}
+		sh.counters[key] = cs
+	}
+	cs.Value = value
+	cs.LastActivity = time.Now()
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// KV Store
+// ---------------------------------------------------------------------------
+
+func (lm *LockManager) KVSet(key, value string, ttlSeconds int) error {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	entry, ok := sh.kvStore[key]
+	if !ok {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			return ErrMaxKeys
+		}
+		entry = &kvEntry{}
+		sh.kvStore[key] = entry
+	}
+	entry.Value = value
+	entry.LastActivity = time.Now()
+	if ttlSeconds > 0 {
+		entry.ExpiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	} else {
+		entry.ExpiresAt = time.Time{}
+	}
+	return nil
+}
+
+func (lm *LockManager) KVGet(key string) (string, bool) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	entry, ok := sh.kvStore[key]
+	if !ok {
+		return "", false
+	}
+	// Lazy expiry check
+	if !entry.ExpiresAt.IsZero() && !time.Now().Before(entry.ExpiresAt) {
+		delete(sh.kvStore, key)
+		return "", false
+	}
+	entry.LastActivity = time.Now()
+	return entry.Value, true
+}
+
+func (lm *LockManager) KVDel(key string) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	delete(sh.kvStore, key)
+}
+
+// ---------------------------------------------------------------------------
+// Lists/Queues
+// ---------------------------------------------------------------------------
+
+func (lm *LockManager) LPush(key, value string) (int, error) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	ls, ok := sh.lists[key]
+	if !ok {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			return 0, ErrMaxKeys
+		}
+		ls = &listState{LastActivity: time.Now()}
+		sh.lists[key] = ls
+	}
+	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
+		return 0, ErrListFull
+	}
+	ls.Items = append([]string{value}, ls.Items...)
+	ls.LastActivity = time.Now()
+	return len(ls.Items), nil
+}
+
+func (lm *LockManager) RPush(key, value string) (int, error) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	ls, ok := sh.lists[key]
+	if !ok {
+		if max := lm.cfg.MaxKeys; max > 0 && lm.totalKeyCount() >= max {
+			return 0, ErrMaxKeys
+		}
+		ls = &listState{LastActivity: time.Now()}
+		sh.lists[key] = ls
+	}
+	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
+		return 0, ErrListFull
+	}
+	ls.Items = append(ls.Items, value)
+	ls.LastActivity = time.Now()
+	return len(ls.Items), nil
+}
+
+func (lm *LockManager) LPop(key string) (string, bool) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	ls, ok := sh.lists[key]
+	if !ok || len(ls.Items) == 0 {
+		return "", false
+	}
+	val := ls.Items[0]
+	ls.Items = ls.Items[1:]
+	ls.LastActivity = time.Now()
+	if len(ls.Items) == 0 {
+		delete(sh.lists, key)
+	}
+	return val, true
+}
+
+func (lm *LockManager) RPop(key string) (string, bool) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	ls, ok := sh.lists[key]
+	if !ok || len(ls.Items) == 0 {
+		return "", false
+	}
+	val := ls.Items[len(ls.Items)-1]
+	ls.Items = ls.Items[:len(ls.Items)-1]
+	ls.LastActivity = time.Now()
+	if len(ls.Items) == 0 {
+		delete(sh.lists, key)
+	}
+	return val, true
+}
+
+func (lm *LockManager) LLen(key string) int {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	ls, ok := sh.lists[key]
+	if !ok {
+		return 0
+	}
+	ls.LastActivity = time.Now()
+	return len(ls.Items)
+}
+
+func (lm *LockManager) LRange(key string, start, stop int) []string {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	ls, ok := sh.lists[key]
+	if !ok || len(ls.Items) == 0 {
+		return []string{}
+	}
+
+	n := len(ls.Items)
+	// Normalize negative indices
+	if start < 0 {
+		start = n + start
+	}
+	if stop < 0 {
+		stop = n + stop
+	}
+	// Clamp
+	if start < 0 {
+		start = 0
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	if start > stop {
+		return []string{}
+	}
+
+	ls.LastActivity = time.Now()
+	result := make([]string, stop-start+1)
+	copy(result, ls.Items[start:stop+1])
+	return result
+}
+
+// ---------------------------------------------------------------------------
 // Connection cleanup
 // ---------------------------------------------------------------------------
 
@@ -842,6 +1122,12 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 						lm.grantNextWaiterLocked(key, st)
 					}
 				}
+				// Sweep expired KV entries
+				for key, entry := range sh.kvStore {
+					if !entry.ExpiresAt.IsZero() && !now.Before(entry.ExpiresAt) {
+						delete(sh.kvStore, key)
+					}
+				}
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
 			}
@@ -875,6 +1161,39 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 					lm.log.Debug("GC: pruning unused state", "key", key)
 					delete(sh.resources, key)
 				}
+				// GC idle counters (only when value == 0)
+				var expiredCounters []string
+				for key, cs := range sh.counters {
+					if cs.Value == 0 && now.Sub(cs.LastActivity) > lm.cfg.GCMaxIdleTime {
+						expiredCounters = append(expiredCounters, key)
+					}
+				}
+				for _, key := range expiredCounters {
+					lm.log.Debug("GC: pruning idle counter", "key", key)
+					delete(sh.counters, key)
+				}
+				// GC idle KV entries (no TTL, just idle)
+				var expiredKV []string
+				for key, entry := range sh.kvStore {
+					if entry.ExpiresAt.IsZero() && now.Sub(entry.LastActivity) > lm.cfg.GCMaxIdleTime {
+						expiredKV = append(expiredKV, key)
+					}
+				}
+				for _, key := range expiredKV {
+					lm.log.Debug("GC: pruning idle KV entry", "key", key)
+					delete(sh.kvStore, key)
+				}
+				// GC idle empty lists
+				var expiredLists []string
+				for key, ls := range sh.lists {
+					if len(ls.Items) == 0 && now.Sub(ls.LastActivity) > lm.cfg.GCMaxIdleTime {
+						expiredLists = append(expiredLists, key)
+					}
+				}
+				for _, key := range expiredLists {
+					lm.log.Debug("GC: pruning idle list", "key", key)
+					delete(sh.lists, key)
+				}
 				sh.mu.Unlock()
 			}
 		}
@@ -904,12 +1223,40 @@ type IdleInfo struct {
 	IdleS float64 `json:"idle_s"`
 }
 
+type CounterInfo struct {
+	Key   string  `json:"key"`
+	Value int64   `json:"value"`
+	IdleS float64 `json:"idle_s"`
+}
+
+type KVInfo struct {
+	Key      string  `json:"key"`
+	ValueLen int     `json:"value_len"`
+	TTL      float64 `json:"ttl"`
+	IdleS    float64 `json:"idle_s"`
+}
+
+type ListInfo struct {
+	Key   string  `json:"key"`
+	Len   int     `json:"len"`
+	IdleS float64 `json:"idle_s"`
+}
+
+type SignalChannelInfo struct {
+	Pattern   string `json:"pattern"`
+	Listeners int    `json:"listeners"`
+}
+
 type Stats struct {
-	Connections    int64      `json:"connections"`
-	Locks          []LockInfo `json:"locks"`
-	Semaphores     []SemInfo  `json:"semaphores"`
-	IdleLocks      []IdleInfo `json:"idle_locks"`
-	IdleSemaphores []IdleInfo `json:"idle_semaphores"`
+	Connections    int64              `json:"connections"`
+	Locks          []LockInfo         `json:"locks"`
+	Semaphores     []SemInfo          `json:"semaphores"`
+	IdleLocks      []IdleInfo         `json:"idle_locks"`
+	IdleSemaphores []IdleInfo         `json:"idle_semaphores"`
+	Counters       []CounterInfo      `json:"counters"`
+	KVEntries      []KVInfo           `json:"kv_entries"`
+	Lists          []ListInfo         `json:"lists"`
+	SignalChannels []SignalChannelInfo `json:"signal_channels"`
 }
 
 // Stats returns a snapshot of the current lock manager state.
@@ -921,6 +1268,9 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		Semaphores:     []SemInfo{},
 		IdleLocks:      []IdleInfo{},
 		IdleSemaphores: []IdleInfo{},
+		Counters:       []CounterInfo{},
+		KVEntries:      []KVInfo{},
+		Lists:          []ListInfo{},
 	}
 
 	for i := range lm.shards {
@@ -977,6 +1327,35 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 					})
 				}
 			}
+		}
+		for key, cs := range sh.counters {
+			s.Counters = append(s.Counters, CounterInfo{
+				Key:   key,
+				Value: cs.Value,
+				IdleS: now.Sub(cs.LastActivity).Seconds(),
+			})
+		}
+		for key, entry := range sh.kvStore {
+			ttl := 0.0
+			if !entry.ExpiresAt.IsZero() {
+				ttl = entry.ExpiresAt.Sub(now).Seconds()
+				if ttl < 0 {
+					ttl = 0
+				}
+			}
+			s.KVEntries = append(s.KVEntries, KVInfo{
+				Key:      key,
+				ValueLen: len(entry.Value),
+				TTL:      ttl,
+				IdleS:    now.Sub(entry.LastActivity).Seconds(),
+			})
+		}
+		for key, ls := range sh.lists {
+			s.Lists = append(s.Lists, ListInfo{
+				Key:   key,
+				Len:   len(ls.Items),
+				IdleS: now.Sub(ls.LastActivity).Seconds(),
+			})
 		}
 		sh.mu.Unlock()
 	}
@@ -1060,6 +1439,9 @@ func (lm *LockManager) ResetForTest() {
 	for i := range lm.shards {
 		lm.shards[i].mu.Lock()
 		lm.shards[i].resources = make(map[string]*ResourceState)
+		lm.shards[i].counters = make(map[string]*counterState)
+		lm.shards[i].kvStore = make(map[string]*kvEntry)
+		lm.shards[i].lists = make(map[string]*listState)
 		lm.shards[i].mu.Unlock()
 	}
 	lm.connOwned = make(map[uint64]map[string]map[string]struct{})

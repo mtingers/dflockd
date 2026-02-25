@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -26,6 +27,9 @@ var (
 	ErrLimitMismatch  = errors.New("dflockd: limit mismatch")
 	ErrLeaseExpired   = errors.New("dflockd: lease expired")
 	ErrAuth           = errors.New("dflockd: authentication failed")
+	ErrMaxKeys        = errors.New("dflockd: max keys reached")
+	ErrNotFound       = errors.New("dflockd: not found")
+	ErrListFull       = errors.New("dflockd: list full")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -516,6 +520,397 @@ func parseOKTokenLease(resp, cmd string) (string, int, error) {
 		return parts[1], ttl, nil
 	}
 	return "", 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
+// ---------------------------------------------------------------------------
+// Response parsing helpers (new types)
+// ---------------------------------------------------------------------------
+
+func parseOKInt64(resp, cmd string) (int64, error) {
+	parts := strings.Fields(resp)
+	if len(parts) == 2 && parts[0] == "ok" {
+		n, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s: bad value %q", ErrServer, cmd, parts[1])
+		}
+		return n, nil
+	}
+	if resp == "error_max_keys" {
+		return 0, ErrMaxKeys
+	}
+	return 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
+func parseOKInt(resp, cmd string) (int, error) {
+	parts := strings.Fields(resp)
+	if len(parts) == 2 && parts[0] == "ok" {
+		n, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s: bad value %q", ErrServer, cmd, parts[1])
+		}
+		return n, nil
+	}
+	if resp == "error_max_keys" {
+		return 0, ErrMaxKeys
+	}
+	if resp == "error_list_full" {
+		return 0, ErrListFull
+	}
+	return 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Counters
+// ---------------------------------------------------------------------------
+
+// Incr increments a counter by delta and returns the new value.
+func Incr(c *Conn, key string, delta int64) (int64, error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("incr", key, strconv.FormatInt(delta, 10))
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt64(resp, "incr")
+}
+
+// Decr decrements a counter by delta and returns the new value.
+func Decr(c *Conn, key string, delta int64) (int64, error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("decr", key, strconv.FormatInt(delta, 10))
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt64(resp, "decr")
+}
+
+// GetCounter returns the current value of a counter (0 if nonexistent).
+func GetCounter(c *Conn, key string) (int64, error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("get", key, "")
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt64(resp, "get")
+}
+
+// SetCounter sets a counter to a specific value.
+func SetCounter(c *Conn, key string, value int64) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	resp, err := c.sendRecv("cset", key, strconv.FormatInt(value, 10))
+	if err != nil {
+		return err
+	}
+	if resp == "error_max_keys" {
+		return ErrMaxKeys
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: cset: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// KV Store
+// ---------------------------------------------------------------------------
+
+// KVSet sets a key-value pair with an optional TTL in seconds (0 = no expiry).
+func KVSet(c *Conn, key, value string, ttlSeconds int) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	arg := value
+	if ttlSeconds > 0 {
+		arg += " " + strconv.Itoa(ttlSeconds)
+	}
+	resp, err := c.sendRecv("kset", key, arg)
+	if err != nil {
+		return err
+	}
+	if resp == "error_max_keys" {
+		return ErrMaxKeys
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: kset: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// KVGet retrieves a value by key. Returns ErrNotFound if the key doesn't exist.
+func KVGet(c *Conn, key string) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	resp, err := c.sendRecv("kget", key, "")
+	if err != nil {
+		return "", err
+	}
+	if resp == "nil" {
+		return "", ErrNotFound
+	}
+	if strings.HasPrefix(resp, "ok ") {
+		return resp[3:], nil
+	}
+	return "", fmt.Errorf("%w: kget: %s", ErrServer, resp)
+}
+
+// KVDel deletes a key-value pair.
+func KVDel(c *Conn, key string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	resp, err := c.sendRecv("kdel", key, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: kdel: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Signaling
+// ---------------------------------------------------------------------------
+
+// Signal represents a received signal from a channel.
+type Signal struct {
+	Channel string
+	Payload string
+}
+
+// SignalConn wraps a Conn for signal operations, providing a background
+// reader that separates push signals from command responses.
+type SignalConn struct {
+	conn   *Conn
+	sigCh  chan Signal
+	respCh chan string
+	done   chan struct{}
+}
+
+// NewSignalConn creates a SignalConn from an existing Conn.
+// The Conn must not be used directly after this call.
+func NewSignalConn(c *Conn) *SignalConn {
+	sc := &SignalConn{
+		conn:   c,
+		sigCh:  make(chan Signal, 64),
+		respCh: make(chan string, 1),
+		done:   make(chan struct{}),
+	}
+	go sc.readLoop()
+	return sc
+}
+
+func (sc *SignalConn) readLoop() {
+	defer close(sc.done)
+	for {
+		line, err := sc.conn.readLine()
+		if err != nil {
+			close(sc.sigCh)
+			return
+		}
+		if strings.HasPrefix(line, "sig ") {
+			// Parse: "sig <channel> <payload>"
+			rest := line[4:]
+			idx := strings.Index(rest, " ")
+			if idx >= 0 {
+				sig := Signal{
+					Channel: rest[:idx],
+					Payload: rest[idx+1:],
+				}
+				select {
+				case sc.sigCh <- sig:
+				default:
+				}
+			}
+		} else {
+			sc.respCh <- line
+		}
+	}
+}
+
+// sendCmd sends a command and waits for the response (from respCh).
+func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
+	sc.conn.mu.Lock()
+	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
+	if _, err := sc.conn.conn.Write([]byte(msg)); err != nil {
+		sc.conn.mu.Unlock()
+		return "", err
+	}
+	sc.conn.mu.Unlock()
+
+	select {
+	case resp, ok := <-sc.respCh:
+		if !ok {
+			return "", fmt.Errorf("dflockd: connection closed")
+		}
+		return resp, nil
+	case <-sc.done:
+		return "", fmt.Errorf("dflockd: connection closed")
+	}
+}
+
+// Listen subscribes to a pattern (supports * and > wildcards).
+func (sc *SignalConn) Listen(pattern string) error {
+	resp, err := sc.sendCmd("listen", pattern, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: listen: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Unlisten unsubscribes from a pattern.
+func (sc *SignalConn) Unlisten(pattern string) error {
+	resp, err := sc.sendCmd("unlisten", pattern, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: unlisten: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Emit sends a signal on a channel (must be literal, no wildcards).
+// Returns the number of receivers.
+func (sc *SignalConn) Emit(channel, payload string) (int, error) {
+	resp, err := sc.sendCmd("signal", channel, payload)
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "signal")
+}
+
+// Signals returns the channel on which received signals are delivered.
+func (sc *SignalConn) Signals() <-chan Signal {
+	return sc.sigCh
+}
+
+// Close closes the underlying connection.
+func (sc *SignalConn) Close() error {
+	err := sc.conn.Close()
+	<-sc.done
+	return err
+}
+
+// Emit sends a signal on a channel using a regular (non-listening) connection.
+// Returns the number of receivers.
+func Emit(c *Conn, channel, payload string) (int, error) {
+	if err := validateKey(channel); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("signal", channel, payload)
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "signal")
+}
+
+// ---------------------------------------------------------------------------
+// Lists/Queues
+// ---------------------------------------------------------------------------
+
+// LPush prepends a value to a list and returns the new length.
+func LPush(c *Conn, key, value string) (int, error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("lpush", key, value)
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "lpush")
+}
+
+// RPush appends a value to a list and returns the new length.
+func RPush(c *Conn, key, value string) (int, error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("rpush", key, value)
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "rpush")
+}
+
+// LPop removes and returns the first element. Returns ErrNotFound if empty.
+func LPop(c *Conn, key string) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	resp, err := c.sendRecv("lpop", key, "")
+	if err != nil {
+		return "", err
+	}
+	if resp == "nil" {
+		return "", ErrNotFound
+	}
+	if strings.HasPrefix(resp, "ok ") {
+		return resp[3:], nil
+	}
+	return "", fmt.Errorf("%w: lpop: %s", ErrServer, resp)
+}
+
+// RPop removes and returns the last element. Returns ErrNotFound if empty.
+func RPop(c *Conn, key string) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	resp, err := c.sendRecv("rpop", key, "")
+	if err != nil {
+		return "", err
+	}
+	if resp == "nil" {
+		return "", ErrNotFound
+	}
+	if strings.HasPrefix(resp, "ok ") {
+		return resp[3:], nil
+	}
+	return "", fmt.Errorf("%w: rpop: %s", ErrServer, resp)
+}
+
+// LLen returns the length of a list (0 if nonexistent).
+func LLen(c *Conn, key string) (int, error) {
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("llen", key, "")
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "llen")
+}
+
+// LRange returns a range of elements from a list.
+// Uses Redis-like index semantics (0-based, negative from end, inclusive).
+func LRange(c *Conn, key string, start, stop int) ([]string, error) {
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
+	arg := strconv.Itoa(start) + " " + strconv.Itoa(stop)
+	resp, err := c.sendRecv("lrange", key, arg)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(resp, "ok ") {
+		return nil, fmt.Errorf("%w: lrange: %s", ErrServer, resp)
+	}
+	var items []string
+	if err := json.Unmarshal([]byte(resp[3:]), &items); err != nil {
+		return nil, fmt.Errorf("%w: lrange: bad json: %v", ErrServer, err)
+	}
+	return items, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -1944,3 +1944,503 @@ func TestIntegration_StatsResponse(t *testing.T) {
 		t.Fatal("stats should include 'locks' field")
 	}
 }
+
+// ===========================================================================
+// Phase 1: Counter Integration Tests
+// ===========================================================================
+
+func TestIntegration_IncrDecr(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "incr", "myctr", "5")
+	if resp != "ok 5" {
+		t.Fatalf("expected 'ok 5', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "incr", "myctr", "3")
+	if resp != "ok 8" {
+		t.Fatalf("expected 'ok 8', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "decr", "myctr", "2")
+	if resp != "ok 6" {
+		t.Fatalf("expected 'ok 6', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "get", "myctr", "")
+	if resp != "ok 6" {
+		t.Fatalf("expected 'ok 6', got %q", resp)
+	}
+}
+
+func TestIntegration_CounterNamespaceIsolation(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Acquire a lock on "foo"
+	resp := connSendCmd(t, conn, reader, "l", "foo", "5")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("lock failed: %s", resp)
+	}
+
+	// Incr counter "foo" — different namespace
+	resp = connSendCmd(t, conn, reader, "incr", "foo", "10")
+	if resp != "ok 10" {
+		t.Fatalf("expected 'ok 10', got %q", resp)
+	}
+}
+
+func TestIntegration_Cset(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "cset", "myctr", "42")
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "get", "myctr", "")
+	if resp != "ok 42" {
+		t.Fatalf("expected 'ok 42', got %q", resp)
+	}
+}
+
+func TestIntegration_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	connSendCmd(t, conn, reader, "incr", "c1", "1")
+	connSendCmd(t, conn, reader, "incr", "c2", "1")
+	resp := connSendCmd(t, conn, reader, "incr", "c3", "1")
+	if resp != "error_max_keys" {
+		t.Fatalf("expected error_max_keys, got %q", resp)
+	}
+}
+
+// ===========================================================================
+// Phase 2: KV Integration Tests
+// ===========================================================================
+
+func TestIntegration_KVSetGetDel(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "kset", "mykey", "hello")
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "kget", "mykey", "")
+	if resp != "ok hello" {
+		t.Fatalf("expected 'ok hello', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "kdel", "mykey", "")
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "kget", "mykey", "")
+	if resp != "nil" {
+		t.Fatalf("expected 'nil', got %q", resp)
+	}
+}
+
+func TestIntegration_KVSetWithTTL(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "kset", "mykey", "hello 1")
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %q", resp)
+	}
+
+	// Immediately should be available
+	resp = connSendCmd(t, conn, reader, "kget", "mykey", "")
+	if resp != "ok hello" {
+		t.Fatalf("expected 'ok hello', got %q", resp)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(1200 * time.Millisecond)
+
+	resp = connSendCmd(t, conn, reader, "kget", "mykey", "")
+	if resp != "nil" {
+		t.Fatalf("expected 'nil' after TTL expiry, got %q", resp)
+	}
+}
+
+// ===========================================================================
+// Phase 3: Signal Integration Tests
+// ===========================================================================
+
+func TestIntegration_Signal_Basic(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Listener connection
+	listenerConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerConn.Close()
+	listenerReader := bufio.NewReader(listenerConn)
+
+	resp := connSendCmd(t, listenerConn, listenerReader, "listen", "alerts.*", "")
+	if resp != "ok" {
+		t.Fatalf("listen failed: %s", resp)
+	}
+
+	// Emitter connection
+	emitterConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emitterConn.Close()
+	emitterReader := bufio.NewReader(emitterConn)
+
+	resp = connSendCmd(t, emitterConn, emitterReader, "signal", "alerts.fire", "building-7!")
+	if resp != "ok 1" {
+		t.Fatalf("signal failed: %s", resp)
+	}
+
+	// Read pushed signal on listener
+	listenerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := listenerReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read signal: %v", err)
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if line != "sig alerts.fire building-7!" {
+		t.Fatalf("expected 'sig alerts.fire building-7!', got %q", line)
+	}
+}
+
+func TestIntegration_Signal_CatchAll(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	listenerConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerConn.Close()
+	listenerReader := bufio.NewReader(listenerConn)
+
+	resp := connSendCmd(t, listenerConn, listenerReader, "listen", ">", "")
+	if resp != "ok" {
+		t.Fatalf("listen failed: %s", resp)
+	}
+
+	emitterConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emitterConn.Close()
+	emitterReader := bufio.NewReader(emitterConn)
+
+	resp = connSendCmd(t, emitterConn, emitterReader, "signal", "any.channel.name", "payload")
+	if resp != "ok 1" {
+		t.Fatalf("expected 'ok 1', got %q", resp)
+	}
+
+	listenerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := listenerReader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if line != "sig any.channel.name payload" {
+		t.Fatalf("expected signal push, got %q", line)
+	}
+}
+
+func TestIntegration_Signal_Unlisten(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	listenerConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerConn.Close()
+	listenerReader := bufio.NewReader(listenerConn)
+
+	connSendCmd(t, listenerConn, listenerReader, "listen", "ch", "")
+
+	// Unlisten
+	resp := connSendCmd(t, listenerConn, listenerReader, "unlisten", "ch", "")
+	if resp != "ok" {
+		t.Fatalf("unlisten failed: %s", resp)
+	}
+
+	// Signal should now have 0 receivers
+	emitterConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emitterConn.Close()
+	emitterReader := bufio.NewReader(emitterConn)
+
+	resp = connSendCmd(t, emitterConn, emitterReader, "signal", "ch", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("expected 'ok 0', got %q", resp)
+	}
+}
+
+func TestIntegration_Signal_DisconnectCleanup(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Connect, listen, then disconnect
+	listenerConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenerReader := bufio.NewReader(listenerConn)
+	connSendCmd(t, listenerConn, listenerReader, "listen", "ch", "")
+	listenerConn.Close()
+
+	// Give the server a moment to clean up
+	time.Sleep(100 * time.Millisecond)
+
+	// Signal should have 0 receivers
+	emitterConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emitterConn.Close()
+	emitterReader := bufio.NewReader(emitterConn)
+
+	resp := connSendCmd(t, emitterConn, emitterReader, "signal", "ch", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("expected 'ok 0' after disconnect cleanup, got %q", resp)
+	}
+}
+
+func TestIntegration_Signal_MixedCommands(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Use same connection for lock + signal + counter
+	resp := connSendCmd(t, conn, reader, "incr", "ctr", "5")
+	if resp != "ok 5" {
+		t.Fatalf("incr: %s", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "signal", "ch", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("signal: %s", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "get", "ctr", "")
+	if resp != "ok 5" {
+		t.Fatalf("get: %s", resp)
+	}
+}
+
+// ===========================================================================
+// Phase 4: List Integration Tests
+// ===========================================================================
+
+func TestIntegration_FIFO_Queue(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	connSendCmd(t, conn, reader, "rpush", "q1", "a")
+	connSendCmd(t, conn, reader, "rpush", "q1", "b")
+	resp := connSendCmd(t, conn, reader, "rpush", "q1", "c")
+	if resp != "ok 3" {
+		t.Fatalf("expected 'ok 3', got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "lpop", "q1", "")
+	if resp != "ok a" {
+		t.Fatalf("expected 'ok a', got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "lpop", "q1", "")
+	if resp != "ok b" {
+		t.Fatalf("expected 'ok b', got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "lpop", "q1", "")
+	if resp != "ok c" {
+		t.Fatalf("expected 'ok c', got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "lpop", "q1", "")
+	if resp != "nil" {
+		t.Fatalf("expected 'nil', got %q", resp)
+	}
+}
+
+func TestIntegration_LRange_JSON(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	connSendCmd(t, conn, reader, "rpush", "q1", "a")
+	connSendCmd(t, conn, reader, "rpush", "q1", "b")
+	connSendCmd(t, conn, reader, "rpush", "q1", "c")
+
+	resp := connSendCmd(t, conn, reader, "lrange", "q1", "0 -1")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("expected ok, got %q", resp)
+	}
+	jsonPart := resp[3:]
+	var items []string
+	if err := json.Unmarshal([]byte(jsonPart), &items); err != nil {
+		t.Fatalf("JSON parse: %v", err)
+	}
+	if len(items) != 3 || items[0] != "a" || items[1] != "b" || items[2] != "c" {
+		t.Fatalf("expected [a b c], got %v", items)
+	}
+}
+
+func TestIntegration_LIFO_Stack(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	connSendCmd(t, conn, reader, "lpush", "stack", "a")
+	connSendCmd(t, conn, reader, "lpush", "stack", "b")
+	connSendCmd(t, conn, reader, "lpush", "stack", "c")
+
+	resp := connSendCmd(t, conn, reader, "lpop", "stack", "")
+	if resp != "ok c" {
+		t.Fatalf("expected 'ok c', got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "lpop", "stack", "")
+	if resp != "ok b" {
+		t.Fatalf("expected 'ok b', got %q", resp)
+	}
+}
+
+func TestIntegration_LLen(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "llen", "q1", "")
+	if resp != "ok 0" {
+		t.Fatalf("expected 'ok 0', got %q", resp)
+	}
+
+	connSendCmd(t, conn, reader, "rpush", "q1", "a")
+	connSendCmd(t, conn, reader, "rpush", "q1", "b")
+
+	resp = connSendCmd(t, conn, reader, "llen", "q1", "")
+	if resp != "ok 2" {
+		t.Fatalf("expected 'ok 2', got %q", resp)
+	}
+}
+
+func TestIntegration_ListFull(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxListLength = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	connSendCmd(t, conn, reader, "rpush", "q1", "a")
+	connSendCmd(t, conn, reader, "rpush", "q1", "b")
+	resp := connSendCmd(t, conn, reader, "rpush", "q1", "c")
+	if resp != "error_list_full" {
+		t.Fatalf("expected 'error_list_full', got %q", resp)
+	}
+}

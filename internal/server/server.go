@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +19,17 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
+	"github.com/mtingers/dflockd/internal/signal"
 )
+
+type connState struct {
+	id      uint64
+	writeCh chan []byte
+}
 
 type Server struct {
 	lm        *lock.LockManager
+	sig       *signal.Manager
 	cfg       *config.Config
 	log       *slog.Logger
 	connSeq   atomic.Uint64
@@ -29,7 +38,7 @@ type Server struct {
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{lm: lm, cfg: cfg, log: log}
+	return &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager()}
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -167,8 +176,32 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	// shuts down, allowing in-progress lock waits to be interrupted.
 	connCtx, connCancel := context.WithCancel(ctx)
 
+	// Write multiplexer: writeMu serializes all writes to the connection.
+	// writeCh is used by the signal push writer goroutine.
+	var writeMu sync.Mutex
+	writeCh := make(chan []byte, 64)
+
+	cs := &connState{id: connID, writeCh: writeCh}
+
+	writeResp := func(data []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return s.writeResponse(conn, data)
+	}
+
+	// Push writer goroutine: drains writeCh and writes to conn.
+	go func() {
+		for data := range writeCh {
+			writeMu.Lock()
+			s.writeResponse(conn, data)
+			writeMu.Unlock()
+		}
+	}()
+
 	defer func() {
 		connCancel()
+		s.sig.UnlistenAll(connID)
+		close(writeCh)
 		s.conns.Delete(conn)
 		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
@@ -185,12 +218,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 		if err != nil || req.Cmd != "auth" ||
 			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
 			s.log.Warn("auth failed", "peer", peer, "conn_id", connID)
-			s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
+			writeResp(protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
 			// Small delay to slow down brute-force attempts.
 			time.Sleep(100 * time.Millisecond)
 			return
 		}
-		s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
+		writeResp(protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
 	}
 
 	for {
@@ -203,7 +236,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 					break
 				}
 				s.log.Warn("protocol error", "peer", peer, "code", pe.Code, "msg", pe.Message)
-				if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
+				if err := writeResp(protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
 					s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 					break
 				}
@@ -220,20 +253,28 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 			break
 		}
 
-		ack := s.handleRequest(connCtx, req, connID)
-		if err := s.writeResponse(conn, protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
+		ack := s.handleRequest(connCtx, req, cs)
+		if err := writeResp(protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
 			s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 			break
 		}
 	}
 }
 
-func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
+func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *connState) *protocol.Ack {
+	connID := cs.id
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
 
 	switch req.Cmd {
 	case "stats":
 		st := s.lm.Stats(s.connCount.Load())
+		sigStats := s.sig.Stats()
+		for _, si := range sigStats {
+			st.SignalChannels = append(st.SignalChannels, lock.SignalChannelInfo{
+				Pattern:   si.Pattern,
+				Listeners: si.Listeners,
+			})
+		}
 		data, err := json.Marshal(st)
 		if err != nil {
 			return &protocol.Ack{Status: "error"}
@@ -322,6 +363,149 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			return &protocol.Ack{Status: "timeout"}
 		}
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
+
+	// --- Phase 1: Atomic Counters ---
+
+	case "incr":
+		val, err := s.lm.Incr(req.Key, req.Delta)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: strconv.FormatInt(val, 10)}
+
+	case "decr":
+		val, err := s.lm.Decr(req.Key, req.Delta)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: strconv.FormatInt(val, 10)}
+
+	case "get":
+		val := s.lm.GetCounter(req.Key)
+		return &protocol.Ack{Status: "ok", Extra: strconv.FormatInt(val, 10)}
+
+	case "cset":
+		if err := s.lm.SetCounter(req.Key, req.Delta); err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok"}
+
+	// --- Phase 2: KV with TTL ---
+
+	case "kset":
+		value := req.Value
+		ttl := 0
+		// Parse optional TTL: last space-separated token is TTL if it parses as int >= 0
+		if idx := strings.LastIndex(value, " "); idx >= 0 {
+			candidate := value[idx+1:]
+			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 {
+				ttl = n
+				value = value[:idx]
+			}
+		}
+		if value == "" {
+			return &protocol.Ack{Status: "error"}
+		}
+		if err := s.lm.KVSet(req.Key, value, ttl); err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok"}
+
+	case "kget":
+		val, ok := s.lm.KVGet(req.Key)
+		if !ok {
+			return &protocol.Ack{Status: "nil"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: val}
+
+	case "kdel":
+		s.lm.KVDel(req.Key)
+		return &protocol.Ack{Status: "ok"}
+
+	// --- Phase 3: Signaling ---
+
+	case "listen":
+		listener := &signal.Listener{
+			ConnID:  connID,
+			Pattern: req.Key,
+			WriteCh: cs.writeCh,
+		}
+		s.sig.Listen(req.Key, listener)
+		return &protocol.Ack{Status: "ok"}
+
+	case "unlisten":
+		s.sig.Unlisten(req.Key, connID)
+		return &protocol.Ack{Status: "ok"}
+
+	case "signal":
+		n := s.sig.Signal(req.Key, req.Value)
+		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
+
+	// --- Phase 4: Lists/Queues ---
+
+	case "lpush":
+		n, err := s.lm.LPush(req.Key, req.Value)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			if errors.Is(err, lock.ErrListFull) {
+				return &protocol.Ack{Status: "error_list_full"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
+
+	case "rpush":
+		n, err := s.lm.RPush(req.Key, req.Value)
+		if err != nil {
+			if errors.Is(err, lock.ErrMaxKeys) {
+				return &protocol.Ack{Status: "error_max_keys"}
+			}
+			if errors.Is(err, lock.ErrListFull) {
+				return &protocol.Ack{Status: "error_list_full"}
+			}
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
+
+	case "lpop":
+		val, ok := s.lm.LPop(req.Key)
+		if !ok {
+			return &protocol.Ack{Status: "nil"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: val}
+
+	case "rpop":
+		val, ok := s.lm.RPop(req.Key)
+		if !ok {
+			return &protocol.Ack{Status: "nil"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: val}
+
+	case "llen":
+		n := s.lm.LLen(req.Key)
+		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
+
+	case "lrange":
+		items := s.lm.LRange(req.Key, req.Start, req.Stop)
+		data, err := json.Marshal(items)
+		if err != nil {
+			return &protocol.Ack{Status: "error"}
+		}
+		return &protocol.Ack{Status: "ok", Extra: string(data)}
 	}
 
 	s.log.Warn("unknown command in handleRequest", "cmd", req.Cmd, "conn", connID)

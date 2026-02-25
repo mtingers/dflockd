@@ -1272,3 +1272,436 @@ func TestSemaphoreAcquireReleaseAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ===========================================================================
+// Phase 1: Counter Client Tests
+// ===========================================================================
+
+func TestClient_Incr(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	val, err := client.Incr(c, "ctr", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 5 {
+		t.Fatalf("expected 5, got %d", val)
+	}
+	val, err = client.Incr(c, "ctr", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 8 {
+		t.Fatalf("expected 8, got %d", val)
+	}
+}
+
+func TestClient_Decr(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	client.Incr(c, "ctr", 10)
+	val, err := client.Decr(c, "ctr", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 7 {
+		t.Fatalf("expected 7, got %d", val)
+	}
+}
+
+func TestClient_GetCounter(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	val, err := client.GetCounter(c, "ctr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 0 {
+		t.Fatalf("expected 0, got %d", val)
+	}
+
+	client.Incr(c, "ctr", 42)
+	val, err = client.GetCounter(c, "ctr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 42 {
+		t.Fatalf("expected 42, got %d", val)
+	}
+}
+
+func TestClient_SetCounter(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.SetCounter(c, "ctr", 99); err != nil {
+		t.Fatal(err)
+	}
+	val, _ := client.GetCounter(c, "ctr")
+	if val != 99 {
+		t.Fatalf("expected 99, got %d", val)
+	}
+}
+
+// ===========================================================================
+// Phase 2: KV Client Tests
+// ===========================================================================
+
+func TestClient_KVSetGet(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.KVSet(c, "mykey", "hello", 0); err != nil {
+		t.Fatal(err)
+	}
+	val, err := client.KVGet(c, "mykey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "hello" {
+		t.Fatalf("expected 'hello', got %q", val)
+	}
+}
+
+func TestClient_KVDel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	client.KVSet(c, "mykey", "hello", 0)
+	if err := client.KVDel(c, "mykey"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.KVGet(c, "mykey")
+	if err != client.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestClient_KVNotFound(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.KVGet(c, "nosuchkey")
+	if err != client.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestClient_KVWithTTL(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.KVSet(c, "mykey", "hello", 1); err != nil {
+		t.Fatal(err)
+	}
+	val, err := client.KVGet(c, "mykey")
+	if err != nil || val != "hello" {
+		t.Fatalf("expected 'hello', got %q err=%v", val, err)
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+
+	_, err = client.KVGet(c, "mykey")
+	if err != client.ErrNotFound {
+		t.Fatalf("expected ErrNotFound after TTL, got %v", err)
+	}
+}
+
+// ===========================================================================
+// Phase 3: Signal Client Tests
+// ===========================================================================
+
+func TestClient_SignalConn(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Listener
+	lc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(lc)
+	defer sc.Close()
+
+	if err := sc.Listen("alerts.*"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emitter
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	n, err := client.Emit(ec, "alerts.fire", "help!")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 receiver, got %d", n)
+	}
+
+	// Receive signal
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "alerts.fire" || sig.Payload != "help!" {
+			t.Fatalf("unexpected signal: %+v", sig)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for signal")
+	}
+}
+
+func TestClient_SignalConn_WildcardGT(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	lc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(lc)
+	defer sc.Close()
+
+	if err := sc.Listen("events.>"); err != nil {
+		t.Fatal(err)
+	}
+
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	client.Emit(ec, "events.user.login", "user42")
+
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "events.user.login" || sig.Payload != "user42" {
+			t.Fatalf("unexpected signal: %+v", sig)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestClient_SignalConn_Emit(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	n, err := sc.Emit("ch", "payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 receivers, got %d", n)
+	}
+}
+
+func TestClient_EmitWithoutListening(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	n, err := client.Emit(c, "ch", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 receivers, got %d", n)
+	}
+}
+
+func TestClient_SignalConn_MultipleChannels(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	lc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(lc)
+	defer sc.Close()
+
+	sc.Listen("ch1")
+	sc.Listen("ch2")
+
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	client.Emit(ec, "ch1", "msg1")
+	client.Emit(ec, "ch2", "msg2")
+
+	received := make(map[string]string)
+	for i := 0; i < 2; i++ {
+		select {
+		case sig := <-sc.Signals():
+			received[sig.Channel] = sig.Payload
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout")
+		}
+	}
+
+	if received["ch1"] != "msg1" || received["ch2"] != "msg2" {
+		t.Fatalf("unexpected: %v", received)
+	}
+}
+
+// ===========================================================================
+// Phase 4: List Client Tests
+// ===========================================================================
+
+func TestClient_LPush_RPush(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	n, err := client.RPush(c, "q1", "a")
+	if err != nil || n != 1 {
+		t.Fatalf("rpush: n=%d err=%v", n, err)
+	}
+	n, err = client.RPush(c, "q1", "b")
+	if err != nil || n != 2 {
+		t.Fatalf("rpush: n=%d err=%v", n, err)
+	}
+	n, err = client.LPush(c, "q1", "z")
+	if err != nil || n != 3 {
+		t.Fatalf("lpush: n=%d err=%v", n, err)
+	}
+}
+
+func TestClient_LPop_RPop(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	client.RPush(c, "q1", "a")
+	client.RPush(c, "q1", "b")
+	client.RPush(c, "q1", "c")
+
+	val, err := client.LPop(c, "q1")
+	if err != nil || val != "a" {
+		t.Fatalf("lpop: %q err=%v", val, err)
+	}
+	val, err = client.RPop(c, "q1")
+	if err != nil || val != "c" {
+		t.Fatalf("rpop: %q err=%v", val, err)
+	}
+}
+
+func TestClient_LPop_Empty(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.LPop(c, "empty")
+	if err != client.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestClient_LLen(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	n, err := client.LLen(c, "q1")
+	if err != nil || n != 0 {
+		t.Fatalf("expected 0, got %d err=%v", n, err)
+	}
+
+	client.RPush(c, "q1", "a")
+	client.RPush(c, "q1", "b")
+
+	n, err = client.LLen(c, "q1")
+	if err != nil || n != 2 {
+		t.Fatalf("expected 2, got %d err=%v", n, err)
+	}
+}
+
+func TestClient_LRange(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	client.RPush(c, "q1", "a")
+	client.RPush(c, "q1", "b")
+	client.RPush(c, "q1", "c")
+
+	items, err := client.LRange(c, "q1", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 || items[0] != "a" || items[1] != "b" || items[2] != "c" {
+		t.Fatalf("expected [a b c], got %v", items)
+	}
+
+	items, err = client.LRange(c, "q1", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0] != "b" {
+		t.Fatalf("expected [b], got %v", items)
+	}
+}

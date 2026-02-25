@@ -476,3 +476,354 @@ func TestReadLine_ExactMax(t *testing.T) {
 		t.Fatalf("expected len %d, got %d", MaxLineBytes, len(line))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1: Atomic Counters
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_Incr(t *testing.T) {
+	r := makeReader("incr", "mykey", "5")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "incr" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Delta != 5 {
+		t.Fatalf("delta: got %d", req.Delta)
+	}
+}
+
+func TestReadRequest_Decr(t *testing.T) {
+	r := makeReader("decr", "mykey", "3")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "decr" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Delta != 3 {
+		t.Fatalf("delta: got %d", req.Delta)
+	}
+}
+
+func TestReadRequest_Get(t *testing.T) {
+	r := makeReader("get", "mykey", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "get" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Cset(t *testing.T) {
+	r := makeReader("cset", "mykey", "42")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "cset" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Delta != 42 {
+		t.Fatalf("delta: got %d", req.Delta)
+	}
+}
+
+func TestReadRequest_IncrBadDelta(t *testing.T) {
+	r := makeReader("incr", "mykey", "notanumber")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 4 {
+		t.Fatalf("expected code 4, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: KV with TTL
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_Kset(t *testing.T) {
+	r := makeReader("kset", "mykey", "hello 60")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "kset" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Value != "hello 60" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_KsetNoTTL(t *testing.T) {
+	r := makeReader("kset", "mykey", "hello")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "kset" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Value != "hello" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_KsetEmptyValue(t *testing.T) {
+	r := makeReader("kset", "mykey", "")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 8 {
+		t.Fatalf("expected code 8, got %v", err)
+	}
+}
+
+func TestReadRequest_Kget(t *testing.T) {
+	r := makeReader("kget", "mykey", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "kget" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Kdel(t *testing.T) {
+	r := makeReader("kdel", "mykey", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "kdel" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mykey" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Signaling
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_Listen(t *testing.T) {
+	r := makeReader("listen", "alerts.*", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "listen" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "alerts.*" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Unlisten(t *testing.T) {
+	r := makeReader("unlisten", "alerts.*", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "unlisten" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "alerts.*" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Signal(t *testing.T) {
+	r := makeReader("signal", "alerts.fire", "hello world")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "signal" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "alerts.fire" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Value != "hello world" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_SignalRejectsWildcard(t *testing.T) {
+	r := makeReader("signal", "alerts.*", "payload")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 5 {
+		t.Fatalf("expected code 5, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Lists/Queues
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_Lpush(t *testing.T) {
+	r := makeReader("lpush", "mylist", "item1")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "lpush" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mylist" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Value != "item1" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_Rpush(t *testing.T) {
+	r := makeReader("rpush", "mylist", "item1")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "rpush" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mylist" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Value != "item1" {
+		t.Fatalf("value: got %q", req.Value)
+	}
+}
+
+func TestReadRequest_LpushEmptyValue(t *testing.T) {
+	r := makeReader("lpush", "mylist", "")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 8 {
+		t.Fatalf("expected code 8, got %v", err)
+	}
+}
+
+func TestReadRequest_Lpop(t *testing.T) {
+	r := makeReader("lpop", "mylist", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "lpop" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mylist" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Rpop(t *testing.T) {
+	r := makeReader("rpop", "mylist", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "rpop" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mylist" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Llen(t *testing.T) {
+	r := makeReader("llen", "mylist", "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "llen" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mylist" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+}
+
+func TestReadRequest_Lrange(t *testing.T) {
+	r := makeReader("lrange", "mylist", "0 -1")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Cmd != "lrange" {
+		t.Fatalf("cmd: got %q", req.Cmd)
+	}
+	if req.Key != "mylist" {
+		t.Fatalf("key: got %q", req.Key)
+	}
+	if req.Start != 0 {
+		t.Fatalf("start: got %d", req.Start)
+	}
+	if req.Stop != -1 {
+		t.Fatalf("stop: got %d", req.Stop)
+	}
+}
+
+func TestReadRequest_LrangeBadArgs(t *testing.T) {
+	r := makeReader("lrange", "mylist", "0")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 8 {
+		t.Fatalf("expected code 8, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FormatResponse: new statuses
+// ---------------------------------------------------------------------------
+
+func TestFormatResponse_Nil(t *testing.T) {
+	got := string(FormatResponse(&Ack{Status: "nil"}, 33))
+	if got != "nil\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestFormatResponse_ErrorMaxKeys(t *testing.T) {
+	got := string(FormatResponse(&Ack{Status: "error_max_keys"}, 33))
+	if got != "error_max_keys\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestFormatResponse_ErrorListFull(t *testing.T) {
+	got := string(FormatResponse(&Ack{Status: "error_list_full"}, 33))
+	if got != "error_list_full\n" {
+		t.Fatalf("got %q", got)
+	}
+}

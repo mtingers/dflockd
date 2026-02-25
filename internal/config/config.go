@@ -17,6 +17,8 @@ type Config struct {
 	GCInterval              time.Duration
 	GCMaxIdleTime           time.Duration
 	MaxLocks                int
+	MaxKeys                 int
+	MaxListLength           int
 	MaxConnections          int
 	MaxWaiters              int
 	ReadTimeout             time.Duration
@@ -116,6 +118,8 @@ func Load(args []string) (*Config, error) {
 	gcInterval := fs.Int("gc-interval", 5, "Lock state GC interval (seconds)")
 	gcMaxIdle := fs.Int("gc-max-idle", 60, "Idle seconds before pruning lock state")
 	maxLocks := fs.Int("max-locks", 1024, "Maximum number of unique lock keys")
+	maxKeys := fs.Int("max-keys", 0, "Maximum aggregate keys across all types (0 = unlimited)")
+	maxListLength := fs.Int("max-list-length", 0, "Maximum items per list (0 = unlimited)")
 	maxConnections := fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
 	maxWaiters := fs.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
 	readTimeout := fs.Int("read-timeout", 23, "Client read timeout (seconds)")
@@ -177,6 +181,8 @@ func Load(args []string) (*Config, error) {
 		GCInterval:              resolveDuration("gc-interval", "DFLOCKD_GC_LOOP_SLEEP", *gcInterval),
 		GCMaxIdleTime:           resolveDuration("gc-max-idle", "DFLOCKD_GC_MAX_UNUSED_TIME", *gcMaxIdle),
 		MaxLocks:                resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks),
+		MaxKeys:                 resolveInt("max-keys", "DFLOCKD_MAX_KEYS", *maxKeys),
+		MaxListLength:           resolveInt("max-list-length", "DFLOCKD_MAX_LIST_LENGTH", *maxListLength),
 		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
 		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
 		ReadTimeout:             resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout),
@@ -220,6 +226,12 @@ func (c *Config) validate() error {
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("--port must be 0-65535 (got %d)", c.Port)
+	}
+	if c.MaxKeys < 0 {
+		return fmt.Errorf("--max-keys must be >= 0 (got %d)", c.MaxKeys)
+	}
+	if c.MaxListLength < 0 {
+		return fmt.Errorf("--max-list-length must be >= 0 (got %d)", c.MaxListLength)
 	}
 	if c.MaxConnections < 0 {
 		return fmt.Errorf("--max-connections must be >= 0 (got %d)", c.MaxConnections)
