@@ -45,6 +45,17 @@ func isWildPattern(pattern string) bool {
 	return strings.Contains(pattern, "*") || strings.Contains(pattern, ">")
 }
 
+// validatePattern checks that ">" only appears as the final token.
+func validatePattern(pattern string) error {
+	tokens := strings.Split(pattern, ".")
+	for i, t := range tokens {
+		if t == ">" && i != len(tokens)-1 {
+			return fmt.Errorf("'>' must be the last token in pattern")
+		}
+	}
+	return nil
+}
+
 // MatchPattern checks if a literal channel name matches a pattern.
 func MatchPattern(pattern, channel string) bool {
 	patTokens := strings.Split(pattern, ".")
@@ -63,16 +74,21 @@ func MatchPattern(pattern, channel string) bool {
 	return len(patTokens) == len(chanTokens)
 }
 
-// Listen registers a listener for a pattern.
+// Listen registers a listener for the pattern specified in listener.Pattern.
 // Duplicate subscriptions (same connID + pattern) are ignored.
-func (m *Manager) Listen(pattern string, listener *Listener) {
+// Returns an error if the pattern is invalid (e.g. ">" not as last token).
+func (m *Manager) Listen(listener *Listener) error {
+	pattern := listener.Pattern
+	if err := validatePattern(pattern); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Check for duplicate subscription
 	for _, e := range m.connListeners[listener.ConnID] {
 		if e.pattern == pattern {
-			return // already subscribed
+			return nil // already subscribed
 		}
 	}
 
@@ -92,6 +108,7 @@ func (m *Manager) Listen(pattern string, listener *Listener) {
 		pattern: pattern,
 		isWild:  wild,
 	})
+	return nil
 }
 
 // Unlisten removes a listener for a specific pattern and connID.

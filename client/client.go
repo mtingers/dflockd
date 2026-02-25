@@ -177,6 +177,13 @@ func validateKey(key string) error {
 	return nil
 }
 
+func validateValue(value string) error {
+	if strings.ContainsAny(value, "\n\r") {
+		return fmt.Errorf("dflockd: value contains newline")
+	}
+	return nil
+}
+
 // secondsCeil converts a duration to whole seconds, rounding up so that
 // sub-second durations are not silently truncated to zero.
 func secondsCeil(d time.Duration) int {
@@ -626,10 +633,14 @@ func KVSet(c *Conn, key, value string, ttlSeconds int) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
-	arg := value
-	if ttlSeconds > 0 {
-		arg += " " + strconv.Itoa(ttlSeconds)
+	if err := validateValue(value); err != nil {
+		return err
 	}
+	if ttlSeconds < 0 {
+		ttlSeconds = 0
+	}
+	// Always send TTL explicitly to avoid ambiguity with numeric values.
+	arg := value + " " + strconv.Itoa(ttlSeconds)
 	resp, err := c.sendRecv("kset", key, arg)
 	if err != nil {
 		return err
@@ -785,6 +796,9 @@ func (sc *SignalConn) Unlisten(pattern string) error {
 // Emit sends a signal on a channel (must be literal, no wildcards).
 // Returns the number of receivers.
 func (sc *SignalConn) Emit(channel, payload string) (int, error) {
+	if err := validateValue(payload); err != nil {
+		return 0, err
+	}
 	resp, err := sc.sendCmd("signal", channel, payload)
 	if err != nil {
 		return 0, err
@@ -810,6 +824,9 @@ func Emit(c *Conn, channel, payload string) (int, error) {
 	if err := validateKey(channel); err != nil {
 		return 0, err
 	}
+	if err := validateValue(payload); err != nil {
+		return 0, err
+	}
 	resp, err := c.sendRecv("signal", channel, payload)
 	if err != nil {
 		return 0, err
@@ -826,6 +843,9 @@ func LPush(c *Conn, key, value string) (int, error) {
 	if err := validateKey(key); err != nil {
 		return 0, err
 	}
+	if err := validateValue(value); err != nil {
+		return 0, err
+	}
 	resp, err := c.sendRecv("lpush", key, value)
 	if err != nil {
 		return 0, err
@@ -836,6 +856,9 @@ func LPush(c *Conn, key, value string) (int, error) {
 // RPush appends a value to a list and returns the new length.
 func RPush(c *Conn, key, value string) (int, error) {
 	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	if err := validateValue(value); err != nil {
 		return 0, err
 	}
 	resp, err := c.sendRecv("rpush", key, value)

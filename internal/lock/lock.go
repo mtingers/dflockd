@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/config"
@@ -132,13 +133,15 @@ type shard struct {
 }
 
 type LockManager struct {
-	shards       [numShards]shard
-	connMu       sync.Mutex // protects connOwned and connEnqueued
-	connOwned    map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
-	connEnqueued map[connKey]*enqueuedState
-	cfg          *config.Config
-	log          *slog.Logger
-	tokBuf       tokenBuf
+	shards        [numShards]shard
+	connMu        sync.Mutex // protects connOwned and connEnqueued
+	connOwned     map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
+	connEnqueued  map[connKey]*enqueuedState
+	cfg           *config.Config
+	log           *slog.Logger
+	tokBuf        tokenBuf
+	resourceTotal atomic.Int64 // total resources across all shards
+	keyTotal      atomic.Int64 // total keys across all types (counters+kv+lists)
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
@@ -301,13 +304,8 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 }
 
 // resourceCount returns total number of resources across all shards.
-// Caller must ensure no concurrent modification (or accept approximate count).
 func (lm *LockManager) resourceCount() int {
-	total := 0
-	for i := range lm.shards {
-		total += len(lm.shards[i].resources)
-	}
-	return total
+	return int(lm.resourceTotal.Load())
 }
 
 func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*ResourceState, error) {
@@ -327,6 +325,7 @@ func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*Res
 		LastActivity: time.Now(),
 	}
 	sh.resources[key] = st
+	lm.resourceTotal.Add(1)
 	return st, nil
 }
 
@@ -728,18 +727,10 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 // Aggregate key count (across all types)
 // ---------------------------------------------------------------------------
 
-// totalKeyCount returns the total number of keys across all types in all shards.
-// Must be called with the shard lock held for the shard being checked.
-// Approximation: counts all shards without holding all locks simultaneously.
+// totalKeyCount returns the total number of keys across all non-resource types
+// (counters, kv, lists). Uses an atomic counter for race-free reads.
 func (lm *LockManager) totalKeyCount() int {
-	total := 0
-	for i := range lm.shards {
-		total += len(lm.shards[i].resources)
-		total += len(lm.shards[i].counters)
-		total += len(lm.shards[i].kvStore)
-		total += len(lm.shards[i].lists)
-	}
-	return total
+	return int(lm.keyTotal.Load())
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +749,7 @@ func (lm *LockManager) Incr(key string, delta int64) (int64, error) {
 		}
 		cs = &counterState{LastActivity: time.Now()}
 		sh.counters[key] = cs
+		lm.keyTotal.Add(1)
 	}
 	cs.Value += delta
 	cs.LastActivity = time.Now()
@@ -792,6 +784,7 @@ func (lm *LockManager) SetCounter(key string, value int64) error {
 		}
 		cs = &counterState{}
 		sh.counters[key] = cs
+		lm.keyTotal.Add(1)
 	}
 	cs.Value = value
 	cs.LastActivity = time.Now()
@@ -814,6 +807,7 @@ func (lm *LockManager) KVSet(key, value string, ttlSeconds int) error {
 		}
 		entry = &kvEntry{}
 		sh.kvStore[key] = entry
+		lm.keyTotal.Add(1)
 	}
 	entry.Value = value
 	entry.LastActivity = time.Now()
@@ -837,6 +831,7 @@ func (lm *LockManager) KVGet(key string) (string, bool) {
 	// Lazy expiry check
 	if !entry.ExpiresAt.IsZero() && !time.Now().Before(entry.ExpiresAt) {
 		delete(sh.kvStore, key)
+		lm.keyTotal.Add(-1)
 		return "", false
 	}
 	entry.LastActivity = time.Now()
@@ -847,7 +842,10 @@ func (lm *LockManager) KVDel(key string) {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	delete(sh.kvStore, key)
+	if _, ok := sh.kvStore[key]; ok {
+		delete(sh.kvStore, key)
+		lm.keyTotal.Add(-1)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +864,7 @@ func (lm *LockManager) LPush(key, value string) (int, error) {
 		}
 		ls = &listState{LastActivity: time.Now()}
 		sh.lists[key] = ls
+		lm.keyTotal.Add(1)
 	}
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
@@ -887,6 +886,7 @@ func (lm *LockManager) RPush(key, value string) (int, error) {
 		}
 		ls = &listState{LastActivity: time.Now()}
 		sh.lists[key] = ls
+		lm.keyTotal.Add(1)
 	}
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
@@ -906,10 +906,12 @@ func (lm *LockManager) LPop(key string) (string, bool) {
 		return "", false
 	}
 	val := ls.Items[0]
+	ls.Items[0] = "" // allow GC of the string
 	ls.Items = ls.Items[1:]
 	ls.LastActivity = time.Now()
 	if len(ls.Items) == 0 {
 		delete(sh.lists, key)
+		lm.keyTotal.Add(-1)
 	}
 	return val, true
 }
@@ -923,11 +925,14 @@ func (lm *LockManager) RPop(key string) (string, bool) {
 	if !ok || len(ls.Items) == 0 {
 		return "", false
 	}
-	val := ls.Items[len(ls.Items)-1]
-	ls.Items = ls.Items[:len(ls.Items)-1]
+	last := len(ls.Items) - 1
+	val := ls.Items[last]
+	ls.Items[last] = "" // allow GC of the string
+	ls.Items = ls.Items[:last]
 	ls.LastActivity = time.Now()
 	if len(ls.Items) == 0 {
 		delete(sh.lists, key)
+		lm.keyTotal.Add(-1)
 	}
 	return val, true
 }
@@ -1126,6 +1131,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 				for key, entry := range sh.kvStore {
 					if !entry.ExpiresAt.IsZero() && !now.Before(entry.ExpiresAt) {
 						delete(sh.kvStore, key)
+						lm.keyTotal.Add(-1)
 					}
 				}
 				sh.mu.Unlock()
@@ -1160,6 +1166,7 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 				for _, key := range expired {
 					lm.log.Debug("GC: pruning unused state", "key", key)
 					delete(sh.resources, key)
+					lm.resourceTotal.Add(-1)
 				}
 				// GC idle counters (only when value == 0)
 				var expiredCounters []string
@@ -1171,6 +1178,7 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 				for _, key := range expiredCounters {
 					lm.log.Debug("GC: pruning idle counter", "key", key)
 					delete(sh.counters, key)
+					lm.keyTotal.Add(-1)
 				}
 				// GC idle KV entries (no TTL, just idle)
 				var expiredKV []string
@@ -1182,6 +1190,7 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 				for _, key := range expiredKV {
 					lm.log.Debug("GC: pruning idle KV entry", "key", key)
 					delete(sh.kvStore, key)
+					lm.keyTotal.Add(-1)
 				}
 				// GC idle empty lists
 				var expiredLists []string
@@ -1193,6 +1202,7 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 				for _, key := range expiredLists {
 					lm.log.Debug("GC: pruning idle list", "key", key)
 					delete(sh.lists, key)
+					lm.keyTotal.Add(-1)
 				}
 				sh.mu.Unlock()
 			}
@@ -1336,12 +1346,13 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 			})
 		}
 		for key, entry := range sh.kvStore {
+			// Skip expired entries (consistent with KVGet lazy-deletion)
+			if !entry.ExpiresAt.IsZero() && !now.Before(entry.ExpiresAt) {
+				continue
+			}
 			ttl := 0.0
 			if !entry.ExpiresAt.IsZero() {
 				ttl = entry.ExpiresAt.Sub(now).Seconds()
-				if ttl < 0 {
-					ttl = 0
-				}
 			}
 			s.KVEntries = append(s.KVEntries, KVInfo{
 				Key:      key,
@@ -1446,4 +1457,6 @@ func (lm *LockManager) ResetForTest() {
 	}
 	lm.connOwned = make(map[uint64]map[string]map[string]struct{})
 	lm.connEnqueued = make(map[connKey]*enqueuedState)
+	lm.resourceTotal.Store(0)
+	lm.keyTotal.Store(0)
 }

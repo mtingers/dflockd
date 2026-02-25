@@ -90,7 +90,7 @@ func TestMatchPattern(t *testing.T) {
 func TestListenSignalExact(t *testing.T) {
 	m := NewManager()
 	l := makeListener(1, "alerts.fire")
-	m.Listen("alerts.fire", l)
+	m.Listen(l)
 
 	n := m.Signal("alerts.fire", "hot")
 	if n != 1 {
@@ -114,7 +114,7 @@ func TestListenSignalExact(t *testing.T) {
 func TestWildcardStar(t *testing.T) {
 	m := NewManager()
 	l := makeListener(1, "alerts.*")
-	m.Listen("alerts.*", l)
+	m.Listen(l)
 
 	n := m.Signal("alerts.fire", "hot")
 	if n != 1 {
@@ -144,7 +144,7 @@ func TestWildcardStar(t *testing.T) {
 func TestWildcardGT(t *testing.T) {
 	m := NewManager()
 	l := makeListener(1, "alerts.>")
-	m.Listen("alerts.>", l)
+	m.Listen(l)
 
 	n := m.Signal("alerts.fire.critical", "bad")
 	if n != 1 {
@@ -171,8 +171,8 @@ func TestDedup(t *testing.T) {
 
 	l1 := &Listener{ConnID: 1, Pattern: "a.*", WriteCh: ch}
 	l2 := &Listener{ConnID: 1, Pattern: "a.>", WriteCh: ch}
-	m.Listen("a.*", l1)
-	m.Listen("a.>", l2)
+	m.Listen(l1)
+	m.Listen(l2)
 
 	n := m.Signal("a.b", "payload")
 	if n != 1 {
@@ -199,9 +199,9 @@ func TestMultipleListeners(t *testing.T) {
 	l1 := makeListener(1, "ch")
 	l2 := makeListener(2, "ch")
 	l3 := makeListener(3, "ch")
-	m.Listen("ch", l1)
-	m.Listen("ch", l2)
-	m.Listen("ch", l3)
+	m.Listen(l1)
+	m.Listen(l2)
+	m.Listen(l3)
 
 	n := m.Signal("ch", "data")
 	if n != 3 {
@@ -223,7 +223,7 @@ func TestMultipleListeners(t *testing.T) {
 func TestUnlistenExact(t *testing.T) {
 	m := NewManager()
 	l := makeListener(1, "ch")
-	m.Listen("ch", l)
+	m.Listen(l)
 
 	// Verify delivery before unlisten.
 	n := m.Signal("ch", "before")
@@ -254,7 +254,7 @@ func TestUnlistenExact(t *testing.T) {
 func TestUnlistenWildcard(t *testing.T) {
 	m := NewManager()
 	l := makeListener(1, "ch.*")
-	m.Listen("ch.*", l)
+	m.Listen(l)
 
 	n := m.Signal("ch.a", "before")
 	if n != 1 {
@@ -286,9 +286,9 @@ func TestUnlistenAll(t *testing.T) {
 	l1 := makeListener(1, "exact.ch")
 	l2 := makeListener(1, "wild.*")
 	l3 := makeListener(1, "deep.>")
-	m.Listen("exact.ch", l1)
-	m.Listen("wild.*", l2)
-	m.Listen("deep.>", l3)
+	m.Listen(l1)
+	m.Listen(l2)
+	m.Listen(l3)
 
 	m.UnlistenAll(1)
 
@@ -327,7 +327,7 @@ func TestFullBufferDrop(t *testing.T) {
 		Pattern: "ch",
 		WriteCh: make(chan []byte, 1),
 	}
-	m.Listen("ch", l)
+	m.Listen(l)
 
 	// Fill the buffer.
 	m.Signal("ch", "first")
@@ -361,28 +361,28 @@ func TestSignalReturnsCount(t *testing.T) {
 
 	// One exact listener.
 	l1 := makeListener(1, "ch")
-	m.Listen("ch", l1)
+	m.Listen(l1)
 	if n := m.Signal("ch", "x"); n != 1 {
 		t.Errorf("one exact: got %d, want 1", n)
 	}
 
 	// Add a wildcard listener with a different connID.
 	l2 := makeListener(2, "c*")
-	m.Listen("c*", l2)
+	m.Listen(l2)
 	// "c*" is treated as a wildcard (contains *), but MatchPattern("c*","ch")
 	// would split on '.' giving tokens ["c*"] vs ["ch"]. "c*" != "*" and != "ch",
 	// so it won't match. Use a proper dotted wildcard instead.
 	m.Unlisten("c*", 2)
 
 	l2b := makeListener(2, "*")
-	m.Listen("*", l2b)
+	m.Listen(l2b)
 	if n := m.Signal("ch", "x"); n != 2 {
 		t.Errorf("exact + wildcard: got %d, want 2", n)
 	}
 
 	// Add a third listener with yet another connID on a > wildcard.
 	l3 := makeListener(3, ">")
-	m.Listen(">", l3)
+	m.Listen(l3)
 	if n := m.Signal("ch", "x"); n != 3 {
 		t.Errorf("exact + two wildcards: got %d, want 3", n)
 	}
@@ -407,9 +407,9 @@ func TestStats(t *testing.T) {
 	}
 
 	// Add some listeners.
-	m.Listen("exact.ch", makeListener(1, "exact.ch"))
-	m.Listen("exact.ch", makeListener(2, "exact.ch"))
-	m.Listen("wild.*", makeListener(3, "wild.*"))
+	m.Listen(makeListener(1, "exact.ch"))
+	m.Listen(makeListener(2, "exact.ch"))
+	m.Listen(makeListener(3, "wild.*"))
 
 	stats = m.Stats()
 	if len(stats) != 2 {

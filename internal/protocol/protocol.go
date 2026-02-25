@@ -22,6 +22,7 @@ var (
 	respErrorAlreadyEnqueued  = []byte("error_already_enqueued\n")
 	respErrorMaxKeys          = []byte("error_max_keys\n")
 	respErrorListFull         = []byte("error_list_full\n")
+	respErrorLeaseExpired     = []byte("error_lease_expired\n")
 	respNil                   = []byte("nil\n")
 	respQueued                = []byte("queued\n")
 
@@ -533,6 +534,8 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			return respErrorMaxKeys
 		case "error_list_full":
 			return respErrorListFull
+		case "error_lease_expired":
+			return respErrorLeaseExpired
 		case "nil":
 			return respNil
 		default:

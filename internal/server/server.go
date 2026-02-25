@@ -180,6 +180,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	// writeCh is used by the signal push writer goroutine.
 	var writeMu sync.Mutex
 	writeCh := make(chan []byte, 64)
+	var pushWg sync.WaitGroup
 
 	cs := &connState{id: connID, writeCh: writeCh}
 
@@ -190,7 +191,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}
 
 	// Push writer goroutine: drains writeCh and writes to conn.
+	pushWg.Add(1)
 	go func() {
+		defer pushWg.Done()
 		for data := range writeCh {
 			writeMu.Lock()
 			s.writeResponse(conn, data)
@@ -202,6 +205,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 		connCancel()
 		s.sig.UnlistenAll(connID)
 		close(writeCh)
+		pushWg.Wait() // wait for push writer to drain before closing conn
 		s.conns.Delete(conn)
 		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
@@ -404,11 +408,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "kset":
 		value := req.Value
 		ttl := 0
-		// Parse optional TTL: last space-separated token is TTL if it parses
-		// as int >= 0 AND stripping it does not leave the value empty.
+		// TTL is always the last space-separated token. The client always
+		// appends an explicit TTL (0 = no expiry) to avoid ambiguity.
 		if idx := strings.LastIndex(value, " "); idx >= 0 {
 			candidate := value[idx+1:]
-			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 && idx > 0 {
+			if n, err := strconv.Atoi(candidate); err == nil && n >= 0 {
 				ttl = n
 				value = value[:idx]
 			}
@@ -440,7 +444,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			Pattern: req.Key,
 			WriteCh: cs.writeCh,
 		}
-		s.sig.Listen(req.Key, listener)
+		if err := s.sig.Listen(listener); err != nil {
+			return &protocol.Ack{Status: "error"}
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	case "unlisten":
