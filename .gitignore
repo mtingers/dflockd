@@ -16,3 +16,4 @@ wheels/
 dflockd
 /bench
 /bench-redis
+/soak
