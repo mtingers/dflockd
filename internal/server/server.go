@@ -197,12 +197,19 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}
 
 	// Push writer goroutine: drains writeCh and writes to conn.
+	// On write error (dead connection), stops writing and just drains.
 	pushWg.Add(1)
 	go func() {
 		defer pushWg.Done()
+		var failed bool
 		for data := range writeCh {
+			if failed {
+				continue // drain without writing
+			}
 			writeMu.Lock()
-			s.writeResponse(conn, data)
+			if err := s.writeResponse(conn, data); err != nil {
+				failed = true
+			}
 			writeMu.Unlock()
 		}
 	}()

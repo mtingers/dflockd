@@ -3120,17 +3120,22 @@ func (e *Election) opts() []Option {
 	return nil
 }
 
-func (e *Election) connect() error {
-	if e.lc != nil {
-		// Close the underlying connection to unblock the readLoop,
-		// then wait for readLoop exit with a timeout to avoid blocking.
-		e.lc.conn.Close()
-		select {
-		case <-e.lc.done:
-		case <-time.After(2 * time.Second):
-		}
-		e.lc = nil
+// closeLC closes the LeaderConn without blocking indefinitely.
+// Closes the underlying TCP connection then waits up to 2s for readLoop exit.
+func (e *Election) closeLC() {
+	if e.lc == nil {
+		return
 	}
+	e.lc.conn.Close()
+	select {
+	case <-e.lc.done:
+	case <-time.After(2 * time.Second):
+	}
+	e.lc = nil
+}
+
+func (e *Election) connect() error {
+	e.closeLC()
 	addr := e.serverAddr()
 	var conn *Conn
 	var err error
@@ -3181,23 +3186,19 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			e.lc.Close()
-			e.lc = nil
+			e.closeLC()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			e.lc.Close()
-			e.lc = nil
+			e.closeLC()
 			return false, ctx.Err()
 		}
-		e.lc.Close()
-		e.lc = nil
+		e.closeLC()
 		return false, err
 	}
 
 	if ctx.Err() != nil {
-		e.lc.Close()
-		e.lc = nil
+		e.closeLC()
 		return false, ctx.Err()
 	}
 
@@ -3227,8 +3228,7 @@ func (e *Election) Resign(ctx context.Context) error {
 
 	err := e.lc.Resign(e.Key, e.token)
 	e.isLeader = false
-	e.lc.Close()
-	e.lc = nil
+	e.closeLC()
 	e.token = ""
 	e.fence = 0
 	e.lease = 0
@@ -3272,13 +3272,12 @@ func (e *Election) Close() error {
 		return nil
 	}
 
-	err := e.lc.Close()
-	e.lc = nil
+	e.closeLC()
 	e.token = ""
 	e.fence = 0
 	e.lease = 0
 	e.isLeader = false
-	return err
+	return nil
 }
 
 func (e *Election) stopRenew() {

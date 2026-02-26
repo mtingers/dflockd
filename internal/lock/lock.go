@@ -341,8 +341,9 @@ func (lm *LockManager) grantNextLocked(key string, st *ResourceState) {
 }
 
 // evictExpiredLocked evicts any holders whose leases have expired and grants
-// freed slots to waiting callers. Must be called with the shard lock AND connMu held.
-func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
+// freed slots to waiting callers. Returns true if any holders were evicted.
+// Must be called with the shard lock AND connMu held.
+func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) bool {
 	sh := lm.shardFor(key)
 	now := time.Now()
 	var expired []string
@@ -378,6 +379,7 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 		st.LastActivity = now
 		lm.grantNextLocked(key, st)
 	}
+	return len(expired) > 0
 }
 
 // resourceCount returns total number of resources across all shards.
@@ -430,7 +432,12 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 	st.LastActivity = time.Now()
 
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
-	lm.evictExpiredLocked(key, st)
+	evicted := lm.evictExpiredLocked(key, st)
+	notifyRelease := func() {
+		if evicted && lm.OnLockRelease != nil {
+			lm.OnLockRelease(key)
+		}
+	}
 
 	// Fast path: capacity available and no waiters — no waiter allocation needed
 	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
@@ -445,6 +452,7 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		lm.connAddOwned(connID, key, token)
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
+		notifyRelease()
 		return token, fence, nil
 	}
 
@@ -452,6 +460,7 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
+		notifyRelease()
 		return "", 0, ErrMaxWaiters
 	}
 	w := &waiter{
@@ -462,6 +471,7 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 	st.Waiters = append(st.Waiters, w)
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
+	notifyRelease()
 
 	var timer *time.Timer
 	if timeout > 0 {
@@ -559,15 +569,17 @@ func (lm *LockManager) EnqueueWithFence(key string, leaseTTL time.Duration, conn
 
 	lm.connMu.Lock()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	defer lm.connMu.Unlock()
 
 	if _, exists := lm.connEnqueued[eqKey]; exists {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", "", 0, 0, ErrAlreadyEnqueued
 	}
 
 	st, err := lm.getOrCreateLocked(sh, key, limit)
 	if err != nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", "", 0, 0, err
 	}
 
@@ -575,7 +587,12 @@ func (lm *LockManager) EnqueueWithFence(key string, leaseTTL time.Duration, conn
 	leaseSec := int(leaseTTL / time.Second)
 
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
-	lm.evictExpiredLocked(key, st)
+	evicted := lm.evictExpiredLocked(key, st)
+	notifyRelease := func() {
+		if evicted && lm.OnLockRelease != nil {
+			lm.OnLockRelease(key)
+		}
+	}
 
 	// Fast path: capacity available and no waiters
 	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
@@ -589,11 +606,17 @@ func (lm *LockManager) EnqueueWithFence(key string, leaseTTL time.Duration, conn
 		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key, token)
 		lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		notifyRelease()
 		return "acquired", token, leaseSec, fence, nil
 	}
 
 	// Slow path: create waiter and enqueue
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		notifyRelease()
 		return "", "", 0, 0, ErrMaxWaiters
 	}
 	w := &waiter{
@@ -603,6 +626,9 @@ func (lm *LockManager) EnqueueWithFence(key string, leaseTTL time.Duration, conn
 	}
 	st.Waiters = append(st.Waiters, w)
 	lm.connEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
+	notifyRelease()
 	return "queued", "", 0, 0, nil
 }
 
@@ -843,6 +869,19 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 		if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 			delete(lm.connEnqueued, eqKey)
 		}
+		// Clean up leader watcher for the expired holder
+		if watchers, wok := sh.leaderWatchers[key]; wok {
+			delete(watchers, h.connID)
+			if len(watchers) == 0 {
+				delete(sh.leaderWatchers, key)
+			}
+		}
+		if keys, kok := lm.connLeaderKeys[h.connID]; kok {
+			delete(keys, key)
+			if len(keys) == 0 {
+				delete(lm.connLeaderKeys, h.connID)
+			}
+		}
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.grantNextLocked(key, st)
@@ -901,6 +940,19 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 		eqKey := connKey{ConnID: h.connID, Key: key}
 		if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 			delete(lm.connEnqueued, eqKey)
+		}
+		// Clean up leader watcher for the expired holder
+		if watchers, wok := sh.leaderWatchers[key]; wok {
+			delete(watchers, h.connID)
+			if len(watchers) == 0 {
+				delete(sh.leaderWatchers, key)
+			}
+		}
+		if keys, kok := lm.connLeaderKeys[h.connID]; kok {
+			delete(keys, key)
+			if len(keys) == 0 {
+				delete(lm.connLeaderKeys, h.connID)
+			}
 		}
 		delete(st.Holders, token)
 		st.LastActivity = now
@@ -1442,7 +1494,12 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 	}
 
 	st.LastActivity = time.Now()
-	lm.evictExpiredLocked(key, st)
+	evicted := lm.evictExpiredLocked(key, st)
+	notifyRelease := func() {
+		if evicted && lm.OnLockRelease != nil {
+			lm.OnLockRelease(key)
+		}
+	}
 
 	// Fast path
 	if st.waiterCount() == 0 {
@@ -1474,6 +1531,7 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 			lm.connAddOwned(connID, key, token)
 			sh.mu.Unlock()
 			lm.connMu.Unlock()
+			notifyRelease()
 			return token, fence, nil
 		}
 	}
@@ -1482,6 +1540,7 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
+		notifyRelease()
 		return "", 0, ErrMaxWaiters
 	}
 	w := &waiter{
@@ -1493,6 +1552,7 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 	st.Waiters = append(st.Waiters, w)
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
+	notifyRelease()
 
 	var timer *time.Timer
 	if timeout > 0 {
@@ -1588,21 +1648,28 @@ func (lm *LockManager) RWEnqueue(key string, mode byte, leaseTTL time.Duration, 
 
 	lm.connMu.Lock()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	defer lm.connMu.Unlock()
 
 	if _, exists := lm.connEnqueued[eqKey]; exists {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", "", 0, 0, ErrAlreadyEnqueued
 	}
 
 	st, err := lm.getOrCreateLocked(sh, key, -1)
 	if err != nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", "", 0, 0, err
 	}
 
 	st.LastActivity = time.Now()
 	leaseSec := int(leaseTTL / time.Second)
-	lm.evictExpiredLocked(key, st)
+	evicted := lm.evictExpiredLocked(key, st)
+	notifyRelease := func() {
+		if evicted && lm.OnLockRelease != nil {
+			lm.OnLockRelease(key)
+		}
+	}
 
 	// Fast path
 	if st.waiterCount() == 0 {
@@ -1631,12 +1698,18 @@ func (lm *LockManager) RWEnqueue(key string, mode byte, leaseTTL time.Duration, 
 			st.LastActivity = time.Now()
 			lm.connAddOwned(connID, key, token)
 			lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
+			sh.mu.Unlock()
+			lm.connMu.Unlock()
+			notifyRelease()
 			return "acquired", token, leaseSec, fence, nil
 		}
 	}
 
 	// Slow path
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		notifyRelease()
 		return "", "", 0, 0, ErrMaxWaiters
 	}
 	w := &waiter{
@@ -1647,6 +1720,9 @@ func (lm *LockManager) RWEnqueue(key string, mode byte, leaseTTL time.Duration, 
 	}
 	st.Waiters = append(st.Waiters, w)
 	lm.connEnqueued[eqKey] = &enqueuedState{waiter: w, leaseTTL: leaseTTL}
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
+	notifyRelease()
 	return "queued", "", 0, 0, nil
 }
 
@@ -1807,7 +1883,13 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 	case <-p.ch:
 		return true, nil
 	case <-cancelled:
-		// A participant disconnected — barrier can never trip.
+		// Re-check: barrier may have tripped concurrently with cancellation
+		// (e.g. a new participant joined and completed the barrier).
+		select {
+		case <-p.ch:
+			return true, nil
+		default:
+		}
 		sh.mu.Lock()
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
@@ -1904,6 +1986,11 @@ func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uin
 		sh.leaderWatchers[key] = watchers
 	}
 	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+	// Notify all pre-existing watchers (excluding the new leader).
+	// Note: an observer that registered between AcquireWithFence and this call
+	// may receive a duplicate "elected" notification (once from
+	// RegisterLeaderWatcherWithStatus, once from here). This is benign —
+	// "leader elected" is idempotent.
 	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
 	for cid, lw := range watchers {
 		if cid == connID {
