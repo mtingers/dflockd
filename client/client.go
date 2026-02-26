@@ -1227,6 +1227,9 @@ func (l *Lock) connect() error {
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	l.mu.Lock()
 	l.stopRenew()
+	l.token = ""
+	l.fence = 0
+	l.lease = 0
 	if err := l.connect(); err != nil {
 		l.mu.Unlock()
 		return false, err
@@ -1285,6 +1288,9 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	l.mu.Lock()
 	l.stopRenew()
+	l.token = ""
+	l.fence = 0
+	l.lease = 0
 	if err := l.connect(); err != nil {
 		l.mu.Unlock()
 		return "", err
@@ -1635,6 +1641,9 @@ func (s *Semaphore) connect() error {
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	s.mu.Lock()
 	s.stopRenew()
+	s.token = ""
+	s.fence = 0
+	s.lease = 0
 	if err := s.connect(); err != nil {
 		s.mu.Unlock()
 		return false, err
@@ -1689,6 +1698,9 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	s.stopRenew()
+	s.token = ""
+	s.fence = 0
+	s.lease = 0
 	if err := s.connect(); err != nil {
 		s.mu.Unlock()
 		return "", err
@@ -2551,6 +2563,10 @@ func (rw *RWLock) WLock(ctx context.Context) (bool, error) {
 func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 	rw.mu.Lock()
 	rw.stopRenew()
+	rw.token = ""
+	rw.fence = 0
+	rw.lease = 0
+	rw.mode = ""
 	if err := rw.connect(); err != nil {
 		rw.mu.Unlock()
 		return false, err
@@ -3231,6 +3247,10 @@ func (e *Election) connect() error {
 func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	e.mu.Lock()
 	e.stopRenew()
+	e.isLeader = false
+	e.token = ""
+	e.fence = 0
+	e.lease = 0
 	if err := e.connect(); err != nil {
 		e.mu.Unlock()
 		return false, err
@@ -3291,6 +3311,7 @@ func (e *Election) Resign(ctx context.Context) error {
 	defer e.mu.Unlock()
 
 	e.stopRenew()
+	wasLeader := e.isLeader
 
 	if e.lc == nil {
 		return nil
@@ -3303,7 +3324,7 @@ func (e *Election) Resign(ctx context.Context) error {
 	e.fence = 0
 	e.lease = 0
 
-	if e.OnResigned != nil {
+	if wasLeader && e.OnResigned != nil {
 		go e.OnResigned()
 	}
 

@@ -276,6 +276,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 
 		ack := s.handleRequest(connCtx, req, cs)
 		if ack == nil {
+			if connCtx.Err() != nil {
+				break // connection shutting down
+			}
 			continue // no response needed (e.g. connection closing)
 		}
 		if err := writeResp(protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {

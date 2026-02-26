@@ -312,14 +312,16 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
 			}
 			st.LastActivity = time.Now()
 			lm.connAddOwned(w.connID, key, token)
-			// Notify leader watchers on failover grant
-			if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
-				msg := []byte(fmt.Sprintf("leader failover %s\n", key))
-				for _, lw := range watchers {
-					select {
-					case lw.ch <- msg:
-					default:
-						lw.cancelConn()
+			// Notify leader watchers on failover grant (only for mutex locks, not semaphores)
+			if st.Limit == 1 {
+				if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
+					msg := []byte(fmt.Sprintf("leader failover %s\n", key))
+					for _, lw := range watchers {
+						select {
+						case lw.ch <- msg:
+						default:
+							lw.cancelConn()
+						}
 					}
 				}
 			}
@@ -804,11 +806,11 @@ func (lm *LockManager) Release(key, token string) bool {
 
 	lm.connMu.Lock()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	defer lm.connMu.Unlock()
 
 	st := sh.resources[key]
 	if st == nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return false
 	}
 
@@ -816,6 +818,8 @@ func (lm *LockManager) Release(key, token string) bool {
 
 	h, ok := st.Holders[token]
 	if !ok {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return false
 	}
 
@@ -826,6 +830,9 @@ func (lm *LockManager) Release(key, token string) bool {
 	}
 	delete(st.Holders, token)
 	lm.grantNextLocked(key, st)
+
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
 	return true
 }
 
@@ -1973,7 +1980,12 @@ func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh 
 		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
-	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
+	if existing, ok := watchers[connID]; ok {
+		// Already registered (e.g. via elect) — just mark as also an observer.
+		existing.observer = true
+	} else {
+		watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
+	}
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {
 		keys = make(map[string]struct{})
@@ -1995,7 +2007,11 @@ func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uin
 		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
-	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+	existingObserver := false
+	if existing, ok := watchers[connID]; ok {
+		existingObserver = existing.observer
+	}
+	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: existingObserver}
 	// Notify all pre-existing watchers (excluding the new leader).
 	// Note: an observer that registered between AcquireWithFence and this call
 	// may receive a duplicate "elected" notification (once from
@@ -2167,9 +2183,9 @@ func (lm *LockManager) ResignLeader(key, token string, connID uint64) bool {
 	}
 	delete(st.Holders, token)
 
-	// 2. Unregister the resigning connection's leader watcher
+	// 2. Unregister the holder's leader watcher
 	// (preserves observer registrations).
-	lm.removeLeaderHolderWatcher(sh, key, connID)
+	lm.removeLeaderHolderWatcher(sh, key, h.connID)
 
 	// 3. Notify "resigned" before granting to next waiter.
 	if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
@@ -2204,7 +2220,12 @@ func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64
 		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
-	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
+	if existing, ok := watchers[connID]; ok {
+		// Already registered (e.g. via elect) — just mark as also an observer.
+		existing.observer = true
+	} else {
+		watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
+	}
 
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {
