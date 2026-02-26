@@ -272,6 +272,7 @@ func deliverToGroup(qg *queueGroup, msg []byte) bool {
 		return false
 	}
 	start := qg.counter.Add(1) - 1
+	primary := int(start % uint64(n))
 	for i := 0; i < n; i++ {
 		idx := int((start + uint64(i)) % uint64(n))
 		mem := qg.members[idx]
@@ -281,6 +282,10 @@ func deliverToGroup(qg *queueGroup, msg []byte) bool {
 		default:
 			// Buffer full — try next member
 		}
+	}
+	// All members full — disconnect the primary to prevent permanent black hole.
+	if mem := qg.members[primary]; mem.CancelConn != nil {
+		mem.CancelConn()
 	}
 	return false
 }

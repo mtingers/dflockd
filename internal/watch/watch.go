@@ -145,6 +145,7 @@ func (m *Manager) Unwatch(pattern string, connID uint64) {
 	for i, e := range entries {
 		if e.pattern == pattern {
 			copy(entries[i:], entries[i+1:])
+			entries[len(entries)-1] = watcherEntry{} // zero tail for GC
 			entries = entries[:len(entries)-1]
 			break
 		}

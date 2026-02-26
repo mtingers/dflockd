@@ -1317,6 +1317,9 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	}
 
 	if ctx.Err() != nil {
+		if status == "acquired" {
+			Release(conn, l.Key, token)
+		}
 		l.closeConn()
 		return "", ctx.Err()
 	}
@@ -1372,6 +1375,7 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
+		Release(conn, l.Key, token)
 		l.closeConn()
 		return false, ctx.Err()
 	}
@@ -1514,7 +1518,7 @@ func (l *Lock) startRenew() {
 					l.lease = 0
 					l.mu.Unlock()
 					if onErr != nil {
-						onErr(err)
+						go onErr(err)
 					}
 					return
 				}
@@ -1717,6 +1721,9 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	}
 
 	if ctx.Err() != nil {
+		if status == "acquired" {
+			SemRelease(conn, s.Key, token)
+		}
 		s.closeConn()
 		return "", ctx.Err()
 	}
@@ -1771,6 +1778,7 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	}
 
 	if ctx.Err() != nil {
+		SemRelease(conn, s.Key, token)
 		s.closeConn()
 		return false, ctx.Err()
 	}
@@ -1903,7 +1911,7 @@ func (s *Semaphore) startRenew() {
 					s.lease = 0
 					s.mu.Unlock()
 					if onErr != nil {
-						onErr(err)
+						go onErr(err)
 					}
 					return
 				}
@@ -2732,7 +2740,7 @@ func (rw *RWLock) startRenew(cmd string) {
 					rw.lease = 0
 					rw.mu.Unlock()
 					if onErr != nil {
-						onErr(err)
+						go onErr(err)
 					}
 					return
 				}
@@ -3259,6 +3267,7 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
+		lc.Resign(e.Key, token)
 		e.closeLC()
 		return false, ctx.Err()
 	}
@@ -3416,7 +3425,7 @@ func (e *Election) startRenew() {
 					e.lease = 0
 					e.mu.Unlock()
 					if onErr != nil {
-						onErr(err)
+						go onErr(err)
 					}
 					if onResigned != nil {
 						go onResigned()

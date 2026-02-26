@@ -326,6 +326,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			if errors.Is(err, lock.ErrLimitMismatch) {
 				return &protocol.Ack{Status: "error_limit_mismatch"}
 			}
+			if errors.Is(err, lock.ErrTypeMismatch) {
+				return &protocol.Ack{Status: "error_type_mismatch"}
+			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
 			}
@@ -367,6 +370,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			if errors.Is(err, lock.ErrLimitMismatch) {
 				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
+			if errors.Is(err, lock.ErrTypeMismatch) {
+				return &protocol.Ack{Status: "error_type_mismatch"}
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
@@ -567,6 +573,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			if errors.Is(err, lock.ErrWaiterClosed) {
 				return nil // connection closing, skip response
 			}
+			if ctx.Err() != nil {
+				return nil // connection/server shutting down, skip response
+			}
 			if errors.Is(err, lock.ErrMaxKeys) {
 				return &protocol.Ack{Status: "error_max_keys"}
 			}
@@ -583,6 +592,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if err != nil {
 			if errors.Is(err, lock.ErrWaiterClosed) {
 				return nil // connection closing, skip response
+			}
+			if ctx.Err() != nil {
+				return nil // connection/server shutting down, skip response
 			}
 			if errors.Is(err, lock.ErrMaxKeys) {
 				return &protocol.Ack{Status: "error_max_keys"}
@@ -720,6 +732,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			if errors.Is(err, lock.ErrLimitMismatch) {
 				return &protocol.Ack{Status: "error_limit_mismatch"}
+			}
+			if errors.Is(err, lock.ErrTypeMismatch) {
+				return &protocol.Ack{Status: "error_type_mismatch"}
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}

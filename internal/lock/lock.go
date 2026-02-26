@@ -752,6 +752,7 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 		if st := sh.resources[key]; st != nil {
 			st.LastActivity = time.Now()
 			removeWaiterFromState(st, w)
+			lm.grantNextLocked(key, st)
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
@@ -777,10 +778,12 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 			}
 		default:
 		}
-		// Remove from queue
+		// Remove from queue and try to grant next waiter (e.g. readers
+		// queued behind a removed writer).
 		if st := sh.resources[key]; st != nil {
 			st.LastActivity = time.Now()
 			removeWaiterFromState(st, w)
+			lm.grantNextLocked(key, st)
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
@@ -1560,12 +1563,14 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		return token, fence, nil
 
 	case <-ctx.Done():
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				fence, held := verifyHolder(token)
 				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				if !held {
 					return "", 0, ErrLeaseExpired
 				}
@@ -1576,17 +1581,21 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			removeWaiterFromState(s, w)
+			lm.grantNextLocked(key, s)
 		}
 		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, ctx.Err()
 
 	case <-timer.C:
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				fence, held := verifyHolder(token)
 				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				if !held {
 					return "", 0, ErrLeaseExpired
 				}
@@ -1597,8 +1606,10 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			removeWaiterFromState(s, w)
+			lm.grantNextLocked(key, s)
 		}
 		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, nil
 	}
 }
@@ -2287,8 +2298,11 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	for i := range lm.shards {
 		sh := &lm.shards[i]
 		sh.mu.Lock()
-		for _, st := range sh.resources {
+		for key, st := range sh.resources {
 			removeWaitersByConn(st, connID, closed)
+			// Unblock waiters that were queued behind the removed waiter
+			// (e.g. readers behind a removed writer in RW locks).
+			lm.grantNextLocked(key, st)
 		}
 		sh.mu.Unlock()
 	}
@@ -2329,13 +2343,22 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 		sh := &lm.shards[i]
 		sh.mu.Lock()
 		for key, ls := range sh.lists {
+			// Remove pop waiters for this connection by compacting the
+			// active region, preserving order for other connections.
+			n := ls.PopWaiterHead
 			for j := ls.PopWaiterHead; j < len(ls.PopWaiters); j++ {
-				if ls.PopWaiters[j] != nil && ls.PopWaiters[j].connID == connID {
-					close(ls.PopWaiters[j].ch)
-					ls.PopWaiters[j] = nil
+				w := ls.PopWaiters[j]
+				if w != nil && w.connID == connID {
+					close(w.ch)
+				} else {
+					ls.PopWaiters[n] = w
+					n++
 				}
 			}
-			compactPopWaiters(ls)
+			for j := n; j < len(ls.PopWaiters); j++ {
+				ls.PopWaiters[j] = nil
+			}
+			ls.PopWaiters = ls.PopWaiters[:n]
 			// Remove the list if it's empty and all pop waiters are gone.
 			if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
 				delete(sh.lists, key)
