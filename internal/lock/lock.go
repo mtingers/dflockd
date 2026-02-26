@@ -475,12 +475,14 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 	}
 	defer timer.Stop()
 
-	// verifyHolder checks that the token is still held (lease not expired).
+	// verifyAndResetLease checks that the token is still held and resets
+	// the lease expiry. Returns (fence, true) if held, (0, false) if evicted.
 	// Must be called with sh.mu held.
 	verifyHolder := func(token string) (uint64, bool) {
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			if h, ok := s.Holders[token]; ok {
+				h.leaseExpires = time.Now().Add(leaseTTL)
 				return h.fence, true
 			}
 		}
@@ -1200,7 +1202,10 @@ func (lm *LockManager) LPush(key, value string) (int, error) {
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
 	}
-	ls.Items = append([]string{value}, ls.Items...)
+	// Prepend: grow by one, shift right, insert at front.
+	ls.Items = append(ls.Items, "")
+	copy(ls.Items[1:], ls.Items)
+	ls.Items[0] = value
 	ls.LastActivity = time.Now()
 	return len(ls.Items), nil
 }
@@ -1544,12 +1549,14 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 	}
 	defer timer.Stop()
 
-	// verifyHolder checks that the token is still held (lease not expired).
+	// verifyAndResetLease checks that the token is still held and resets
+	// the lease expiry. Returns (fence, true) if held, (0, false) if evicted.
 	// Must be called with sh.mu held.
 	verifyHolder := func(token string) (uint64, bool) {
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			if h, ok := s.Holders[token]; ok {
+				h.leaseExpires = time.Now().Add(leaseTTL)
 				return h.fence, true
 			}
 		}
@@ -1951,7 +1958,10 @@ func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *b
 		}
 	}
 	if !bs.Tripped && bs.Cancelled != nil {
-		// Barrier is now unreachable — wake remaining participants
+		// Barrier is now unreachable — wake remaining participants.
+		// Once a participant departs, the barrier cannot trip because the
+		// count was set when the first participant joined and new participants
+		// cannot fill departed slots.
 		select {
 		case <-bs.Cancelled:
 			// already cancelled

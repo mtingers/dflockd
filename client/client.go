@@ -1473,7 +1473,7 @@ func (l *Lock) Token() string {
 // If renewal fails, the OnRenewError callback is invoked (if set)
 // and the goroutine exits.
 func (l *Lock) startRenew() {
-	l.stopRenew()
+	// Callers must have already called stopRenew() before setting state.
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancelRenew = cancel
 
@@ -1873,7 +1873,7 @@ func (s *Semaphore) Token() string {
 // If renewal fails, the OnRenewError callback is invoked (if set)
 // and the goroutine exits.
 func (s *Semaphore) startRenew() {
-	s.stopRenew()
+	// Callers must have already called stopRenew() before setting state.
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelRenew = cancel
 
@@ -2702,7 +2702,7 @@ func (rw *RWLock) stopRenew() {
 }
 
 func (rw *RWLock) startRenew(cmd string) {
-	rw.stopRenew()
+	// Callers must have already called stopRenew() before setting state.
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.cancelRenew = cancel
 
@@ -3203,19 +3203,14 @@ func (e *Election) opts() []Option {
 	return nil
 }
 
-// closeLC closes the LeaderConn without blocking indefinitely.
-// Closes the underlying TCP connection then waits up to 2s for readLoop exit.
+// closeLC closes the LeaderConn. Closes the underlying TCP connection
+// then waits for readLoop to exit.
 func (e *Election) closeLC() {
 	if e.lc == nil {
 		return
 	}
 	e.lc.conn.Close()
-	select {
-	case <-e.lc.done:
-	case <-time.After(2 * time.Second):
-		// Timeout expired; block until goroutine exits to avoid leak.
-		<-e.lc.done
-	}
+	<-e.lc.done
 	e.lc = nil
 }
 
@@ -3394,7 +3389,7 @@ func (e *Election) stopRenew() {
 }
 
 func (e *Election) startRenew() {
-	e.stopRenew()
+	// Callers must have already called stopRenew() before setting state.
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancelRenew = cancel
 

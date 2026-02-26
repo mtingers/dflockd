@@ -116,10 +116,25 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 				continue
 			}
 		}
-		if max := s.cfg.MaxConnections; max > 0 && s.connCount.Load() >= int64(max) {
-			s.log.Warn("max connections reached, rejecting", "max", max)
-			conn.Close()
-			continue
+		if max := s.cfg.MaxConnections; max > 0 {
+			// Atomically claim a connection slot to prevent TOCTOU races.
+			for {
+				current := s.connCount.Load()
+				if current >= int64(max) {
+					s.log.Warn("max connections reached, rejecting", "max", max)
+					conn.Close()
+					conn = nil
+					break
+				}
+				if s.connCount.CompareAndSwap(current, current+1) {
+					break
+				}
+			}
+			if conn == nil {
+				continue
+			}
+		} else {
+			s.connCount.Add(1)
 		}
 		connID := s.connSeq.Add(1)
 		wg.Add(1)
@@ -166,7 +181,7 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 		conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 	}
 	_, err := conn.Write(data)
-	if s.cfg.WriteTimeout > 0 {
+	if s.cfg.WriteTimeout > 0 && err == nil {
 		conn.SetWriteDeadline(time.Time{})
 	}
 	return err
@@ -175,7 +190,7 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	peer := conn.RemoteAddr().String()
 	s.log.Debug("client connected", "peer", peer, "conn_id", connID)
-	s.connCount.Add(1)
+	// connCount already incremented by accept loop (atomic CAS).
 	s.conns.Store(conn, struct{}{})
 
 	// Create a per-connection context that is cancelled when the server
