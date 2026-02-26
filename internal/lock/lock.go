@@ -106,6 +106,7 @@ type enqueuedState struct {
 	waiter   *waiter
 	token    string
 	leaseTTL time.Duration
+	expired  bool // set when lease eviction removes the holder
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +358,7 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) bool {
 			lm.connRemoveOwned(h.connID, key, token)
 			eqKey := connKey{ConnID: h.connID, Key: key}
 			if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
-				delete(lm.connEnqueued, eqKey)
+				es.expired = true
 			}
 			// Clean up leader watcher for the expired holder
 			// (preserves observer registrations).
@@ -589,10 +590,14 @@ func (lm *LockManager) EnqueueWithFence(key string, leaseTTL time.Duration, conn
 	lm.connMu.Lock()
 	sh.mu.Lock()
 
-	if _, exists := lm.connEnqueued[eqKey]; exists {
-		sh.mu.Unlock()
-		lm.connMu.Unlock()
-		return "", "", 0, 0, ErrAlreadyEnqueued
+	if es, exists := lm.connEnqueued[eqKey]; exists {
+		if !es.expired {
+			sh.mu.Unlock()
+			lm.connMu.Unlock()
+			return "", "", 0, 0, ErrAlreadyEnqueued
+		}
+		// Stale expired entry; clean up and proceed with fresh enqueue.
+		delete(lm.connEnqueued, eqKey)
 	}
 
 	st, err := lm.getOrCreateLocked(sh, key, limit)
@@ -669,6 +674,11 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 	if !ok {
 		lm.connMu.Unlock()
 		return "", 0, 0, ErrNotEnqueued
+	}
+	if es.expired {
+		delete(lm.connEnqueued, eqKey)
+		lm.connMu.Unlock()
+		return "", 0, 0, ErrLeaseExpired
 	}
 
 	// Snapshot immutable fields under lock.
@@ -1697,10 +1707,14 @@ func (lm *LockManager) RWEnqueue(key string, mode byte, leaseTTL time.Duration, 
 	lm.connMu.Lock()
 	sh.mu.Lock()
 
-	if _, exists := lm.connEnqueued[eqKey]; exists {
-		sh.mu.Unlock()
-		lm.connMu.Unlock()
-		return "", "", 0, 0, ErrAlreadyEnqueued
+	if es, exists := lm.connEnqueued[eqKey]; exists {
+		if !es.expired {
+			sh.mu.Unlock()
+			lm.connMu.Unlock()
+			return "", "", 0, 0, ErrAlreadyEnqueued
+		}
+		// Stale expired entry; clean up and proceed with fresh enqueue.
+		delete(lm.connEnqueued, eqKey)
 	}
 
 	st, err := lm.getOrCreateLocked(sh, key, -1)
@@ -2521,7 +2535,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 							lm.connRemoveOwned(h.connID, key, token)
 							eqKey := connKey{ConnID: h.connID, Key: key}
 							if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
-								delete(lm.connEnqueued, eqKey)
+								es.expired = true
 							}
 							// Clean up leader watcher for the expired holder
 							// (preserves observer registrations).

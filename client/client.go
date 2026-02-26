@@ -3395,8 +3395,8 @@ func (e *Election) Resign(ctx context.Context) error {
 	defer e.mu.Unlock()
 
 	savedToken := e.token
-	e.stopRenew()
 	wasLeader := e.isLeader
+	e.stopRenew()
 
 	if e.lc == nil {
 		// Connection was force-closed by stopRenew. The server still

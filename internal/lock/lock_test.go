@@ -1887,10 +1887,13 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 	cancel()
 
 	lm.LockConnMuForTest()
-	exists := lm.ConnEnqueuedForTest(eqKey) != nil
+	es := lm.ConnEnqueuedForTest(eqKey)
 	lm.UnlockConnMuForTest()
-	if exists {
-		t.Fatal("connEnqueued should be cleaned up by expiry loop")
+	if es == nil {
+		t.Fatal("connEnqueued should still exist (marked expired)")
+	}
+	if !es.expired {
+		t.Fatal("connEnqueued should be marked expired by expiry loop")
 	}
 }
 
@@ -1910,10 +1913,13 @@ func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 	cancel()
 
 	lm.LockConnMuForTest()
-	exists := lm.ConnEnqueuedForTest(eqKey) != nil
+	es := lm.ConnEnqueuedForTest(eqKey)
 	lm.UnlockConnMuForTest()
-	if exists {
-		t.Fatal("connEnqueued should be cleaned up by expiry loop")
+	if es == nil {
+		t.Fatal("connEnqueued should still exist (marked expired)")
+	}
+	if !es.expired {
+		t.Fatal("connEnqueued should be marked expired by expiry loop")
 	}
 }
 
