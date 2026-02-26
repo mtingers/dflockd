@@ -832,12 +832,7 @@ func (sc *SignalConn) readLoop() {
 			default:
 			}
 		} else {
-			// Non-blocking send prevents deadlock if an unexpected
-			// extra response arrives when no sendCmd is waiting.
-			select {
-			case sc.respCh <- line:
-			default:
-			}
+			sc.respCh <- line
 		}
 	}
 }
@@ -879,6 +874,9 @@ func WithGroup(group string) ListenOption {
 
 // Listen subscribes to a pattern (supports * and > wildcards).
 func (sc *SignalConn) Listen(pattern string, opts ...ListenOption) error {
+	if err := validateKey(pattern); err != nil {
+		return fmt.Errorf("dflockd: invalid pattern: %w", err)
+	}
 	var lo listenOptions
 	for _, o := range opts {
 		o(&lo)
@@ -895,6 +893,9 @@ func (sc *SignalConn) Listen(pattern string, opts ...ListenOption) error {
 
 // Unlisten unsubscribes from a pattern.
 func (sc *SignalConn) Unlisten(pattern string, opts ...ListenOption) error {
+	if err := validateKey(pattern); err != nil {
+		return fmt.Errorf("dflockd: invalid pattern: %w", err)
+	}
 	var lo listenOptions
 	for _, o := range opts {
 		o(&lo)
@@ -912,6 +913,9 @@ func (sc *SignalConn) Unlisten(pattern string, opts ...ListenOption) error {
 // Emit sends a signal on a channel (must be literal, no wildcards).
 // Returns the number of receivers.
 func (sc *SignalConn) Emit(channel, payload string) (int, error) {
+	if err := validateKey(channel); err != nil {
+		return 0, fmt.Errorf("dflockd: invalid channel: %w", err)
+	}
 	if err := validateValue(payload); err != nil {
 		return 0, err
 	}
@@ -2773,10 +2777,7 @@ func (wc *WatchConn) readLoop() {
 			default:
 			}
 		} else {
-			select {
-			case wc.respCh <- line:
-			default:
-			}
+			wc.respCh <- line
 		}
 	}
 }
@@ -2801,6 +2802,9 @@ func (wc *WatchConn) sendCmd(cmd, key, arg string) (string, error) {
 
 // Watch subscribes to changes on a key or pattern.
 func (wc *WatchConn) Watch(pattern string) error {
+	if err := validateKey(pattern); err != nil {
+		return fmt.Errorf("dflockd: invalid pattern: %w", err)
+	}
 	resp, err := wc.sendCmd("watch", pattern, "")
 	if err != nil {
 		return err
@@ -2813,6 +2817,9 @@ func (wc *WatchConn) Watch(pattern string) error {
 
 // Unwatch unsubscribes from a key or pattern.
 func (wc *WatchConn) Unwatch(pattern string) error {
+	if err := validateKey(pattern); err != nil {
+		return fmt.Errorf("dflockd: invalid pattern: %w", err)
+	}
 	resp, err := wc.sendCmd("unwatch", pattern, "")
 	if err != nil {
 		return err
@@ -2921,10 +2928,7 @@ func (lc *LeaderConn) readLoop() {
 			default:
 			}
 		} else {
-			select {
-			case lc.respCh <- line:
-			default:
-			}
+			lc.respCh <- line
 		}
 	}
 }
@@ -3014,6 +3018,9 @@ func (lc *LeaderConn) Renew(key, token string, opts ...Option) (int, uint64, err
 
 // Observe subscribes to leader change events for a key.
 func (lc *LeaderConn) Observe(key string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := lc.sendCmd("observe", key, "")
 	if err != nil {
 		return err
@@ -3026,6 +3033,9 @@ func (lc *LeaderConn) Observe(key string) error {
 
 // Unobserve unsubscribes from leader change events for a key.
 func (lc *LeaderConn) Unobserve(key string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := lc.sendCmd("unobserve", key, "")
 	if err != nil {
 		return err
@@ -3112,7 +3122,13 @@ func (e *Election) opts() []Option {
 
 func (e *Election) connect() error {
 	if e.lc != nil {
-		e.lc.Close()
+		// Close the underlying connection to unblock the readLoop,
+		// then wait for readLoop exit with a timeout to avoid blocking.
+		e.lc.conn.Close()
+		select {
+		case <-e.lc.done:
+		case <-time.After(2 * time.Second):
+		}
 		e.lc = nil
 	}
 	addr := e.serverAddr()

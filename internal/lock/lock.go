@@ -141,6 +141,7 @@ type barrierState struct {
 	Count        int
 	Participants []*barrierParticipant
 	Tripped      bool
+	Cancelled    chan struct{} // closed when barrier becomes unreachable (participant left)
 	LastActivity time.Time
 }
 
@@ -815,11 +816,11 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 
 	lm.connMu.Lock()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	defer lm.connMu.Unlock()
 
 	st := sh.resources[key]
 	if st == nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return 0, 0, false
 	}
 
@@ -828,6 +829,8 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 
 	h, ok := st.Holders[token]
 	if !ok {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return 0, 0, false
 	}
 
@@ -843,6 +846,12 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.grantNextLocked(key, st)
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		// Notify watchers of implicit release (outside locks)
+		if lm.OnLockRelease != nil {
+			lm.OnLockRelease(key)
+		}
 		return 0, 0, false
 	}
 
@@ -854,6 +863,8 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 	if remaining < 0 {
 		remaining = 0
 	}
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
 	return remaining, h.fence, true
 }
 
@@ -864,11 +875,11 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 
 	lm.connMu.Lock()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	defer lm.connMu.Unlock()
 
 	st := sh.resources[key]
 	if st == nil {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return 0, false
 	}
 
@@ -877,6 +888,8 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 
 	h, ok := st.Holders[token]
 	if !ok {
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return 0, false
 	}
 
@@ -892,6 +905,12 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.grantNextLocked(key, st)
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
+		// Notify watchers of implicit release (outside locks)
+		if lm.OnLockRelease != nil {
+			lm.OnLockRelease(key)
+		}
 		return 0, false
 	}
 
@@ -903,6 +922,8 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 	if remaining < 0 {
 		remaining = 0
 	}
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
 	return remaining, true
 }
 
@@ -1135,7 +1156,12 @@ func (lm *LockManager) LPush(key, value string) (int, error) {
 	// Try to hand off to a waiting pop consumer
 	if tryHandoffToPopWaiter(ls, value) {
 		ls.LastActivity = time.Now()
-		return len(ls.Items), nil
+		// Clean up empty list entry if no items and no pop waiters remain
+		if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
+			delete(sh.lists, key)
+			lm.keyTotal.Add(-1)
+		}
+		return 0, nil
 	}
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
@@ -1162,7 +1188,12 @@ func (lm *LockManager) RPush(key, value string) (int, error) {
 	// Try to hand off to a waiting pop consumer
 	if tryHandoffToPopWaiter(ls, value) {
 		ls.LastActivity = time.Now()
-		return len(ls.Items), nil
+		// Clean up empty list entry if no items and no pop waiters remain
+		if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
+			delete(sh.lists, key)
+			lm.keyTotal.Add(-1)
+		}
+		return 0, nil
 	}
 	if max := lm.cfg.MaxListLength; max > 0 && len(ls.Items) >= max {
 		return 0, ErrListFull
@@ -1715,6 +1746,7 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		}
 		bs = &barrierState{
 			Count:        count,
+			Cancelled:    make(chan struct{}),
 			LastActivity: time.Now(),
 		}
 		sh.barriers[key] = bs
@@ -1750,9 +1782,10 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		return true, nil
 	}
 
+	cancelled := bs.Cancelled
 	sh.mu.Unlock()
 
-	// Wait for trip, timeout, or context cancel.
+	// Wait for trip, cancellation, timeout, or context cancel.
 	// Fix #7: For timeout <= 0, check if barrier tripped first (non-blocking)
 	// before starting the timer to avoid non-deterministic select.
 	if timeout <= 0 {
@@ -1773,6 +1806,12 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 	select {
 	case <-p.ch:
 		return true, nil
+	case <-cancelled:
+		// A participant disconnected — barrier can never trip.
+		sh.mu.Lock()
+		lm.removeBarrierParticipant(sh, key, p)
+		sh.mu.Unlock()
+		return false, nil
 	case <-ctx.Done():
 		// Re-check: barrier may have tripped concurrently with cancellation.
 		select {
@@ -1799,6 +1838,8 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 }
 
 // removeBarrierParticipant removes a participant from a barrier.
+// When a participant leaves, the barrier can never trip (count unreachable),
+// so remaining participants are notified via the Cancelled channel.
 // Must be called with the shard lock held.
 func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *barrierParticipant) {
 	bs, ok := sh.barriers[key]
@@ -1809,6 +1850,15 @@ func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *b
 		if p == target {
 			bs.Participants = append(bs.Participants[:i], bs.Participants[i+1:]...)
 			break
+		}
+	}
+	if !bs.Tripped && bs.Cancelled != nil {
+		// Barrier is now unreachable — wake remaining participants
+		select {
+		case <-bs.Cancelled:
+			// already cancelled
+		default:
+			close(bs.Cancelled)
 		}
 	}
 	if len(bs.Participants) == 0 && !bs.Tripped {
@@ -2195,10 +2245,23 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 			}
 		}
 		// Clean up barrier participants for this connection.
+		// When a participant disconnects, the barrier can never trip
+		// (count can't be reached), so cancel it to wake remaining waiters.
 		for key, bs := range sh.barriers {
+			removed := false
 			for i := len(bs.Participants) - 1; i >= 0; i-- {
 				if bs.Participants[i].connID == connID {
 					bs.Participants = append(bs.Participants[:i], bs.Participants[i+1:]...)
+					removed = true
+				}
+			}
+			if removed && !bs.Tripped && bs.Cancelled != nil {
+				// Signal remaining participants that barrier is unreachable
+				select {
+				case <-bs.Cancelled:
+					// already cancelled
+				default:
+					close(bs.Cancelled)
 				}
 			}
 			if len(bs.Participants) == 0 && !bs.Tripped {
