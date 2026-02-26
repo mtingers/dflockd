@@ -118,6 +118,23 @@ func parseInt(s string, what string) (int, error) {
 	return n, nil
 }
 
+// maxSafeSeconds is the largest value (in seconds) that can be multiplied by
+// time.Second without overflowing int64 (time.Duration).
+const maxSafeSeconds = int(^uint(0)>>1) / int(time.Second)
+
+// parseSeconds parses a seconds value and rejects values that would overflow
+// time.Duration when converted via time.Duration(n) * time.Second.
+func parseSeconds(s string, what string) (int, error) {
+	n, err := parseInt(s, what)
+	if err != nil {
+		return 0, err
+	}
+	if n > maxSafeSeconds {
+		return 0, &ProtocolError{Code: 4, Message: fmt.Sprintf("%s too large: %d", what, n)}
+	}
+	return n, nil
+}
+
 func parseInt64(s string, what string) (int64, error) {
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
@@ -185,7 +202,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if len(parts) != 1 && len(parts) != 2 {
 			return nil, &ProtocolError{Code: 8, Message: "lock arg must be: <timeout> [<lease_ttl>]"}
 		}
-		timeout, err := parseInt(parts[0], "timeout")
+		timeout, err := parseSeconds(parts[0], "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -194,7 +211,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -227,7 +244,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -242,7 +259,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		stripped := strings.TrimSpace(arg)
 		leaseTTL := defaultLeaseTTL
 		if stripped != "" {
-			lt, err := parseInt(stripped, "lease_ttl")
+			lt, err := parseSeconds(stripped, "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -258,7 +275,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: "wait arg must be: <timeout>"}
 		}
-		timeout, err := parseInt(stripped, "timeout")
+		timeout, err := parseSeconds(stripped, "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -276,7 +293,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if len(parts) != 2 && len(parts) != 3 {
 			return nil, &ProtocolError{Code: 8, Message: "sl arg must be: <timeout> <limit> [<lease_ttl>]"}
 		}
-		timeout, err := parseInt(parts[0], "timeout")
+		timeout, err := parseSeconds(parts[0], "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -292,7 +309,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 3 {
-			lt, err := parseInt(parts[2], "lease_ttl")
+			lt, err := parseSeconds(parts[2], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -328,7 +345,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -353,7 +370,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -375,7 +392,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: "sw arg must be: <timeout>"}
 		}
-		timeout, err := parseInt(stripped, "timeout")
+		timeout, err := parseSeconds(stripped, "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -433,11 +450,11 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 			if strings.ContainsRune(ttlPart, '\t') {
 				return nil, &ProtocolError{Code: 8, Message: "kset: value must not contain tab characters"}
 			}
-			if n, err := strconv.Atoi(ttlPart); err == nil && n >= 0 {
-				req.TTLSeconds = n
-			} else {
+			n, err := parseSeconds(ttlPart, "kset TTL")
+			if err != nil || n < 0 {
 				return nil, &ProtocolError{Code: 8, Message: "kset: invalid TTL after tab"}
 			}
+			req.TTLSeconds = n
 		} else {
 			req.Value = arg
 		}
@@ -514,7 +531,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <timeout>"}
 		}
-		timeout, err := parseInt(stripped, "timeout")
+		timeout, err := parseSeconds(stripped, "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -534,7 +551,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if len(parts) != 1 && len(parts) != 2 {
 			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <timeout> [<lease_ttl>]"}
 		}
-		timeout, err := parseInt(parts[0], "timeout")
+		timeout, err := parseSeconds(parts[0], "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -543,7 +560,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -578,7 +595,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -594,7 +611,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		stripped := strings.TrimSpace(arg)
 		leaseTTL := defaultLeaseTTL
 		if stripped != "" {
-			lt, err := parseInt(stripped, "lease_ttl")
+			lt, err := parseSeconds(stripped, "lease_ttl")
 			if err != nil {
 				return nil, err
 			}
@@ -611,7 +628,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: cmd + " arg must be: <timeout>"}
 		}
-		timeout, err := parseInt(stripped, "timeout")
+		timeout, err := parseSeconds(stripped, "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -645,7 +662,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		ttl := 0
 		if ttlStr != "" {
-			n, err := strconv.Atoi(ttlStr)
+			n, err := parseSeconds(ttlStr, "kcas TTL")
 			if err != nil || n < 0 {
 				return nil, &ProtocolError{Code: 8, Message: "kcas: invalid TTL"}
 			}
@@ -675,7 +692,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if count <= 0 {
 			return nil, &ProtocolError{Code: 13, Message: "count must be > 0"}
 		}
-		timeout, err := parseInt(parts[1], "timeout")
+		timeout, err := parseSeconds(parts[1], "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -696,7 +713,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if len(parts) != 1 && len(parts) != 2 {
 			return nil, &ProtocolError{Code: 8, Message: "elect arg must be: <timeout> [<lease_ttl>]"}
 		}
-		timeout, err := parseInt(parts[0], "timeout")
+		timeout, err := parseSeconds(parts[0], "timeout")
 		if err != nil {
 			return nil, err
 		}
@@ -705,7 +722,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			lt, err := parseSeconds(parts[1], "lease_ttl")
 			if err != nil {
 				return nil, err
 			}

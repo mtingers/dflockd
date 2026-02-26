@@ -3549,9 +3549,13 @@ func (e *Election) startRenew() {
 						return
 					}
 					// Clear leadership state to prevent split-brain.
-					// Check isLeader under mutex to avoid spurious
-					// OnResigned callback if stopRenew already ran.
+					// Re-check ctx after acquiring mutex: stopRenew may
+					// have cancelled while we were waiting for the lock.
 					e.mu.Lock()
+					if ctx.Err() != nil {
+						e.mu.Unlock()
+						return
+					}
 					wasLeader := e.isLeader
 					e.isLeader = false
 					e.token = ""

@@ -230,6 +230,7 @@ func (m *Manager) Notify(eventType, key string) {
 				if w.CancelConn != nil {
 					w.CancelConn()
 				}
+				delivered[w.ConnID] = struct{}{}
 			}
 		}
 	}
