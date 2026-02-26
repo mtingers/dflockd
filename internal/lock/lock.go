@@ -536,6 +536,7 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			removeWaiterFromState(s, w)
+			lm.grantNextLocked(key, s)
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
@@ -565,6 +566,7 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		if s := sh.resources[key]; s != nil {
 			s.LastActivity = time.Now()
 			removeWaiterFromState(s, w)
+			lm.grantNextLocked(key, s)
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()

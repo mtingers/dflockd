@@ -338,6 +338,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		}
 		tok, fence, err := s.lm.AcquireWithFence(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
 			}
@@ -408,6 +411,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "w", "sw":
 		tok, lease, fence, err := s.lm.WaitWithFence(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}
 			}
@@ -736,6 +742,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "bwait":
 		ok, err := s.lm.BarrierWait(ctx, req.Key, req.Limit, req.AcquireTimeout, connID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			if errors.Is(err, lock.ErrBarrierCountMismatch) {
 				return &protocol.Ack{Status: "error_barrier_count_mismatch"}
 			}
@@ -754,6 +763,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "elect":
 		tok, fence, err := s.lm.AcquireWithFence(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, 1)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
 			}

@@ -581,6 +581,9 @@ func parseOKTokenLeaseFence(resp, cmd string) (string, int, uint64, error) {
 
 // parseRenewWithFence parses "ok <remaining> <fence>".
 func parseRenewWithFence(resp, cmd string) (int, uint64, error) {
+	if resp == "error_lease_expired" {
+		return 0, 0, ErrLeaseExpired
+	}
 	parts := strings.Fields(resp)
 	if (len(parts) == 2 || len(parts) == 3) && parts[0] == "ok" {
 		r, err := strconv.Atoi(parts[1])
@@ -1442,15 +1445,22 @@ func (l *Lock) Release(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	savedToken := l.token
 	l.stopRenew()
 
 	if l.conn == nil {
 		return nil
 	}
 
+	// Use savedToken in case the renew goroutine cleared l.token
+	// between our ctx.Err() check and mu acquisition.
+	token := l.token
+	if token == "" {
+		token = savedToken
+	}
 	var err error
-	if l.token != "" {
-		err = Release(l.conn, l.Key, l.token)
+	if token != "" {
+		err = Release(l.conn, l.Key, token)
 	}
 	l.closeConn()
 	l.token = ""
@@ -1847,15 +1857,21 @@ func (s *Semaphore) Release(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	savedToken := s.token
 	s.stopRenew()
 
 	if s.conn == nil {
 		return nil
 	}
 
+	// Use savedToken in case the renew goroutine cleared s.token.
+	token := s.token
+	if token == "" {
+		token = savedToken
+	}
 	var err error
-	if s.token != "" {
-		err = SemRelease(s.conn, s.Key, s.token)
+	if token != "" {
+		err = SemRelease(s.conn, s.Key, token)
 	}
 	s.closeConn()
 	s.token = ""
@@ -2641,18 +2657,24 @@ func (rw *RWLock) Unlock(ctx context.Context) error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
+	savedToken := rw.token
 	rw.stopRenew()
 
 	if rw.conn == nil {
 		return nil
 	}
 
+	// Use savedToken in case the renew goroutine cleared rw.token.
+	token := rw.token
+	if token == "" {
+		token = savedToken
+	}
 	var err error
-	if rw.token != "" {
+	if token != "" {
 		if rw.mode == "wl" {
-			err = WUnlock(rw.conn, rw.Key, rw.token)
+			err = WUnlock(rw.conn, rw.Key, token)
 		} else {
-			err = RUnlock(rw.conn, rw.Key, rw.token)
+			err = RUnlock(rw.conn, rw.Key, token)
 		}
 	}
 	rw.closeConn()
@@ -3341,6 +3363,7 @@ func (e *Election) Resign(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	savedToken := e.token
 	e.stopRenew()
 	wasLeader := e.isLeader
 
@@ -3361,9 +3384,14 @@ func (e *Election) Resign(ctx context.Context) error {
 		return nil
 	}
 
+	// Use savedToken in case the renew goroutine cleared e.token.
+	token := e.token
+	if token == "" {
+		token = savedToken
+	}
 	var err error
-	if e.token != "" {
-		err = e.lc.Resign(e.Key, e.token)
+	if token != "" {
+		err = e.lc.Resign(e.Key, token)
 	}
 	e.isLeader = false
 	e.closeLC()
