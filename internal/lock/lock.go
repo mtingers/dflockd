@@ -2407,6 +2407,7 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				}
 				lm.log.Warn("disconnect cleanup: releasing",
 					"key", entry.key, "conn_id", connID)
+				lm.removeLeaderHolderWatcher(sh, entry.key, h.connID)
 				delete(st.Holders, token)
 				released = true
 			}

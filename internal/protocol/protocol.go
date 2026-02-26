@@ -90,6 +90,9 @@ func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, er
 		if b == '\n' {
 			break
 		}
+		if b == '\r' {
+			continue // strip all carriage returns, not just trailing
+		}
 		if n >= len(buf) {
 			// Drain the rest of the oversized line before reporting error
 			// to keep the reader in a consistent state.
@@ -100,9 +103,6 @@ func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, er
 				}
 			}
 			return "", &ProtocolError{Code: 12, Message: "line too long"}
-		}
-		if b == '\r' {
-			continue // strip all carriage returns, not just trailing
 		}
 		buf[n] = b
 		n++

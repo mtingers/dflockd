@@ -281,6 +281,9 @@ func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error
 		return 0, err
 	}
 
+	if resp == "error_lease_expired" {
+		return 0, ErrLeaseExpired
+	}
 	parts := strings.Fields(resp)
 	if (len(parts) == 2 || len(parts) == 3) && parts[0] == "ok" {
 		r, err := strconv.Atoi(parts[1])
@@ -430,6 +433,9 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 		return 0, err
 	}
 
+	if resp == "error_lease_expired" {
+		return 0, ErrLeaseExpired
+	}
 	parts := strings.Fields(resp)
 	if (len(parts) == 2 || len(parts) == 3) && parts[0] == "ok" {
 		r, err := strconv.Atoi(parts[1])
@@ -1449,6 +1455,14 @@ func (l *Lock) Release(ctx context.Context) error {
 	l.stopRenew()
 
 	if l.conn == nil {
+		// Connection was force-closed by stopRenew. The server will
+		// release the lock when the disconnect is detected or lease expires.
+		l.token = ""
+		l.fence = 0
+		l.lease = 0
+		if savedToken != "" {
+			return fmt.Errorf("dflockd: connection lost, server-side release skipped (lease will expire)")
+		}
 		return nil
 	}
 
@@ -1861,6 +1875,14 @@ func (s *Semaphore) Release(ctx context.Context) error {
 	s.stopRenew()
 
 	if s.conn == nil {
+		// Connection was force-closed by stopRenew. The server will
+		// release the slot when the disconnect is detected or lease expires.
+		s.token = ""
+		s.fence = 0
+		s.lease = 0
+		if savedToken != "" {
+			return fmt.Errorf("dflockd: connection lost, server-side release skipped (lease will expire)")
+		}
 		return nil
 	}
 
@@ -2661,6 +2683,15 @@ func (rw *RWLock) Unlock(ctx context.Context) error {
 	rw.stopRenew()
 
 	if rw.conn == nil {
+		// Connection was force-closed by stopRenew. The server will
+		// release the lock when the disconnect is detected or lease expires.
+		rw.token = ""
+		rw.fence = 0
+		rw.lease = 0
+		rw.mode = ""
+		if savedToken != "" {
+			return fmt.Errorf("dflockd: connection lost, server-side unlock skipped (lease will expire)")
+		}
 		return nil
 	}
 
