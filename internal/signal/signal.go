@@ -289,6 +289,9 @@ func deliverToGroup(qg *queueGroup, msg []byte) bool {
 // deliveries, so a connection in both a non-grouped and grouped subscription
 // counts as 2).
 func (m *Manager) Signal(channel, payload string) int {
+	// msg is shared read-only across all recipients. Each recipient's push
+	// writer only passes it to conn.Write (read-only). Do not mutate msg
+	// after creation.
 	msg := []byte(fmt.Sprintf("sig %s %s\n", channel, payload))
 
 	m.mu.RLock()

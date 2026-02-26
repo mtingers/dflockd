@@ -457,6 +457,9 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if strings.Contains(key, "*") || strings.Contains(key, ">") {
 			return nil, &ProtocolError{Code: 5, Message: "signal channel must not contain wildcards"}
 		}
+		if strings.ContainsRune(arg, '\r') {
+			return nil, &ProtocolError{Code: 8, Message: "signal payload must not contain carriage return"}
+		}
 		return &Request{Cmd: cmd, Key: key, Value: arg}, nil
 
 	// --- Phase 4: Lists/Queues ---
@@ -620,19 +623,28 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value>\\t<ttl>"}
 		}
 		// Format: <old_value>\t<new_value>\t<ttl> — tab-separated.
-		// Two tabs required: old_value, new_value, TTL.
-		parts := strings.Split(arg, "\t")
-		if len(parts) < 2 {
+		// Parse from the right: TTL is always last (numeric), new_value is
+		// second-to-last, old_value is everything before. This allows tabs
+		// in values (consistent with kset).
+		lastTab := strings.LastIndex(arg, "\t")
+		if lastTab < 0 {
 			return nil, &ProtocolError{Code: 8, Message: "kcas arg must contain tab separators"}
 		}
-		req := &Request{Cmd: cmd, Key: key, OldValue: parts[0], Value: parts[1]}
-		if len(parts) >= 3 {
-			if n, err := strconv.Atoi(parts[2]); err == nil && n >= 0 {
-				req.TTLSeconds = n
-			} else {
+		ttlStr := arg[lastTab+1:]
+		rest := arg[:lastTab]
+		ttl := 0
+		if ttlStr != "" {
+			n, err := strconv.Atoi(ttlStr)
+			if err != nil || n < 0 {
 				return nil, &ProtocolError{Code: 8, Message: "kcas: invalid TTL"}
 			}
+			ttl = n
 		}
+		prevTab := strings.LastIndex(rest, "\t")
+		if prevTab < 0 {
+			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value>\\t<ttl>"}
+		}
+		req := &Request{Cmd: cmd, Key: key, OldValue: rest[:prevTab], Value: rest[prevTab+1:], TTLSeconds: ttl}
 		return req, nil
 
 	// --- Watch/Notify ---

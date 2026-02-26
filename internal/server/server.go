@@ -275,6 +275,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 		}
 
 		ack := s.handleRequest(connCtx, req, cs)
+		if ack == nil {
+			continue // no response needed (e.g. connection closing)
+		}
 		if err := writeResp(protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
 			s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 			break
@@ -560,6 +563,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "blpop":
 		val, err := s.lm.BLPop(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				return nil // connection closing, skip response
+			}
 			if errors.Is(err, lock.ErrMaxKeys) {
 				return &protocol.Ack{Status: "error_max_keys"}
 			}
@@ -574,6 +580,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "brpop":
 		val, err := s.lm.BRPop(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
+			if errors.Is(err, lock.ErrWaiterClosed) {
+				return nil // connection closing, skip response
+			}
 			if errors.Is(err, lock.ErrMaxKeys) {
 				return &protocol.Ack{Status: "error_max_keys"}
 			}

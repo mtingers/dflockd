@@ -902,9 +902,10 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 	if remaining < 0 {
 		remaining = 0
 	}
+	fence := h.fence
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
-	return remaining, h.fence, true
+	return remaining, fence, true
 }
 
 // Renew renews the lease if the token matches (commands "n" and "sn").
@@ -1416,7 +1417,7 @@ func (lm *LockManager) blockingPop(ctx context.Context, key string, timeout time
 	select {
 	case val, ok := <-w.ch:
 		if !ok {
-			return "", nil // channel closed (disconnect cleanup)
+			return "", ErrWaiterClosed
 		}
 		return val, nil
 
@@ -2064,6 +2065,7 @@ func (lm *LockManager) NotifyLeaderChange(key, eventType string, excludeConnID u
 	if !ok {
 		return
 	}
+	// msg is shared read-only across all recipients.
 	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
 	for connID, lw := range watchers {
 		if connID == excludeConnID {
@@ -2314,19 +2316,11 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 					ls.PopWaiters[j] = nil
 				}
 			}
+			compactPopWaiters(ls)
 			// Remove the list if it's empty and all pop waiters are gone.
-			if len(ls.Items) == 0 {
-				allNil := true
-				for k := ls.PopWaiterHead; k < len(ls.PopWaiters); k++ {
-					if ls.PopWaiters[k] != nil {
-						allNil = false
-						break
-					}
-				}
-				if allNil {
-					delete(sh.lists, key)
-					lm.keyTotal.Add(-1)
-				}
+			if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
+				delete(sh.lists, key)
+				lm.keyTotal.Add(-1)
 			}
 		}
 		// Clean up barrier participants for this connection.

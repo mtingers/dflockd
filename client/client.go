@@ -154,6 +154,12 @@ func (c *Conn) readLine() (string, error) {
 // Authenticate sends an auth command with the given token. Returns nil on
 // success, ErrAuth if the server rejects the token.
 func Authenticate(c *Conn, token string) error {
+	if token == "" {
+		return fmt.Errorf("dflockd: empty auth token")
+	}
+	if err := validateArg("token", token); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("auth", "_", token)
 	if err != nil {
 		return err
@@ -182,6 +188,15 @@ func validateKey(key string) error {
 func validateValue(value string) error {
 	if strings.ContainsAny(value, "\n\r") {
 		return fmt.Errorf("dflockd: value contains newline")
+	}
+	return nil
+}
+
+// validateArg checks that a protocol argument does not contain newlines,
+// which would inject extra protocol lines.
+func validateArg(name, value string) error {
+	if strings.ContainsAny(value, "\n\r") {
+		return fmt.Errorf("dflockd: %s contains newline", name)
 	}
 	return nil
 }
@@ -231,6 +246,9 @@ func Release(c *Conn, key, token string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := validateArg("token", token); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("r", key, token)
 	if err != nil {
 		return err
@@ -244,6 +262,9 @@ func Release(c *Conn, key, token string) error {
 // Renew sends a renew ("n") command and returns the remaining lease seconds.
 func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
 	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	if err := validateArg("token", token); err != nil {
 		return 0, err
 	}
 	var o options
@@ -374,6 +395,9 @@ func SemRelease(c *Conn, key, token string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := validateArg("token", token); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("sr", key, token)
 	if err != nil {
 		return err
@@ -387,6 +411,9 @@ func SemRelease(c *Conn, key, token string) error {
 // SemRenew sends a semaphore renew ("sn") command and returns the remaining lease seconds.
 func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
 	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	if err := validateArg("token", token); err != nil {
 		return 0, err
 	}
 	var o options
@@ -744,17 +771,11 @@ func KVCAS(c *Conn, key, oldValue, newValue string, ttlSeconds int) (bool, error
 	if err := validateKey(key); err != nil {
 		return false, err
 	}
+	if err := validateValue(oldValue); err != nil {
+		return false, fmt.Errorf("dflockd: oldValue: %w", err)
+	}
 	if err := validateValue(newValue); err != nil {
 		return false, err
-	}
-	if strings.Contains(oldValue, "\t") {
-		return false, fmt.Errorf("dflockd: oldValue contains tab")
-	}
-	if strings.Contains(newValue, "\t") {
-		return false, fmt.Errorf("dflockd: newValue contains tab")
-	}
-	if strings.ContainsAny(oldValue, "\n\r") {
-		return false, fmt.Errorf("dflockd: oldValue contains newline")
 	}
 	if ttlSeconds < 0 {
 		ttlSeconds = 0
@@ -881,6 +902,9 @@ func (sc *SignalConn) Listen(pattern string, opts ...ListenOption) error {
 	for _, o := range opts {
 		o(&lo)
 	}
+	if err := validateArg("group", lo.group); err != nil {
+		return err
+	}
 	resp, err := sc.sendCmd("listen", pattern, lo.group)
 	if err != nil {
 		return err
@@ -899,6 +923,9 @@ func (sc *SignalConn) Unlisten(pattern string, opts ...ListenOption) error {
 	var lo listenOptions
 	for _, o := range opts {
 		o(&lo)
+	}
+	if err := validateArg("group", lo.group); err != nil {
+		return err
 	}
 	resp, err := sc.sendCmd("unlisten", pattern, lo.group)
 	if err != nil {
@@ -1352,16 +1379,23 @@ func (l *Lock) stopRenew() {
 		done := l.renewDone
 		l.renewDone = nil
 		conn := l.conn
+		forceClosed := false
 		l.mu.Unlock()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			if conn != nil {
 				conn.Close()
+				forceClosed = true
 			}
 			<-done
 		}
 		l.mu.Lock()
+		// If we force-closed the connection, nil it out so callers
+		// (Release, Close) don't try to use the dead connection.
+		if forceClosed && l.conn == conn {
+			l.conn = nil
+		}
 	}
 }
 
@@ -1392,11 +1426,6 @@ func (l *Lock) Close() error {
 	defer l.mu.Unlock()
 
 	l.stopRenew()
-
-	if l.conn == nil {
-		return nil
-	}
-
 	l.closeConn()
 	l.token = ""
 	l.fence = 0
@@ -1742,16 +1771,21 @@ func (s *Semaphore) stopRenew() {
 		done := s.renewDone
 		s.renewDone = nil
 		conn := s.conn
+		forceClosed := false
 		s.mu.Unlock()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			if conn != nil {
 				conn.Close()
+				forceClosed = true
 			}
 			<-done
 		}
 		s.mu.Lock()
+		if forceClosed && s.conn == conn {
+			s.conn = nil
+		}
 	}
 }
 
@@ -1781,11 +1815,6 @@ func (s *Semaphore) Close() error {
 	defer s.mu.Unlock()
 
 	s.stopRenew()
-
-	if s.conn == nil {
-		return nil
-	}
-
 	s.closeConn()
 	s.token = ""
 	s.fence = 0
@@ -2084,6 +2113,9 @@ func RenewWithFence(c *Conn, key, token string, opts ...Option) (remaining int, 
 	if err := validateKey(key); err != nil {
 		return 0, 0, err
 	}
+	if err := validateArg("token", token); err != nil {
+		return 0, 0, err
+	}
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -2102,6 +2134,9 @@ func RenewWithFence(c *Conn, key, token string, opts ...Option) (remaining int, 
 // SemRenewWithFence sends a semaphore renew ("sn") and returns the fencing token.
 func SemRenewWithFence(c *Conn, key, token string, opts ...Option) (remaining int, fence uint64, err error) {
 	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
+	if err := validateArg("token", token); err != nil {
 		return 0, 0, err
 	}
 	var o options
@@ -2223,6 +2258,9 @@ func RUnlock(c *Conn, key, token string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := validateArg("token", token); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("rr", key, token)
 	if err != nil {
 		return err
@@ -2236,6 +2274,9 @@ func RUnlock(c *Conn, key, token string) error {
 // WUnlock sends a write-unlock ("wr") command.
 func WUnlock(c *Conn, key, token string) error {
 	if err := validateKey(key); err != nil {
+		return err
+	}
+	if err := validateArg("token", token); err != nil {
 		return err
 	}
 	resp, err := c.sendRecv("wr", key, token)
@@ -2260,6 +2301,9 @@ func WRenew(c *Conn, key, token string, opts ...Option) (remaining int, fence ui
 
 func rwRenew(c *Conn, cmd, key, token string, opts ...Option) (int, uint64, error) {
 	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
+	if err := validateArg("token", token); err != nil {
 		return 0, 0, err
 	}
 	var o options
@@ -2593,16 +2637,21 @@ func (rw *RWLock) stopRenew() {
 		done := rw.renewDone
 		rw.renewDone = nil
 		conn := rw.conn
+		forceClosed := false
 		rw.mu.Unlock()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			if conn != nil {
 				conn.Close()
+				forceClosed = true
 			}
 			<-done
 		}
 		rw.mu.Lock()
+		if forceClosed && rw.conn == conn {
+			rw.conn = nil
+		}
 	}
 }
 
@@ -2953,6 +3002,9 @@ func (lc *LeaderConn) Resign(key, token string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := validateArg("token", token); err != nil {
+		return err
+	}
 	resp, err := lc.sendCmd("resign", key, token)
 	if err != nil {
 		return err
@@ -2966,6 +3018,9 @@ func (lc *LeaderConn) Resign(key, token string) error {
 // Renew renews the leader lease. Returns the remaining seconds and fence.
 func (lc *LeaderConn) Renew(key, token string, opts ...Option) (int, uint64, error) {
 	if err := validateKey(key); err != nil {
+		return 0, 0, err
+	}
+	if err := validateArg("token", token); err != nil {
 		return 0, 0, err
 	}
 	var o options
@@ -3258,16 +3313,21 @@ func (e *Election) stopRenew() {
 		done := e.renewDone
 		e.renewDone = nil
 		lc := e.lc
+		forceClosed := false
 		e.mu.Unlock()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			if lc != nil {
 				lc.conn.Close()
+				forceClosed = true
 			}
 			<-done
 		}
 		e.mu.Lock()
+		if forceClosed && e.lc == lc {
+			e.lc = nil
+		}
 	}
 }
 

@@ -186,6 +186,9 @@ func (m *Manager) UnwatchAll(connID uint64) {
 // Notify sends a watch event to all watchers matching the key.
 // Slow consumers (full WriteCh) are disconnected via CancelConn.
 func (m *Manager) Notify(eventType, key string) {
+	// msg is shared read-only across all recipients. Each recipient's push
+	// writer only passes it to conn.Write (read-only). Do not mutate msg
+	// after creation.
 	msg := []byte(fmt.Sprintf("watch %s %s\n", eventType, key))
 
 	m.mu.RLock()
