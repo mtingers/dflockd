@@ -1144,13 +1144,19 @@ func (l *Lock) opts() []Option {
 	return nil
 }
 
-// connect dials the appropriate shard server. If there is an existing
-// connection it is closed first to prevent resource leaks.
-func (l *Lock) connect() error {
+// closeConn closes the connection if non-nil and sets it to nil.
+// Must be called with l.mu held.
+func (l *Lock) closeConn() {
 	if l.conn != nil {
 		l.conn.Close()
 		l.conn = nil
 	}
+}
+
+// connect dials the appropriate shard server. If there is an existing
+// connection it is closed first to prevent resource leaks.
+func (l *Lock) connect() error {
+	l.closeConn()
 	addr := l.serverAddr()
 	var conn *Conn
 	var err error
@@ -1204,32 +1210,19 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			l.conn.Close()
-			l.conn = nil
+			l.closeConn()
 			return false, nil
 		}
-		// If context was cancelled, the conn.Close in the cancellation
-		// goroutine may have caused this I/O error — but the goroutine
-		// is not guaranteed to have run (select is non-deterministic when
-		// both done and ctx.Done() are ready). Always close to avoid a
-		// leaked FD; double-close on net.Conn is harmless.
 		if ctx.Err() != nil {
-			l.conn.Close()
-			l.conn = nil
+			l.closeConn()
 			return false, ctx.Err()
 		}
-		l.conn.Close()
-		l.conn = nil
+		l.closeConn()
 		return false, err
 	}
 
-	// Guard against the cancellation goroutine closing the connection
-	// after the operation succeeded (race between close(done) and ctx.Done()).
-	// Don't attempt Release — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		l.conn.Close()
-		l.conn = nil
+		l.closeConn()
 		return false, ctx.Err()
 	}
 
@@ -1271,20 +1264,15 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 
 	if err != nil {
 		if ctx.Err() != nil {
-			l.conn.Close()
-			l.conn = nil
+			l.closeConn()
 			return "", ctx.Err()
 		}
-		l.conn.Close()
-		l.conn = nil
+		l.closeConn()
 		return "", err
 	}
 
-	// Don't attempt Release — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		l.conn.Close()
-		l.conn = nil
+		l.closeConn()
 		return "", ctx.Err()
 	}
 
@@ -1327,25 +1315,19 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			l.conn.Close()
-			l.conn = nil
+			l.closeConn()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			l.conn.Close()
-			l.conn = nil
+			l.closeConn()
 			return false, ctx.Err()
 		}
-		l.conn.Close()
-		l.conn = nil
+		l.closeConn()
 		return false, err
 	}
 
-	// Don't attempt Release — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		l.conn.Close()
-		l.conn = nil
+		l.closeConn()
 		return false, ctx.Err()
 	}
 
@@ -1396,8 +1378,7 @@ func (l *Lock) Release(ctx context.Context) error {
 	}
 
 	err := Release(l.conn, l.Key, l.token)
-	l.conn.Close()
-	l.conn = nil
+	l.closeConn()
 	l.token = ""
 	l.fence = 0
 	l.lease = 0
@@ -1416,12 +1397,11 @@ func (l *Lock) Close() error {
 		return nil
 	}
 
-	err := l.conn.Close()
-	l.conn = nil
+	l.closeConn()
 	l.token = ""
 	l.fence = 0
 	l.lease = 0
-	return err
+	return nil
 }
 
 // Token returns the current lock token, or "" if not acquired.
@@ -1564,13 +1544,19 @@ func (s *Semaphore) opts() []Option {
 	return nil
 }
 
-// connect dials the appropriate shard server. If there is an existing
-// connection it is closed first to prevent resource leaks.
-func (s *Semaphore) connect() error {
+// closeConn closes the connection if non-nil and sets it to nil.
+// Must be called with s.mu held.
+func (s *Semaphore) closeConn() {
 	if s.conn != nil {
 		s.conn.Close()
 		s.conn = nil
 	}
+}
+
+// connect dials the appropriate shard server. If there is an existing
+// connection it is closed first to prevent resource leaks.
+func (s *Semaphore) connect() error {
+	s.closeConn()
 	addr := s.serverAddr()
 	var conn *Conn
 	var err error
@@ -1621,25 +1607,19 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			s.conn.Close()
-			s.conn = nil
+			s.closeConn()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			s.conn.Close()
-			s.conn = nil
+			s.closeConn()
 			return false, ctx.Err()
 		}
-		s.conn.Close()
-		s.conn = nil
+		s.closeConn()
 		return false, err
 	}
 
-	// Don't attempt SemRelease — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		s.conn.Close()
-		s.conn = nil
+		s.closeConn()
 		return false, ctx.Err()
 	}
 
@@ -1680,20 +1660,15 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 
 	if err != nil {
 		if ctx.Err() != nil {
-			s.conn.Close()
-			s.conn = nil
+			s.closeConn()
 			return "", ctx.Err()
 		}
-		s.conn.Close()
-		s.conn = nil
+		s.closeConn()
 		return "", err
 	}
 
-	// Don't attempt SemRelease — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		s.conn.Close()
-		s.conn = nil
+		s.closeConn()
 		return "", ctx.Err()
 	}
 
@@ -1735,25 +1710,19 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			s.conn.Close()
-			s.conn = nil
+			s.closeConn()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			s.conn.Close()
-			s.conn = nil
+			s.closeConn()
 			return false, ctx.Err()
 		}
-		s.conn.Close()
-		s.conn = nil
+		s.closeConn()
 		return false, err
 	}
 
-	// Don't attempt SemRelease — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		s.conn.Close()
-		s.conn = nil
+		s.closeConn()
 		return false, ctx.Err()
 	}
 
@@ -1799,8 +1768,7 @@ func (s *Semaphore) Release(ctx context.Context) error {
 	}
 
 	err := SemRelease(s.conn, s.Key, s.token)
-	s.conn.Close()
-	s.conn = nil
+	s.closeConn()
 	s.token = ""
 	s.fence = 0
 	s.lease = 0
@@ -1818,12 +1786,11 @@ func (s *Semaphore) Close() error {
 		return nil
 	}
 
-	err := s.conn.Close()
-	s.conn = nil
+	s.closeConn()
 	s.token = ""
 	s.fence = 0
 	s.lease = 0
-	return err
+	return nil
 }
 
 // Token returns the current semaphore slot token, or "" if not acquired.
@@ -2466,11 +2433,17 @@ func (rw *RWLock) opts() []Option {
 	return nil
 }
 
-func (rw *RWLock) connect() error {
+// closeConn closes the connection if non-nil and sets it to nil.
+// Must be called with rw.mu held.
+func (rw *RWLock) closeConn() {
 	if rw.conn != nil {
 		rw.conn.Close()
 		rw.conn = nil
 	}
+}
+
+func (rw *RWLock) connect() error {
+	rw.closeConn()
 	addr := rw.serverAddr()
 	var conn *Conn
 	var err error
@@ -2529,23 +2502,19 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			rw.conn.Close()
-			rw.conn = nil
+			rw.closeConn()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			rw.conn.Close()
-			rw.conn = nil
+			rw.closeConn()
 			return false, ctx.Err()
 		}
-		rw.conn.Close()
-		rw.conn = nil
+		rw.closeConn()
 		return false, err
 	}
 
 	if ctx.Err() != nil {
-		rw.conn.Close()
-		rw.conn = nil
+		rw.closeConn()
 		return false, ctx.Err()
 	}
 
@@ -2574,8 +2543,7 @@ func (rw *RWLock) Unlock(ctx context.Context) error {
 	} else {
 		err = RUnlock(rw.conn, rw.Key, rw.token)
 	}
-	rw.conn.Close()
-	rw.conn = nil
+	rw.closeConn()
 	rw.token = ""
 	rw.fence = 0
 	rw.lease = 0
@@ -2594,13 +2562,12 @@ func (rw *RWLock) Close() error {
 		return nil
 	}
 
-	err := rw.conn.Close()
-	rw.conn = nil
+	rw.closeConn()
 	rw.token = ""
 	rw.fence = 0
 	rw.lease = 0
 	rw.mode = ""
-	return err
+	return nil
 }
 
 // Token returns the current lock token.
@@ -3130,6 +3097,8 @@ func (e *Election) closeLC() {
 	select {
 	case <-e.lc.done:
 	case <-time.After(2 * time.Second):
+		// Timeout expired; block until goroutine exits to avoid leak.
+		<-e.lc.done
 	}
 	e.lc = nil
 }
