@@ -144,7 +144,8 @@ func (m *Manager) Unwatch(pattern string, connID uint64) {
 	entries := m.connWatchers[connID]
 	for i, e := range entries {
 		if e.pattern == pattern {
-			entries = append(entries[:i], entries[i+1:]...)
+			copy(entries[i:], entries[i+1:])
+			entries = entries[:len(entries)-1]
 			break
 		}
 	}
@@ -208,6 +209,9 @@ func (m *Manager) Notify(eventType, key string) {
 				if w.CancelConn != nil {
 					w.CancelConn()
 				}
+				// Mark delivered to prevent wildcard path from racing
+				// against the teardown on the same connection.
+				delivered[connID] = struct{}{}
 			}
 		}
 	}

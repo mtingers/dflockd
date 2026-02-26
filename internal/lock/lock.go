@@ -148,6 +148,7 @@ type barrierState struct {
 type leaderWatcher struct {
 	ch         chan []byte
 	cancelConn func() // called when ch is full (slow consumer)
+	observer   bool   // true if registered via observe (not elect)
 }
 
 type shard struct {
@@ -356,19 +357,9 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) bool {
 			if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 				delete(lm.connEnqueued, eqKey)
 			}
-			// Clean up leader watcher for the expired holder.
-			if watchers, wok := sh.leaderWatchers[key]; wok {
-				delete(watchers, h.connID)
-				if len(watchers) == 0 {
-					delete(sh.leaderWatchers, key)
-				}
-			}
-			if keys, kok := lm.connLeaderKeys[h.connID]; kok {
-				delete(keys, key)
-				if len(keys) == 0 {
-					delete(lm.connLeaderKeys, h.connID)
-				}
-			}
+			// Clean up leader watcher for the expired holder
+			// (preserves observer registrations).
+			lm.removeLeaderHolderWatcher(sh, key, h.connID)
 			expired = append(expired, token)
 		}
 	}
@@ -870,18 +861,8 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 			delete(lm.connEnqueued, eqKey)
 		}
 		// Clean up leader watcher for the expired holder
-		if watchers, wok := sh.leaderWatchers[key]; wok {
-			delete(watchers, h.connID)
-			if len(watchers) == 0 {
-				delete(sh.leaderWatchers, key)
-			}
-		}
-		if keys, kok := lm.connLeaderKeys[h.connID]; kok {
-			delete(keys, key)
-			if len(keys) == 0 {
-				delete(lm.connLeaderKeys, h.connID)
-			}
-		}
+		// (preserves observer registrations).
+		lm.removeLeaderHolderWatcher(sh, key, h.connID)
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.grantNextLocked(key, st)
@@ -943,18 +924,8 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 			delete(lm.connEnqueued, eqKey)
 		}
 		// Clean up leader watcher for the expired holder
-		if watchers, wok := sh.leaderWatchers[key]; wok {
-			delete(watchers, h.connID)
-			if len(watchers) == 0 {
-				delete(sh.leaderWatchers, key)
-			}
-		}
-		if keys, kok := lm.connLeaderKeys[h.connID]; kok {
-			delete(keys, key)
-			if len(keys) == 0 {
-				delete(lm.connLeaderKeys, h.connID)
-			}
-		}
+		// (preserves observer registrations).
+		lm.removeLeaderHolderWatcher(sh, key, h.connID)
 		delete(st.Holders, token)
 		st.LastActivity = now
 		lm.grantNextLocked(key, st)
@@ -1929,7 +1900,9 @@ func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *b
 	}
 	for i, p := range bs.Participants {
 		if p == target {
-			bs.Participants = append(bs.Participants[:i], bs.Participants[i+1:]...)
+			copy(bs.Participants[i:], bs.Participants[i+1:])
+			bs.Participants[len(bs.Participants)-1] = nil
+			bs.Participants = bs.Participants[:len(bs.Participants)-1]
 			break
 		}
 	}
@@ -1952,7 +1925,8 @@ func (lm *LockManager) removeBarrierParticipant(sh *shard, key string, target *b
 // Leader Election Watchers
 // ---------------------------------------------------------------------------
 
-// RegisterLeaderWatcher registers a connection to receive leader change notifications.
+// RegisterLeaderWatcher registers a connection to receive leader change notifications
+// as an observer (not as the elected leader).
 func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh chan []byte, cancelConn func()) {
 	sh := lm.shardFor(key)
 	lm.connMu.Lock()
@@ -1962,7 +1936,7 @@ func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh 
 		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
-	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {
 		keys = make(map[string]struct{})
@@ -2009,6 +1983,35 @@ func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uin
 	keys[key] = struct{}{}
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
+}
+
+// removeLeaderHolderWatcher removes a leader watcher for an expired/released
+// holder, but only if it was not registered as an observer. This prevents
+// lease expiry from silently unregistering observe-registered watchers.
+// Must be called with connMu and sh.mu held.
+func (lm *LockManager) removeLeaderHolderWatcher(sh *shard, key string, connID uint64) {
+	if watchers, ok := sh.leaderWatchers[key]; ok {
+		if lw, exists := watchers[connID]; exists && !lw.observer {
+			delete(watchers, connID)
+			if len(watchers) == 0 {
+				delete(sh.leaderWatchers, key)
+			}
+		}
+	}
+	if keys, ok := lm.connLeaderKeys[connID]; ok {
+		// Only remove the key from connLeaderKeys if the watcher was
+		// actually removed (i.e. not an observer).
+		if _, stillExists := sh.leaderWatchers[key]; !stillExists {
+			delete(keys, key)
+		} else if watchers := sh.leaderWatchers[key]; watchers != nil {
+			if _, has := watchers[connID]; !has {
+				delete(keys, key)
+			}
+		}
+		if len(keys) == 0 {
+			delete(lm.connLeaderKeys, connID)
+		}
+	}
 }
 
 // UnregisterLeaderWatcher removes a leader change watcher.
@@ -2127,19 +2130,9 @@ func (lm *LockManager) ResignLeader(key, token string, connID uint64) bool {
 	}
 	delete(st.Holders, token)
 
-	// 2. Unregister the resigning connection's leader watcher.
-	if watchers, ok := sh.leaderWatchers[key]; ok {
-		delete(watchers, connID)
-		if len(watchers) == 0 {
-			delete(sh.leaderWatchers, key)
-		}
-	}
-	if keys, ok := lm.connLeaderKeys[connID]; ok {
-		delete(keys, key)
-		if len(keys) == 0 {
-			delete(lm.connLeaderKeys, connID)
-		}
-	}
+	// 2. Unregister the resigning connection's leader watcher
+	// (preserves observer registrations).
+	lm.removeLeaderHolderWatcher(sh, key, connID)
 
 	// 3. Notify "resigned" before granting to next waiter.
 	if watchers, ok := sh.leaderWatchers[key]; ok && len(watchers) > 0 {
@@ -2330,7 +2323,9 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 			removed := false
 			for i := len(bs.Participants) - 1; i >= 0; i-- {
 				if bs.Participants[i].connID == connID {
-					bs.Participants = append(bs.Participants[:i], bs.Participants[i+1:]...)
+					copy(bs.Participants[i:], bs.Participants[i+1:])
+					bs.Participants[len(bs.Participants)-1] = nil
+					bs.Participants = bs.Participants[:len(bs.Participants)-1]
 					removed = true
 				}
 			}
@@ -2396,19 +2391,9 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 							if es, ok := lm.connEnqueued[eqKey]; ok && es.token == token {
 								delete(lm.connEnqueued, eqKey)
 							}
-							// Clean up leader watcher for the expired holder.
-							if watchers, wok := sh.leaderWatchers[key]; wok {
-								delete(watchers, h.connID)
-								if len(watchers) == 0 {
-									delete(sh.leaderWatchers, key)
-								}
-							}
-							if keys, kok := lm.connLeaderKeys[h.connID]; kok {
-								delete(keys, key)
-								if len(keys) == 0 {
-									delete(lm.connLeaderKeys, h.connID)
-								}
-							}
+							// Clean up leader watcher for the expired holder
+							// (preserves observer registrations).
+							lm.removeLeaderHolderWatcher(sh, key, h.connID)
 							expired = append(expired, token)
 						}
 					}

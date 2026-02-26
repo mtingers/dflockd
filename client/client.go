@@ -853,7 +853,11 @@ func (sc *SignalConn) readLoop() {
 			default:
 			}
 		} else {
-			sc.respCh <- line
+			select {
+			case sc.respCh <- line:
+			default:
+				// Drop unexpected response to prevent readLoop from blocking.
+			}
 		}
 	}
 }
@@ -2601,11 +2605,6 @@ func (rw *RWLock) Close() error {
 	defer rw.mu.Unlock()
 
 	rw.stopRenew()
-
-	if rw.conn == nil {
-		return nil
-	}
-
 	rw.closeConn()
 	rw.token = ""
 	rw.fence = 0
@@ -2793,7 +2792,10 @@ func (wc *WatchConn) readLoop() {
 			default:
 			}
 		} else {
-			wc.respCh <- line
+			select {
+			case wc.respCh <- line:
+			default:
+			}
 		}
 	}
 }
@@ -2944,7 +2946,10 @@ func (lc *LeaderConn) readLoop() {
 			default:
 			}
 		} else {
-			lc.respCh <- line
+			select {
+			case lc.respCh <- line:
+			default:
+			}
 		}
 	}
 }
@@ -3291,11 +3296,6 @@ func (e *Election) Close() error {
 	defer e.mu.Unlock()
 
 	e.stopRenew()
-
-	if e.lc == nil {
-		return nil
-	}
-
 	e.closeLC()
 	e.token = ""
 	e.fence = 0

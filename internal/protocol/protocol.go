@@ -101,11 +101,13 @@ func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, er
 			}
 			return "", &ProtocolError{Code: 12, Message: "line too long"}
 		}
+		if b == '\r' {
+			continue // strip all carriage returns, not just trailing
+		}
 		buf[n] = b
 		n++
 	}
-	line := string(buf[:n])
-	return strings.TrimRight(line, "\r"), nil
+	return string(buf[:n]), nil
 }
 
 func parseInt(s string, what string) (int, error) {
@@ -423,6 +425,9 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		req := &Request{Cmd: cmd, Key: key}
 		if tabIdx := strings.LastIndex(arg, "\t"); tabIdx >= 0 {
 			req.Value = arg[:tabIdx]
+			if req.Value == "" {
+				return nil, &ProtocolError{Code: 8, Message: "kset: empty value"}
+			}
 			if n, err := strconv.Atoi(arg[tabIdx+1:]); err == nil && n >= 0 {
 				req.TTLSeconds = n
 			} else {
