@@ -3423,6 +3423,9 @@ func (e *Election) Resign(ctx context.Context) error {
 	var err error
 	if token != "" {
 		err = e.lc.Resign(e.Key, token)
+	} else if wasLeader {
+		// Leadership was lost by renewal failure before Resign was called.
+		err = fmt.Errorf("dflockd: not leader (leadership lost before resign)")
 	}
 	e.isLeader = false
 	e.closeLC()
@@ -3494,6 +3497,7 @@ func (e *Election) stopRenew() {
 		}
 		e.mu.Lock()
 		if forceClosed && e.lc == lc {
+			<-lc.done // wait for readLoop goroutine to exit
 			e.lc = nil
 		}
 	}
