@@ -1841,6 +1841,14 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		default:
 		}
 		sh.mu.Lock()
+		// Re-check under lock: barrier may have tripped between the
+		// non-blocking check and acquiring the shard lock.
+		select {
+		case <-p.ch:
+			sh.mu.Unlock()
+			return true, nil
+		default:
+		}
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
 		return false, nil
@@ -1861,6 +1869,12 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		default:
 		}
 		sh.mu.Lock()
+		select {
+		case <-p.ch:
+			sh.mu.Unlock()
+			return true, nil
+		default:
+		}
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
 		return false, nil
@@ -1872,17 +1886,29 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 		default:
 		}
 		sh.mu.Lock()
+		select {
+		case <-p.ch:
+			sh.mu.Unlock()
+			return true, nil
+		default:
+		}
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
 		return false, ctx.Err()
 	case <-timer.C:
-		// Fix #9: Re-check if barrier tripped concurrently with timer.
+		// Re-check: barrier may have tripped concurrently with timer.
 		select {
 		case <-p.ch:
 			return true, nil
 		default:
 		}
 		sh.mu.Lock()
+		select {
+		case <-p.ch:
+			sh.mu.Unlock()
+			return true, nil
+		default:
+		}
 		lm.removeBarrierParticipant(sh, key, p)
 		sh.mu.Unlock()
 		return false, nil
@@ -2167,7 +2193,7 @@ func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64
 		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
-	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn}
+	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
 
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {

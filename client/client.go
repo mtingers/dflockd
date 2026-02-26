@@ -774,8 +774,14 @@ func KVCAS(c *Conn, key, oldValue, newValue string, ttlSeconds int) (bool, error
 	if err := validateValue(oldValue); err != nil {
 		return false, fmt.Errorf("dflockd: oldValue: %w", err)
 	}
+	if strings.Contains(oldValue, "\t") {
+		return false, fmt.Errorf("dflockd: oldValue contains tab")
+	}
 	if err := validateValue(newValue); err != nil {
 		return false, err
+	}
+	if strings.Contains(newValue, "\t") {
+		return false, fmt.Errorf("dflockd: newValue contains tab")
 	}
 	if ttlSeconds < 0 {
 		ttlSeconds = 0
@@ -868,6 +874,11 @@ func (sc *SignalConn) readLoop() {
 func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
 	sc.conn.mu.Lock()
 	defer sc.conn.mu.Unlock()
+	// Drain any stale response left from a previous race to prevent desync.
+	select {
+	case <-sc.respCh:
+	default:
+	}
 	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
 	if _, err := sc.conn.conn.Write([]byte(msg)); err != nil {
 		return "", err
@@ -1253,6 +1264,9 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
+		// Lock acquired but context cancelled — release to avoid holding
+		// the server-side lock until lease expiry.
+		Release(conn, l.Key, token)
 		l.closeConn()
 		return false, ctx.Err()
 	}
@@ -1497,6 +1511,7 @@ func (l *Lock) startRenew() {
 					l.mu.Lock()
 					l.token = ""
 					l.fence = 0
+					l.lease = 0
 					l.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
@@ -1652,6 +1667,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
+		SemRelease(conn, s.Key, token)
 		s.closeConn()
 		return false, ctx.Err()
 	}
@@ -1884,6 +1900,7 @@ func (s *Semaphore) startRenew() {
 					s.mu.Lock()
 					s.token = ""
 					s.fence = 0
+					s.lease = 0
 					s.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
@@ -2562,6 +2579,12 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
+		// Release the acquired lock to avoid holding it until lease expiry.
+		if cmd == "wl" {
+			WUnlock(conn, rw.Key, token)
+		} else {
+			RUnlock(conn, rw.Key, token)
+		}
 		rw.closeConn()
 		return false, ctx.Err()
 	}
@@ -2706,6 +2729,7 @@ func (rw *RWLock) startRenew(cmd string) {
 					rw.mu.Lock()
 					rw.token = ""
 					rw.fence = 0
+					rw.lease = 0
 					rw.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
@@ -2803,6 +2827,10 @@ func (wc *WatchConn) readLoop() {
 func (wc *WatchConn) sendCmd(cmd, key, arg string) (string, error) {
 	wc.conn.mu.Lock()
 	defer wc.conn.mu.Unlock()
+	select {
+	case <-wc.respCh:
+	default:
+	}
 	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
 	if _, err := wc.conn.conn.Write([]byte(msg)); err != nil {
 		return "", err
@@ -2957,6 +2985,10 @@ func (lc *LeaderConn) readLoop() {
 func (lc *LeaderConn) sendCmd(cmd, key, arg string) (string, error) {
 	lc.conn.mu.Lock()
 	defer lc.conn.mu.Unlock()
+	select {
+	case <-lc.respCh:
+	default:
+	}
 	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
 	if _, err := lc.conn.conn.Write([]byte(msg)); err != nil {
 		return "", err
@@ -3381,6 +3413,7 @@ func (e *Election) startRenew() {
 					e.isLeader = false
 					e.token = ""
 					e.fence = 0
+					e.lease = 0
 					e.mu.Unlock()
 					if onErr != nil {
 						onErr(err)

@@ -9,10 +9,11 @@ import (
 
 // Listener represents a connection listening for signals on a pattern.
 type Listener struct {
-	ConnID  uint64
-	Pattern string
-	Group   string // empty = non-grouped (individual delivery)
-	WriteCh chan []byte
+	ConnID     uint64
+	Pattern    string
+	Group      string     // empty = non-grouped (individual delivery)
+	WriteCh    chan []byte
+	CancelConn func()     // called when WriteCh is full (slow consumer)
 }
 
 type listenerEntry struct {
@@ -312,7 +313,10 @@ func (m *Manager) Signal(channel, payload string) int {
 				count++
 				delivered[connID] = struct{}{}
 			default:
-				// Buffer full — don't mark delivered; wildcard path may succeed
+				if l.CancelConn != nil {
+					l.CancelConn()
+				}
+				delivered[connID] = struct{}{}
 			}
 		}
 	}
@@ -337,6 +341,10 @@ func (m *Manager) Signal(channel, payload string) int {
 				count++
 				delivered[l.ConnID] = struct{}{}
 			default:
+				if l.CancelConn != nil {
+					l.CancelConn()
+				}
+				delivered[l.ConnID] = struct{}{}
 			}
 		}
 	}

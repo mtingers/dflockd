@@ -628,9 +628,9 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value>\\t<ttl>"}
 		}
 		// Format: <old_value>\t<new_value>\t<ttl> — tab-separated.
-		// Parse from the right: TTL is always last (numeric), new_value is
-		// second-to-last, old_value is everything before. This allows tabs
-		// in values (consistent with kset).
+		// Parse TTL from the right (last tab), then split old_value from
+		// new_value using the first tab. Tabs in values are rejected by
+		// the client, so there are exactly two tab separators.
 		lastTab := strings.LastIndex(arg, "\t")
 		if lastTab < 0 {
 			return nil, &ProtocolError{Code: 8, Message: "kcas arg must contain tab separators"}
@@ -645,11 +645,15 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 			}
 			ttl = n
 		}
-		prevTab := strings.LastIndex(rest, "\t")
-		if prevTab < 0 {
+		firstTab := strings.Index(rest, "\t")
+		if firstTab < 0 {
 			return nil, &ProtocolError{Code: 8, Message: "kcas arg must be: <old_value>\\t<new_value>\\t<ttl>"}
 		}
-		req := &Request{Cmd: cmd, Key: key, OldValue: rest[:prevTab], Value: rest[prevTab+1:], TTLSeconds: ttl}
+		newValue := rest[firstTab+1:]
+		if newValue == "" {
+			return nil, &ProtocolError{Code: 8, Message: "kcas: empty new value"}
+		}
+		req := &Request{Cmd: cmd, Key: key, OldValue: rest[:firstTab], Value: newValue, TTLSeconds: ttl}
 		return req, nil
 
 	// --- Watch/Notify ---

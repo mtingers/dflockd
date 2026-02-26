@@ -948,21 +948,30 @@ func TestReadRequest_KCAS_EmptyOld(t *testing.T) {
 	}
 }
 
-func TestReadRequest_KCAS_TabInValue(t *testing.T) {
-	// old_value contains a tab: "old\tpart" \t "new" \t "30"
-	r := makeReader("kcas", "mykey", "old\tpart\tnew\t30")
+func TestReadRequest_KCAS_NormalValues(t *testing.T) {
+	// Standard three-field format: old_value \t new_value \t ttl
+	r := makeReader("kcas", "mykey", "old\tnew\t30")
 	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.OldValue != "old\tpart" {
-		t.Fatalf("old_value: got %q, want %q", req.OldValue, "old\tpart")
+	if req.OldValue != "old" {
+		t.Fatalf("old_value: got %q, want %q", req.OldValue, "old")
 	}
 	if req.Value != "new" {
-		t.Fatalf("value: got %q", req.Value)
+		t.Fatalf("value: got %q, want %q", req.Value, "new")
 	}
 	if req.TTLSeconds != 30 {
-		t.Fatalf("ttl: got %d", req.TTLSeconds)
+		t.Fatalf("ttl: got %d, want 30", req.TTLSeconds)
+	}
+}
+
+func TestReadRequest_KCAS_EmptyNewValue(t *testing.T) {
+	// Empty new_value should be rejected.
+	r := makeReader("kcas", "mykey", "old\t\t0")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for empty new value")
 	}
 }
 

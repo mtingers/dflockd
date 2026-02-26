@@ -482,10 +482,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "listen":
 		listener := &signal.Listener{
-			ConnID:  connID,
-			Pattern: req.Key,
-			Group:   req.Group,
-			WriteCh: cs.writeCh,
+			ConnID:     connID,
+			Pattern:    req.Key,
+			Group:      req.Group,
+			WriteCh:    cs.writeCh,
+			CancelConn: cs.cancelConn,
 		}
 		if err := s.sig.Listen(listener); err != nil {
 			return &protocol.Ack{Status: "error"}
