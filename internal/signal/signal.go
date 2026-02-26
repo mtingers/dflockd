@@ -253,9 +253,9 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 }
 
 // deliverToGroup delivers a message to one member of a queue group via round-robin.
-// Returns true if a delivery was made. The delivered connID is added to the delivered map.
+// Returns true if a delivery was made.
 // Falls back to the next member if the selected member's buffer is full.
-func deliverToGroup(qg *queueGroup, msg []byte, delivered map[uint64]struct{}) bool {
+func deliverToGroup(qg *queueGroup, msg []byte) bool {
 	n := len(qg.members)
 	if n == 0 {
 		return false
@@ -266,7 +266,6 @@ func deliverToGroup(qg *queueGroup, msg []byte, delivered map[uint64]struct{}) b
 		mem := qg.members[idx]
 		select {
 		case mem.WriteCh <- msg:
-			delivered[mem.ConnID] = struct{}{}
 			return true
 		default:
 			// Buffer full — try next member
@@ -289,6 +288,7 @@ func (m *Manager) Signal(channel, payload string) int {
 
 	// Deduplicate non-grouped: a connection listening on both exact and wildcard
 	// should only receive the signal once via non-grouped paths.
+	// Groups are independent and do not participate in dedup.
 	delivered := make(map[uint64]struct{})
 
 	// 1. Exact non-grouped
@@ -296,18 +296,18 @@ func (m *Manager) Signal(channel, payload string) int {
 		for connID, l := range subs {
 			select {
 			case l.WriteCh <- msg:
+				count++
 			default:
 				// Buffer full — fire-and-forget drop
 			}
 			delivered[connID] = struct{}{}
-			count++
 		}
 	}
 
 	// 2. Exact grouped — each group independently delivers to one member
 	if groups, ok := m.exactGroups[channel]; ok {
 		for _, qg := range groups {
-			if deliverToGroup(qg, msg, delivered) {
+			if deliverToGroup(qg, msg) {
 				count++
 			}
 		}
@@ -321,17 +321,17 @@ func (m *Manager) Signal(channel, payload string) int {
 		if MatchPattern(l.Pattern, channel) {
 			select {
 			case l.WriteCh <- msg:
+				count++
 			default:
 			}
 			delivered[l.ConnID] = struct{}{}
-			count++
 		}
 	}
 
 	// 4. Wildcard grouped — each group independently delivers to one member
 	for _, wge := range m.wildGroups {
 		if MatchPattern(wge.pattern, channel) {
-			if deliverToGroup(wge.qg, msg, delivered) {
+			if deliverToGroup(wge.qg, msg) {
 				count++
 			}
 		}

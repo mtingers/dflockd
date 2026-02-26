@@ -40,7 +40,11 @@ type Server struct {
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager(), wm: watch.NewManager()}
+	s := &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager(), wm: watch.NewManager()}
+	lm.OnLockRelease = func(key string) {
+		s.wm.Notify("release", key)
+	}
+	return s
 }
 
 func (s *Server) Run(ctx context.Context) error {

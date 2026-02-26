@@ -176,6 +176,7 @@ type LockManager struct {
 	resourceTotal      atomic.Int64  // total resources across all shards
 	keyTotal           atomic.Int64  // total keys across all types (counters+kv+lists)
 	fenceSeq           atomic.Uint64 // global monotonic fencing token counter
+	OnLockRelease      func(key string) // optional: called when a lock is released by expiry or disconnect cleanup
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
@@ -1891,11 +1892,12 @@ func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
 }
 
 // UnregisterAllLeaderWatchers removes all leader change watchers for a connection.
+// Holds connMu across the entire operation to prevent concurrent RegisterLeaderWatcher
+// from re-adding entries between the connLeaderKeys deletion and shard iteration.
 func (lm *LockManager) UnregisterAllLeaderWatchers(connID uint64) {
 	lm.connMu.Lock()
 	keys := lm.connLeaderKeys[connID]
 	delete(lm.connLeaderKeys, connID)
-	lm.connMu.Unlock()
 
 	for key := range keys {
 		sh := lm.shardFor(key)
@@ -1908,6 +1910,7 @@ func (lm *LockManager) UnregisterAllLeaderWatchers(connID uint64) {
 		}
 		sh.mu.Unlock()
 	}
+	lm.connMu.Unlock()
 }
 
 // NotifyLeaderChange sends a leader change event to all watchers of a key.
@@ -2121,11 +2124,13 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	}
 
 	// Release owned slots.
+	var releasedKeys []string
 	for _, entry := range ownedEntries {
 		sh := lm.shardFor(entry.key)
 		sh.mu.Lock()
 		st := sh.resources[entry.key]
 		if st != nil {
+			released := false
 			for token := range entry.tokens {
 				h, ok := st.Holders[token]
 				if !ok {
@@ -2137,9 +2142,13 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				lm.log.Warn("disconnect cleanup: releasing",
 					"key", entry.key, "conn_id", connID)
 				delete(st.Holders, token)
+				released = true
 			}
 			st.LastActivity = time.Now()
 			lm.grantNextLocked(entry.key, st)
+			if released {
+				releasedKeys = append(releasedKeys, entry.key)
+			}
 		}
 		sh.mu.Unlock()
 	}
@@ -2187,6 +2196,13 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	}
 
 	lm.connMu.Unlock()
+
+	// Notify watchers of released keys outside of locks.
+	if lm.OnLockRelease != nil {
+		for _, key := range releasedKeys {
+			lm.OnLockRelease(key)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2209,6 +2225,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 				sh := &lm.shards[i]
 				lm.connMu.Lock()
 				sh.mu.Lock()
+				var releasedKeys []string
 				for key, st := range sh.resources {
 					var expired []string
 					for token, h := range st.Holders {
@@ -2245,6 +2262,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 					if len(expired) > 0 {
 						st.LastActivity = now
 						lm.grantNextLocked(key, st)
+						releasedKeys = append(releasedKeys, key)
 					}
 				}
 				// Sweep expired KV entries
@@ -2256,6 +2274,12 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 				}
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
+				// Notify watchers of released keys outside of locks.
+				if lm.OnLockRelease != nil {
+					for _, key := range releasedKeys {
+						lm.OnLockRelease(key)
+					}
+				}
 			}
 		}
 	}
@@ -2336,6 +2360,12 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 					lm.log.Debug("GC: pruning idle barrier", "key", key)
 					delete(sh.barriers, key)
 					lm.keyTotal.Add(-1)
+				}
+				// GC empty leaderWatchers maps (no watchers remaining)
+				for key, watchers := range sh.leaderWatchers {
+					if len(watchers) == 0 {
+						delete(sh.leaderWatchers, key)
+					}
 				}
 				sh.mu.Unlock()
 			}

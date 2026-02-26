@@ -1192,7 +1192,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 		}
 	}()
 
-	token, lease, err := Acquire(conn, l.Key, l.acquireTimeout(), l.opts()...)
+	token, lease, fence, err := AcquireWithFence(conn, l.Key, l.acquireTimeout(), l.opts()...)
 	close(done)
 
 	l.mu.Lock()
@@ -1231,6 +1231,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 	l.token = token
 	l.lease = lease
+	l.fence = fence
 	l.startRenew()
 	return true, nil
 }
@@ -1258,7 +1259,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		}
 	}()
 
-	status, token, lease, err := Enqueue(conn, l.Key, l.opts()...)
+	status, token, lease, fence, err := EnqueueWithFence(conn, l.Key, l.opts()...)
 	close(done)
 
 	l.mu.Lock()
@@ -1286,6 +1287,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	if status == "acquired" {
 		l.token = token
 		l.lease = lease
+		l.fence = fence
 		l.startRenew()
 	}
 	return status, nil
@@ -1313,7 +1315,7 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 		}
 	}()
 
-	token, lease, err := Wait(conn, l.Key, timeout)
+	token, lease, fence, err := WaitWithFence(conn, l.Key, timeout)
 	close(done)
 
 	l.mu.Lock()
@@ -1345,6 +1347,7 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	l.token = token
 	l.lease = lease
+	l.fence = fence
 	l.startRenew()
 	return true, nil
 }
@@ -1382,6 +1385,7 @@ func (l *Lock) Release(ctx context.Context) error {
 	l.conn.Close()
 	l.conn = nil
 	l.token = ""
+	l.fence = 0
 	l.lease = 0
 	return err
 }
@@ -1401,6 +1405,7 @@ func (l *Lock) Close() error {
 	err := l.conn.Close()
 	l.conn = nil
 	l.token = ""
+	l.fence = 0
 	l.lease = 0
 	return err
 }
@@ -1456,7 +1461,7 @@ func (l *Lock) startRenew() {
 				token = l.token
 				l.mu.Unlock()
 
-				_, err := Renew(conn, key, token, opts...)
+				_, newFence, err := RenewWithFence(conn, key, token, opts...)
 				if err != nil {
 					if ctx.Err() != nil {
 						return // Deliberately stopped; not a real failure.
@@ -1464,11 +1469,17 @@ func (l *Lock) startRenew() {
 					// Clear token to prevent stale lock usage.
 					l.mu.Lock()
 					l.token = ""
+					l.fence = 0
 					l.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
 					}
 					return
+				}
+				if newFence > 0 {
+					l.mu.Lock()
+					l.fence = newFence
+					l.mu.Unlock()
 				}
 			}
 		}
@@ -1588,7 +1599,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 		}
 	}()
 
-	token, lease, err := SemAcquire(conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
+	token, lease, fence, err := SemAcquireWithFence(conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
 	close(done)
 
 	s.mu.Lock()
@@ -1620,6 +1631,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 
 	s.token = token
 	s.lease = lease
+	s.fence = fence
 	s.startRenew()
 	return true, nil
 }
@@ -1646,7 +1658,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		}
 	}()
 
-	status, token, lease, err := SemEnqueue(conn, s.Key, s.Limit, s.opts()...)
+	status, token, lease, fence, err := SemEnqueueWithFence(conn, s.Key, s.Limit, s.opts()...)
 	close(done)
 
 	s.mu.Lock()
@@ -1674,6 +1686,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	if status == "acquired" {
 		s.token = token
 		s.lease = lease
+		s.fence = fence
 		s.startRenew()
 	}
 	return status, nil
@@ -1700,7 +1713,7 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 		}
 	}()
 
-	token, lease, err := SemWait(conn, s.Key, timeout)
+	token, lease, fence, err := SemWaitWithFence(conn, s.Key, timeout)
 	close(done)
 
 	s.mu.Lock()
@@ -1732,6 +1745,7 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	s.token = token
 	s.lease = lease
+	s.fence = fence
 	s.startRenew()
 	return true, nil
 }
@@ -1766,6 +1780,7 @@ func (s *Semaphore) Release(ctx context.Context) error {
 	s.conn.Close()
 	s.conn = nil
 	s.token = ""
+	s.fence = 0
 	s.lease = 0
 	return err
 }
@@ -1784,6 +1799,7 @@ func (s *Semaphore) Close() error {
 	err := s.conn.Close()
 	s.conn = nil
 	s.token = ""
+	s.fence = 0
 	s.lease = 0
 	return err
 }
@@ -1837,7 +1853,7 @@ func (s *Semaphore) startRenew() {
 				token = s.token
 				s.mu.Unlock()
 
-				_, err := SemRenew(conn, key, token, opts...)
+				_, newFence, err := SemRenewWithFence(conn, key, token, opts...)
 				if err != nil {
 					if ctx.Err() != nil {
 						return // Deliberately stopped; not a real failure.
@@ -1845,11 +1861,17 @@ func (s *Semaphore) startRenew() {
 					// Clear token to prevent stale semaphore usage.
 					s.mu.Lock()
 					s.token = ""
+					s.fence = 0
 					s.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
 					}
 					return
+				}
+				if newFence > 0 {
+					s.mu.Lock()
+					s.fence = newFence
+					s.mu.Unlock()
 				}
 			}
 		}
@@ -2629,7 +2651,7 @@ func (rw *RWLock) startRenew(cmd string) {
 				token = rw.token
 				rw.mu.Unlock()
 
-				_, _, err := rwRenew(conn, renewCmd, key, token, opts...)
+				_, newFence, err := rwRenew(conn, renewCmd, key, token, opts...)
 				if err != nil {
 					if ctx.Err() != nil {
 						return
@@ -2637,11 +2659,17 @@ func (rw *RWLock) startRenew(cmd string) {
 					// Clear token to prevent stale lock usage.
 					rw.mu.Lock()
 					rw.token = ""
+					rw.fence = 0
 					rw.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
 					}
 					return
+				}
+				if newFence > 0 {
+					rw.mu.Lock()
+					rw.fence = newFence
+					rw.mu.Unlock()
 				}
 			}
 		}
@@ -3159,6 +3187,7 @@ func (e *Election) Resign(ctx context.Context) error {
 	e.lc.Close()
 	e.lc = nil
 	e.token = ""
+	e.fence = 0
 	e.lease = 0
 
 	if e.OnResigned != nil {
@@ -3203,6 +3232,7 @@ func (e *Election) Close() error {
 	err := e.lc.Close()
 	e.lc = nil
 	e.token = ""
+	e.fence = 0
 	e.lease = 0
 	e.isLeader = false
 	return err
@@ -3262,7 +3292,7 @@ func (e *Election) startRenew() {
 				token = e.token
 				e.mu.Unlock()
 
-				_, _, err := lc.Renew(key, token, opts...)
+				_, newFence, err := lc.Renew(key, token, opts...)
 				if err != nil {
 					if ctx.Err() != nil {
 						return
@@ -3271,6 +3301,7 @@ func (e *Election) startRenew() {
 					e.mu.Lock()
 					e.isLeader = false
 					e.token = ""
+					e.fence = 0
 					e.mu.Unlock()
 					if onErr != nil {
 						onErr(err)
@@ -3279,6 +3310,11 @@ func (e *Election) startRenew() {
 						go onResigned()
 					}
 					return
+				}
+				if newFence > 0 {
+					e.mu.Lock()
+					e.fence = newFence
+					e.mu.Unlock()
 				}
 			}
 		}
