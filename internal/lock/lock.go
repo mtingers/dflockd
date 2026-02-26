@@ -690,6 +690,7 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 					// Expired: clean up holder and grant to next waiter
 					lm.connRemoveOwned(connID, key, esToken)
 					delete(st.Holders, esToken)
+					lm.removeLeaderHolderWatcher(sh, key, connID)
 					st.LastActivity = time.Now()
 					lm.grantNextLocked(key, st)
 					sh.mu.Unlock()
@@ -857,6 +858,7 @@ func (lm *LockManager) Release(key, token string) bool {
 		delete(lm.connEnqueued, eqKey)
 	}
 	delete(st.Holders, token)
+	lm.removeLeaderHolderWatcher(sh, key, h.connID)
 	lm.grantNextLocked(key, st)
 
 	sh.mu.Unlock()

@@ -630,6 +630,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "rl":
 		tok, fence, err := s.lm.RWAcquire(ctx, req.Key, 'r', req.AcquireTimeout, req.LeaseTTL, connID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			return rwAcquireError(err)
 		}
 		if tok == "" {
@@ -641,6 +644,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "wl":
 		tok, fence, err := s.lm.RWAcquire(ctx, req.Key, 'w', req.AcquireTimeout, req.LeaseTTL, connID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			return rwAcquireError(err)
 		}
 		if tok == "" {
@@ -686,6 +692,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "rw", "ww":
 		tok, lease, fence, err := s.lm.RWWait(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil // connection shutting down
+			}
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}
 			}
@@ -802,6 +811,9 @@ func rwAcquireError(err error) *protocol.Ack {
 	}
 	if errors.Is(err, lock.ErrAlreadyEnqueued) {
 		return &protocol.Ack{Status: "error_already_enqueued"}
+	}
+	if errors.Is(err, lock.ErrLeaseExpired) {
+		return &protocol.Ack{Status: "error_lease_expired"}
 	}
 	if errors.Is(err, lock.ErrWaiterClosed) {
 		return &protocol.Ack{Status: "error"}

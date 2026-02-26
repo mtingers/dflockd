@@ -1448,7 +1448,10 @@ func (l *Lock) Release(ctx context.Context) error {
 		return nil
 	}
 
-	err := Release(l.conn, l.Key, l.token)
+	var err error
+	if l.token != "" {
+		err = Release(l.conn, l.Key, l.token)
+	}
 	l.closeConn()
 	l.token = ""
 	l.fence = 0
@@ -1850,7 +1853,10 @@ func (s *Semaphore) Release(ctx context.Context) error {
 		return nil
 	}
 
-	err := SemRelease(s.conn, s.Key, s.token)
+	var err error
+	if s.token != "" {
+		err = SemRelease(s.conn, s.Key, s.token)
+	}
 	s.closeConn()
 	s.token = ""
 	s.fence = 0
@@ -2642,10 +2648,12 @@ func (rw *RWLock) Unlock(ctx context.Context) error {
 	}
 
 	var err error
-	if rw.mode == "wl" {
-		err = WUnlock(rw.conn, rw.Key, rw.token)
-	} else {
-		err = RUnlock(rw.conn, rw.Key, rw.token)
+	if rw.token != "" {
+		if rw.mode == "wl" {
+			err = WUnlock(rw.conn, rw.Key, rw.token)
+		} else {
+			err = RUnlock(rw.conn, rw.Key, rw.token)
+		}
 	}
 	rw.closeConn()
 	rw.token = ""
@@ -2758,12 +2766,12 @@ func (rw *RWLock) startRenew(cmd string) {
 					if ctx.Err() != nil {
 						return
 					}
-					// Clear all state to prevent stale lock usage.
+					// Clear token state to prevent stale lock usage.
+					// Preserve rw.mode so Unlock sends the correct command.
 					rw.mu.Lock()
 					rw.token = ""
 					rw.fence = 0
 					rw.lease = 0
-					rw.mode = ""
 					rw.mu.Unlock()
 					if onErr != nil {
 						go onErr(err)
@@ -3353,7 +3361,10 @@ func (e *Election) Resign(ctx context.Context) error {
 		return nil
 	}
 
-	err := e.lc.Resign(e.Key, e.token)
+	var err error
+	if e.token != "" {
+		err = e.lc.Resign(e.Key, e.token)
+	}
 	e.isLeader = false
 	e.closeLC()
 	e.token = ""
@@ -3475,7 +3486,10 @@ func (e *Election) startRenew() {
 						return
 					}
 					// Clear leadership state to prevent split-brain.
+					// Check isLeader under mutex to avoid spurious
+					// OnResigned callback if stopRenew already ran.
 					e.mu.Lock()
+					wasLeader := e.isLeader
 					e.isLeader = false
 					e.token = ""
 					e.fence = 0
@@ -3484,7 +3498,7 @@ func (e *Election) startRenew() {
 					if onErr != nil {
 						go onErr(err)
 					}
-					if onResigned != nil {
+					if wasLeader && onResigned != nil {
 						go onResigned()
 					}
 					return
