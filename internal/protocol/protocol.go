@@ -12,6 +12,7 @@ import (
 // Pre-computed response prefixes to avoid allocations on the hot path.
 var (
 	respOK               = []byte("ok\n")
+	respAcquired         = []byte("acquired\n")
 	respTimeout          = []byte("timeout\n")
 	respError            = []byte("error\n")
 	respErrorAuth        = []byte("error_auth\n")
@@ -757,7 +758,10 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			buf = append(buf, '\n')
 			return buf
 		}
-		return respOK // "ok\n" — bare ok is the only case without token/extra
+		if ack.Status == "acquired" {
+			return respAcquired
+		}
+		return respOK
 	default:
 		// Use pre-computed slices for known statuses.
 		switch ack.Status {

@@ -1355,6 +1355,8 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 // stopRenew cancels the renewal goroutine and waits for it to exit.
 // Must be called with l.mu held; temporarily releases the mutex so
 // the renewal goroutine can complete its tick (which grabs l.mu).
+// If the goroutine doesn't exit promptly (blocked in I/O), the connection
+// is closed to force-unblock it.
 func (l *Lock) stopRenew() {
 	if l.cancelRenew != nil {
 		l.cancelRenew()
@@ -1363,8 +1365,16 @@ func (l *Lock) stopRenew() {
 	if l.renewDone != nil {
 		done := l.renewDone
 		l.renewDone = nil
+		conn := l.conn
 		l.mu.Unlock()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			if conn != nil {
+				conn.Close()
+			}
+			<-done
+		}
 		l.mu.Lock()
 	}
 }
@@ -1758,8 +1768,16 @@ func (s *Semaphore) stopRenew() {
 	if s.renewDone != nil {
 		done := s.renewDone
 		s.renewDone = nil
+		conn := s.conn
 		s.mu.Unlock()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			if conn != nil {
+				conn.Close()
+			}
+			<-done
+		}
 		s.mu.Lock()
 	}
 }
@@ -2577,6 +2595,7 @@ func (rw *RWLock) Close() error {
 	rw.token = ""
 	rw.fence = 0
 	rw.lease = 0
+	rw.mode = ""
 	return err
 }
 
@@ -2602,8 +2621,16 @@ func (rw *RWLock) stopRenew() {
 	if rw.renewDone != nil {
 		done := rw.renewDone
 		rw.renewDone = nil
+		conn := rw.conn
 		rw.mu.Unlock()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			if conn != nil {
+				conn.Close()
+			}
+			<-done
+		}
 		rw.mu.Lock()
 	}
 }
@@ -3246,8 +3273,16 @@ func (e *Election) stopRenew() {
 	if e.renewDone != nil {
 		done := e.renewDone
 		e.renewDone = nil
+		lc := e.lc
 		e.mu.Unlock()
-		<-done
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			if lc != nil {
+				lc.conn.Close()
+			}
+			<-done
+		}
 		e.mu.Lock()
 	}
 }

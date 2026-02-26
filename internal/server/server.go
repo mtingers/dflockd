@@ -214,9 +214,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 		s.lm.UnregisterAllLeaderWatchers(connID)
 		close(writeCh)
 		pushWg.Wait() // wait for push writer to drain before closing conn
+		s.lm.CleanupConnection(connID)
 		s.conns.Delete(conn)
 		s.connCount.Add(-1)
-		s.lm.CleanupConnection(connID)
 		conn.Close()
 		s.log.Debug("client closed", "peer", peer, "conn_id", connID)
 	}()
@@ -714,25 +714,19 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
+		s.wm.Notify("elect", req.Key)
 		s.lm.RegisterAndNotifyLeader(req.Key, "elected", connID, cs.writeCh, cs.cancelConn)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "resign":
 		if s.lm.ResignLeader(req.Key, req.Token, connID) {
+			s.wm.Notify("resign", req.Key)
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
 
 	case "observe":
-		holderConn := s.lm.RegisterLeaderWatcherWithStatus(req.Key, connID, cs.writeCh, cs.cancelConn)
-		if holderConn > 0 {
-			msg := []byte(fmt.Sprintf("leader elected %s\n", req.Key))
-			select {
-			case cs.writeCh <- msg:
-			default:
-				cs.cancelConn()
-			}
-		}
+		s.lm.RegisterLeaderWatcherWithStatus(req.Key, connID, cs.writeCh, cs.cancelConn)
 		return &protocol.Ack{Status: "ok"}
 
 	case "unobserve":

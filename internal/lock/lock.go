@@ -471,13 +471,16 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 	}
 	defer timer.Stop()
 
-	getFence := func(token string) uint64 {
+	// verifyHolder checks that the token is still held (lease not expired).
+	// Must be called with sh.mu held.
+	verifyHolder := func(token string) (uint64, bool) {
 		if s := sh.resources[key]; s != nil {
+			s.LastActivity = time.Now()
 			if h, ok := s.Holders[token]; ok {
-				return h.fence
+				return h.fence, true
 			}
 		}
-		return 0
+		return 0, false
 	}
 
 	select {
@@ -486,12 +489,11 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 			return "", 0, ErrWaiterClosed
 		}
 		sh.mu.Lock()
-		var fence uint64
-		if s := sh.resources[key]; s != nil {
-			s.LastActivity = time.Now()
-			fence = getFence(token)
-		}
+		fence, held := verifyHolder(token)
 		sh.mu.Unlock()
+		if !held {
+			return "", 0, ErrLeaseExpired
+		}
 		return token, fence, nil
 
 	case <-ctx.Done():
@@ -501,11 +503,11 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := sh.resources[key]; s != nil {
-					s.LastActivity = time.Now()
-				}
-				fence := getFence(token)
+				fence, held := verifyHolder(token)
 				sh.mu.Unlock()
+				if !held {
+					return "", 0, ErrLeaseExpired
+				}
 				return token, fence, nil
 			}
 		default:
@@ -524,11 +526,11 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := sh.resources[key]; s != nil {
-					s.LastActivity = time.Now()
-				}
-				fence := getFence(token)
+				fence, held := verifyHolder(token)
 				sh.mu.Unlock()
+				if !held {
+					return "", 0, ErrLeaseExpired
+				}
 				return token, fence, nil
 			}
 		default:
@@ -675,13 +677,18 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 	}
 	defer timer.Stop()
 
-	getFence := func(token string) uint64 {
+	// verifyAndResetLease checks that the token is still held and resets
+	// the lease expiry. Returns (fence, true) if held, (0, false) if evicted.
+	// Must be called with sh.mu held.
+	verifyAndResetLease := func(token string) (uint64, bool) {
 		if st := sh.resources[key]; st != nil {
+			st.LastActivity = time.Now()
 			if h, ok := st.Holders[token]; ok {
-				return h.fence
+				h.leaseExpires = time.Now().Add(leaseTTL)
+				return h.fence, true
 			}
 		}
-		return 0
+		return 0, false
 	}
 
 	select {
@@ -695,15 +702,13 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
-		var fence uint64
-		if st := sh.resources[key]; st != nil {
-			if h, hOK := st.Holders[token]; hOK {
-				h.leaseExpires = time.Now().Add(leaseTTL)
-			}
-			st.LastActivity = time.Now()
-			fence = getFence(token)
-		}
+		fence, held := verifyAndResetLease(token)
 		sh.mu.Unlock()
+		if !held {
+			lm.connRemoveOwned(connID, key, token)
+			lm.connMu.Unlock()
+			return "", 0, 0, ErrLeaseExpired
+		}
 		lm.connMu.Unlock()
 		return token, leaseSec, fence, nil
 
@@ -714,14 +719,13 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if st := sh.resources[key]; st != nil {
-					if h, hOK := st.Holders[token]; hOK {
-						h.leaseExpires = time.Now().Add(leaseTTL)
-					}
-					st.LastActivity = time.Now()
-				}
-				fence := getFence(token)
+				fence, held := verifyAndResetLease(token)
 				sh.mu.Unlock()
+				if !held {
+					lm.connRemoveOwned(connID, key, token)
+					lm.connMu.Unlock()
+					return "", 0, 0, ErrLeaseExpired
+				}
 				lm.connMu.Unlock()
 				return token, leaseSec, fence, nil
 			}
@@ -743,14 +747,13 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if st := sh.resources[key]; st != nil {
-					if h, hOK := st.Holders[token]; hOK {
-						h.leaseExpires = time.Now().Add(leaseTTL)
-					}
-					st.LastActivity = time.Now()
-				}
-				fence := getFence(token)
+				fence, held := verifyAndResetLease(token)
 				sh.mu.Unlock()
+				if !held {
+					lm.connRemoveOwned(connID, key, token)
+					lm.connMu.Unlock()
+					return "", 0, 0, ErrLeaseExpired
+				}
 				lm.connMu.Unlock()
 				return token, leaseSec, fence, nil
 			}
@@ -1468,13 +1471,16 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 	}
 	defer timer.Stop()
 
-	getFence := func(token string) uint64 {
+	// verifyHolder checks that the token is still held (lease not expired).
+	// Must be called with sh.mu held.
+	verifyHolder := func(token string) (uint64, bool) {
 		if s := sh.resources[key]; s != nil {
+			s.LastActivity = time.Now()
 			if h, ok := s.Holders[token]; ok {
-				return h.fence
+				return h.fence, true
 			}
 		}
-		return 0
+		return 0, false
 	}
 
 	select {
@@ -1483,12 +1489,11 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 			return "", 0, ErrWaiterClosed
 		}
 		sh.mu.Lock()
-		var fence uint64
-		if s := sh.resources[key]; s != nil {
-			s.LastActivity = time.Now()
-			fence = getFence(token)
-		}
+		fence, held := verifyHolder(token)
 		sh.mu.Unlock()
+		if !held {
+			return "", 0, ErrLeaseExpired
+		}
 		return token, fence, nil
 
 	case <-ctx.Done():
@@ -1496,11 +1501,11 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := sh.resources[key]; s != nil {
-					s.LastActivity = time.Now()
-				}
-				fence := getFence(token)
+				fence, held := verifyHolder(token)
 				sh.mu.Unlock()
+				if !held {
+					return "", 0, ErrLeaseExpired
+				}
 				return token, fence, nil
 			}
 		default:
@@ -1517,11 +1522,11 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
-				if s := sh.resources[key]; s != nil {
-					s.LastActivity = time.Now()
-				}
-				fence := getFence(token)
+				fence, held := verifyHolder(token)
 				sh.mu.Unlock()
+				if !held {
+					return "", 0, ErrLeaseExpired
+				}
 				return token, fence, nil
 			}
 		default:
@@ -2019,10 +2024,10 @@ func (lm *LockManager) ResignLeader(key, token string, connID uint64) bool {
 	return true
 }
 
-// RegisterLeaderWatcherWithStatus atomically registers a watcher and returns
-// the current leader's connID (0 if none). This avoids a TOCTOU race
-// between registering and checking for an existing leader.
-func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64, writeCh chan []byte, cancelConn func()) uint64 {
+// RegisterLeaderWatcherWithStatus atomically registers a watcher and, if a
+// leader currently exists, sends the initial "leader elected" notification
+// while still holding the lock to prevent TOCTOU races with resign/failover.
+func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64, writeCh chan []byte, cancelConn func()) {
 	sh := lm.shardFor(key)
 	lm.connMu.Lock()
 	sh.mu.Lock()
@@ -2041,17 +2046,26 @@ func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64
 	}
 	keys[key] = struct{}{}
 
-	var holderConn uint64
+	// Send initial notification while holding the lock to avoid TOCTOU
+	// where the leader resigns between the check and the send.
+	hasLeader := false
 	if st, ok := sh.resources[key]; ok {
-		for _, h := range st.Holders {
-			holderConn = h.connID
+		for range st.Holders {
+			hasLeader = true
 			break
+		}
+	}
+	if hasLeader {
+		msg := []byte(fmt.Sprintf("leader elected %s\n", key))
+		select {
+		case writeCh <- msg:
+		default:
+			cancelConn()
 		}
 	}
 
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
-	return holderConn
 }
 
 // ---------------------------------------------------------------------------
