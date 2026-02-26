@@ -188,7 +188,9 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 		if wild {
 			for i, l := range m.wildcards {
 				if l.ConnID == connID && l.Pattern == pattern {
-					m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
+					copy(m.wildcards[i:], m.wildcards[i+1:])
+					m.wildcards[len(m.wildcards)-1] = nil
+					m.wildcards = m.wildcards[:len(m.wildcards)-1]
 					break
 				}
 			}
@@ -207,12 +209,16 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 				if wge.pattern == pattern && wge.group == group {
 					for mi, mem := range wge.qg.members {
 						if mem.ConnID == connID {
-							wge.qg.members = append(wge.qg.members[:mi], wge.qg.members[mi+1:]...)
+							copy(wge.qg.members[mi:], wge.qg.members[mi+1:])
+						wge.qg.members[len(wge.qg.members)-1] = nil
+						wge.qg.members = wge.qg.members[:len(wge.qg.members)-1]
 							break
 						}
 					}
 					if len(wge.qg.members) == 0 {
-						m.wildGroups = append(m.wildGroups[:wi], m.wildGroups[wi+1:]...)
+						copy(m.wildGroups[wi:], m.wildGroups[wi+1:])
+					m.wildGroups[len(m.wildGroups)-1] = nil
+					m.wildGroups = m.wildGroups[:len(m.wildGroups)-1]
 					}
 					break
 				}
@@ -222,7 +228,9 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 				if qg, ok := groups[group]; ok {
 					for mi, mem := range qg.members {
 						if mem.ConnID == connID {
-							qg.members = append(qg.members[:mi], qg.members[mi+1:]...)
+							copy(qg.members[mi:], qg.members[mi+1:])
+						qg.members[len(qg.members)-1] = nil
+						qg.members = qg.members[:len(qg.members)-1]
 							break
 						}
 					}
@@ -241,7 +249,9 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 	entries := m.connListeners[connID]
 	for i, e := range entries {
 		if e.pattern == pattern && e.group == group {
-			entries = append(entries[:i], entries[i+1:]...)
+			copy(entries[i:], entries[i+1:])
+			entries[len(entries)-1] = nil
+			entries = entries[:len(entries)-1]
 			break
 		}
 	}
@@ -297,10 +307,10 @@ func (m *Manager) Signal(channel, payload string) int {
 			select {
 			case l.WriteCh <- msg:
 				count++
+				delivered[connID] = struct{}{}
 			default:
-				// Buffer full — fire-and-forget drop
+				// Buffer full — don't mark delivered; wildcard path may succeed
 			}
-			delivered[connID] = struct{}{}
 		}
 	}
 
@@ -322,9 +332,9 @@ func (m *Manager) Signal(channel, payload string) int {
 			select {
 			case l.WriteCh <- msg:
 				count++
+				delivered[l.ConnID] = struct{}{}
 			default:
 			}
-			delivered[l.ConnID] = struct{}{}
 		}
 	}
 
@@ -352,7 +362,9 @@ func (m *Manager) UnlistenAll(connID uint64) {
 			if e.isWild {
 				for i, l := range m.wildcards {
 					if l.ConnID == connID && l.Pattern == e.pattern {
-						m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
+						copy(m.wildcards[i:], m.wildcards[i+1:])
+						m.wildcards[len(m.wildcards)-1] = nil
+						m.wildcards = m.wildcards[:len(m.wildcards)-1]
 						break
 					}
 				}
@@ -371,12 +383,16 @@ func (m *Manager) UnlistenAll(connID uint64) {
 					if wge.pattern == e.pattern && wge.group == e.group {
 						for mi, mem := range wge.qg.members {
 							if mem.ConnID == connID {
-								wge.qg.members = append(wge.qg.members[:mi], wge.qg.members[mi+1:]...)
+								copy(wge.qg.members[mi:], wge.qg.members[mi+1:])
+						wge.qg.members[len(wge.qg.members)-1] = nil
+						wge.qg.members = wge.qg.members[:len(wge.qg.members)-1]
 								break
 							}
 						}
 						if len(wge.qg.members) == 0 {
-							m.wildGroups = append(m.wildGroups[:wi], m.wildGroups[wi+1:]...)
+							copy(m.wildGroups[wi:], m.wildGroups[wi+1:])
+					m.wildGroups[len(m.wildGroups)-1] = nil
+					m.wildGroups = m.wildGroups[:len(m.wildGroups)-1]
 						}
 						break
 					}
@@ -386,7 +402,9 @@ func (m *Manager) UnlistenAll(connID uint64) {
 					if qg, ok := groups[e.group]; ok {
 						for mi, mem := range qg.members {
 							if mem.ConnID == connID {
-								qg.members = append(qg.members[:mi], qg.members[mi+1:]...)
+								copy(qg.members[mi:], qg.members[mi+1:])
+						qg.members[len(qg.members)-1] = nil
+						qg.members = qg.members[:len(qg.members)-1]
 								break
 							}
 						}

@@ -2124,7 +2124,7 @@ func SemRenewWithFence(c *Conn, key, token string, opts ...Option) (remaining in
 // ---------------------------------------------------------------------------
 
 // BLPop blocks until an item is available at the left of the list, or timeout.
-// Returns ("", nil) on timeout.
+// Returns ("", ErrTimeout) on timeout.
 func BLPop(c *Conn, key string, timeout time.Duration) (string, error) {
 	if err := validateKey(key); err != nil {
 		return "", err
@@ -2134,7 +2134,7 @@ func BLPop(c *Conn, key string, timeout time.Duration) (string, error) {
 		return "", err
 	}
 	if resp == "nil" {
-		return "", nil
+		return "", ErrTimeout
 	}
 	if resp == "ok" {
 		return "", nil
@@ -2149,7 +2149,7 @@ func BLPop(c *Conn, key string, timeout time.Duration) (string, error) {
 }
 
 // BRPop blocks until an item is available at the right of the list, or timeout.
-// Returns ("", nil) on timeout.
+// Returns ("", ErrTimeout) on timeout.
 func BRPop(c *Conn, key string, timeout time.Duration) (string, error) {
 	if err := validateKey(key); err != nil {
 		return "", err
@@ -2159,7 +2159,7 @@ func BRPop(c *Conn, key string, timeout time.Duration) (string, error) {
 		return "", err
 	}
 	if resp == "nil" {
-		return "", nil
+		return "", ErrTimeout
 	}
 	if resp == "ok" {
 		return "", nil

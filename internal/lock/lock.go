@@ -301,9 +301,9 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
 		st.Waiters[st.WaiterHead] = nil // avoid memory leak
 		st.WaiterHead++
 		token := lm.newToken()
-		fence := lm.fenceSeq.Add(1)
 		select {
 		case w.ch <- token:
+			fence := lm.fenceSeq.Add(1)
 			st.Holders[token] = &holder{
 				connID:       w.connID,
 				leaseExpires: time.Now().Add(w.leaseTTL),
@@ -1743,9 +1743,9 @@ func (lm *LockManager) grantNextRWWaiterLocked(key string, st *ResourceState) {
 				st.Waiters[st.WaiterHead] = nil
 				st.WaiterHead++
 				token := lm.newToken()
-				fence := lm.fenceSeq.Add(1)
 				select {
 				case w.ch <- token:
+					fence := lm.fenceSeq.Add(1)
 					st.Holders[token] = &holder{
 						connID:       w.connID,
 						leaseExpires: time.Now().Add(w.leaseTTL),
@@ -1776,9 +1776,9 @@ func (lm *LockManager) grantNextRWWaiterLocked(key string, st *ResourceState) {
 		st.Waiters[st.WaiterHead] = nil
 		st.WaiterHead++
 		token := lm.newToken()
-		fence := lm.fenceSeq.Add(1)
 		select {
 		case w.ch <- token:
+			fence := lm.fenceSeq.Add(1)
 			st.Holders[token] = &holder{
 				connID:       w.connID,
 				leaseExpires: time.Now().Add(w.leaseTTL),
@@ -1807,10 +1807,8 @@ func (lm *LockManager) BarrierWait(ctx context.Context, key string, count int, t
 
 	bs, ok := sh.barriers[key]
 	if ok {
-		if bs.Tripped {
-			sh.mu.Unlock()
-			return true, nil
-		}
+		// Note: tripped barriers are deleted atomically (under the shard lock)
+		// when they trip, so bs.Tripped is always false here.
 		if bs.Count != count {
 			sh.mu.Unlock()
 			return false, ErrBarrierCountMismatch

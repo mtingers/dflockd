@@ -126,7 +126,9 @@ func (m *Manager) Unwatch(pattern string, connID uint64) {
 	if wild {
 		for i, w := range m.wildcards {
 			if w.ConnID == connID && w.Pattern == pattern {
-				m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
+				copy(m.wildcards[i:], m.wildcards[i+1:])
+				m.wildcards[len(m.wildcards)-1] = nil
+				m.wildcards = m.wildcards[:len(m.wildcards)-1]
 				break
 			}
 		}
@@ -163,7 +165,9 @@ func (m *Manager) UnwatchAll(connID uint64) {
 		if e.isWild {
 			for i, w := range m.wildcards {
 				if w.ConnID == connID && w.Pattern == e.pattern {
-					m.wildcards = append(m.wildcards[:i], m.wildcards[i+1:]...)
+					copy(m.wildcards[i:], m.wildcards[i+1:])
+					m.wildcards[len(m.wildcards)-1] = nil
+					m.wildcards = m.wildcards[:len(m.wildcards)-1]
 					break
 				}
 			}
@@ -196,12 +200,12 @@ func (m *Manager) Notify(eventType, key string) {
 		for connID, w := range subs {
 			select {
 			case w.WriteCh <- msg:
+				delivered[connID] = struct{}{}
 			default:
 				if w.CancelConn != nil {
 					w.CancelConn()
 				}
 			}
-			delivered[connID] = struct{}{}
 		}
 	}
 
@@ -213,12 +217,12 @@ func (m *Manager) Notify(eventType, key string) {
 		if matchPattern(w.Pattern, key) {
 			select {
 			case w.WriteCh <- msg:
+				delivered[w.ConnID] = struct{}{}
 			default:
 				if w.CancelConn != nil {
 					w.CancelConn()
 				}
 			}
-			delivered[w.ConnID] = struct{}{}
 		}
 	}
 }
