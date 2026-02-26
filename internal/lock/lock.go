@@ -466,14 +466,19 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 	lm.connMu.Unlock()
 	notifyRelease()
 
+	// timeout == 0 means fire immediately (non-blocking try-acquire).
+	var timerCh <-chan time.Time
 	var timer *time.Timer
 	if timeout > 0 {
 		timer = time.NewTimer(timeout)
+		timerCh = timer.C
+		defer timer.Stop()
 	} else {
-		// Zero timeout: fire immediately
+		// Zero timeout: fire immediately for non-blocking acquire.
 		timer = time.NewTimer(0)
+		timerCh = timer.C
+		defer timer.Stop()
 	}
-	defer timer.Stop()
 
 	// verifyAndResetLease checks that the token is still held and resets
 	// the lease expiry. Returns (fence, true) if held, (0, false) if evicted.
@@ -494,15 +499,21 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		if !ok || token == "" {
 			return "", 0, ErrWaiterClosed
 		}
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		fence, held := verifyHolder(token)
-		sh.mu.Unlock()
 		if !held {
+			lm.connRemoveOwned(connID, key, token)
+			sh.mu.Unlock()
+			lm.connMu.Unlock()
 			return "", 0, ErrLeaseExpired
 		}
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return token, fence, nil
 
 	case <-ctx.Done():
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		// Race check: token may have arrived between ctx cancellation
 		// and acquiring the mutex.
@@ -510,10 +521,14 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				fence, held := verifyHolder(token)
-				sh.mu.Unlock()
 				if !held {
+					lm.connRemoveOwned(connID, key, token)
+					sh.mu.Unlock()
+					lm.connMu.Unlock()
 					return "", 0, ErrLeaseExpired
 				}
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return token, fence, nil
 			}
 		default:
@@ -523,20 +538,26 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 			removeWaiterFromState(s, w)
 		}
 		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, ctx.Err()
 
-	case <-timer.C:
+	case <-timerCh:
 		// Timeout — remove from queue
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		// Race check: token may have arrived
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				fence, held := verifyHolder(token)
-				sh.mu.Unlock()
 				if !held {
+					lm.connRemoveOwned(connID, key, token)
+					sh.mu.Unlock()
+					lm.connMu.Unlock()
 					return "", 0, ErrLeaseExpired
 				}
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return token, fence, nil
 			}
 		default:
@@ -546,6 +567,7 @@ func (lm *LockManager) AcquireWithFence(ctx context.Context, key string, timeout
 			removeWaiterFromState(s, w)
 		}
 		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return "", 0, nil
 	}
 }
@@ -690,12 +712,16 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 		return "", 0, 0, ErrLeaseExpired
 	}
 
-	// Slow path: waiter is pending
+	// Slow path: waiter is pending.
+	// timeout == 0 means fire immediately (non-blocking wait).
+	var timerCh <-chan time.Time
 	var timer *time.Timer
 	if timeout > 0 {
 		timer = time.NewTimer(timeout)
+		timerCh = timer.C
 	} else {
 		timer = time.NewTimer(0)
+		timerCh = timer.C
 	}
 	defer timer.Stop()
 
@@ -762,7 +788,7 @@ func (lm *LockManager) WaitWithFence(ctx context.Context, key string, timeout ti
 		lm.connMu.Unlock()
 		return "", 0, 0, ctx.Err()
 
-	case <-timer.C:
+	case <-timerCh:
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
@@ -1392,13 +1418,18 @@ func (lm *LockManager) blockingPop(ctx context.Context, key string, timeout time
 	ls.PopWaiters = append(ls.PopWaiters, w)
 	sh.mu.Unlock()
 
+	// timeout == 0 means fire immediately (non-blocking try-pop).
+	var timerCh <-chan time.Time
 	var timer *time.Timer
 	if timeout > 0 {
 		timer = time.NewTimer(timeout)
+		timerCh = timer.C
+		defer timer.Stop()
 	} else {
 		timer = time.NewTimer(0)
+		timerCh = timer.C
+		defer timer.Stop()
 	}
-	defer timer.Stop()
 
 	select {
 	case val, ok := <-w.ch:
@@ -1422,7 +1453,7 @@ func (lm *LockManager) blockingPop(ctx context.Context, key string, timeout time
 		sh.mu.Unlock()
 		return "", ctx.Err()
 
-	case <-timer.C:
+	case <-timerCh:
 		sh.mu.Lock()
 		// Race check
 		select {
@@ -1541,13 +1572,18 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 	lm.connMu.Unlock()
 	notifyRelease()
 
+	// timeout == 0 means fire immediately (non-blocking try-acquire).
+	var timerCh <-chan time.Time
 	var timer *time.Timer
 	if timeout > 0 {
 		timer = time.NewTimer(timeout)
+		timerCh = timer.C
+		defer timer.Stop()
 	} else {
 		timer = time.NewTimer(0)
+		timerCh = timer.C
+		defer timer.Stop()
 	}
-	defer timer.Stop()
 
 	// verifyAndResetLease checks that the token is still held and resets
 	// the lease expiry. Returns (fence, true) if held, (0, false) if evicted.
@@ -1568,12 +1604,17 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		if !ok || token == "" {
 			return "", 0, ErrWaiterClosed
 		}
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		fence, held := verifyHolder(token)
-		sh.mu.Unlock()
 		if !held {
+			lm.connRemoveOwned(connID, key, token)
+			sh.mu.Unlock()
+			lm.connMu.Unlock()
 			return "", 0, ErrLeaseExpired
 		}
+		sh.mu.Unlock()
+		lm.connMu.Unlock()
 		return token, fence, nil
 
 	case <-ctx.Done():
@@ -1583,11 +1624,14 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				fence, held := verifyHolder(token)
-				sh.mu.Unlock()
-				lm.connMu.Unlock()
 				if !held {
+					lm.connRemoveOwned(connID, key, token)
+					sh.mu.Unlock()
+					lm.connMu.Unlock()
 					return "", 0, ErrLeaseExpired
 				}
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return token, fence, nil
 			}
 		default:
@@ -1601,18 +1645,21 @@ func (lm *LockManager) RWAcquire(ctx context.Context, key string, mode byte, tim
 		lm.connMu.Unlock()
 		return "", 0, ctx.Err()
 
-	case <-timer.C:
+	case <-timerCh:
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				fence, held := verifyHolder(token)
-				sh.mu.Unlock()
-				lm.connMu.Unlock()
 				if !held {
+					lm.connRemoveOwned(connID, key, token)
+					sh.mu.Unlock()
+					lm.connMu.Unlock()
 					return "", 0, ErrLeaseExpired
 				}
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
 				return token, fence, nil
 			}
 		default:

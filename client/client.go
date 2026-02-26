@@ -891,6 +891,15 @@ func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
 		}
 		return resp, nil
 	case <-sc.done:
+		// Check respCh once more: the response may have arrived just
+		// before readLoop closed done.
+		select {
+		case resp, ok := <-sc.respCh:
+			if ok {
+				return resp, nil
+			}
+		default:
+		}
 		return "", fmt.Errorf("dflockd: connection closed")
 	}
 }
@@ -2749,11 +2758,12 @@ func (rw *RWLock) startRenew(cmd string) {
 					if ctx.Err() != nil {
 						return
 					}
-					// Clear token to prevent stale lock usage.
+					// Clear all state to prevent stale lock usage.
 					rw.mu.Lock()
 					rw.token = ""
 					rw.fence = 0
 					rw.lease = 0
+					rw.mode = ""
 					rw.mu.Unlock()
 					if onErr != nil {
 						go onErr(err)
@@ -2866,6 +2876,15 @@ func (wc *WatchConn) sendCmd(cmd, key, arg string) (string, error) {
 		}
 		return resp, nil
 	case <-wc.done:
+		// Check respCh once more: the response may have arrived just
+		// before readLoop closed done.
+		select {
+		case resp, ok := <-wc.respCh:
+			if ok {
+				return resp, nil
+			}
+		default:
+		}
 		return "", fmt.Errorf("dflockd: connection closed")
 	}
 }
@@ -3024,6 +3043,15 @@ func (lc *LeaderConn) sendCmd(cmd, key, arg string) (string, error) {
 		}
 		return resp, nil
 	case <-lc.done:
+		// Check respCh once more: the response may have arrived just
+		// before readLoop closed done.
+		select {
+		case resp, ok := <-lc.respCh:
+			if ok {
+				return resp, nil
+			}
+		default:
+		}
 		return "", fmt.Errorf("dflockd: connection closed")
 	}
 }
@@ -3309,6 +3337,19 @@ func (e *Election) Resign(ctx context.Context) error {
 	wasLeader := e.isLeader
 
 	if e.lc == nil {
+		// Connection was force-closed by stopRenew. The server still
+		// considers us the leader until lease expiry. Clear local state
+		// and report the error to the caller.
+		e.isLeader = false
+		e.token = ""
+		e.fence = 0
+		e.lease = 0
+		if wasLeader && e.OnResigned != nil {
+			go e.OnResigned()
+		}
+		if wasLeader {
+			return fmt.Errorf("dflockd: connection lost, server-side resign skipped (lease will expire)")
+		}
 		return nil
 	}
 
