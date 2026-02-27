@@ -3,6 +3,7 @@ package client_test
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -4964,5 +4965,121 @@ func TestWatchConn_Close(t *testing.T) {
 	// Close should not panic or error.
 	if err := wc.Close(); err != nil {
 		t.Fatalf("WatchConn.Close error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: DefaultDialTimeout constant is used correctly
+// ---------------------------------------------------------------------------
+
+func TestDefaultDialTimeout(t *testing.T) {
+	if client.DefaultDialTimeout <= 0 {
+		t.Fatal("DefaultDialTimeout should be positive")
+	}
+	if client.DefaultDialTimeout > 60*time.Second {
+		t.Fatal("DefaultDialTimeout seems unreasonably large")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: RPop empty list via client
+// ---------------------------------------------------------------------------
+
+func TestClient_RPop_Empty(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.RPop(c, "empty-list")
+	if !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("RPop on empty list: expected ErrNotFound, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: KVDel via client - nonexistent key and double-delete
+// ---------------------------------------------------------------------------
+
+func TestClient_KVDel_Nonexistent(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Should not error
+	if err := client.KVDel(c, "no-such-key"); err != nil {
+		t.Fatalf("KVDel nonexistent key: %v", err)
+	}
+}
+
+func TestClient_KVDel_DoubleDelete(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.KVSet(c, "k1", "val", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.KVDel(c, "k1"); err != nil {
+		t.Fatal(err)
+	}
+	// Double delete should be safe
+	if err := client.KVDel(c, "k1"); err != nil {
+		t.Fatalf("double delete: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: SetCounter via client - overwrite and incr-after-set
+// ---------------------------------------------------------------------------
+
+func TestClient_SetCounter_Overwrite(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.SetCounter(c, "c1", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetCounter(c, "c1", -50); err != nil {
+		t.Fatal(err)
+	}
+	val, err := client.GetCounter(c, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != -50 {
+		t.Fatalf("expected -50, got %d", val)
+	}
+}
+
+func TestClient_SetCounter_ThenIncr(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.SetCounter(c, "c1", 100); err != nil {
+		t.Fatal(err)
+	}
+	val, err := client.Incr(c, "c1", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 105 {
+		t.Fatalf("expected 105, got %d", val)
 	}
 }

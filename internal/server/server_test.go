@@ -5116,3 +5116,68 @@ func TestIntegration_Election_ResignFailoverObserve(t *testing.T) {
 		t.Fatalf("leader 2: expected ok, got %q", l2line)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap-filling: Server.Run() happy-path and error-path tests
+// ---------------------------------------------------------------------------
+
+func TestServer_Run_HappyPath(t *testing.T) {
+	cfg := testConfig()
+	// Use port 0 to let OS assign a free port
+	cfg.Port = 0
+	cfg.Host = "127.0.0.1"
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Run(ctx)
+	}()
+
+	// Give it time to start listening
+	time.Sleep(100 * time.Millisecond)
+
+	// Shut it down
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+func TestServer_Run_PortAlreadyBound(t *testing.T) {
+	// Bind a port first
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// Extract port from the listener
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cfg := testConfig()
+	cfg.Port = port
+	cfg.Host = "127.0.0.1"
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = srv.Run(ctx)
+	if err == nil {
+		t.Fatal("expected error when port is already bound")
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("expected listen error, got: %v", err)
+	}
+}

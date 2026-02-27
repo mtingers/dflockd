@@ -5540,3 +5540,250 @@ func TestCleanup_AutoReleaseDisabled(t *testing.T) {
 		t.Fatalf("expected lock still held by conn 1, got %d", connID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap-filling: RPop positive cases (previously only empty-case tested)
+// ---------------------------------------------------------------------------
+
+func TestRPop_Basic(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+
+	// RPop returns from the right (LIFO order for RPush+RPop)
+	v, ok := lm.RPop("q1")
+	if !ok || v != "c" {
+		t.Fatalf("expected (c, true), got (%s, %v)", v, ok)
+	}
+	v, ok = lm.RPop("q1")
+	if !ok || v != "b" {
+		t.Fatalf("expected (b, true), got (%s, %v)", v, ok)
+	}
+	v, ok = lm.RPop("q1")
+	if !ok || v != "a" {
+		t.Fatalf("expected (a, true), got (%s, %v)", v, ok)
+	}
+	// Now empty
+	_, ok = lm.RPop("q1")
+	if ok {
+		t.Fatal("expected false after draining list")
+	}
+}
+
+func TestRPop_MixedWithLPop(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+	lm.RPush("q1", "d")
+
+	// LPop from left, RPop from right
+	v1, _ := lm.LPop("q1")
+	v2, _ := lm.RPop("q1")
+	if v1 != "a" {
+		t.Fatalf("LPop expected a, got %s", v1)
+	}
+	if v2 != "d" {
+		t.Fatalf("RPop expected d, got %s", v2)
+	}
+	// Remaining: [b, c]
+	if lm.LLen("q1") != 2 {
+		t.Fatalf("expected len 2, got %d", lm.LLen("q1"))
+	}
+}
+
+func TestRPop_SingleElement(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "only")
+	v, ok := lm.RPop("q1")
+	if !ok || v != "only" {
+		t.Fatalf("expected (only, true), got (%s, %v)", v, ok)
+	}
+	// List should be cleaned up
+	if lm.LLen("q1") != 0 {
+		t.Fatalf("expected len 0 after draining, got %d", lm.LLen("q1"))
+	}
+}
+
+func TestRPop_WithLPush(t *testing.T) {
+	lm := testManager()
+	// LPush pushes to front, RPop pops from back
+	lm.LPush("q1", "a") // [a]
+	lm.LPush("q1", "b") // [b, a]
+	lm.LPush("q1", "c") // [c, b, a]
+
+	v, ok := lm.RPop("q1")
+	if !ok || v != "a" {
+		t.Fatalf("expected (a, true), got (%s, %v)", v, ok)
+	}
+	v, ok = lm.RPop("q1")
+	if !ok || v != "b" {
+		t.Fatalf("expected (b, true), got (%s, %v)", v, ok)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: KVDel edge cases
+// ---------------------------------------------------------------------------
+
+func TestKVDel_Nonexistent(t *testing.T) {
+	lm := testManager()
+	// Deleting a key that doesn't exist should be a safe no-op.
+	lm.KVDel("no-such-key")
+}
+
+func TestKVDel_DoubleDelete(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "val", 0)
+	lm.KVDel("k1")
+	// Second delete should be a safe no-op.
+	lm.KVDel("k1")
+
+	_, ok := lm.KVGet("k1")
+	if ok {
+		t.Fatal("expected not found after double delete")
+	}
+}
+
+func TestKVDel_FreesKeySlot(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 2
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	if err := lm.KVSet("k1", "a", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := lm.KVSet("k2", "b", 0); err != nil {
+		t.Fatal(err)
+	}
+	// At capacity
+	if err := lm.KVSet("k3", "c", 0); !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+
+	// Delete one, then the slot should be free
+	lm.KVDel("k1")
+	if err := lm.KVSet("k3", "c", 0); err != nil {
+		t.Fatalf("expected success after delete, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: SetCounter edge cases
+// ---------------------------------------------------------------------------
+
+func TestSetCounter_Overwrite(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", 100)
+	lm.SetCounter("c1", -50)
+	v := lm.GetCounter("c1")
+	if v != -50 {
+		t.Fatalf("expected -50, got %d", v)
+	}
+}
+
+func TestSetCounter_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	if err := lm.SetCounter("c1", 10); err != nil {
+		t.Fatal(err)
+	}
+	// Second different key should fail
+	if err := lm.SetCounter("c2", 20); !errors.Is(err, ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+	// Overwrite existing key should still work
+	if err := lm.SetCounter("c1", 30); err != nil {
+		t.Fatalf("expected overwrite to succeed, got %v", err)
+	}
+}
+
+func TestSetCounter_ZeroValue(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", 0)
+	v := lm.GetCounter("c1")
+	if v != 0 {
+		t.Fatalf("expected 0, got %d", v)
+	}
+}
+
+func TestSetCounter_IncrAfterSet(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", 100)
+	val, err := lm.Incr("c1", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 105 {
+		t.Fatalf("expected 105, got %d", val)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: RenewWithFence additional coverage
+// ---------------------------------------------------------------------------
+
+func TestRenewWithFence_WrongToken(t *testing.T) {
+	lm := testManager()
+	lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+
+	_, _, ok := lm.RenewWithFence("k1", "wrong-token", 60*time.Second)
+	if ok {
+		t.Fatal("RenewWithFence with wrong token should fail")
+	}
+}
+
+func TestRenewWithFence_NonexistentKey(t *testing.T) {
+	lm := testManager()
+	_, _, ok := lm.RenewWithFence("no-key", "no-token", 60*time.Second)
+	if ok {
+		t.Fatal("RenewWithFence on nonexistent key should fail")
+	}
+}
+
+func TestRenewWithFence_ExpiredLease(t *testing.T) {
+	cfg := testConfig()
+	cfg.LeaseSweepInterval = 50 * time.Millisecond
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	tok, _, err := lm.AcquireWithFence(bg(), "k1", 100*time.Millisecond, 100*time.Millisecond, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for lease to expire
+	time.Sleep(200 * time.Millisecond)
+
+	_, _, ok := lm.RenewWithFence("k1", tok, 60*time.Second)
+	if ok {
+		t.Fatal("RenewWithFence on expired lease should fail")
+	}
+}
+
+func TestRenewWithFence_PreservesFenceAfterRenew(t *testing.T) {
+	lm := testManager()
+	tok, fence1, err := lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Renew multiple times — fence should remain the same
+	for i := 0; i < 5; i++ {
+		remaining, fence, ok := lm.RenewWithFence("k1", tok, 30*time.Second)
+		if !ok {
+			t.Fatalf("renew %d failed", i)
+		}
+		if fence != fence1 {
+			t.Fatalf("renew %d: fence changed from %d to %d", i, fence1, fence)
+		}
+		if remaining <= 0 {
+			t.Fatalf("renew %d: remaining should be positive, got %d", i, remaining)
+		}
+	}
+}
