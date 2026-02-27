@@ -938,3 +938,91 @@ func TestConcurrent_QueueGroupSignal(t *testing.T) {
 	wg.Wait()
 	// No panic or deadlock
 }
+
+// ---------------------------------------------------------------------------
+// Regression: UnlistenAll with multiple wildcard groups must not skip entries
+// ---------------------------------------------------------------------------
+
+// TestUnlistenAll_WildcardGroups_NoSkip verifies that UnlistenAll removes all
+// wildcard-group subscriptions for a connection even when multiple entries
+// exist. Before the fix, iterating forward during removal caused the loop to
+// skip entries that slid into the removed slot.
+func TestUnlistenAll_WildcardGroups_NoSkip(t *testing.T) {
+	m := NewManager()
+
+	// Register 3 different wildcard-group subscriptions for the same connID.
+	for _, group := range []string{"g1", "g2", "g3"} {
+		l := &Listener{
+			ConnID:  42,
+			Pattern: "events.*",
+			Group:   group,
+			WriteCh: make(chan []byte, 4),
+		}
+		if err := m.Listen(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Also add a non-grouped wildcard to verify it's cleaned up too.
+	l := makeListener(42, "events.*")
+	if err := m.Listen(l); err != nil {
+		t.Fatal(err)
+	}
+
+	m.UnlistenAll(42)
+
+	// After UnlistenAll, no wildcard groups should remain.
+	if len(m.wildGroups) != 0 {
+		t.Errorf("expected 0 wildGroups after UnlistenAll, got %d", len(m.wildGroups))
+	}
+	if len(m.wildcards) != 0 {
+		t.Errorf("expected 0 wildcards after UnlistenAll, got %d", len(m.wildcards))
+	}
+	if len(m.connListeners) != 0 {
+		t.Errorf("expected empty connListeners, got %d entries", len(m.connListeners))
+	}
+
+	// Signal should deliver to nobody.
+	n := m.Signal("events.foo", "payload")
+	if n != 0 {
+		t.Errorf("expected 0 deliveries after full cleanup, got %d", n)
+	}
+}
+
+// TestUnlistenAll_WildcardGroups_MultipleConns verifies that cleaning up one
+// connection's wildcard groups does not affect another connection's entries.
+func TestUnlistenAll_WildcardGroups_MultipleConns(t *testing.T) {
+	m := NewManager()
+
+	// conn 1: two wildcard groups
+	for _, group := range []string{"workers", "loggers"} {
+		m.Listen(&Listener{
+			ConnID:  1,
+			Pattern: "jobs.>",
+			Group:   group,
+			WriteCh: make(chan []byte, 4),
+		})
+	}
+
+	// conn 2: same patterns
+	ch2 := make(chan []byte, 4)
+	for _, group := range []string{"workers", "loggers"} {
+		m.Listen(&Listener{
+			ConnID:  2,
+			Pattern: "jobs.>",
+			Group:   group,
+			WriteCh: ch2,
+		})
+	}
+
+	m.UnlistenAll(1)
+
+	// conn 2's groups should still work.
+	n := m.Signal("jobs.build", "data")
+	if n != 2 { // one delivery per group (workers + loggers)
+		t.Errorf("expected 2 deliveries to conn2 groups, got %d", n)
+	}
+	if len(m.wildGroups) != 2 {
+		t.Errorf("expected 2 wildGroups remaining, got %d", len(m.wildGroups))
+	}
+}

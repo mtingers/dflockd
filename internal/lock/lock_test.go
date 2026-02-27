@@ -3,6 +3,7 @@ package lock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"os"
@@ -4380,4 +4381,214 @@ func TestBarrier_DuplicateParticipant(t *testing.T) {
 	// Clean up: cancel the barrier
 	lm.CleanupConnection(1)
 	<-done
+}
+
+// ---------------------------------------------------------------------------
+// Regression: LPop backing array memory leak
+// ---------------------------------------------------------------------------
+
+// TestLPop_BackingArrayCompaction verifies that repeated RPush+LPop cycles do
+// not leak memory via the backing array. After enough pops, compactItems()
+// should reallocate the slice, allowing the old backing array to be GC'd.
+func TestLPop_BackingArrayCompaction(t *testing.T) {
+	lm := testManager()
+
+	// Push N items then pop them all. The itemsStart counter should trigger
+	// compaction and the backing array should be reclaimed.
+	const N = 200
+	for i := range N {
+		_, err := lm.RPush("compactq", fmt.Sprintf("item%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for range N {
+		val, ok := lm.LPop("compactq")
+		if !ok {
+			t.Fatal("expected item from LPop")
+		}
+		_ = val
+	}
+
+	// After all pops, the list should be empty and cleaned up.
+	_, ok := lm.LPop("compactq")
+	if ok {
+		t.Fatal("expected empty list after all pops")
+	}
+}
+
+// TestLPop_FIFOCompactionPreservesOrder verifies that compaction does not
+// corrupt the item order during interleaved push/pop operations.
+func TestLPop_FIFOCompactionPreservesOrder(t *testing.T) {
+	lm := testManager()
+
+	// Interleave pushes and pops to trigger compaction mid-stream.
+	pushed := 0
+	popped := 0
+	for i := range 500 {
+		// Push 3 items for every 2 pops to gradually build up and trigger compaction.
+		lm.RPush("fifoq", fmt.Sprintf("v%d", i))
+		pushed++
+
+		if i%3 == 0 && pushed > popped {
+			val, ok := lm.LPop("fifoq")
+			if !ok {
+				t.Fatalf("expected item at pop %d", popped)
+			}
+			expected := fmt.Sprintf("v%d", popped)
+			if val != expected {
+				t.Fatalf("FIFO order broken: expected %q, got %q", expected, val)
+			}
+			popped++
+		}
+	}
+
+	// Drain remaining items and verify order.
+	for popped < pushed {
+		val, ok := lm.LPop("fifoq")
+		if !ok {
+			t.Fatalf("expected item at pop %d, list empty", popped)
+		}
+		expected := fmt.Sprintf("v%d", popped)
+		if val != expected {
+			t.Fatalf("FIFO order broken: expected %q, got %q", expected, val)
+		}
+		popped++
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: Dead writer blocking live readers in RW lock
+// ---------------------------------------------------------------------------
+
+// TestRWLock_DeadWriterSkipped verifies that when a writer's connection is
+// cleaned up while it's queued, subsequent readers are not permanently blocked.
+func TestRWLock_DeadWriterSkipped(t *testing.T) {
+	lm := testManager()
+
+	// Reader 1 acquires the RW lock.
+	tok1, _, err := lm.RWAcquire(bg(), "rwdead", 'r', 5*time.Second, 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok1 == "" {
+		t.Fatal("expected reader 1 to acquire")
+	}
+
+	// Writer (conn 2) enqueues — it should be queued behind the reader.
+	status, _, _, _, err := lm.RWEnqueue("rwdead", 'w', 5*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected writer to be queued, got %q", status)
+	}
+
+	// Reader 3 enqueues — it should be queued behind the writer.
+	status, _, _, _, err = lm.RWEnqueue("rwdead", 'r', 5*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected reader 3 to be queued, got %q", status)
+	}
+
+	// Simulate the writer's connection being cleaned up (dead writer).
+	lm.CleanupConnection(2)
+
+	// Release reader 1 — this should trigger grantNextRWWaiterLocked.
+	// The dead writer should be skipped, and reader 3 should be granted.
+	if !lm.Release("rwdead", tok1) {
+		t.Fatal("expected release to succeed")
+	}
+
+	// Reader 3 should now be able to complete its Wait.
+	ctx, cancel := context.WithTimeout(bg(), 2*time.Second)
+	defer cancel()
+	tok3, _, _, err := lm.RWWait(ctx, "rwdead", 2*time.Second, 3)
+	if err != nil {
+		t.Fatalf("reader 3 should have been granted after dead writer skipped: %v", err)
+	}
+	if tok3 == "" {
+		t.Fatal("expected reader 3 to get a token")
+	}
+}
+
+// TestRWLock_LiveWriterStillBlocks confirms that a live (non-dead) writer in
+// the queue still correctly blocks subsequent readers.
+func TestRWLock_LiveWriterStillBlocks(t *testing.T) {
+	lm := testManager()
+
+	// Reader 1 acquires.
+	tok1, _, err := lm.RWAcquire(bg(), "rwlive", 'r', 5*time.Second, 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Writer (conn 2) enqueues — should be queued behind reader 1.
+	status, _, _, _, err := lm.RWEnqueue("rwlive", 'w', 5*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %q", status)
+	}
+
+	// Reader 3 enqueues — should be queued behind writer 2.
+	status, _, _, _, err = lm.RWEnqueue("rwlive", 'r', 5*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %q", status)
+	}
+
+	// Start writer 2's Wait in a goroutine — it will get granted when reader 1 releases.
+	writerDone := make(chan string, 1)
+	go func() {
+		tok, _, _, err := lm.RWWait(bg(), "rwlive", 5*time.Second, 2)
+		if err != nil {
+			t.Errorf("writer wait error: %v", err)
+		}
+		writerDone <- tok
+	}()
+
+	// Start reader 3's Wait — it should block because writer 2 is in the queue.
+	readerDone := make(chan struct{}, 1)
+	go func() {
+		_, _, _, _ = lm.RWWait(bg(), "rwlive", 5*time.Second, 3)
+		readerDone <- struct{}{}
+	}()
+
+	// Release reader 1 — writer 2 is alive, so it should be granted (not skipped).
+	if !lm.Release("rwlive", tok1) {
+		t.Fatal("expected release to succeed")
+	}
+
+	// Writer 2 should be granted.
+	select {
+	case tok2 := <-writerDone:
+		if tok2 == "" {
+			t.Fatal("expected writer 2 to get a token")
+		}
+		// While writer 2 holds the lock, reader 3 must NOT be granted yet.
+		select {
+		case <-readerDone:
+			t.Fatal("reader 3 was granted while writer 2 still holds lock")
+		case <-time.After(200 * time.Millisecond):
+			// Good — reader 3 is still blocked as expected.
+		}
+		// Release writer 2 — now reader 3 should be granted.
+		lm.Release("rwlive", tok2)
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer 2 was not granted within timeout")
+	}
+
+	select {
+	case <-readerDone:
+		// Good — reader 3 was granted after writer released.
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader 3 was not granted after writer released")
+	}
 }

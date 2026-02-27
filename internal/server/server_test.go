@@ -3778,3 +3778,228 @@ func dialTest(t *testing.T, addr string) net.Conn {
 	}
 	return conn
 }
+
+// ---------------------------------------------------------------------------
+// Regression: Watch notifications use semantic event names, not command names
+// ---------------------------------------------------------------------------
+
+// TestIntegration_Watch_SemanticEventNames verifies that watch notifications
+// use semantic event names (e.g. "acquire", "release") instead of raw protocol
+// command names (e.g. "l", "r", "e").
+func TestIntegration_Watch_SemanticEventNames(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// Watcher connection
+	wConn := dialTest(t, addr)
+	defer wConn.Close()
+	wReader := bufio.NewReader(wConn)
+
+	resp := connSendCmd(t, wConn, wReader, "watch", "semkey", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+
+	// Another connection acquires a lock (command "l")
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	resp = connSendCmd(t, conn2, reader2, "l", "semkey", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("lock: expected ok, got %q", resp)
+	}
+	token := strings.Fields(resp)[1]
+
+	// Watch event should say "acquire", NOT "l"
+	wConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := wReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read watch event: %v", err)
+	}
+	line = strings.TrimRight(line, "\n\r")
+	if line != "watch acquire semkey" {
+		t.Fatalf("expected 'watch acquire semkey', got %q", line)
+	}
+
+	// Release (command "r") should produce "release" event
+	resp = connSendCmd(t, conn2, reader2, "r", "semkey", token)
+	if resp != "ok" {
+		t.Fatalf("release: expected ok, got %q", resp)
+	}
+
+	line, err = wReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read release event: %v", err)
+	}
+	line = strings.TrimRight(line, "\n\r")
+	if line != "watch release semkey" {
+		t.Fatalf("expected 'watch release semkey', got %q", line)
+	}
+}
+
+// TestIntegration_Watch_RWLockSemanticEvents verifies that RW lock enqueue
+// and release produce "acquire" and "release" watch events.
+func TestIntegration_Watch_RWLockSemanticEvents(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	wConn := dialTest(t, addr)
+	defer wConn.Close()
+	wReader := bufio.NewReader(wConn)
+
+	resp := connSendCmd(t, wConn, wReader, "watch", "rwkey", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+
+	// Acquire a read lock (command "rl")
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	resp = connSendCmd(t, conn2, reader2, "rl", "rwkey", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("rl: expected ok, got %q", resp)
+	}
+	token := strings.Fields(resp)[1]
+
+	wConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := wReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read rl event: %v", err)
+	}
+	line = strings.TrimRight(line, "\n\r")
+	if line != "watch acquire rwkey" {
+		t.Fatalf("expected 'watch acquire rwkey', got %q", line)
+	}
+
+	// Release (command "rr")
+	resp = connSendCmd(t, conn2, reader2, "rr", "rwkey", token)
+	if resp != "ok" {
+		t.Fatalf("rr: expected ok, got %q", resp)
+	}
+
+	line, err = wReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read rr event: %v", err)
+	}
+	line = strings.TrimRight(line, "\n\r")
+	if line != "watch release rwkey" {
+		t.Fatalf("expected 'watch release rwkey', got %q", line)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: MaxSubscriptions limit for watch/listen registrations
+// ---------------------------------------------------------------------------
+
+func TestIntegration_MaxSubscriptions_Watch(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// First two watches should succeed.
+	resp := connSendCmd(t, conn, reader, "watch", "key1", "")
+	if resp != "ok" {
+		t.Fatalf("watch 1: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "watch", "key2", "")
+	if resp != "ok" {
+		t.Fatalf("watch 2: expected ok, got %q", resp)
+	}
+
+	// Third watch should be rejected.
+	resp = connSendCmd(t, conn, reader, "watch", "key3", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("watch 3: expected error, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_Listen(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("listen 1: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "listen", "ch2", "")
+	if resp != "ok" {
+		t.Fatalf("listen 2: expected ok, got %q", resp)
+	}
+
+	// Third should be rejected.
+	resp = connSendCmd(t, conn, reader, "listen", "ch3", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("listen 3: expected error, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_MixedWatchListen(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// One watch + one listen = 2 subscriptions.
+	resp := connSendCmd(t, conn, reader, "watch", "key1", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	// Third (either type) should be rejected.
+	resp = connSendCmd(t, conn, reader, "watch", "key2", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("expected error for exceeding subscription limit, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_UnwatchFreesSlot(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "watch", "key1", "")
+	if resp != "ok" {
+		t.Fatalf("watch 1: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "watch", "key2", "")
+	if resp != "ok" {
+		t.Fatalf("watch 2: expected ok, got %q", resp)
+	}
+
+	// At limit — unwatch one to free a slot.
+	resp = connSendCmd(t, conn, reader, "unwatch", "key1", "")
+	if resp != "ok" {
+		t.Fatalf("unwatch: expected ok, got %q", resp)
+	}
+
+	// Now key3 should succeed.
+	resp = connSendCmd(t, conn, reader, "watch", "key3", "")
+	if resp != "ok" {
+		t.Fatalf("watch 3 after unwatch: expected ok, got %q", resp)
+	}
+}

@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoad_Defaults(t *testing.T) {
@@ -428,5 +430,70 @@ func TestLoad_AutoReleaseEnvVar(t *testing.T) {
 	}
 	if cfg.AutoReleaseOnDisconnect {
 		t.Error("auto-release-on-disconnect: got true, want false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: envOrDuration must not overflow for large second values
+// ---------------------------------------------------------------------------
+
+func TestEnvOrDuration_LargeValueClamped(t *testing.T) {
+	// Use a value that fits in int but would overflow time.Duration (int64
+	// nanoseconds) when multiplied by time.Second (1e9). maxSafeSeconds is
+	// about 9.2e9 on 64-bit, so 9999999999 (just over) will be clamped.
+	largeVal := fmt.Sprintf("%d", maxSafeSeconds+1)
+	t.Setenv("DFLOCKD_TEST_LARGE_DUR", largeVal)
+	d := envOrDuration("DFLOCKD_TEST_LARGE_DUR", 5)
+	if d <= 0 {
+		t.Fatalf("expected positive clamped duration, got %v", d)
+	}
+	// The result should be maxSafeSeconds * time.Second, not an overflow.
+	expected := time.Duration(maxSafeSeconds) * time.Second
+	if d != expected {
+		t.Errorf("expected clamped duration %v, got %v", expected, d)
+	}
+}
+
+func TestEnvOrDuration_NormalValue(t *testing.T) {
+	t.Setenv("DFLOCKD_TEST_NORMAL", "42")
+	d := envOrDuration("DFLOCKD_TEST_NORMAL", 5)
+	if d != 42*time.Second {
+		t.Errorf("expected 42s, got %v", d)
+	}
+}
+
+func TestEnvOrDuration_FallbackDefault(t *testing.T) {
+	// No env var set, should use the flag default.
+	d := envOrDuration("DFLOCKD_NONEXISTENT_KEY_XYZZY", 10)
+	if d != 10*time.Second {
+		t.Errorf("expected 10s, got %v", d)
+	}
+}
+
+func TestLoad_MaxSubscriptionsFlag(t *testing.T) {
+	cfg, err := Load([]string{"--max-subscriptions", "100"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxSubscriptions != 100 {
+		t.Errorf("expected MaxSubscriptions=100, got %d", cfg.MaxSubscriptions)
+	}
+}
+
+func TestLoad_MaxSubscriptionsEnvVar(t *testing.T) {
+	t.Setenv("DFLOCKD_MAX_SUBSCRIPTIONS", "50")
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxSubscriptions != 50 {
+		t.Errorf("expected MaxSubscriptions=50, got %d", cfg.MaxSubscriptions)
+	}
+}
+
+func TestLoad_MaxSubscriptionsNegativeInvalid(t *testing.T) {
+	_, err := Load([]string{"--max-subscriptions", "-1"})
+	if err == nil {
+		t.Fatal("expected error for negative max-subscriptions")
 	}
 }

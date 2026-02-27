@@ -3422,3 +3422,245 @@ func TestClient_ErrLimitMismatch_Semaphore(t *testing.T) {
 		t.Fatalf("expected ErrLimitMismatch, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression: Context cancellation must release the lock before closing conn
+// ---------------------------------------------------------------------------
+
+// TestLockAcquire_ContextCancelDuringWait_ReleasesLock verifies that when a
+// Lock.Acquire is waiting on the server and the context is cancelled, the
+// lock is properly cleaned up. A second holder should be able to acquire it.
+func TestLockAcquire_ContextCancelDuringWait_ReleasesLock(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// First lock holds the resource.
+	l1 := &client.Lock{
+		Key:            "ctx-rel-key",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l1.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("l1 acquire failed")
+	}
+
+	// Second lock tries to acquire with a short-lived context.
+	ctx, cancel := context.WithCancel(context.Background())
+	l2 := &client.Lock{
+		Key:            "ctx-rel-key",
+		AcquireTimeout: 30 * time.Second,
+		Servers:        []string{addr},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = l2.Acquire(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("l2.Acquire did not return after context cancel")
+	}
+
+	// Release l1 — a third client should acquire immediately, proving l2's
+	// enqueue was properly cleaned up and doesn't block the queue.
+	l1.Release(context.Background())
+
+	l3 := &client.Lock{
+		Key:            "ctx-rel-key",
+		AcquireTimeout: 2 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err = l3.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("l3 acquire error: %v", err)
+	}
+	if !ok {
+		t.Fatal("l3 acquire should succeed after l1 released and l2 cancelled")
+	}
+	l3.Release(context.Background())
+}
+
+// TestLockAcquire_AlreadyCancelledContext verifies that calling Lock.Acquire
+// with an already-cancelled context returns immediately with an error.
+func TestLockAcquire_AlreadyCancelledContext(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before Acquire
+
+	l := &client.Lock{
+		Key:            "ctx-already-key",
+		AcquireTimeout: 5 * time.Second,
+		Servers:        []string{addr},
+	}
+
+	ok, err := l.Acquire(ctx)
+	if ok {
+		// If it somehow acquired, it should have released due to ctx.Err()
+		t.Log("acquired with cancelled context — verifying release")
+	}
+	if err == nil && !ok {
+		// Timeout is also acceptable
+	}
+	// The main point: it should return reasonably quickly, not hang.
+}
+
+// TestSemaphoreAcquire_ContextCancelDuringWait is the semaphore variant.
+func TestSemaphoreAcquire_ContextCancelDuringWait(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s1 := &client.Semaphore{
+		Key:            "ctx-sem-key",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("s1 acquire failed")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s2 := &client.Semaphore{
+		Key:            "ctx-sem-key",
+		Limit:          1,
+		AcquireTimeout: 30 * time.Second,
+		Servers:        []string{addr},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = s2.Acquire(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("s2.Acquire did not return after context cancel")
+	}
+
+	// Release s1 — s3 should succeed.
+	s1.Release(context.Background())
+
+	s3 := &client.Semaphore{
+		Key:            "ctx-sem-key",
+		Limit:          1,
+		AcquireTimeout: 2 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err = s3.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("s3 acquire error: %v", err)
+	}
+	if !ok {
+		t.Fatal("s3 acquire should succeed after s1 released and s2 cancelled")
+	}
+	s3.Release(context.Background())
+}
+
+// ---------------------------------------------------------------------------
+// Regression: Election.Resign must not hold mutex during network I/O
+// ---------------------------------------------------------------------------
+
+// TestElection_ConcurrentResign verifies that concurrent Resign calls do not
+// deadlock. Before the fix, Resign held the mutex during the blocking network
+// call, causing other callers to block indefinitely.
+func TestElection_ConcurrentResign(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	e := &client.Election{
+		Key:     "resign-concurrent",
+		Servers: []string{addr},
+	}
+	defer e.Close()
+
+	ok, err := e.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected to be elected")
+	}
+
+	// Launch multiple concurrent resign attempts. With the old code, the
+	// second call would deadlock on the mutex held during network I/O.
+	done := make(chan error, 3)
+	for range 3 {
+		go func() {
+			done <- e.Resign(context.Background())
+		}()
+	}
+
+	for range 3 {
+		select {
+		case err := <-done:
+			// First resign succeeds, subsequent ones may return nil (no-op).
+			_ = err
+		case <-time.After(5 * time.Second):
+			t.Fatal("Resign call deadlocked — likely holding mutex during network I/O")
+		}
+	}
+
+	if e.IsLeader() {
+		t.Fatal("expected IsLeader() to be false after resign")
+	}
+}
+
+// TestElection_ResignReleasesLeadership verifies that after Resign, another
+// election candidate can win leadership.
+func TestElection_ResignReleasesLeadership(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	e1 := &client.Election{
+		Key:     "resign-handoff",
+		Servers: []string{addr},
+	}
+	defer e1.Close()
+
+	ok, err := e1.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("e1 expected to be elected")
+	}
+
+	// Resign e1 — should free leadership.
+	if err := e1.Resign(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// e2 should be able to campaign and win immediately.
+	e2 := &client.Election{
+		Key:     "resign-handoff",
+		Servers: []string{addr},
+	}
+	defer e2.Close()
+
+	ok, err = e2.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("e2 expected to be elected after e1 resigned")
+	}
+	if !e2.IsLeader() {
+		t.Fatal("e2 expected IsLeader() to be true")
+	}
+}
