@@ -211,15 +211,15 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 					for mi, mem := range wge.qg.members {
 						if mem.ConnID == connID {
 							copy(wge.qg.members[mi:], wge.qg.members[mi+1:])
-						wge.qg.members[len(wge.qg.members)-1] = nil
-						wge.qg.members = wge.qg.members[:len(wge.qg.members)-1]
+							wge.qg.members[len(wge.qg.members)-1] = nil
+							wge.qg.members = wge.qg.members[:len(wge.qg.members)-1]
 							break
 						}
 					}
 					if len(wge.qg.members) == 0 {
 						copy(m.wildGroups[wi:], m.wildGroups[wi+1:])
-					m.wildGroups[len(m.wildGroups)-1] = nil
-					m.wildGroups = m.wildGroups[:len(m.wildGroups)-1]
+						m.wildGroups[len(m.wildGroups)-1] = nil
+						m.wildGroups = m.wildGroups[:len(m.wildGroups)-1]
 					}
 					break
 				}
@@ -230,8 +230,8 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 					for mi, mem := range qg.members {
 						if mem.ConnID == connID {
 							copy(qg.members[mi:], qg.members[mi+1:])
-						qg.members[len(qg.members)-1] = nil
-						qg.members = qg.members[:len(qg.members)-1]
+							qg.members[len(qg.members)-1] = nil
+							qg.members = qg.members[:len(qg.members)-1]
 							break
 						}
 					}
@@ -395,20 +395,23 @@ func (m *Manager) UnlistenAll(connID uint64) {
 		} else {
 			// Grouped
 			if e.isWild {
-				for wi, wge := range m.wildGroups {
+				// Iterate backwards so that removing an empty entry does
+				// not cause the loop to skip the next element.
+				for wi := len(m.wildGroups) - 1; wi >= 0; wi-- {
+					wge := m.wildGroups[wi]
 					if wge.pattern == e.pattern && wge.group == e.group {
 						for mi, mem := range wge.qg.members {
 							if mem.ConnID == connID {
 								copy(wge.qg.members[mi:], wge.qg.members[mi+1:])
-						wge.qg.members[len(wge.qg.members)-1] = nil
-						wge.qg.members = wge.qg.members[:len(wge.qg.members)-1]
+								wge.qg.members[len(wge.qg.members)-1] = nil
+								wge.qg.members = wge.qg.members[:len(wge.qg.members)-1]
 								break
 							}
 						}
 						if len(wge.qg.members) == 0 {
 							copy(m.wildGroups[wi:], m.wildGroups[wi+1:])
-					m.wildGroups[len(m.wildGroups)-1] = nil
-					m.wildGroups = m.wildGroups[:len(m.wildGroups)-1]
+							m.wildGroups[len(m.wildGroups)-1] = nil
+							m.wildGroups = m.wildGroups[:len(m.wildGroups)-1]
 						}
 						break
 					}
@@ -419,8 +422,8 @@ func (m *Manager) UnlistenAll(connID uint64) {
 						for mi, mem := range qg.members {
 							if mem.ConnID == connID {
 								copy(qg.members[mi:], qg.members[mi+1:])
-						qg.members[len(qg.members)-1] = nil
-						qg.members = qg.members[:len(qg.members)-1]
+								qg.members[len(qg.members)-1] = nil
+								qg.members = qg.members[:len(qg.members)-1]
 								break
 							}
 						}

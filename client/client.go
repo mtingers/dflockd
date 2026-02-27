@@ -1277,6 +1277,8 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	l.mu.Unlock()
 
 	// If context is cancellable, close the connection on cancel to unblock.
+	// The done channel prevents the goroutine from closing the connection
+	// after the RPC completes, so we can still perform cleanup (release).
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -1287,12 +1289,12 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}()
 
 	token, lease, fence, err := AcquireWithFence(conn, l.Key, l.acquireTimeout(), l.opts()...)
-	close(done)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if errors.Is(err, ErrTimeout) {
 			l.closeConn()
 			return false, nil
@@ -1306,12 +1308,15 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
-		// Lock acquired but context cancelled — release to avoid holding
-		// the server-side lock until lease expiry.
+		// Lock acquired but context cancelled — release BEFORE signalling
+		// done so the cancellation goroutine cannot close the connection
+		// out from under us.
 		Release(conn, l.Key, token)
+		close(done)
 		l.closeConn()
 		return false, ctx.Err()
 	}
+	close(done)
 
 	l.token = token
 	l.lease = lease
@@ -1347,12 +1352,12 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	}()
 
 	status, token, lease, fence, err := EnqueueWithFence(conn, l.Key, l.opts()...)
-	close(done)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if ctx.Err() != nil {
 			l.closeConn()
 			return "", ctx.Err()
@@ -1365,9 +1370,11 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		if status == "acquired" {
 			Release(conn, l.Key, token)
 		}
+		close(done)
 		l.closeConn()
 		return "", ctx.Err()
 	}
+	close(done)
 
 	if status == "acquired" {
 		l.token = token
@@ -1401,12 +1408,12 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	}()
 
 	token, lease, fence, err := WaitWithFence(conn, l.Key, timeout)
-	close(done)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if errors.Is(err, ErrTimeout) {
 			l.closeConn()
 			return false, nil
@@ -1421,9 +1428,11 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	if ctx.Err() != nil {
 		Release(conn, l.Key, token)
+		close(done)
 		l.closeConn()
 		return false, ctx.Err()
 	}
+	close(done)
 
 	l.token = token
 	l.lease = lease
@@ -1724,12 +1733,12 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	}()
 
 	token, lease, fence, err := SemAcquireWithFence(conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
-	close(done)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if errors.Is(err, ErrTimeout) {
 			s.closeConn()
 			return false, nil
@@ -1744,9 +1753,11 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 
 	if ctx.Err() != nil {
 		SemRelease(conn, s.Key, token)
+		close(done)
 		s.closeConn()
 		return false, ctx.Err()
 	}
+	close(done)
 
 	s.token = token
 	s.lease = lease
@@ -1781,12 +1792,12 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	}()
 
 	status, token, lease, fence, err := SemEnqueueWithFence(conn, s.Key, s.Limit, s.opts()...)
-	close(done)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if ctx.Err() != nil {
 			s.closeConn()
 			return "", ctx.Err()
@@ -1799,9 +1810,11 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		if status == "acquired" {
 			SemRelease(conn, s.Key, token)
 		}
+		close(done)
 		s.closeConn()
 		return "", ctx.Err()
 	}
+	close(done)
 
 	if status == "acquired" {
 		s.token = token
@@ -1834,12 +1847,12 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	}()
 
 	token, lease, fence, err := SemWaitWithFence(conn, s.Key, timeout)
-	close(done)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if errors.Is(err, ErrTimeout) {
 			s.closeConn()
 			return false, nil
@@ -1854,9 +1867,11 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	if ctx.Err() != nil {
 		SemRelease(conn, s.Key, token)
+		close(done)
 		s.closeConn()
 		return false, ctx.Err()
 	}
+	close(done)
 
 	s.token = token
 	s.lease = lease
@@ -2691,12 +2706,12 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 	}()
 
 	token, lease, fence, err := rwLock(conn, cmd, rw.Key, rw.acquireTimeout(), rw.opts()...)
-	close(done)
 
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if errors.Is(err, ErrTimeout) {
 			rw.closeConn()
 			return false, nil
@@ -2716,9 +2731,11 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 		} else {
 			RUnlock(conn, rw.Key, token)
 		}
+		close(done)
 		rw.closeConn()
 		return false, ctx.Err()
 	}
+	close(done)
 
 	rw.token = token
 	rw.fence = fence
@@ -3418,12 +3435,12 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	}()
 
 	token, lease, fence, err := lc.Elect(e.Key, e.acquireTimeout(), e.opts()...)
-	close(done)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if err != nil {
+		close(done)
 		if errors.Is(err, ErrTimeout) {
 			e.closeLC()
 			return false, nil
@@ -3438,9 +3455,12 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 
 	if ctx.Err() != nil {
 		lc.Resign(e.Key, token)
+		close(done)
 		e.closeLC()
 		return false, ctx.Err()
 	}
+
+	close(done)
 
 	e.token = token
 	e.lease = lease
@@ -3458,7 +3478,6 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 // Resign gives up leadership.
 func (e *Election) Resign(ctx context.Context) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	savedToken := e.token
 	wasLeader := e.isLeader
@@ -3472,6 +3491,7 @@ func (e *Election) Resign(ctx context.Context) error {
 		e.token = ""
 		e.fence = 0
 		e.lease = 0
+		e.mu.Unlock()
 		if wasLeader && e.OnResigned != nil {
 			go e.OnResigned()
 		}
@@ -3486,18 +3506,28 @@ func (e *Election) Resign(ctx context.Context) error {
 	if token == "" {
 		token = savedToken
 	}
+	lc := e.lc
+	key := e.Key
+
+	// Drop the lock during the blocking network call so that accessors
+	// (IsLeader, Token, Fence) are not blocked.
+	e.mu.Unlock()
+
 	var err error
 	if token != "" {
-		err = e.lc.Resign(e.Key, token)
+		err = lc.Resign(key, token)
 	} else if wasLeader {
 		// Leadership was lost by renewal failure before Resign was called.
 		err = fmt.Errorf("dflockd: not leader (leadership lost before resign)")
 	}
+
+	e.mu.Lock()
 	e.isLeader = false
 	e.closeLC()
 	e.token = ""
 	e.fence = 0
 	e.lease = 0
+	e.mu.Unlock()
 
 	if wasLeader && e.OnResigned != nil {
 		go e.OnResigned()

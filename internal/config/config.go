@@ -21,6 +21,7 @@ type Config struct {
 	MaxListLength           int
 	MaxConnections          int
 	MaxWaiters              int
+	MaxSubscriptions        int
 	ReadTimeout             time.Duration
 	WriteTimeout            time.Duration
 	ShutdownTimeout         time.Duration
@@ -74,10 +75,20 @@ func envOrString(envKey string, flagVal string) string {
 	return v
 }
 
+// maxSafeSeconds is the largest value (in seconds) that can be multiplied by
+// time.Second without overflowing time.Duration (an int64 in nanoseconds).
+const maxSafeSeconds = int(^uint(0)>>1) / int(time.Second)
+
 // envOrDuration returns a time.Duration in seconds from the environment
 // variable, or converts the flag default (in seconds) if the env var is unset.
+// Values that would overflow time.Duration are clamped to the maximum safe
+// duration.
 func envOrDuration(envKey string, flagVal int) time.Duration {
-	return time.Duration(envOrInt(envKey, flagVal)) * time.Second
+	n := envOrInt(envKey, flagVal)
+	if n > maxSafeSeconds {
+		n = maxSafeSeconds
+	}
+	return time.Duration(n) * time.Second
 }
 
 // loadAuthToken resolves the auth token from (in priority order):
@@ -122,6 +133,7 @@ func Load(args []string) (*Config, error) {
 	maxListLength := fs.Int("max-list-length", 0, "Maximum items per list (0 = unlimited)")
 	maxConnections := fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
 	maxWaiters := fs.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
+	maxSubscriptions := fs.Int("max-subscriptions", 0, "Maximum watch+listen registrations per connection (0 = unlimited)")
 	readTimeout := fs.Int("read-timeout", 23, "Client read timeout (seconds)")
 	writeTimeout := fs.Int("write-timeout", 5, "Client write timeout (seconds)")
 	shutdownTimeout := fs.Int("shutdown-timeout", 30, "Graceful shutdown drain timeout (seconds, 0 = wait forever)")
@@ -185,6 +197,7 @@ func Load(args []string) (*Config, error) {
 		MaxListLength:           resolveInt("max-list-length", "DFLOCKD_MAX_LIST_LENGTH", *maxListLength),
 		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
 		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
+		MaxSubscriptions:        resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions),
 		ReadTimeout:             resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout),
 		WriteTimeout:            resolveDuration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout),
 		ShutdownTimeout:         resolveDuration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout),
@@ -238,6 +251,9 @@ func (c *Config) validate() error {
 	}
 	if c.MaxWaiters < 0 {
 		return fmt.Errorf("--max-waiters must be >= 0 (got %d)", c.MaxWaiters)
+	}
+	if c.MaxSubscriptions < 0 {
+		return fmt.Errorf("--max-subscriptions must be >= 0 (got %d)", c.MaxSubscriptions)
 	}
 	if c.GCMaxIdleTime <= 0 {
 		return fmt.Errorf("--gc-max-idle must be > 0 (got %s)", c.GCMaxIdleTime)

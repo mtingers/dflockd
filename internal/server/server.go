@@ -23,9 +23,10 @@ import (
 )
 
 type connState struct {
-	id         uint64
-	writeCh    chan []byte
-	cancelConn func() // cancels the connection context (disconnect slow consumer)
+	id             uint64
+	writeCh        chan []byte
+	cancelConn     func() // cancels the connection context (disconnect slow consumer)
+	subscriptions  int    // number of active watch + listen registrations
 }
 
 type Server struct {
@@ -404,7 +405,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			return &protocol.Ack{Status: "error"}
 		}
 		if status == "acquired" {
-			s.wm.Notify(req.Cmd, req.Key)
+			s.wm.Notify("acquire", req.Key)
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
@@ -429,7 +430,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		s.wm.Notify(req.Cmd, req.Key)
+		s.wm.Notify("acquire", req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease, Fence: fence}
 
 	// --- Phase 1: Atomic Counters ---
@@ -511,6 +512,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	// --- Phase 3: Signaling ---
 
 	case "listen":
+		if max := s.cfg.MaxSubscriptions; max > 0 && cs.subscriptions >= max {
+			return &protocol.Ack{Status: "error"}
+		}
 		listener := &signal.Listener{
 			ConnID:     connID,
 			Pattern:    req.Key,
@@ -521,10 +525,14 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if err := s.sig.Listen(listener); err != nil {
 			return &protocol.Ack{Status: "error"}
 		}
+		cs.subscriptions++
 		return &protocol.Ack{Status: "ok"}
 
 	case "unlisten":
 		s.sig.Unlisten(req.Key, connID, req.Group)
+		if cs.subscriptions > 0 {
+			cs.subscriptions--
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	case "signal":
@@ -644,7 +652,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		s.wm.Notify("rl", req.Key)
+		s.wm.Notify("acquire", req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "wl":
@@ -658,12 +666,12 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		s.wm.Notify("wl", req.Key)
+		s.wm.Notify("acquire", req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds()), Fence: fence}
 
 	case "rr", "wr":
 		if s.lm.RWRelease(req.Key, req.Token) {
-			s.wm.Notify(req.Cmd, req.Key)
+			s.wm.Notify("release", req.Key)
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
@@ -681,7 +689,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			return rwAcquireError(err)
 		}
 		if status == "acquired" {
-			s.wm.Notify("re", req.Key)
+			s.wm.Notify("acquire", req.Key)
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
@@ -691,7 +699,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			return rwAcquireError(err)
 		}
 		if status == "acquired" {
-			s.wm.Notify("we", req.Key)
+			s.wm.Notify("acquire", req.Key)
 		}
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease, Fence: fence}
 
@@ -716,12 +724,15 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if tok == "" {
 			return &protocol.Ack{Status: "timeout"}
 		}
-		s.wm.Notify(req.Cmd, req.Key)
+		s.wm.Notify("acquire", req.Key)
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease, Fence: fence}
 
 	// --- Watch/Notify ---
 
 	case "watch":
+		if max := s.cfg.MaxSubscriptions; max > 0 && cs.subscriptions >= max {
+			return &protocol.Ack{Status: "error"}
+		}
 		w := &watch.Watcher{
 			ConnID:     connID,
 			Pattern:    req.Key,
@@ -731,10 +742,14 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if err := s.wm.Watch(w); err != nil {
 			return &protocol.Ack{Status: "error"}
 		}
+		cs.subscriptions++
 		return &protocol.Ack{Status: "ok"}
 
 	case "unwatch":
 		s.wm.Unwatch(req.Key, connID)
+		if cs.subscriptions > 0 {
+			cs.subscriptions--
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	// --- Barriers ---

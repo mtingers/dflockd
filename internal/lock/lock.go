@@ -132,6 +132,23 @@ type listState struct {
 	PopWaiters    []*listWaiter
 	PopWaiterHead int
 	LastActivity  time.Time
+	itemsStart    int // number of slots consumed from the front of the backing array
+}
+
+// compactItems reclaims the backing array when more than half is wasted from
+// left-pops. Without this, FIFO (RPush + LPop) patterns leak memory because
+// the backing array grows monotonically while the slice window slides forward.
+func (ls *listState) compactItems() {
+	if ls.itemsStart > 0 && ls.itemsStart > cap(ls.Items) {
+		// After reslicing, cap(ls.Items) reflects remaining capacity from
+		// the current start, not the original allocation. Use itemsStart
+		// to track total wasted slots.
+		n := len(ls.Items)
+		newItems := make([]string, n)
+		copy(newItems, ls.Items)
+		ls.Items = newItems
+		ls.itemsStart = 0
+	}
 }
 
 type barrierParticipant struct {
@@ -257,6 +274,23 @@ func removeWaitersByConn(st *ResourceState, connID uint64, closed map[chan strin
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+// isWaiterDead checks if a waiter's channel has been closed (e.g. by
+// CleanupConnection). A closed channel yields a zero-value receive
+// immediately. This allows the grant loop to skip dead waiters rather
+// than letting them block the queue.
+//
+// IMPORTANT: only call this when no token has been sent to the waiter yet
+// (i.e., the channel should be empty). If the channel has a buffered value,
+// this will consume and lose it.
+func isWaiterDead(w *waiter) bool {
+	select {
+	case _, ok := <-w.ch:
+		return !ok // closed → true, open with value → false (value lost, but should not happen)
+	default:
+		return false // channel open, nothing to read
+	}
+}
 
 // connAddOwned adds a token to the connOwned map. Must be called with connMu held.
 func (lm *LockManager) connAddOwned(connID uint64, key, token string) {
@@ -1298,6 +1332,8 @@ func (lm *LockManager) LPop(key string) (string, bool) {
 	val := ls.Items[0]
 	ls.Items[0] = "" // allow GC of the string
 	ls.Items = ls.Items[1:]
+	ls.itemsStart++
+	ls.compactItems()
 	ls.LastActivity = time.Now()
 	if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
 		delete(sh.lists, key)
@@ -1403,6 +1439,8 @@ func (lm *LockManager) blockingPop(ctx context.Context, key string, timeout time
 			val = ls.Items[0]
 			ls.Items[0] = ""
 			ls.Items = ls.Items[1:]
+			ls.itemsStart++
+			ls.compactItems()
 		} else {
 			last := len(ls.Items) - 1
 			val = ls.Items[last]
@@ -1799,7 +1837,8 @@ func (lm *LockManager) RWWait(ctx context.Context, key string, timeout time.Dura
 
 // grantNextRWWaiterLocked implements the FIFO fair granting for RW locks.
 // Consecutive readers at the queue head are batch-granted. A writer in the
-// queue blocks all subsequent grants. Must be called with shard lock AND connMu held.
+// queue blocks all subsequent grants unless its channel has been closed
+// (connection cleaned up). Must be called with shard lock AND connMu held.
 func (lm *LockManager) grantNextRWWaiterLocked(key string, st *ResourceState) {
 	for st.WaiterHead < len(st.Waiters) {
 		w := st.Waiters[st.WaiterHead]
@@ -1825,7 +1864,15 @@ func (lm *LockManager) grantNextRWWaiterLocked(key string, st *ResourceState) {
 				}
 				break // writer is exclusive, done
 			}
-			break // can't grant writer, holders exist
+			// Holders exist — check if this writer's connection has been
+			// cleaned up (channel closed). If so, skip it rather than
+			// blocking subsequent readers.
+			if isWaiterDead(w) {
+				st.Waiters[st.WaiterHead] = nil
+				st.WaiterHead++
+				continue
+			}
+			break // live writer blocks queue
 		}
 		// Reader
 		hasWriter := false
