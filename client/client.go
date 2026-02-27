@@ -327,6 +327,12 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	if resp == "error_already_enqueued" {
 		return "", "", 0, ErrAlreadyQueued
 	}
+	if resp == "error_type_mismatch" {
+		return "", "", 0, ErrTypeMismatch
+	}
+	if resp == "error_limit_mismatch" {
+		return "", "", 0, ErrLimitMismatch
+	}
 
 	parts := strings.Fields(resp)
 	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
@@ -479,6 +485,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	if resp == "error_limit_mismatch" {
 		return "", "", 0, ErrLimitMismatch
 	}
+	if resp == "error_type_mismatch" {
+		return "", "", 0, ErrTypeMismatch
+	}
 	if resp == "error_already_enqueued" {
 		return "", "", 0, ErrAlreadyQueued
 	}
@@ -536,6 +545,9 @@ func parseSemAcquireResponse(resp string) (string, int, error) {
 	if resp == "error_limit_mismatch" {
 		return "", 0, ErrLimitMismatch
 	}
+	if resp == "error_type_mismatch" {
+		return "", 0, ErrTypeMismatch
+	}
 	return parseOKTokenLease(resp, "sem_acquire")
 }
 
@@ -548,6 +560,12 @@ func parseAcquireResponse(resp string) (string, int, error) {
 	}
 	if resp == "error_max_waiters" {
 		return "", 0, ErrMaxWaiters
+	}
+	if resp == "error_type_mismatch" {
+		return "", 0, ErrTypeMismatch
+	}
+	if resp == "error_limit_mismatch" {
+		return "", 0, ErrLimitMismatch
 	}
 	return parseOKTokenLease(resp, "acquire")
 }
@@ -2022,6 +2040,12 @@ func AcquireWithFence(c *Conn, key string, acquireTimeout time.Duration, opts ..
 	if resp == "error_max_waiters" {
 		return "", 0, 0, ErrMaxWaiters
 	}
+	if resp == "error_type_mismatch" {
+		return "", 0, 0, ErrTypeMismatch
+	}
+	if resp == "error_limit_mismatch" {
+		return "", 0, 0, ErrLimitMismatch
+	}
 	return parseOKTokenLeaseFence(resp, "acquire")
 }
 
@@ -2054,6 +2078,9 @@ func SemAcquireWithFence(c *Conn, key string, acquireTimeout time.Duration, limi
 	if resp == "error_limit_mismatch" {
 		return "", 0, 0, ErrLimitMismatch
 	}
+	if resp == "error_type_mismatch" {
+		return "", 0, 0, ErrTypeMismatch
+	}
 	return parseOKTokenLeaseFence(resp, "sem_acquire")
 }
 
@@ -2085,6 +2112,12 @@ func EnqueueWithFence(c *Conn, key string, opts ...Option) (status, token string
 	}
 	if resp == "error_already_enqueued" {
 		return "", "", 0, 0, ErrAlreadyQueued
+	}
+	if resp == "error_type_mismatch" {
+		return "", "", 0, 0, ErrTypeMismatch
+	}
+	if resp == "error_limit_mismatch" {
+		return "", "", 0, 0, ErrLimitMismatch
 	}
 	parts := strings.Fields(resp)
 	if (len(parts) == 3 || len(parts) == 4) && parts[0] == "acquired" {
@@ -2132,6 +2165,9 @@ func SemEnqueueWithFence(c *Conn, key string, limit int, opts ...Option) (status
 	}
 	if resp == "error_limit_mismatch" {
 		return "", "", 0, 0, ErrLimitMismatch
+	}
+	if resp == "error_type_mismatch" {
+		return "", "", 0, 0, ErrTypeMismatch
 	}
 	if resp == "error_already_enqueued" {
 		return "", "", 0, 0, ErrAlreadyQueued
@@ -3143,6 +3179,12 @@ func (lc *LeaderConn) Elect(key string, timeout time.Duration, opts ...Option) (
 	}
 	if resp == "error_max_waiters" {
 		return "", 0, 0, ErrMaxWaiters
+	}
+	if resp == "error_type_mismatch" {
+		return "", 0, 0, ErrTypeMismatch
+	}
+	if resp == "error_limit_mismatch" {
+		return "", 0, 0, ErrLimitMismatch
 	}
 	return parseOKTokenLeaseFence(resp, "elect")
 }
