@@ -1,6 +1,8 @@
 package signal
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -790,4 +792,149 @@ func TestQueueGroup_WildcardMixedGroupAndIndividual(t *testing.T) {
 	if okA == okB {
 		t.Fatalf("expected exactly one of A/B: A=%v B=%v", okA, okB)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// CancelConn callback on full buffer (non-grouped)
+// ---------------------------------------------------------------------------
+
+func TestFullBuffer_CancelConnCalled(t *testing.T) {
+	m := NewManager()
+	var cancelled atomic.Int32
+	l := &Listener{
+		ConnID:     1,
+		Pattern:    "ch",
+		WriteCh:    make(chan []byte, 1),
+		CancelConn: func() { cancelled.Add(1) },
+	}
+	m.Listen(l)
+
+	// Fill the buffer
+	m.Signal("ch", "first")
+
+	// Second signal should trigger CancelConn
+	m.Signal("ch", "second")
+
+	if cancelled.Load() != 1 {
+		t.Fatalf("expected CancelConn to be called once, got %d", cancelled.Load())
+	}
+}
+
+func TestFullBuffer_CancelConnCalled_Wildcard(t *testing.T) {
+	m := NewManager()
+	var cancelled atomic.Int32
+	l := &Listener{
+		ConnID:     1,
+		Pattern:    "ch.*",
+		WriteCh:    make(chan []byte, 1),
+		CancelConn: func() { cancelled.Add(1) },
+	}
+	m.Listen(l)
+
+	m.Signal("ch.a", "first")
+	m.Signal("ch.b", "second")
+
+	if cancelled.Load() != 1 {
+		t.Fatalf("expected CancelConn to be called once, got %d", cancelled.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CancelConn on full buffer for queue groups
+// ---------------------------------------------------------------------------
+
+func TestQueueGroup_AllMembersFull_CancelConn(t *testing.T) {
+	m := NewManager()
+	var cancelledA, cancelledB atomic.Int32
+	a := &Listener{
+		ConnID:     1,
+		Pattern:    "ch",
+		Group:      "g1",
+		WriteCh:    make(chan []byte, 1),
+		CancelConn: func() { cancelledA.Add(1) },
+	}
+	b := &Listener{
+		ConnID:     2,
+		Pattern:    "ch",
+		Group:      "g1",
+		WriteCh:    make(chan []byte, 1),
+		CancelConn: func() { cancelledB.Add(1) },
+	}
+	m.Listen(a)
+	m.Listen(b)
+
+	// Fill both members' buffers
+	m.Signal("ch", "first")  // goes to member 0
+	m.Signal("ch", "second") // goes to member 1
+
+	// Third signal: both full, CancelConn should be called on primary
+	m.Signal("ch", "third")
+
+	total := cancelledA.Load() + cancelledB.Load()
+	if total < 1 {
+		t.Fatalf("expected CancelConn to be called, total=%d", total)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent safety: Signal/Listen/Unlisten
+// ---------------------------------------------------------------------------
+
+func TestConcurrent_SignalListenUnlisten(t *testing.T) {
+	m := NewManager()
+	var wg sync.WaitGroup
+	const goroutines = 20
+	const signals = 50
+
+	// Start listeners
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			l := &Listener{
+				ConnID:  uint64(id),
+				Pattern: "ch",
+				WriteCh: make(chan []byte, signals*2),
+			}
+			m.Listen(l)
+			// Signal while others are listening/unlistening
+			for j := 0; j < signals; j++ {
+				m.Signal("ch", "payload")
+			}
+			m.UnlistenAll(uint64(id))
+		}(i)
+	}
+	wg.Wait()
+
+	// Should not panic or deadlock
+}
+
+func TestConcurrent_QueueGroupSignal(t *testing.T) {
+	m := NewManager()
+	var wg sync.WaitGroup
+	const members = 5
+	const signals = 100
+
+	for i := 0; i < members; i++ {
+		l := &Listener{
+			ConnID:  uint64(i + 1),
+			Pattern: "ch",
+			Group:   "workers",
+			WriteCh: make(chan []byte, signals*2),
+		}
+		m.Listen(l)
+	}
+
+	// Concurrent signals
+	for i := 0; i < members; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < signals; j++ {
+				m.Signal("ch", "job")
+			}
+		}()
+	}
+	wg.Wait()
+	// No panic or deadlock
 }

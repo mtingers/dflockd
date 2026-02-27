@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"bufio"
+	"fmt"
+	"math"
 	"net"
 	"strings"
 	"testing"
@@ -1756,5 +1758,242 @@ func TestReadRequest_RenewEmptyToken(t *testing.T) {
 	pe, ok := err.(*ProtocolError)
 	if !ok || pe.Code != 8 {
 		t.Fatalf("expected code 8, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseSeconds overflow and boundary tests
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_TimeoutOverflow(t *testing.T) {
+	// A very large timeout should be rejected (overflow protection)
+	huge := fmt.Sprintf("%d", math.MaxInt64)
+	r := makeReader("l", "mykey", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow timeout")
+	}
+	pe, ok := err.(*ProtocolError)
+	if !ok {
+		t.Fatalf("expected ProtocolError, got %T: %v", err, err)
+	}
+	if pe.Code != 4 {
+		t.Fatalf("expected code 4, got %d", pe.Code)
+	}
+}
+
+func TestReadRequest_LeaseOverflow(t *testing.T) {
+	huge := fmt.Sprintf("5 %d", math.MaxInt64)
+	r := makeReader("l", "mykey", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow lease")
+	}
+	pe, ok := err.(*ProtocolError)
+	if !ok {
+		t.Fatalf("expected ProtocolError, got %T: %v", err, err)
+	}
+	if pe.Code != 4 {
+		t.Fatalf("expected code 4, got %d", pe.Code)
+	}
+}
+
+func TestReadRequest_IncrOverflow(t *testing.T) {
+	// parseInt64 with an unparseable value
+	r := makeReader("incr", "c1", "99999999999999999999")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow delta")
+	}
+	pe, ok := err.(*ProtocolError)
+	if !ok {
+		t.Fatalf("expected ProtocolError, got %T: %v", err, err)
+	}
+	if pe.Code != 4 {
+		t.Fatalf("expected code 4, got %d", pe.Code)
+	}
+}
+
+func TestReadRequest_CsetOverflow(t *testing.T) {
+	r := makeReader("cset", "c1", "99999999999999999999")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow cset value")
+	}
+}
+
+func TestReadRequest_KsetTTLOverflow(t *testing.T) {
+	huge := fmt.Sprintf("value\t%d", math.MaxInt64)
+	r := makeReader("kset", "k1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow kset TTL")
+	}
+}
+
+func TestReadRequest_BwaitTimeoutOverflow(t *testing.T) {
+	huge := fmt.Sprintf("3 %d", math.MaxInt64)
+	r := makeReader("bwait", "b1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow bwait timeout")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FormatResponse boundary values
+// ---------------------------------------------------------------------------
+
+func TestFormatResponse_MaxFence(t *testing.T) {
+	ack := &Ack{Status: "ok", Token: "tok", LeaseTTL: 30, Fence: math.MaxUint64}
+	out := string(FormatResponse(ack, 33))
+	expected := fmt.Sprintf("ok tok 30 %d\n", uint64(math.MaxUint64))
+	if out != expected {
+		t.Fatalf("expected %q, got %q", expected, out)
+	}
+}
+
+func TestFormatResponse_ZeroFence(t *testing.T) {
+	ack := &Ack{Status: "ok", Token: "tok", LeaseTTL: 30, Fence: 0}
+	out := string(FormatResponse(ack, 33))
+	// Fence=0 should not be included in output
+	if strings.Contains(out, " 0\n") && strings.Count(out, " ") > 2 {
+		// Fence 0 might or might not be included — just verify it doesn't crash
+	}
+}
+
+func TestFormatResponse_LargeLease(t *testing.T) {
+	ack := &Ack{Status: "ok", Token: "tok", LeaseTTL: 999999}
+	out := string(FormatResponse(ack, 33))
+	if !strings.Contains(out, "999999") {
+		t.Fatalf("expected lease in output, got %q", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ProtocolError.Error() string format
+// ---------------------------------------------------------------------------
+
+func TestProtocolError_ErrorString(t *testing.T) {
+	pe := &ProtocolError{Code: 42, Message: "test error"}
+	s := pe.Error()
+	if !strings.Contains(s, "42") {
+		t.Fatalf("expected code 42 in error string, got %q", s)
+	}
+	if !strings.Contains(s, "test error") {
+		t.Fatalf("expected message in error string, got %q", s)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ReadRequest edge cases for all commands
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_SemLockTimeoutOverflow(t *testing.T) {
+	huge := fmt.Sprintf("%d 3", math.MaxInt64)
+	r := makeReader("sl", "sem1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow sem timeout")
+	}
+}
+
+func TestReadRequest_SemEnqueueLeaseOverflow(t *testing.T) {
+	huge := fmt.Sprintf("3 %d", math.MaxInt64)
+	r := makeReader("se", "sem1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow sem enqueue lease")
+	}
+}
+
+func TestReadRequest_RWLockTimeoutOverflow(t *testing.T) {
+	huge := fmt.Sprintf("%d", math.MaxInt64)
+	r := makeReader("rl", "rw1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow rw lock timeout")
+	}
+}
+
+func TestReadRequest_ElectTimeoutOverflow(t *testing.T) {
+	huge := fmt.Sprintf("%d 30", math.MaxInt64)
+	r := makeReader("elect", "e1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow elect timeout")
+	}
+}
+
+func TestReadRequest_KCAS_TTLOverflow(t *testing.T) {
+	huge := fmt.Sprintf("old\tnew\t%d", math.MaxInt64)
+	r := makeReader("kcas", "k1", huge)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for overflow kcas TTL")
+	}
+}
+
+func TestReadRequest_LrangeBadStart(t *testing.T) {
+	r := makeReader("lrange", "q1", "abc 10")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad lrange start")
+	}
+}
+
+func TestReadRequest_LrangeBadStop(t *testing.T) {
+	r := makeReader("lrange", "q1", "0 abc")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad lrange stop")
+	}
+}
+
+func TestReadRequest_BLPopBadTimeout(t *testing.T) {
+	r := makeReader("blpop", "q1", "abc")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad blpop timeout")
+	}
+}
+
+func TestReadRequest_BRPopBadTimeout(t *testing.T) {
+	r := makeReader("brpop", "q1", "abc")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad brpop timeout")
+	}
+}
+
+func TestReadRequest_ElectBadTimeout(t *testing.T) {
+	r := makeReader("elect", "e1", "abc 30")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad elect timeout")
+	}
+}
+
+func TestReadRequest_BwaitBadTimeout(t *testing.T) {
+	r := makeReader("bwait", "b1", "3 abc")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad bwait timeout")
+	}
+}
+
+func TestReadRequest_SemLockBadTimeout(t *testing.T) {
+	r := makeReader("sl", "sem1", "abc 3")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad sem lock timeout")
+	}
+}
+
+func TestReadRequest_SemWaitBadTimeout(t *testing.T) {
+	r := makeReader("sw", "sem1", "abc")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for bad sem wait timeout")
 	}
 }

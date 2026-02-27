@@ -3568,6 +3568,208 @@ func TestIntegration_FencingToken_TwoPhase(t *testing.T) {
 	}
 }
 
+func TestIntegration_RPop(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Push two items
+	resp := connSendCmd(t, conn, reader, "rpush", "rlist", "first")
+	if !strings.HasPrefix(resp, "ok") {
+		t.Fatalf("rpush first: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "rpush", "rlist", "second")
+	if !strings.HasPrefix(resp, "ok") {
+		t.Fatalf("rpush second: expected ok, got %q", resp)
+	}
+
+	// RPop should return the last pushed item
+	resp = connSendCmd(t, conn, reader, "rpop", "rlist", "")
+	if resp != "ok second" {
+		t.Fatalf("rpop: expected 'ok second', got %q", resp)
+	}
+
+	// RPop again should return the first
+	resp = connSendCmd(t, conn, reader, "rpop", "rlist", "")
+	if resp != "ok first" {
+		t.Fatalf("rpop: expected 'ok first', got %q", resp)
+	}
+
+	// RPop on empty list returns nil
+	resp = connSendCmd(t, conn, reader, "rpop", "rlist", "")
+	if resp != "nil" {
+		t.Fatalf("rpop empty: expected 'nil', got %q", resp)
+	}
+}
+
+func TestIntegration_RWLock_WriteEnqueueWait(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// conn1 takes a read lock
+	conn1 := dialTest(t, addr)
+	defer conn1.Close()
+	reader1 := bufio.NewReader(conn1)
+
+	resp := connSendCmd(t, conn1, reader1, "rl", "rwkey", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("rl: expected ok, got %q", resp)
+	}
+	readToken := strings.Fields(resp)[1]
+
+	// conn2 write-enqueues (should be queued since read lock is held)
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+
+	resp = connSendCmd(t, conn2, reader2, "we", "rwkey", "10")
+	if resp != "queued" {
+		t.Fatalf("we: expected queued, got %q", resp)
+	}
+
+	// Release the read lock so the writer can proceed
+	resp = connSendCmd(t, conn1, reader1, "rr", "rwkey", readToken)
+	if resp != "ok" {
+		t.Fatalf("rr: expected ok, got %q", resp)
+	}
+
+	// conn2 write-waits to get the write lock
+	resp = connSendCmd(t, conn2, reader2, "ww", "rwkey", "5")
+	parts := strings.Fields(resp)
+	if parts[0] != "ok" {
+		t.Fatalf("ww: expected ok, got %q", resp)
+	}
+	writeToken := parts[1]
+
+	// Renew the write lock
+	resp = connSendCmd(t, conn2, reader2, "wn", "rwkey", writeToken)
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("wn: expected ok, got %q", resp)
+	}
+
+	// Release write lock
+	resp = connSendCmd(t, conn2, reader2, "wr", "rwkey", writeToken)
+	if resp != "ok" {
+		t.Fatalf("wr: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_Unwatch(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Subscribe to a watch pattern
+	resp := connSendCmd(t, conn, reader, "watch", "mypattern", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+
+	// Unwatch it
+	resp = connSendCmd(t, conn, reader, "unwatch", "mypattern", "")
+	if resp != "ok" {
+		t.Fatalf("unwatch: expected ok, got %q", resp)
+	}
+
+	// Trigger the pattern — conn should NOT receive watch notification
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	connSendCmd(t, conn2, reader2, "kset", "mypattern", "val 0")
+
+	// Try to read from conn — set short deadline
+	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err := reader.ReadString('\n')
+	if err == nil {
+		t.Fatal("expected no data after unwatch, but got a message")
+	}
+}
+
+func TestIntegration_BarrierCountMismatch_Explicit(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// First connection sets barrier count = 3
+	conn1 := dialTest(t, addr)
+	defer conn1.Close()
+
+	msg := fmt.Sprintf("bwait\nbarr1\n3 5\n")
+	conn1.Write([]byte(msg))
+	time.Sleep(50 * time.Millisecond)
+
+	// Second connection tries to join with count = 5 — should get error_barrier_count_mismatch
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+
+	resp := connSendCmd(t, conn2, reader2, "bwait", "barr1", "5 5")
+	if resp != "error_barrier_count_mismatch" {
+		t.Fatalf("expected 'error_barrier_count_mismatch', got %q", resp)
+	}
+}
+
+func TestIntegration_RWLock_DisconnectReleases(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// conn1 acquires a write lock
+	conn1 := dialTest(t, addr)
+	reader1 := bufio.NewReader(conn1)
+
+	resp := connSendCmd(t, conn1, reader1, "wl", "rwdisco", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("wl: expected ok, got %q", resp)
+	}
+
+	// Disconnect conn1
+	conn1.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// conn2 should be able to acquire the same write lock now
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+
+	resp = connSendCmd(t, conn2, reader2, "wl", "rwdisco", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("wl after disconnect: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_RWLock_ReadDisconnectReleases(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// conn1 acquires a read lock
+	conn1 := dialTest(t, addr)
+	reader1 := bufio.NewReader(conn1)
+
+	resp := connSendCmd(t, conn1, reader1, "rl", "rwdisco2", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("rl: expected ok, got %q", resp)
+	}
+
+	// Disconnect conn1
+	conn1.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// conn2 should be able to acquire a write lock (write lock blocked by readers)
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+
+	resp = connSendCmd(t, conn2, reader2, "wl", "rwdisco2", "10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("wl after read disconnect: expected ok, got %q", resp)
+	}
+}
+
 func dialTest(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)

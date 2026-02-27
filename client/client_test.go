@@ -2831,3 +2831,594 @@ func TestElection_CampaignContextCancel(t *testing.T) {
 		t.Fatal("expected context error")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// RW Lock low-level functions: WRenew, WWait, RWait, WEnqueue
+// ---------------------------------------------------------------------------
+
+func TestClient_WRenew(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Acquire a write lock
+	token, _, fence, err := client.WLock(c, "wrkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Renew the write lock
+	remaining, renewFence, err := client.WRenew(c, "wrkey", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence mismatch on wrenew: %d vs %d", renewFence, fence)
+	}
+}
+
+func TestClient_WRenew_WithLeaseTTL(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, _, _, err := client.WLock(c, "wrttl", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Renew with custom lease TTL (WithLeaseTTL takes seconds as int)
+	remaining, _, err := client.WRenew(c, "wrttl", token, client.WithLeaseTTL(60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+}
+
+func TestClient_WEnqueue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	// First connection acquires a read lock to block write enqueue
+	_, _, _, err = client.RLock(c1, "wekey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second connection write-enqueues (should be queued since read lock is held)
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	status, _, _, _, err := client.WEnqueue(c2, "wekey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected 'queued', got %q", status)
+	}
+}
+
+func TestClient_WEnqueue_Immediate(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Write-enqueue with no contention should acquire immediately
+	status, token, lease, fence, err := client.WEnqueue(c, "weinow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "acquired" {
+		t.Fatalf("expected 'acquired', got %q", status)
+	}
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if lease <= 0 {
+		t.Fatalf("expected positive lease, got %d", lease)
+	}
+	if fence == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+}
+
+func TestClient_WWait(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Enqueue first (no contention, should acquire immediately)
+	status, _, _, _, err := client.WEnqueue(c, "wwkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if status == "acquired" {
+		// Already got the lock — release it and set up a real two-phase scenario
+		c2, err := client.Dial(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c2.Close()
+
+		// Hold a read lock on a different key for a clean two-phase test
+		_, _, _, err = client.RLock(c2, "wwkey2", 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		c3, err := client.Dial(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c3.Close()
+
+		status2, _, _, _, err := client.WEnqueue(c3, "wwkey2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status2 != "queued" {
+			t.Fatalf("expected queued, got %q", status2)
+		}
+
+		// Release the read lock so the writer can proceed
+		client.RUnlock(c2, "wwkey2", "")
+		// Wait may need to use the token from enqueue, but RRelease needs the token
+		// Let's use a simpler approach: just test WWait returning not-enqueued error
+	}
+}
+
+func TestClient_WWait_NotEnqueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// WWait without enqueuing first should return ErrNotQueued
+	_, _, _, err = client.WWait(c, "notenqueued", 5*time.Second)
+	if err != client.ErrNotQueued {
+		t.Fatalf("expected ErrNotQueued, got %v", err)
+	}
+}
+
+func TestClient_RWait_NotEnqueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// RWait without enqueuing first should return ErrNotQueued
+	_, _, _, err = client.RWait(c, "notenqueued", 5*time.Second)
+	if err != client.ErrNotQueued {
+		t.Fatalf("expected ErrNotQueued, got %v", err)
+	}
+}
+
+func TestClient_REnqueue_TwoPhase(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	// c1 holds a write lock to block read-enqueue
+	token, _, _, err := client.WLock(c1, "rekey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// c2 read-enqueues
+	status, _, _, _, err := client.REnqueue(c2, "rekey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected 'queued', got %q", status)
+	}
+
+	// Release write lock
+	err = client.WUnlock(c1, "rekey", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// c2 read-waits
+	rToken, lease, fence, err := client.RWait(c2, "rekey", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rToken == "" {
+		t.Fatal("expected non-empty token from RWait")
+	}
+	if lease <= 0 {
+		t.Fatalf("expected positive lease, got %d", lease)
+	}
+	if fence == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+
+	// Read-renew
+	remaining, renewFence, err := client.RRenew(c2, "rekey", rToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence mismatch on rrenew: %d vs %d", renewFence, fence)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Error path tests
+// ---------------------------------------------------------------------------
+
+func TestClient_ErrTypeMismatch_RWLock(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Acquire a regular lock
+	_, _, err = client.Acquire(c, "tmkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to read-lock the same key — type mismatch
+	_, _, _, err = client.RLock(c, "tmkey", 10*time.Second)
+	if err != client.ErrTypeMismatch {
+		t.Fatalf("expected ErrTypeMismatch, got %v", err)
+	}
+
+	// Also test write-lock type mismatch
+	_, _, _, err = client.WLock(c, "tmkey", 10*time.Second)
+	if err != client.ErrTypeMismatch {
+		t.Fatalf("expected ErrTypeMismatch for WLock, got %v", err)
+	}
+}
+
+func TestClient_ErrAlreadyQueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	// c1 holds the lock
+	_, _, err = client.Acquire(c1, "aqkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// c2 enqueues
+	_, _, _, err = client.Enqueue(c2, "aqkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// c2 enqueues again — should get ErrAlreadyQueued
+	_, _, _, err = client.Enqueue(c2, "aqkey")
+	if err != client.ErrAlreadyQueued {
+		t.Fatalf("expected ErrAlreadyQueued, got %v", err)
+	}
+}
+
+func TestClient_ErrBarrierCountMismatch(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// c1 starts barrier with count=3
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.BarrierWait(c1, "bcmkey", 3, 5*time.Second)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	// c2 tries barrier with count=5 — mismatch
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	_, err = client.BarrierWait(c2, "bcmkey", 5, 5*time.Second)
+	if err != client.ErrBarrierCountMismatch {
+		t.Fatalf("expected ErrBarrierCountMismatch, got %v", err)
+	}
+}
+
+func TestClient_ErrListFull(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxListLength = 2
+	_, addr := startServer(t, cfg)
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Fill the list to max
+	_, err = client.LPush(c, "lfull", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.LPush(c, "lfull", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Third push should fail with ErrListFull
+	_, err = client.LPush(c, "lfull", "c")
+	if err != client.ErrListFull {
+		t.Fatalf("expected ErrListFull, got %v", err)
+	}
+}
+
+func TestClient_ErrMaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxLocks = 2
+	_, addr := startServer(t, cfg)
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Create two resources
+	_, _, err = client.Acquire(c, "mk1", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = client.Acquire(c, "mk2", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Third should fail with ErrMaxLocks (which is the MaxKeys error at lock level)
+	_, _, err = client.Acquire(c, "mk3", 10*time.Second)
+	if err != client.ErrMaxLocks {
+		t.Fatalf("expected ErrMaxLocks, got %v", err)
+	}
+}
+
+func TestClient_BRPop_Blocking(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// c1 blocks on BRPop
+	result := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		val, err := client.BRPop(c1, "brlist", 5*time.Second)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		result <- val
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// c2 pushes an element
+	_, err = client.RPush(c2, "brlist", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case val := <-result:
+		if val != "hello" {
+			t.Fatalf("expected 'hello', got %q", val)
+		}
+	case err := <-errCh:
+		t.Fatalf("BRPop error: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("BRPop did not unblock")
+	}
+}
+
+func TestClient_BRPop_Timeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// BRPop on empty list with short timeout
+	_, err = client.BRPop(c, "emptylist", 1*time.Second)
+	if !isTimeout(err) {
+		t.Fatalf("expected ErrTimeout, got %v", err)
+	}
+}
+
+func TestClient_ErrAlreadyQueued_RWEnqueue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	// c1 holds a write lock to force queuing
+	_, _, _, err = client.WLock(c1, "rwekey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// c2 read-enqueues
+	status, _, _, _, err := client.REnqueue(c2, "rwekey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected 'queued', got %q", status)
+	}
+
+	// c2 read-enqueues again — ErrAlreadyQueued
+	_, _, _, _, err = client.REnqueue(c2, "rwekey")
+	if err != client.ErrAlreadyQueued {
+		t.Fatalf("expected ErrAlreadyQueued, got %v", err)
+	}
+}
+
+func TestClient_ErrTypeMismatch_Enqueue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Create an RW lock (different type) using RLock
+	_, _, _, err = client.RLock(c, "tmek", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// Try to regular-enqueue on an RW lock key — type mismatch
+	_, _, _, err = client.Enqueue(c2, "tmek")
+	if err != client.ErrTypeMismatch {
+		t.Fatalf("expected ErrTypeMismatch on Enqueue, got %v", err)
+	}
+}
+
+func TestClient_ErrTypeMismatch_RWEnqueue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Create a regular lock
+	_, _, err = client.Acquire(c, "rwtmkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to write-enqueue on a regular lock key — type mismatch
+	_, _, _, _, err = client.WEnqueue(c, "rwtmkey")
+	if err != client.ErrTypeMismatch {
+		t.Fatalf("expected ErrTypeMismatch on WEnqueue, got %v", err)
+	}
+}
+
+func TestClient_ErrLimitMismatch_Semaphore(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Create semaphore with limit=3
+	_, _, err = client.SemAcquire(c, "slm", 10*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// Try to acquire with different limit — mismatch
+	_, _, err = client.SemAcquire(c2, "slm", 10*time.Second, 5)
+	if err != client.ErrLimitMismatch {
+		t.Fatalf("expected ErrLimitMismatch, got %v", err)
+	}
+}

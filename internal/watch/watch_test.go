@@ -1,6 +1,8 @@
 package watch
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -453,4 +455,142 @@ func TestWatch_StatsAfterUnwatch(t *testing.T) {
 	if len(stats) != 0 {
 		t.Fatalf("expected 0 stats after unwatch, got %d", len(stats))
 	}
+}
+
+func TestWatch_ConcurrentWatchUnwatch(t *testing.T) {
+	m := NewManager()
+	const N = 100
+	var wg sync.WaitGroup
+
+	// Concurrently watch many patterns from many connections
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ch := make(chan []byte, 10)
+			pattern := fmt.Sprintf("key%d", id)
+			m.Watch(&Watcher{ConnID: uint64(id), Pattern: pattern, WriteCh: ch, CancelConn: func() {}})
+		}(i)
+	}
+	wg.Wait()
+
+	// Concurrently unwatch all
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			pattern := fmt.Sprintf("key%d", id)
+			m.Unwatch(pattern, uint64(id))
+		}(i)
+	}
+	wg.Wait()
+
+	stats := m.Stats()
+	if len(stats) != 0 {
+		t.Fatalf("expected 0 stats after concurrent unwatch, got %d", len(stats))
+	}
+}
+
+func TestWatch_ConcurrentNotify(t *testing.T) {
+	m := NewManager()
+	const watchers = 10
+	const notifies = 50
+	channels := make([]chan []byte, watchers)
+
+	for i := 0; i < watchers; i++ {
+		channels[i] = make(chan []byte, notifies*2)
+		m.Watch(&Watcher{
+			ConnID:     uint64(i),
+			Pattern:    "shared",
+			WriteCh:    channels[i],
+			CancelConn: func() {},
+		})
+	}
+
+	// Concurrently send many notifications
+	var wg sync.WaitGroup
+	for i := 0; i < notifies; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.Notify("kset", "shared")
+		}()
+	}
+	wg.Wait()
+
+	// Each watcher should have received exactly notifies messages
+	for i, ch := range channels {
+		got := len(ch)
+		if got != notifies {
+			t.Errorf("watcher %d: expected %d notifications, got %d", i, notifies, got)
+		}
+	}
+}
+
+func TestWatch_ConcurrentWatchAndNotify(t *testing.T) {
+	m := NewManager()
+	const N = 50
+	var wg sync.WaitGroup
+
+	// Concurrently watch and notify at the same time
+	for i := 0; i < N; i++ {
+		wg.Add(2)
+		go func(id int) {
+			defer wg.Done()
+			ch := make(chan []byte, 100)
+			m.Watch(&Watcher{ConnID: uint64(id), Pattern: "race", WriteCh: ch, CancelConn: func() {}})
+		}(i)
+		go func() {
+			defer wg.Done()
+			m.Notify("kset", "race")
+		}()
+	}
+	wg.Wait()
+	// No panics or races = pass
+}
+
+func TestWatch_ConcurrentUnwatchAll(t *testing.T) {
+	m := NewManager()
+	const N = 50
+
+	// Set up watchers with both exact and wildcard patterns
+	for i := 0; i < N; i++ {
+		ch := make(chan []byte, 10)
+		m.Watch(&Watcher{ConnID: uint64(i), Pattern: "exact", WriteCh: ch, CancelConn: func() {}})
+		m.Watch(&Watcher{ConnID: uint64(i), Pattern: "wild.*", WriteCh: ch, CancelConn: func() {}})
+	}
+
+	// Concurrently UnwatchAll for every connection
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			m.UnwatchAll(uint64(id))
+		}(i)
+	}
+	wg.Wait()
+
+	stats := m.Stats()
+	if len(stats) != 0 {
+		t.Fatalf("expected 0 stats after concurrent unwatch all, got %d", len(stats))
+	}
+}
+
+func TestWatch_ConcurrentStats(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 100)
+	m.Watch(&Watcher{ConnID: 1, Pattern: "k1", WriteCh: ch, CancelConn: func() {}})
+	m.Watch(&Watcher{ConnID: 2, Pattern: "k2.*", WriteCh: ch, CancelConn: func() {}})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = m.Stats()
+		}()
+	}
+	wg.Wait()
+	// No panics or races = pass
 }

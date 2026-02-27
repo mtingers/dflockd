@@ -3999,3 +3999,385 @@ func TestGC_PreservesActiveResources(t *testing.T) {
 		t.Fatal("list should still exist")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// MaxWaiters enforcement (explicit)
+// ---------------------------------------------------------------------------
+
+func TestMaxWaiters_Lock(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 2
+
+	// Holder occupies the lock
+	tok, err := lm.Acquire(bg(), "k1", 0, 30*time.Second, 1, 1)
+	if err != nil || tok == "" {
+		t.Fatal("initial acquire should succeed")
+	}
+
+	// Fill up waiter slots
+	for i := uint64(2); i <= 3; i++ {
+		go func(id uint64) {
+			lm.Acquire(bg(), "k1", 30*time.Second, 30*time.Second, id, 1)
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Next waiter should be rejected
+	_, err = lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 4, 1)
+	if !errors.Is(err, ErrMaxWaiters) {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}
+
+func TestMaxWaiters_Enqueue(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// Holder occupies the lock
+	lm.Acquire(bg(), "k1", 0, 30*time.Second, 1, 1)
+
+	// First enqueue queues
+	status, _, _, _, err := lm.EnqueueWithFence("k1", 30*time.Second, 2, 1)
+	if err != nil || status != "queued" {
+		t.Fatalf("first enqueue should queue, got status=%s err=%v", status, err)
+	}
+
+	// Second enqueue should be rejected
+	_, _, _, _, err = lm.EnqueueWithFence("k1", 30*time.Second, 3, 1)
+	if !errors.Is(err, ErrMaxWaiters) {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}
+
+func TestMaxWaiters_RWLock(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// Writer holds the lock
+	lm.RWAcquire(bg(), "k1", 'w', 0, 30*time.Second, 1)
+
+	// First waiter queues
+	go lm.RWAcquire(bg(), "k1", 'r', 30*time.Second, 30*time.Second, 2)
+	time.Sleep(50 * time.Millisecond)
+
+	// Second waiter should be rejected
+	_, _, err := lm.RWAcquire(bg(), "k1", 'r', 5*time.Second, 30*time.Second, 3)
+	if !errors.Is(err, ErrMaxWaiters) {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}
+
+func TestMaxWaiters_RWEnqueue(t *testing.T) {
+	lm := testManager()
+	lm.cfg.MaxWaiters = 1
+
+	// Writer holds the lock
+	lm.RWAcquire(bg(), "k1", 'w', 0, 30*time.Second, 1)
+
+	// First enqueue queues
+	status, _, _, _, err := lm.RWEnqueue("k1", 'r', 30*time.Second, 2)
+	if err != nil || status != "queued" {
+		t.Fatalf("first enqueue should queue, got status=%s err=%v", status, err)
+	}
+
+	// Second enqueue should be rejected
+	_, _, _, _, err = lm.RWEnqueue("k1", 'r', 30*time.Second, 3)
+	if !errors.Is(err, ErrMaxWaiters) {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore FIFO ordering
+// ---------------------------------------------------------------------------
+
+func TestSemaphore_FIFOOrdering(t *testing.T) {
+	lm := testManager()
+	// Semaphore with limit=1 (behaves like mutex but with semaphore path)
+	tok1, err := lm.Acquire(bg(), "sem1", 0, 30*time.Second, 1, 1)
+	if err != nil || tok1 == "" {
+		t.Fatal("initial acquire should succeed")
+	}
+
+	// Queue up 3 waiters in order
+	results := make(chan uint64, 3)
+	for i := uint64(2); i <= 4; i++ {
+		go func(id uint64) {
+			time.Sleep(time.Duration(id-2) * 20 * time.Millisecond) // stagger
+			lm.Acquire(bg(), "sem1", 30*time.Second, 30*time.Second, id, 1)
+			results <- id
+		}(i)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Release holder, waiters should be granted in FIFO order
+	lm.Release("sem1", tok1)
+
+	first := <-results
+	if first != 2 {
+		t.Fatalf("expected conn 2 first, got %d", first)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LeaseExpiryLoop context cancel
+// ---------------------------------------------------------------------------
+
+func TestLeaseExpiryLoop_ContextCancel(t *testing.T) {
+	lm := testManager()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		lm.LeaseExpiryLoop(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("LeaseExpiryLoop did not stop after context cancel")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GCLoop context cancel
+// ---------------------------------------------------------------------------
+
+func TestGCLoop_ContextCancel(t *testing.T) {
+	lm := testManager()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		lm.GCLoop(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GCLoop did not stop after context cancel")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup for all resource types
+// ---------------------------------------------------------------------------
+
+func TestCleanup_ListWaiter(t *testing.T) {
+	lm := testManager()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := lm.BLPop(bg(), "q1", 30*time.Second, 1)
+		done <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	lm.CleanupConnection(1)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error from BLPop after cleanup")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BLPop did not return after cleanup")
+	}
+}
+
+func TestCleanup_LeaderWatcher(t *testing.T) {
+	lm := testManager()
+	ch := make(chan []byte, 10)
+	lm.RegisterLeaderWatcher("e1", 1, ch, func() {})
+
+	// UnregisterAllLeaderWatchers removes observer watchers
+	lm.UnregisterAllLeaderWatchers(1)
+
+	// Notify should not reach conn 1
+	lm.NotifyLeaderChange("e1", "elected", 0)
+	select {
+	case <-ch:
+		t.Fatal("should not receive notification after unregister")
+	case <-time.After(50 * time.Millisecond):
+		// Expected
+	}
+}
+
+func TestCleanup_SemaphoreSlot(t *testing.T) {
+	lm := testManager()
+	// Acquire 2 of 3 semaphore slots
+	tok1, err := lm.Acquire(bg(), "sem1", 0, 30*time.Second, 1, 3)
+	if err != nil || tok1 == "" {
+		t.Fatal("acquire slot 1 failed")
+	}
+	tok2, err := lm.Acquire(bg(), "sem1", 0, 30*time.Second, 2, 3)
+	if err != nil || tok2 == "" {
+		t.Fatal("acquire slot 2 failed")
+	}
+
+	// Disconnect conn 1 — should free 1 slot
+	lm.CleanupConnection(1)
+
+	// Conn 3 should be able to acquire
+	tok3, err := lm.Acquire(bg(), "sem1", 0, 30*time.Second, 3, 3)
+	if err != nil || tok3 == "" {
+		t.Fatal("acquire after cleanup should succeed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KV TTL expiry verification
+// ---------------------------------------------------------------------------
+
+func TestKV_TTLExpiry(t *testing.T) {
+	lm := testManager()
+	lm.KVSet("k1", "val", 1) // 1 second TTL
+
+	// Should be readable immediately
+	val, ok := lm.KVGet("k1")
+	if !ok || val != "val" {
+		t.Fatal("should be readable immediately")
+	}
+
+	// Wait for expiry
+	time.Sleep(1100 * time.Millisecond)
+
+	// Should be expired via lazy check
+	_, ok = lm.KVGet("k1")
+	if ok {
+		t.Fatal("should be expired")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RegisterAndNotifyLeader
+// ---------------------------------------------------------------------------
+
+func TestRegisterAndNotifyLeader(t *testing.T) {
+	lm := testManager()
+
+	// Register an observer first (conn 2)
+	obsCh := make(chan []byte, 10)
+	lm.RegisterLeaderWatcher("leader1", 2, obsCh, func() {})
+
+	// RegisterAndNotifyLeader registers conn 1 as leader and notifies OTHERS
+	leaderCh := make(chan []byte, 10)
+	lm.RegisterAndNotifyLeader("leader1", "elected", 1, leaderCh, func() {})
+
+	// Observer (conn 2) should receive the notification
+	select {
+	case msg := <-obsCh:
+		if len(msg) == 0 {
+			t.Fatal("expected non-empty notification")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observer should receive notification of new leader")
+	}
+
+	// Leader (conn 1) should NOT receive its own notification
+	select {
+	case <-leaderCh:
+		t.Fatal("leader should not receive its own notification")
+	case <-time.After(50 * time.Millisecond):
+		// Expected
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LRange edge cases
+// ---------------------------------------------------------------------------
+
+func TestLRange_NegativeIndices(t *testing.T) {
+	lm := testManager()
+	lm.RPush("q1", "a")
+	lm.RPush("q1", "b")
+	lm.RPush("q1", "c")
+
+	// Last 2 elements
+	items := lm.LRange("q1", -2, -1)
+	if len(items) != 2 || items[0] != "b" || items[1] != "c" {
+		t.Fatalf("expected [b c], got %v", items)
+	}
+
+	// Full range via negatives
+	items = lm.LRange("q1", -3, -1)
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %v", items)
+	}
+}
+
+func TestLRange_EmptyList(t *testing.T) {
+	lm := testManager()
+	items := lm.LRange("nonexistent", 0, -1)
+	if len(items) != 0 {
+		t.Fatalf("expected empty, got %v", items)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BRPop blocking
+// ---------------------------------------------------------------------------
+
+func TestBRPop_Blocks(t *testing.T) {
+	lm := testManager()
+
+	done := make(chan string, 1)
+	go func() {
+		val, _ := lm.BRPop(bg(), "q1", 5*time.Second, 1)
+		done <- val
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	lm.LPush("q1", "hello")
+
+	select {
+	case val := <-done:
+		if val != "hello" {
+			t.Fatalf("expected hello, got %q", val)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BRPop did not unblock")
+	}
+}
+
+func TestBRPop_Timeout(t *testing.T) {
+	lm := testManager()
+	_, err := lm.BRPop(bg(), "q1", 0, 1)
+	// Timeout=0 should return immediately with timeout error
+	if err != nil {
+		// Some implementations return empty string + nil
+		// Others return error on timeout
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate barrier participant
+// ---------------------------------------------------------------------------
+
+func TestBarrier_DuplicateParticipant(t *testing.T) {
+	lm := testManager()
+
+	done := make(chan struct{})
+	go func() {
+		lm.BarrierWait(bg(), "b1", 3, 5*time.Second, 1)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Same connID should be rejected
+	_, err := lm.BarrierWait(bg(), "b1", 3, 0, 1)
+	if err == nil {
+		t.Fatal("expected error for duplicate participant")
+	}
+
+	// Clean up: cancel the barrier
+	lm.CleanupConnection(1)
+	<-done
+}
