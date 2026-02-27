@@ -4592,3 +4592,807 @@ func TestRWLock_LiveWriterStillBlocks(t *testing.T) {
 		t.Fatal("reader 3 was not granted after writer released")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Stress and edge-case tests
+// ---------------------------------------------------------------------------
+
+// TestConcurrent_MixedLockTypes exercises 50 goroutines simultaneously
+// acquiring locks (limit=1), semaphores (limit=3), and RW locks on
+// overlapping keys. The test passes if no panics or deadlocks occur.
+func TestConcurrent_MixedLockTypes(t *testing.T) {
+	lm := testManager()
+	var wg sync.WaitGroup
+	const goroutines = 50
+	const iterations = 50
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			connID := uint64(id + 1)
+			for j := 0; j < iterations; j++ {
+				switch id % 3 {
+				case 0: // mutex
+					key := fmt.Sprintf("mixed-lock-%d", j%5)
+					tok, _ := lm.Acquire(bg(), key, 10*time.Millisecond, 5*time.Second, connID, 1)
+					if tok != "" {
+						lm.Release(key, tok)
+					}
+				case 1: // semaphore
+					key := fmt.Sprintf("mixed-sem-%d", j%5)
+					tok, _ := lm.Acquire(bg(), key, 10*time.Millisecond, 5*time.Second, connID, 3)
+					if tok != "" {
+						lm.Release(key, tok)
+					}
+				case 2: // RW lock
+					key := fmt.Sprintf("mixed-rw-%d", j%5)
+					mode := byte('r')
+					if j%4 == 0 {
+						mode = 'w'
+					}
+					tok, _, err := lm.RWAcquire(bg(), key, mode, 10*time.Millisecond, 5*time.Second, connID)
+					if err == nil && tok != "" {
+						lm.RWRelease(key, tok)
+					}
+				}
+			}
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All goroutines completed without panic or deadlock.
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock: goroutines did not finish within 10s")
+	}
+}
+
+// TestConcurrent_CleanupDuringAcquire starts 10 goroutines attempting to
+// acquire a held lock with a timeout, while concurrently cleaning up some
+// of their connections. The test passes if no panics occur.
+func TestConcurrent_CleanupDuringAcquire(t *testing.T) {
+	lm := testManager()
+	// Hold the lock so all acquires block.
+	tok, err := lm.Acquire(bg(), "cleanup-race", 5*time.Second, 30*time.Second, 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lm.Release("cleanup-race", tok)
+
+	var wg sync.WaitGroup
+	const n = 10
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(bg(), 500*time.Millisecond)
+			defer cancel()
+			lm.Acquire(ctx, "cleanup-race", 500*time.Millisecond, 5*time.Second, uint64(id+1), 1)
+		}(i)
+	}
+
+	// Give goroutines time to enqueue.
+	time.Sleep(50 * time.Millisecond)
+
+	// Clean up half the connections while they are waiting.
+	for i := 0; i < n/2; i++ {
+		lm.CleanupConnection(uint64(i + 1))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// No panics or deadlocks.
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: goroutines did not finish within 5s")
+	}
+}
+
+// TestRWLock_MultipleDeadWriters enqueues reader(1) -> writer(2) ->
+// writer(3) -> reader(4). Connections 2 and 3 are cleaned up (dead
+// writers). When reader 1 releases, reader 4 should be granted because
+// both dead writers are skipped.
+func TestRWLock_MultipleDeadWriters(t *testing.T) {
+	lm := testManager()
+
+	// Reader 1 acquires.
+	tok1, _, err := lm.RWAcquire(bg(), "rw-multi-dead", 'r', 5*time.Second, 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok1 == "" {
+		t.Fatal("expected reader 1 to acquire")
+	}
+
+	// Writer 2 enqueues.
+	status, _, _, _, err := lm.RWEnqueue("rw-multi-dead", 'w', 5*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected writer 2 queued, got %q", status)
+	}
+
+	// Writer 3 enqueues.
+	status, _, _, _, err = lm.RWEnqueue("rw-multi-dead", 'w', 5*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected writer 3 queued, got %q", status)
+	}
+
+	// Reader 4 enqueues.
+	status, _, _, _, err = lm.RWEnqueue("rw-multi-dead", 'r', 5*time.Second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected reader 4 queued, got %q", status)
+	}
+
+	// Kill connections 2 and 3 (dead writers).
+	lm.CleanupConnection(2)
+	lm.CleanupConnection(3)
+
+	// Release reader 1. Dead writers should be skipped, reader 4 granted.
+	if !lm.Release("rw-multi-dead", tok1) {
+		t.Fatal("expected release to succeed")
+	}
+
+	// Reader 4 should be able to Wait and get a token.
+	ctx, cancel := context.WithTimeout(bg(), 2*time.Second)
+	defer cancel()
+	tok4, _, _, err := lm.RWWait(ctx, "rw-multi-dead", 2*time.Second, 4)
+	if err != nil {
+		t.Fatalf("reader 4 wait error: %v", err)
+	}
+	if tok4 == "" {
+		t.Fatal("expected reader 4 to get a token after dead writers skipped")
+	}
+}
+
+// TestRWLock_DeadWriterAmongLiveReaders sets up:
+// writer(1, holding) -> reader(2, queued) -> writer(3, dead) -> reader(4, queued).
+// When writer 1 releases, reader 2 is granted. Writer 3 is dead so it is
+// skipped, and reader 4 should also be batch-granted along with reader 2.
+func TestRWLock_DeadWriterAmongLiveReaders(t *testing.T) {
+	lm := testManager()
+
+	// Writer 1 acquires.
+	tok1, _, err := lm.RWAcquire(bg(), "rw-dead-among", 'w', 5*time.Second, 5*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok1 == "" {
+		t.Fatal("expected writer 1 to acquire")
+	}
+
+	// Reader 2 enqueues.
+	status, _, _, _, err := lm.RWEnqueue("rw-dead-among", 'r', 5*time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected reader 2 queued, got %q", status)
+	}
+
+	// Writer 3 enqueues.
+	status, _, _, _, err = lm.RWEnqueue("rw-dead-among", 'w', 5*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected writer 3 queued, got %q", status)
+	}
+
+	// Reader 4 enqueues.
+	status, _, _, _, err = lm.RWEnqueue("rw-dead-among", 'r', 5*time.Second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected reader 4 queued, got %q", status)
+	}
+
+	// Kill writer 3 (dead writer in the middle of the queue).
+	lm.CleanupConnection(3)
+
+	// Start Wait goroutines for reader 2 and reader 4.
+	reader2Done := make(chan string, 1)
+	reader4Done := make(chan string, 1)
+
+	go func() {
+		tok, _, _, _ := lm.RWWait(bg(), "rw-dead-among", 5*time.Second, 2)
+		reader2Done <- tok
+	}()
+	go func() {
+		tok, _, _, _ := lm.RWWait(bg(), "rw-dead-among", 5*time.Second, 4)
+		reader4Done <- tok
+	}()
+
+	// Release writer 1. Reader 2 should be granted. Dead writer 3 is
+	// skipped, so reader 4 should also be batch-granted.
+	if !lm.RWRelease("rw-dead-among", tok1) {
+		t.Fatal("expected release to succeed")
+	}
+
+	// Reader 2 must be granted.
+	select {
+	case tok2 := <-reader2Done:
+		if tok2 == "" {
+			t.Fatal("expected reader 2 to get a token")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader 2 was not granted within timeout")
+	}
+
+	// Reader 4 must also be granted (writer 3 was dead, so no barrier).
+	select {
+	case tok4 := <-reader4Done:
+		if tok4 == "" {
+			t.Fatal("expected reader 4 to get a token")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader 4 was not granted within timeout")
+	}
+}
+
+// TestLeaseExpiry_SimultaneousMultipleKeys acquires 20 locks with very
+// short lease TTLs, waits for expiry, and verifies all are released.
+func TestLeaseExpiry_SimultaneousMultipleKeys(t *testing.T) {
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+	const n = 20
+
+	tokens := make(map[string]string) // key -> token
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("lease-exp-%d", i)
+		tok, err := lm.Acquire(bg(), key, 5*time.Second, 5*time.Second, uint64(i+1), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tok == "" {
+			t.Fatalf("expected to acquire lock %s", key)
+		}
+		tokens[key] = tok
+	}
+
+	// Manually expire all leases.
+	for key, tok := range tokens {
+		lm.LockKeyForTest(key)
+		st := lm.ResourceForTest(key)
+		if st != nil {
+			st.Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+		}
+		lm.UnlockKeyForTest(key)
+	}
+
+	// Run the expiry loop briefly.
+	ctx, cancel := context.WithCancel(bg())
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		lm.LeaseExpiryLoop(ctx)
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-loopDone
+
+	// Verify all locks are released.
+	for key := range tokens {
+		lm.LockKeyForTest(key)
+		st := lm.ResourceForTest(key)
+		holders := 0
+		if st != nil {
+			holders = len(st.Holders)
+		}
+		lm.UnlockKeyForTest(key)
+		if holders != 0 {
+			t.Errorf("key %s: expected 0 holders, got %d", key, holders)
+		}
+	}
+}
+
+// TestBarrier_ExactlyNParticipants verifies a barrier with N=5 succeeds
+// when exactly 5 goroutines join.
+func TestBarrier_ExactlyNParticipants(t *testing.T) {
+	lm := testManager()
+	const n = 5
+	var wg sync.WaitGroup
+	results := make([]bool, n)
+	errs := make([]error, n)
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			defer wg.Done()
+			ok, err := lm.BarrierWait(bg(), "barrier-exact", n, 5*time.Second, uint64(id+1))
+			results[id] = ok
+			errs[id] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Errorf("participant %d error: %v", i, errs[i])
+		}
+		if !results[i] {
+			t.Errorf("participant %d: barrier did not trip", i)
+		}
+	}
+}
+
+// TestBarrier_ContextCancelPartial launches 2 of 3 required participants,
+// cancels one's context, and verifies:
+//   - The cancelled participant returns an error.
+//   - The remaining participant is also woken (barrier becomes unreachable).
+//   - A fresh barrier on the same key can be created and tripped afterwards.
+func TestBarrier_ContextCancelPartial(t *testing.T) {
+	lm := testManager()
+
+	type result struct {
+		ok  bool
+		err error
+	}
+
+	// Participant 1 waits normally.
+	p1Done := make(chan result, 1)
+	go func() {
+		ok, err := lm.BarrierWait(bg(), "barrier-cancel", 3, 5*time.Second, 1)
+		p1Done <- result{ok, err}
+	}()
+
+	// Participant 2 will be cancelled.
+	ctx2, cancel2 := context.WithCancel(bg())
+	p2Done := make(chan result, 1)
+	go func() {
+		ok, err := lm.BarrierWait(ctx2, "barrier-cancel", 3, 5*time.Second, 2)
+		p2Done <- result{ok, err}
+	}()
+
+	// Give participants time to enqueue.
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel participant 2. This makes the barrier unreachable (count=3
+	// can never be met with only 1 remaining participant), so the barrier
+	// cancels all remaining participants.
+	cancel2()
+
+	select {
+	case r := <-p2Done:
+		if r.err == nil {
+			t.Fatal("expected error from cancelled participant 2")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled participant did not return")
+	}
+
+	// Participant 1 should also be woken because the barrier is now
+	// unreachable (it returns ok=false, err=nil via the Cancelled channel).
+	select {
+	case r := <-p1Done:
+		if r.ok {
+			t.Fatal("participant 1: barrier should not have tripped")
+		}
+		// err may or may not be set, but ok must be false.
+	case <-time.After(2 * time.Second):
+		t.Fatal("participant 1 was not woken after barrier became unreachable")
+	}
+
+	// Now the barrier key is fully cleaned up. A fresh barrier on the
+	// same key should work. Use 3 new participants (3, 4, 5).
+	freshResults := make([]result, 3)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	for i := 0; i < 3; i++ {
+		go func(id int) {
+			defer wg.Done()
+			ok, err := lm.BarrierWait(bg(), "barrier-cancel", 3, 5*time.Second, uint64(id+3))
+			freshResults[id] = result{ok, err}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, r := range freshResults {
+		if r.err != nil {
+			t.Errorf("fresh participant %d error: %v", i+3, r.err)
+		}
+		if !r.ok {
+			t.Errorf("fresh participant %d: barrier did not trip", i+3)
+		}
+	}
+}
+
+// TestKVCAS_ConcurrentSwapMultiRound runs 20 goroutines all attempting CAS
+// on the same key. Exactly one should win per round, across multiple rounds.
+func TestKVCAS_ConcurrentSwapMultiRound(t *testing.T) {
+	lm := testManager()
+	const goroutines = 20
+	const rounds = 10
+
+	for round := 0; round < rounds; round++ {
+		expected := fmt.Sprintf("val-%d", round)
+		next := fmt.Sprintf("val-%d", round+1)
+
+		if round == 0 {
+			lm.KVSet("cas-race", expected, 0)
+		}
+
+		var wg sync.WaitGroup
+		var wins int64
+		wg.Add(goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				defer wg.Done()
+				ok, _ := lm.KVCAS("cas-race", expected, next, 0)
+				if ok {
+					atomic.AddInt64(&wins, 1)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if wins != 1 {
+			t.Fatalf("round %d: expected exactly 1 CAS winner, got %d", round, wins)
+		}
+		val, exists := lm.KVGet("cas-race")
+		if !exists || val != next {
+			t.Fatalf("round %d: expected %q, got %q (exists=%v)", round, next, val, exists)
+		}
+	}
+}
+
+// TestElection_FenceMonotonic elects and resigns a leader 10 times in a
+// row and verifies the fence token strictly increases each time.
+func TestElection_FenceMonotonic(t *testing.T) {
+	lm := testManager()
+	var prevFence uint64
+
+	for i := 0; i < 10; i++ {
+		connID := uint64(i + 1)
+		tok, fence, err := lm.AcquireWithFence(bg(), "elect-fence", 5*time.Second, 30*time.Second, connID, 1)
+		if err != nil {
+			t.Fatalf("iteration %d: acquire error: %v", i, err)
+		}
+		if tok == "" {
+			t.Fatalf("iteration %d: expected token", i)
+		}
+		if fence <= prevFence {
+			t.Fatalf("iteration %d: fence %d not greater than prev %d", i, fence, prevFence)
+		}
+		prevFence = fence
+
+		if !lm.ResignLeader("elect-fence", tok, connID) {
+			t.Fatalf("iteration %d: resign failed", i)
+		}
+	}
+}
+
+// TestList_ConcurrentPushPopStress exercises 20 pushers (100 items each)
+// and 10 poppers concurrently on the same list. All pushed items must be
+// accounted for (pushed - popped = remaining in list).
+func TestList_ConcurrentPushPopStress(t *testing.T) {
+	lm := testManager()
+	const pushers = 20
+	const popsPerPopper = 50
+	const poppers = 10
+	const itemsPerPusher = 100
+
+	var wg sync.WaitGroup
+	var totalPushed int64
+	var totalPopped int64
+
+	// Start pushers.
+	wg.Add(pushers)
+	for i := 0; i < pushers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < itemsPerPusher; j++ {
+				val := fmt.Sprintf("pusher-%d-item-%d", id, j)
+				_, err := lm.RPush("stress-list", val)
+				if err != nil {
+					t.Errorf("push error: %v", err)
+					return
+				}
+				atomic.AddInt64(&totalPushed, 1)
+			}
+		}(i)
+	}
+
+	// Start poppers.
+	wg.Add(poppers)
+	for i := 0; i < poppers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < popsPerPopper; j++ {
+				_, ok := lm.LPop("stress-list")
+				if ok {
+					atomic.AddInt64(&totalPopped, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	remaining := lm.LLen("stress-list")
+	pushed := atomic.LoadInt64(&totalPushed)
+	popped := atomic.LoadInt64(&totalPopped)
+
+	if int64(remaining) != pushed-popped {
+		t.Fatalf("accounting mismatch: pushed=%d popped=%d remaining=%d (expected %d)",
+			pushed, popped, remaining, pushed-popped)
+	}
+}
+
+// TestSemaphore_ConcurrentContention creates a semaphore with limit=3 and
+// launches 20 goroutines all trying to acquire. An atomic counter tracks
+// concurrent holders and verifies the count never exceeds the limit.
+func TestSemaphore_ConcurrentContention(t *testing.T) {
+	lm := testManager()
+	const limit = 3
+	const goroutines = 20
+	const iterations = 20
+
+	var concurrent int64
+	var maxSeen int64
+	var wg sync.WaitGroup
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			connID := uint64(id + 1)
+			for j := 0; j < iterations; j++ {
+				tok, err := lm.Acquire(bg(), "sem-contention", 2*time.Second, 5*time.Second, connID, limit)
+				if err != nil {
+					t.Errorf("goroutine %d iter %d: acquire error: %v", id, j, err)
+					return
+				}
+				if tok == "" {
+					// Timeout, try again.
+					continue
+				}
+
+				cur := atomic.AddInt64(&concurrent, 1)
+				// Track max.
+				for {
+					old := atomic.LoadInt64(&maxSeen)
+					if cur <= old || atomic.CompareAndSwapInt64(&maxSeen, old, cur) {
+						break
+					}
+				}
+
+				if cur > int64(limit) {
+					t.Errorf("concurrent holders %d exceeds limit %d", cur, limit)
+				}
+
+				// Hold briefly.
+				time.Sleep(time.Millisecond)
+				atomic.AddInt64(&concurrent, -1)
+
+				lm.Release("sem-contention", tok)
+			}
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All goroutines completed.
+	case <-time.After(30 * time.Second):
+		t.Fatal("deadlock: goroutines did not finish within 30s")
+	}
+
+	if atomic.LoadInt64(&maxSeen) > int64(limit) {
+		t.Fatalf("max concurrent holders %d exceeded limit %d", maxSeen, limit)
+	}
+}
+
+// TestCleanup_ConcurrentCleanupSameConn calls CleanupConnection with the
+// same connID from multiple goroutines simultaneously. The test passes if
+// there are no panics or data races.
+func TestCleanup_ConcurrentCleanupSameConn(t *testing.T) {
+	lm := testManager()
+
+	// Acquire several resources under connID 1.
+	lm.Acquire(bg(), "cc-lock", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "cc-sem", 5*time.Second, 30*time.Second, 1, 3)
+	lm.RWAcquire(bg(), "cc-rw", 'r', 5*time.Second, 30*time.Second, 1)
+
+	var wg sync.WaitGroup
+	const goroutines = 10
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			lm.CleanupConnection(1)
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// No panics or races.
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: concurrent cleanup did not finish within 5s")
+	}
+}
+
+// TestFencingToken_GloballyIncreasing acquires locks across multiple
+// different keys and verifies that fence tokens are globally monotonically
+// increasing (since they come from a single atomic counter).
+func TestFencingToken_GloballyIncreasing(t *testing.T) {
+	lm := testManager()
+
+	var prevFence uint64
+	keys := []string{"fence-a", "fence-b", "fence-c", "fence-d", "fence-e"}
+
+	for i, key := range keys {
+		connID := uint64(i + 1)
+		tok, fence, err := lm.AcquireWithFence(bg(), key, 5*time.Second, 30*time.Second, connID, 1)
+		if err != nil {
+			t.Fatalf("key %s: acquire error: %v", key, err)
+		}
+		if tok == "" {
+			t.Fatalf("key %s: expected token", key)
+		}
+		if fence <= prevFence {
+			t.Fatalf("key %s: fence %d not greater than prev %d", key, fence, prevFence)
+		}
+		prevFence = fence
+	}
+
+	// Also verify across RW locks and semaphores.
+	rwtok, rwfence, err := lm.RWAcquire(bg(), "fence-rw", 'w', 5*time.Second, 30*time.Second, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rwtok == "" {
+		t.Fatal("expected rw token")
+	}
+	if rwfence <= prevFence {
+		t.Fatalf("rw fence %d not greater than prev %d", rwfence, prevFence)
+	}
+	prevFence = rwfence
+
+	// Semaphore acquire via AcquireWithFence.
+	semtok, semfence, err := lm.AcquireWithFence(bg(), "fence-sem", 5*time.Second, 30*time.Second, 200, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if semtok == "" {
+		t.Fatal("expected sem token")
+	}
+	if semfence <= prevFence {
+		t.Fatalf("sem fence %d not greater than prev %d", semfence, prevFence)
+	}
+}
+
+// TestStats_ComprehensiveUnderLoad acquires various lock types, runs
+// Stats(), and verifies the returned fields are populated correctly.
+func TestStats_ComprehensiveUnderLoad(t *testing.T) {
+	lm := testManager()
+
+	// Create a mutex lock.
+	lm.Acquire(bg(), "stat-lock-1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Acquire(bg(), "stat-lock-2", 5*time.Second, 30*time.Second, 2, 1)
+
+	// Create semaphores.
+	lm.Acquire(bg(), "stat-sem-1", 5*time.Second, 30*time.Second, 3, 3)
+	lm.Acquire(bg(), "stat-sem-1", 5*time.Second, 30*time.Second, 4, 3)
+
+	// Create an RW lock.
+	lm.RWAcquire(bg(), "stat-rw-1", 'r', 5*time.Second, 30*time.Second, 5)
+	lm.RWAcquire(bg(), "stat-rw-1", 'r', 5*time.Second, 30*time.Second, 6)
+
+	// Create an idle lock (acquire then release).
+	idleTok, _ := lm.Acquire(bg(), "stat-idle", 5*time.Second, 30*time.Second, 7, 1)
+	lm.Release("stat-idle", idleTok)
+
+	// Create counters.
+	lm.Incr("stat-counter", 42)
+
+	// Create KV entries.
+	lm.KVSet("stat-kv", "value", 0)
+
+	// Create lists.
+	lm.RPush("stat-list", "item1")
+	lm.RPush("stat-list", "item2")
+
+	// Create a barrier (1 of 2 participants waiting).
+	go func() {
+		lm.BarrierWait(bg(), "stat-barrier", 2, 2*time.Second, 10)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	stats := lm.Stats(10)
+
+	// Verify connections.
+	if stats.Connections != 10 {
+		t.Errorf("connections: got %d, want 10", stats.Connections)
+	}
+
+	// Verify locks (mutex + idle should both appear somewhere).
+	if len(stats.Locks) < 2 {
+		t.Errorf("locks: got %d, want >= 2", len(stats.Locks))
+	}
+
+	// Verify semaphores.
+	foundSem := false
+	for _, s := range stats.Semaphores {
+		if s.Key == "stat-sem-1" {
+			foundSem = true
+		}
+	}
+	if !foundSem {
+		t.Error("stat-sem-1 not found in semaphores")
+	}
+
+	// Verify RW locks.
+	foundRW := false
+	for _, rw := range stats.RWLocks {
+		if rw.Key == "stat-rw-1" {
+			foundRW = true
+		}
+	}
+	if !foundRW {
+		t.Error("stat-rw-1 not found in rw_locks")
+	}
+
+	// Verify idle locks.
+	foundIdle := false
+	for _, il := range stats.IdleLocks {
+		if il.Key == "stat-idle" {
+			foundIdle = true
+		}
+	}
+	if !foundIdle {
+		t.Error("stat-idle not found in idle_locks")
+	}
+
+	// Verify counters.
+	if len(stats.Counters) < 1 {
+		t.Errorf("counters: got %d, want >= 1", len(stats.Counters))
+	}
+
+	// Verify KV entries.
+	if len(stats.KVEntries) < 1 {
+		t.Errorf("kv_entries: got %d, want >= 1", len(stats.KVEntries))
+	}
+
+	// Verify lists.
+	if len(stats.Lists) < 1 {
+		t.Errorf("lists: got %d, want >= 1", len(stats.Lists))
+	}
+
+	// Verify barriers.
+	if len(stats.Barriers) < 1 {
+		t.Errorf("barriers: got %d, want >= 1", len(stats.Barriers))
+	}
+}

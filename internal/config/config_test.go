@@ -497,3 +497,291 @@ func TestLoad_MaxSubscriptionsNegativeInvalid(t *testing.T) {
 		t.Fatal("expected error for negative max-subscriptions")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Edge-case tests
+// ---------------------------------------------------------------------------
+
+func TestLoad_TLSCertNoKey(t *testing.T) {
+	// Config doesn't cross-validate TLS cert/key; it just stores them
+	// independently. Verify each can be set without the other.
+	t.Run("cert_only", func(t *testing.T) {
+		cfg, err := Load([]string{"--tls-cert", "/path/to/cert.pem"})
+		if err != nil {
+			t.Fatalf("tls-cert without tls-key should be accepted: %v", err)
+		}
+		if cfg.TLSCert != "/path/to/cert.pem" {
+			t.Fatalf("tls-cert: got %q, want %q", cfg.TLSCert, "/path/to/cert.pem")
+		}
+		if cfg.TLSKey != "" {
+			t.Fatalf("tls-key should be empty, got %q", cfg.TLSKey)
+		}
+	})
+
+	t.Run("key_only", func(t *testing.T) {
+		cfg, err := Load([]string{"--tls-key", "/path/to/key.pem"})
+		if err != nil {
+			t.Fatalf("tls-key without tls-cert should be accepted: %v", err)
+		}
+		if cfg.TLSKey != "/path/to/key.pem" {
+			t.Fatalf("tls-key: got %q, want %q", cfg.TLSKey, "/path/to/key.pem")
+		}
+		if cfg.TLSCert != "" {
+			t.Fatalf("tls-cert should be empty, got %q", cfg.TLSCert)
+		}
+	})
+
+	t.Run("both_set", func(t *testing.T) {
+		cfg, err := Load([]string{
+			"--tls-cert", "/path/to/cert.pem",
+			"--tls-key", "/path/to/key.pem",
+		})
+		if err != nil {
+			t.Fatalf("tls-cert + tls-key should be accepted: %v", err)
+		}
+		if cfg.TLSCert != "/path/to/cert.pem" {
+			t.Fatalf("tls-cert: got %q", cfg.TLSCert)
+		}
+		if cfg.TLSKey != "/path/to/key.pem" {
+			t.Fatalf("tls-key: got %q", cfg.TLSKey)
+		}
+	})
+}
+
+func TestLoad_AllMaxValues(t *testing.T) {
+	// Set all max-* flags to large (but safe) values and verify they parse.
+	bigInt := "999999999"
+	cfg, err := Load([]string{
+		"--max-locks", bigInt,
+		"--max-keys", bigInt,
+		"--max-list-length", bigInt,
+		"--max-connections", bigInt,
+		"--max-waiters", bigInt,
+		"--max-subscriptions", bigInt,
+	})
+	if err != nil {
+		t.Fatalf("all max values should parse: %v", err)
+	}
+	if cfg.MaxLocks != 999999999 {
+		t.Errorf("max-locks: got %d, want 999999999", cfg.MaxLocks)
+	}
+	if cfg.MaxKeys != 999999999 {
+		t.Errorf("max-keys: got %d, want 999999999", cfg.MaxKeys)
+	}
+	if cfg.MaxListLength != 999999999 {
+		t.Errorf("max-list-length: got %d, want 999999999", cfg.MaxListLength)
+	}
+	if cfg.MaxConnections != 999999999 {
+		t.Errorf("max-connections: got %d, want 999999999", cfg.MaxConnections)
+	}
+	if cfg.MaxWaiters != 999999999 {
+		t.Errorf("max-waiters: got %d, want 999999999", cfg.MaxWaiters)
+	}
+	if cfg.MaxSubscriptions != 999999999 {
+		t.Errorf("max-subscriptions: got %d, want 999999999", cfg.MaxSubscriptions)
+	}
+}
+
+func TestLoad_ZeroValues(t *testing.T) {
+	// All zero-able values should be accepted (0 = unlimited for these).
+	cfg, err := Load([]string{
+		"--max-keys", "0",
+		"--max-list-length", "0",
+		"--max-connections", "0",
+		"--max-waiters", "0",
+		"--max-subscriptions", "0",
+		"--write-timeout", "0",
+		"--shutdown-timeout", "0",
+	})
+	if err != nil {
+		t.Fatalf("zero values should be accepted: %v", err)
+	}
+	if cfg.MaxKeys != 0 {
+		t.Errorf("max-keys: got %d, want 0", cfg.MaxKeys)
+	}
+	if cfg.MaxListLength != 0 {
+		t.Errorf("max-list-length: got %d, want 0", cfg.MaxListLength)
+	}
+	if cfg.MaxConnections != 0 {
+		t.Errorf("max-connections: got %d, want 0", cfg.MaxConnections)
+	}
+	if cfg.MaxWaiters != 0 {
+		t.Errorf("max-waiters: got %d, want 0", cfg.MaxWaiters)
+	}
+	if cfg.MaxSubscriptions != 0 {
+		t.Errorf("max-subscriptions: got %d, want 0", cfg.MaxSubscriptions)
+	}
+	if cfg.WriteTimeout != 0 {
+		t.Errorf("write-timeout: got %v, want 0", cfg.WriteTimeout)
+	}
+	if cfg.ShutdownTimeout != 0 {
+		t.Errorf("shutdown-timeout: got %v, want 0", cfg.ShutdownTimeout)
+	}
+}
+
+func TestLoad_AuthTokenFile_EmptyFile(t *testing.T) {
+	tmpFile := t.TempDir() + "/empty_token.txt"
+	if err := os.WriteFile(tmpFile, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load([]string{"--auth-token-file", tmpFile})
+	if err != nil {
+		t.Fatalf("empty auth token file should be accepted: %v", err)
+	}
+	if cfg.AuthToken != "" {
+		t.Fatalf("auth-token: got %q, want empty string", cfg.AuthToken)
+	}
+}
+
+func TestLoad_AuthTokenFile_WithNewlines(t *testing.T) {
+	tmpFile := t.TempDir() + "/token_newlines.txt"
+	if err := os.WriteFile(tmpFile, []byte("my-secret-token\n\n\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load([]string{"--auth-token-file", tmpFile})
+	if err != nil {
+		t.Fatalf("auth token file with newlines should be accepted: %v", err)
+	}
+	if cfg.AuthToken != "my-secret-token" {
+		t.Fatalf("auth-token: got %q, want %q (trailing newlines should be trimmed)",
+			cfg.AuthToken, "my-secret-token")
+	}
+}
+
+func TestLoad_EnvVarPrecedence_AllTypes(t *testing.T) {
+	// Test that env vars override defaults for int, bool, string, duration types.
+
+	t.Run("int", func(t *testing.T) {
+		t.Setenv("DFLOCKD_MAX_LOCKS", "8192")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.MaxLocks != 8192 {
+			t.Errorf("max-locks: got %d, want 8192 (env override)", cfg.MaxLocks)
+		}
+	})
+
+	t.Run("bool", func(t *testing.T) {
+		t.Setenv("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "false")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AutoReleaseOnDisconnect {
+			t.Error("auto-release: got true, want false (env override)")
+		}
+	})
+
+	t.Run("string", func(t *testing.T) {
+		t.Setenv("DFLOCKD_HOST", "192.168.1.100")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Host != "192.168.1.100" {
+			t.Errorf("host: got %q, want %q (env override)", cfg.Host, "192.168.1.100")
+		}
+	})
+
+	t.Run("duration", func(t *testing.T) {
+		t.Setenv("DFLOCKD_DEFAULT_LEASE_TTL_S", "999")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DefaultLeaseTTL != 999*time.Second {
+			t.Errorf("default-lease-ttl: got %v, want %v (env override)",
+				cfg.DefaultLeaseTTL, 999*time.Second)
+		}
+	})
+}
+
+func TestLoad_FlagOverridesEnvVar_AllTypes(t *testing.T) {
+	// Explicit flags should override env vars for all types.
+
+	t.Run("int", func(t *testing.T) {
+		t.Setenv("DFLOCKD_MAX_LOCKS", "8192")
+		cfg, err := Load([]string{"--max-locks", "256"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.MaxLocks != 256 {
+			t.Errorf("max-locks: got %d, want 256 (flag should override env)", cfg.MaxLocks)
+		}
+	})
+
+	t.Run("bool", func(t *testing.T) {
+		t.Setenv("DFLOCKD_DEBUG", "true")
+		cfg, err := Load([]string{"--debug=false"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Debug {
+			t.Error("debug: got true, want false (flag should override env)")
+		}
+	})
+
+	t.Run("string", func(t *testing.T) {
+		t.Setenv("DFLOCKD_HOST", "192.168.1.100")
+		cfg, err := Load([]string{"--host", "10.0.0.1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Host != "10.0.0.1" {
+			t.Errorf("host: got %q, want %q (flag should override env)", cfg.Host, "10.0.0.1")
+		}
+	})
+
+	t.Run("duration", func(t *testing.T) {
+		t.Setenv("DFLOCKD_DEFAULT_LEASE_TTL_S", "999")
+		cfg, err := Load([]string{"--default-lease-ttl", "15"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DefaultLeaseTTL != 15*time.Second {
+			t.Errorf("default-lease-ttl: got %v, want %v (flag should override env)",
+				cfg.DefaultLeaseTTL, 15*time.Second)
+		}
+	})
+}
+
+func TestLoad_DebugFlag(t *testing.T) {
+	// --debug should set Debug=true
+	cfg, err := Load([]string{"--debug"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Debug {
+		t.Error("debug: got false, want true")
+	}
+
+	// Without --debug, it should default to false
+	cfg, err = Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Debug {
+		t.Error("debug: got true, want false (default)")
+	}
+}
+
+func TestLoad_ShutdownTimeoutZero(t *testing.T) {
+	cfg, err := Load([]string{"--shutdown-timeout", "0"})
+	if err != nil {
+		t.Fatalf("shutdown-timeout=0 should be valid (means wait forever): %v", err)
+	}
+	if cfg.ShutdownTimeout != 0 {
+		t.Fatalf("shutdown-timeout: got %v, want 0", cfg.ShutdownTimeout)
+	}
+}
+
+func TestLoad_WriteTimeoutZero(t *testing.T) {
+	cfg, err := Load([]string{"--write-timeout", "0"})
+	if err != nil {
+		t.Fatalf("write-timeout=0 should be valid (disables write timeout): %v", err)
+	}
+	if cfg.WriteTimeout != 0 {
+		t.Fatalf("write-timeout: got %v, want 0", cfg.WriteTimeout)
+	}
+}

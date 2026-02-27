@@ -3664,3 +3664,1042 @@ func TestElection_ResignReleasesLeadership(t *testing.T) {
 		t.Fatal("e2 expected IsLeader() to be true")
 	}
 }
+
+// ===========================================================================
+// New comprehensive tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 1. TestRWLock_ReadAcquireRelease
+// ---------------------------------------------------------------------------
+
+func TestRWLock_ReadAcquireRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	rw := &client.RWLock{
+		Key:     "rw-read-ar",
+		Servers: []string{addr},
+	}
+	defer rw.Close()
+
+	ok, err := rw.RLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected RLock to succeed")
+	}
+	if rw.Token() == "" {
+		t.Fatal("expected non-empty token after RLock")
+	}
+	if rw.Fence() == 0 {
+		t.Fatal("expected non-zero fence after RLock")
+	}
+
+	if err := rw.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rw.Token() != "" {
+		t.Fatal("expected empty token after Unlock")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2. TestRWLock_WriteAcquireRelease
+// ---------------------------------------------------------------------------
+
+func TestRWLock_WriteAcquireRelease(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	rw := &client.RWLock{
+		Key:     "rw-write-ar",
+		Servers: []string{addr},
+	}
+	defer rw.Close()
+
+	ok, err := rw.WLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected WLock to succeed")
+	}
+	if rw.Token() == "" {
+		t.Fatal("expected non-empty token after WLock")
+	}
+	if rw.Fence() == 0 {
+		t.Fatal("expected non-zero fence after WLock")
+	}
+
+	if err := rw.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rw.Token() != "" {
+		t.Fatal("expected empty token after Unlock")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 3. TestRWLock_ConcurrentReaders_Both
+// ---------------------------------------------------------------------------
+
+func TestRWLock_ConcurrentReaders_Both(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Two readers on the same key should both acquire simultaneously.
+	rw1 := &client.RWLock{
+		Key:     "rw-conc-readers",
+		Servers: []string{addr},
+	}
+	defer rw1.Close()
+
+	rw2 := &client.RWLock{
+		Key:     "rw-conc-readers",
+		Servers: []string{addr},
+	}
+	defer rw2.Close()
+
+	ok1, err := rw1.RLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok1 {
+		t.Fatal("rw1 RLock failed")
+	}
+
+	// Second reader should also succeed while first is held.
+	ok2, err := rw2.RLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok2 {
+		t.Fatal("rw2 RLock failed — concurrent readers should both succeed")
+	}
+
+	if rw1.Token() == "" || rw2.Token() == "" {
+		t.Fatal("both readers should have non-empty tokens")
+	}
+
+	if err := rw1.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw2.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 4. TestRWLock_WriterBlocksReader
+// ---------------------------------------------------------------------------
+
+func TestRWLock_WriterBlocksReader(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	writer := &client.RWLock{
+		Key:     "rw-writer-blocks",
+		Servers: []string{addr},
+	}
+	defer writer.Close()
+
+	ok, err := writer.WLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("writer WLock failed")
+	}
+
+	// Reader with very short timeout should fail because writer holds the lock.
+	reader := &client.RWLock{
+		Key:            "rw-writer-blocks",
+		Servers:        []string{addr},
+		AcquireTimeout: 1 * time.Millisecond,
+	}
+	defer reader.Close()
+
+	ok, err = reader.RLock(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected reader to fail while writer holds lock")
+	}
+
+	if err := writer.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 5. TestRWLock_ContextCancel
+// ---------------------------------------------------------------------------
+
+func TestRWLock_ContextCancel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Writer holds the lock.
+	writer := &client.RWLock{
+		Key:     "rw-ctx-cancel",
+		Servers: []string{addr},
+	}
+	defer writer.Close()
+
+	ok, err := writer.WLock(context.Background())
+	if err != nil || !ok {
+		t.Fatal("writer WLock failed")
+	}
+
+	// Reader tries to acquire with a context we cancel.
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &client.RWLock{
+		Key:            "rw-ctx-cancel",
+		Servers:        []string{addr},
+		AcquireTimeout: 30 * time.Second, // long timeout
+	}
+	defer reader.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := reader.RLock(ctx)
+		if err == nil {
+			t.Error("expected error from cancelled context")
+		}
+	}()
+
+	// Give the RLock time to connect and start waiting.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// Success.
+	case <-time.After(3 * time.Second):
+		t.Fatal("RLock did not return after context cancellation")
+	}
+
+	if err := writer.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. TestElection_MultipleContenders
+// ---------------------------------------------------------------------------
+
+func TestElection_MultipleContenders(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// First contender campaigns and wins.
+	e1 := &client.Election{
+		Key:     "election-multi",
+		Servers: []string{addr},
+	}
+	defer e1.Close()
+
+	ok, err := e1.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("e1 expected to be elected")
+	}
+	if !e1.IsLeader() {
+		t.Fatal("e1 expected IsLeader() to be true")
+	}
+
+	// Second contender campaigns with short timeout and should fail (times out).
+	e2 := &client.Election{
+		Key:            "election-multi",
+		Servers:        []string{addr},
+		AcquireTimeout: 1 * time.Millisecond,
+	}
+	defer e2.Close()
+
+	ok, err = e2.Campaign(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("e2 should not win while e1 holds leadership")
+	}
+	if e2.IsLeader() {
+		t.Fatal("e2 should not be leader")
+	}
+
+	if err := e1.Resign(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 7. TestElection_ReelectAfterResign
+// ---------------------------------------------------------------------------
+
+func TestElection_ReelectAfterResign(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	e := &client.Election{
+		Key:     "election-reelect",
+		Servers: []string{addr},
+	}
+	defer e.Close()
+
+	// First campaign.
+	ok, err := e.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("first campaign failed")
+	}
+	fence1 := e.Fence()
+	if fence1 == 0 {
+		t.Fatal("expected non-zero fence on first campaign")
+	}
+
+	// Resign.
+	if err := e.Resign(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second campaign.
+	ok, err = e.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("second campaign failed")
+	}
+	fence2 := e.Fence()
+	if fence2 == 0 {
+		t.Fatal("expected non-zero fence on second campaign")
+	}
+	if fence2 <= fence1 {
+		t.Fatalf("fence should increase after re-election: %d -> %d", fence1, fence2)
+	}
+
+	if err := e.Resign(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 8. TestElection_OnElectedOnResignedCallbacks
+// ---------------------------------------------------------------------------
+
+func TestElection_OnElectedOnResignedCallbacks(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	electedCh := make(chan struct{}, 1)
+	resignedCh := make(chan struct{}, 1)
+
+	e := &client.Election{
+		Key:     "election-callbacks",
+		Servers: []string{addr},
+		OnElected: func() {
+			electedCh <- struct{}{}
+		},
+		OnResigned: func() {
+			resignedCh <- struct{}{}
+		},
+	}
+	defer e.Close()
+
+	// Campaign should trigger OnElected.
+	ok, err := e.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected to be elected")
+	}
+
+	select {
+	case <-electedCh:
+		// OnElected fired correctly.
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnElected callback was not called")
+	}
+
+	// OnResigned should NOT have fired yet.
+	select {
+	case <-resignedCh:
+		t.Fatal("OnResigned should not have fired before Resign")
+	default:
+		// Good.
+	}
+
+	// Resign should trigger OnResigned.
+	if err := e.Resign(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-resignedCh:
+		// OnResigned fired correctly.
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnResigned callback was not called")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 9. TestWatchConn_MultiplePatterns
+// ---------------------------------------------------------------------------
+
+func TestWatchConn_MultiplePatterns(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	wc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch := client.NewWatchConn(wc)
+	defer watch.Close()
+
+	// Watch two different patterns.
+	if err := watch.Watch("alpha.*"); err != nil {
+		t.Fatal(err)
+	}
+	if err := watch.Watch("beta.*"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Separate connection to trigger events.
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Trigger events on both patterns.
+	if err := client.KVSet(c, "alpha.one", "val1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.KVSet(c, "beta.two", "val2", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		select {
+		case evt := <-watch.Events():
+			received[evt.Key] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for watch event %d", i)
+		}
+	}
+
+	if !received["alpha.one"] {
+		t.Fatal("did not receive event for alpha.one")
+	}
+	if !received["beta.two"] {
+		t.Fatal("did not receive event for beta.two")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 10. TestWatchConn_WildcardPattern
+// ---------------------------------------------------------------------------
+
+func TestWatchConn_WildcardPattern(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	wc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch := client.NewWatchConn(wc)
+	defer watch.Close()
+
+	// Watch "*.events" — should match keys like "foo.events".
+	if err := watch.Watch("*.events"); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Trigger "foo.events" — should be received.
+	if err := client.KVSet(c, "foo.events", "val1", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case evt := <-watch.Events():
+		if evt.Key != "foo.events" {
+			t.Fatalf("expected key foo.events, got %q", evt.Key)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for foo.events watch event")
+	}
+
+	// Trigger "foo.bar" — should NOT match "*.events".
+	if err := client.KVSet(c, "foo.bar", "val2", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case evt := <-watch.Events():
+		t.Fatalf("should not receive event for foo.bar, got %+v", evt)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: no event.
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. TestSignalConn_QueueGroupFairness
+// ---------------------------------------------------------------------------
+
+func TestSignalConn_QueueGroupFairness(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Two listeners in same queue group.
+	lc1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc1 := client.NewSignalConn(lc1)
+	defer sc1.Close()
+
+	lc2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc2 := client.NewSignalConn(lc2)
+	defer sc2.Close()
+
+	if err := sc1.Listen("fairness.ch", client.WithGroup("fairgrp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc2.Listen("fairness.ch", client.WithGroup("fairgrp")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emitter.
+	ec, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ec.Close()
+
+	const totalSignals = 20
+	for i := 0; i < totalSignals; i++ {
+		n, err := client.Emit(ec, "fairness.ch", fmt.Sprintf("msg-%d", i))
+		if err != nil {
+			t.Fatalf("emit %d: %v", i, err)
+		}
+		if n != 1 {
+			t.Fatalf("expected 1 receiver per emit (queue group), got %d", n)
+		}
+	}
+
+	// Collect signals from both listeners.
+	var count1, count2 int
+	timeout := time.After(5 * time.Second)
+	for count1+count2 < totalSignals {
+		select {
+		case _, ok := <-sc1.Signals():
+			if ok {
+				count1++
+			}
+		case _, ok := <-sc2.Signals():
+			if ok {
+				count2++
+			}
+		case <-timeout:
+			t.Fatalf("timeout: received %d/%d signals (sc1=%d, sc2=%d)", count1+count2, totalSignals, count1, count2)
+		}
+	}
+
+	// Both should have received roughly half. Allow generous tolerance.
+	if count1 == 0 || count2 == 0 {
+		t.Fatalf("one listener got zero signals — not fair: sc1=%d, sc2=%d", count1, count2)
+	}
+	if count1+count2 != totalSignals {
+		t.Fatalf("expected %d total signals, got %d (sc1=%d, sc2=%d)", totalSignals, count1+count2, count1, count2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 12. TestLeaderConn_RenewLeadership
+// ---------------------------------------------------------------------------
+
+func TestLeaderConn_RenewLeadership(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc := client.NewLeaderConn(c)
+	defer lc.Close()
+
+	token, _, fence, err := lc.Elect("leader-renew", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// Renew — token should stay the same but lease is refreshed.
+	remaining, renewFence, err := lc.Renew("leader-renew", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence should be same after renew: %d vs %d", fence, renewFence)
+	}
+
+	// Renew again to confirm stability.
+	remaining2, renewFence2, err := lc.Renew("leader-renew", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining2 <= 0 {
+		t.Fatalf("expected positive remaining on second renew, got %d", remaining2)
+	}
+	if renewFence2 != fence {
+		t.Fatalf("fence should remain stable: %d vs %d", fence, renewFence2)
+	}
+
+	if err := lc.Resign("leader-renew", token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 13. TestClient_BLPop_ConcurrentPushPop
+// ---------------------------------------------------------------------------
+
+func TestClient_BLPop_ConcurrentPushPop(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// Goroutine blocks on BLPop on an empty list.
+	result := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		val, err := client.BLPop(c1, "blpop-conc", 5*time.Second)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		result <- val
+	}()
+
+	// After a delay, push a value from another connection.
+	time.Sleep(100 * time.Millisecond)
+	if _, err := client.RPush(c2, "blpop-conc", "pushed-value"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case val := <-result:
+		if val != "pushed-value" {
+			t.Fatalf("expected 'pushed-value', got %q", val)
+		}
+	case err := <-errCh:
+		t.Fatalf("BLPop error: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("BLPop did not return after push")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 14. TestClient_KVSetGetDel_Lifecycle
+// ---------------------------------------------------------------------------
+
+func TestClient_KVSetGetDel_Lifecycle(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Set.
+	if err := client.KVSet(c, "lifecycle-key", "hello-world", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get — verify value.
+	val, err := client.KVGet(c, "lifecycle-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "hello-world" {
+		t.Fatalf("expected 'hello-world', got %q", val)
+	}
+
+	// Delete.
+	if err := client.KVDel(c, "lifecycle-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get after delete — should be not found.
+	_, err = client.KVGet(c, "lifecycle-key")
+	if err != client.ErrNotFound {
+		t.Fatalf("expected ErrNotFound after delete, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 15. TestClient_KVCAS_RetryLoop
+// ---------------------------------------------------------------------------
+
+func TestClient_KVCAS_RetryLoop(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Set the initial value.
+	c0, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c0.Close()
+	if err := client.KVSet(c0, "cas-retry", "0", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3 goroutines each try to CAS-increment the value.
+	const numGoroutines = 3
+	const incrementsPerGoroutine = 5
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gc, err := client.Dial(addr)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer gc.Close()
+
+			for i := 0; i < incrementsPerGoroutine; i++ {
+				for attempts := 0; attempts < 100; attempts++ {
+					oldVal, err := client.KVGet(gc, "cas-retry")
+					if err != nil {
+						errCh <- err
+						return
+					}
+					var n int
+					fmt.Sscanf(oldVal, "%d", &n)
+					newVal := fmt.Sprintf("%d", n+1)
+					ok, err := client.KVCAS(gc, "cas-retry", oldVal, newVal, 0)
+					if err != nil {
+						errCh <- err
+						return
+					}
+					if ok {
+						break // success
+					}
+					// CAS conflict — retry
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Final value should be numGoroutines * incrementsPerGoroutine.
+	finalVal, err := client.KVGet(c0, "cas-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := fmt.Sprintf("%d", numGoroutines*incrementsPerGoroutine)
+	if finalVal != expected {
+		t.Fatalf("expected %s, got %s", expected, finalVal)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 16. TestClient_BarrierWait_Concurrent
+// ---------------------------------------------------------------------------
+
+func TestClient_BarrierWait_Concurrent(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	const n = 3
+	var wg sync.WaitGroup
+	results := make([]bool, n)
+	errs := make([]error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			defer c.Close()
+
+			ok, err := client.BarrierWait(c, "barrier-conc", n, 5*time.Second)
+			results[idx] = ok
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("participant %d error: %v", i, errs[i])
+		}
+		if !results[i] {
+			t.Fatalf("participant %d: expected barrier to trip", i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 17. TestClient_LRange_VariousIndices
+// ---------------------------------------------------------------------------
+
+func TestClient_LRange_VariousIndices(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Push 5 items: [a, b, c, d, e]
+	for _, v := range []string{"a", "b", "c", "d", "e"} {
+		if _, err := client.RPush(c, "lr-test", v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		start, stop int
+		expected    []string
+	}{
+		{0, -1, []string{"a", "b", "c", "d", "e"}},   // all
+		{0, 0, []string{"a"}},                          // first only
+		{0, 2, []string{"a", "b", "c"}},                // first three
+		{1, 3, []string{"b", "c", "d"}},                // middle
+		{-2, -1, []string{"d", "e"}},                   // last two
+		{-3, -2, []string{"c", "d"}},                   // negative range
+		{2, 2, []string{"c"}},                           // single element
+		{4, 4, []string{"e"}},                           // last element
+		{0, 100, []string{"a", "b", "c", "d", "e"}},   // stop beyond length
+	}
+
+	for _, tc := range tests {
+		items, err := client.LRange(c, "lr-test", tc.start, tc.stop)
+		if err != nil {
+			t.Fatalf("LRange(%d, %d): %v", tc.start, tc.stop, err)
+		}
+		if len(items) != len(tc.expected) {
+			t.Fatalf("LRange(%d, %d): expected %v, got %v", tc.start, tc.stop, tc.expected, items)
+		}
+		for i, want := range tc.expected {
+			if items[i] != want {
+				t.Fatalf("LRange(%d, %d)[%d]: expected %q, got %q", tc.start, tc.stop, i, want, items[i])
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 18. TestClient_Incr_Decr_Concurrent
+// ---------------------------------------------------------------------------
+
+func TestClient_Incr_Decr_Concurrent(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	const numWorkers = 10
+	const opsPerWorker = 50
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numWorkers*2)
+
+	// 10 goroutines incrementing.
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer c.Close()
+			for j := 0; j < opsPerWorker; j++ {
+				if _, err := client.Incr(c, "conc-ctr", 1); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+
+	// 10 goroutines decrementing.
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer c.Close()
+			for j := 0; j < opsPerWorker; j++ {
+				if _, err := client.Decr(c, "conc-ctr", 1); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Final counter should be 0.
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	val, err := client.GetCounter(c, "conc-ctr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != 0 {
+		t.Fatalf("expected counter to be 0, got %d", val)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 19. TestLock_AutoRenew_KeepsLease
+// ---------------------------------------------------------------------------
+
+func TestLock_AutoRenew_KeepsLease(t *testing.T) {
+	cfg := testConfig()
+	cfg.DefaultLeaseTTL = 2 * time.Second
+	_, addr := startServer(t, cfg)
+
+	l := &client.Lock{
+		Key:            "auto-renew-keep",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		RenewRatio:     0.5, // renew every 1s on a 2s lease
+	}
+
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("acquire failed")
+	}
+
+	// Sleep longer than the original lease TTL.
+	time.Sleep(3 * time.Second)
+
+	// Lock should still be held thanks to auto-renewal.
+	if l.Token() == "" {
+		t.Fatal("expected lock to still be held (auto-renewal should keep it alive)")
+	}
+
+	// Release should succeed (the lock is still valid).
+	if err := l.Release(context.Background()); err != nil {
+		t.Fatalf("release after auto-renew failed: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 20. TestSemaphore_LimitEnforcement
+// ---------------------------------------------------------------------------
+
+func TestSemaphore_LimitEnforcement(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Acquire two slots out of limit=2.
+	s1 := &client.Semaphore{
+		Key:            "sem-limit-enforce",
+		Limit:          2,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("s1 acquire failed")
+	}
+
+	s2 := &client.Semaphore{
+		Key:            "sem-limit-enforce",
+		Limit:          2,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err = s2.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("s2 acquire failed")
+	}
+
+	// Third acquire with very short timeout should fail — all slots taken.
+	s3 := &client.Semaphore{
+		Key:            "sem-limit-enforce",
+		Limit:          2,
+		AcquireTimeout: 1 * time.Millisecond,
+		Servers:        []string{addr},
+	}
+	ok, err = s3.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("s3 should not acquire — semaphore at capacity")
+	}
+
+	// Clean up.
+	if err := s1.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

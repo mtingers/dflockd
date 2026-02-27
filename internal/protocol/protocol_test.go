@@ -1997,3 +1997,490 @@ func TestReadRequest_SemWaitBadTimeout(t *testing.T) {
 		t.Fatal("expected error for bad sem wait timeout")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Edge-case tests
+// ---------------------------------------------------------------------------
+
+func TestReadRequest_NullByteInKey(t *testing.T) {
+	// The protocol doesn't validate content bytes; null bytes in a key
+	// should be accepted as-is.
+	key := "my\x00key"
+	r := makeReader("get", key, "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatalf("null byte in key should be accepted: %v", err)
+	}
+	if req.Key != key {
+		t.Fatalf("key mismatch: got %q, want %q", req.Key, key)
+	}
+}
+
+func TestReadRequest_VeryLongKey(t *testing.T) {
+	// Key at exactly MaxLineBytes should succeed.
+	key := strings.Repeat("k", MaxLineBytes)
+	r := makeReader("get", key, "")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatalf("key at MaxLineBytes should succeed: %v", err)
+	}
+	if req.Key != key {
+		t.Fatalf("key length: got %d, want %d", len(req.Key), MaxLineBytes)
+	}
+}
+
+func TestReadRequest_KeyExceedsMaxLine(t *testing.T) {
+	// Key over MaxLineBytes should error with "line too long".
+	key := strings.Repeat("k", MaxLineBytes+1)
+	r := makeReader("get", key, "")
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error for key exceeding MaxLineBytes")
+	}
+	pe, ok := err.(*ProtocolError)
+	if !ok {
+		t.Fatalf("expected *ProtocolError, got %T: %v", err, err)
+	}
+	if pe.Code != 12 {
+		t.Fatalf("expected code 12 (line too long), got %d: %s", pe.Code, pe.Message)
+	}
+}
+
+func TestReadRequest_TabInArg(t *testing.T) {
+	// Tab is meaningful for kset and kcas (delimiter), but tabs are just
+	// regular bytes for other commands. Verify both cases.
+
+	t.Run("kset_with_tab", func(t *testing.T) {
+		// kset expects <value>\t<ttl>
+		r := makeReader("kset", "mykey", "hello\t60")
+		req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+		if err != nil {
+			t.Fatalf("kset with tab should parse: %v", err)
+		}
+		if req.Value != "hello" {
+			t.Fatalf("value: got %q, want %q", req.Value, "hello")
+		}
+		if req.TTLSeconds != 60 {
+			t.Fatalf("TTL: got %d, want 60", req.TTLSeconds)
+		}
+	})
+
+	t.Run("kcas_with_tabs", func(t *testing.T) {
+		// kcas expects <old>\t<new>\t<ttl>
+		r := makeReader("kcas", "mykey", "old\tnew\t30")
+		req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+		if err != nil {
+			t.Fatalf("kcas with tabs should parse: %v", err)
+		}
+		if req.OldValue != "old" || req.Value != "new" || req.TTLSeconds != 30 {
+			t.Fatalf("unexpected kcas parse: old=%q new=%q ttl=%d",
+				req.OldValue, req.Value, req.TTLSeconds)
+		}
+	})
+
+	t.Run("signal_with_tab_in_payload", func(t *testing.T) {
+		// Tab in signal payload should be preserved as-is.
+		r := makeReader("signal", "chan1", "hello\tworld")
+		req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+		if err != nil {
+			t.Fatalf("signal with tab should parse: %v", err)
+		}
+		if req.Value != "hello\tworld" {
+			t.Fatalf("value: got %q, want %q", req.Value, "hello\tworld")
+		}
+	})
+
+	t.Run("lpush_with_tab_in_value", func(t *testing.T) {
+		// Tab in lpush value should be preserved.
+		r := makeReader("lpush", "mylist", "val\twith\ttabs")
+		req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+		if err != nil {
+			t.Fatalf("lpush with tab should parse: %v", err)
+		}
+		if req.Value != "val\twith\ttabs" {
+			t.Fatalf("value: got %q, want %q", req.Value, "val\twith\ttabs")
+		}
+	})
+}
+
+func TestReadRequest_AllCommands(t *testing.T) {
+	// Table-driven test that exercises every single recognized command with
+	// valid minimal args and verifies they parse successfully.
+	tests := []struct {
+		cmd string
+		arg string
+	}{
+		// Mutex commands
+		{"l", "10"},
+		{"r", "token1"},
+		{"n", "token1"},
+		{"e", ""},
+		{"w", "10"},
+
+		// Semaphore commands
+		{"sl", "10 3"},
+		{"sr", "token1"},
+		{"sn", "token1"},
+		{"se", "3"},
+		{"sw", "10"},
+
+		// Atomic counters
+		{"incr", "1"},
+		{"decr", "1"},
+		{"get", ""},
+		{"cset", "42"},
+
+		// KV with TTL
+		{"kset", "myvalue"},
+		{"kget", ""},
+		{"kdel", ""},
+		{"kcas", "old\tnew\t0"},
+
+		// Lists/Queues
+		{"lpush", "val"},
+		{"rpush", "val"},
+		{"lpop", ""},
+		{"rpop", ""},
+		{"llen", ""},
+		{"lrange", "0 -1"},
+
+		// Blocking list pop
+		{"blpop", "10"},
+		{"brpop", "10"},
+
+		// Signaling
+		{"signal", "payload"},
+		{"listen", ""},
+		{"unlisten", ""},
+
+		// Watch/Notify
+		{"watch", ""},
+		{"unwatch", ""},
+
+		// Barriers
+		{"bwait", "3 10"},
+
+		// Leader election
+		{"elect", "10"},
+		{"resign", "token1"},
+		{"observe", ""},
+		{"unobserve", ""},
+
+		// Read-Write locks
+		{"rl", "10"},
+		{"rr", "token1"},
+		{"rn", "token1"},
+		{"wl", "10"},
+		{"wr", "token1"},
+		{"wn", "token1"},
+		{"re", ""},
+		{"rw", "10"},
+		{"we", ""},
+		{"ww", "10"},
+
+		// Auth & Stats
+		{"auth", "secret"},
+		{"stats", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.cmd, func(t *testing.T) {
+			// auth and stats don't require a valid key
+			key := "testkey"
+			r := makeReader(tc.cmd, key, tc.arg)
+			req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+			if err != nil {
+				t.Fatalf("command %q should parse with arg %q: %v", tc.cmd, tc.arg, err)
+			}
+			if req.Cmd != tc.cmd {
+				t.Fatalf("cmd: got %q, want %q", req.Cmd, tc.cmd)
+			}
+		})
+	}
+}
+
+func TestReadRequest_BoundaryTimeouts(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout string
+		want    time.Duration
+	}{
+		{"zero", "0", 0},
+		{"one", "1", 1 * time.Second},
+		{"maxSafeSeconds", fmt.Sprintf("%d", maxSafeSeconds), time.Duration(maxSafeSeconds) * time.Second},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := makeReader("l", "mykey", tc.timeout)
+			req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+			if err != nil {
+				t.Fatalf("timeout=%s should parse: %v", tc.timeout, err)
+			}
+			if req.AcquireTimeout != tc.want {
+				t.Fatalf("timeout: got %v, want %v", req.AcquireTimeout, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadRequest_ListenWithGroupColonFormat(t *testing.T) {
+	// listen with a group argument in "group:mygroup" colon-delimited style.
+	// The protocol stores the trimmed arg as Group.
+	r := makeReader("listen", "mychannel", "group:mygroup")
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatalf("listen with group should parse: %v", err)
+	}
+	if req.Cmd != "listen" {
+		t.Fatalf("cmd: got %q, want %q", req.Cmd, "listen")
+	}
+	if req.Key != "mychannel" {
+		t.Fatalf("key: got %q, want %q", req.Key, "mychannel")
+	}
+	if req.Group != "group:mygroup" {
+		t.Fatalf("group: got %q, want %q", req.Group, "group:mygroup")
+	}
+}
+
+func TestFormatResponse_AllStatuses(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		// Simple statuses (no token, no extra)
+		{"ok", "ok\n"},
+		{"acquired", "acquired\n"},
+		{"timeout", "timeout\n"},
+		{"error", "error\n"},
+		{"error_auth", "error_auth\n"},
+		{"error_max_locks", "error_max_locks\n"},
+		{"error_max_waiters", "error_max_waiters\n"},
+		{"error_limit_mismatch", "error_limit_mismatch\n"},
+		{"error_not_enqueued", "error_not_enqueued\n"},
+		{"error_already_enqueued", "error_already_enqueued\n"},
+		{"error_max_keys", "error_max_keys\n"},
+		{"error_list_full", "error_list_full\n"},
+		{"error_lease_expired", "error_lease_expired\n"},
+		{"error_type_mismatch", "error_type_mismatch\n"},
+		{"nil", "nil\n"},
+		{"queued", "queued\n"},
+		{"cas_conflict", "cas_conflict\n"},
+		{"error_barrier_count_mismatch", "error_barrier_count_mismatch\n"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.status, func(t *testing.T) {
+			ack := &Ack{Status: tc.status}
+			got := string(FormatResponse(ack, 33))
+			if got != tc.want {
+				t.Fatalf("FormatResponse(%q): got %q, want %q", tc.status, got, tc.want)
+			}
+		})
+	}
+
+	// ok/acquired with Token
+	t.Run("ok_with_token", func(t *testing.T) {
+		ack := &Ack{Status: "ok", Token: "tok123", LeaseTTL: 30, Fence: 5}
+		got := string(FormatResponse(ack, 33))
+		if got != "ok tok123 30 5\n" {
+			t.Fatalf("got %q, want %q", got, "ok tok123 30 5\n")
+		}
+	})
+
+	t.Run("acquired_with_token", func(t *testing.T) {
+		ack := &Ack{Status: "acquired", Token: "tok456", LeaseTTL: 20, Fence: 1}
+		got := string(FormatResponse(ack, 33))
+		if got != "acquired tok456 20 1\n" {
+			t.Fatalf("got %q, want %q", got, "acquired tok456 20 1\n")
+		}
+	})
+
+	// ok/acquired with Extra
+	t.Run("ok_with_extra", func(t *testing.T) {
+		ack := &Ack{Status: "ok", Extra: "42"}
+		got := string(FormatResponse(ack, 33))
+		if got != "ok 42\n" {
+			t.Fatalf("got %q, want %q", got, "ok 42\n")
+		}
+	})
+
+	t.Run("acquired_with_extra", func(t *testing.T) {
+		ack := &Ack{Status: "acquired", Extra: "data"}
+		got := string(FormatResponse(ack, 33))
+		if got != "acquired data\n" {
+			t.Fatalf("got %q, want %q", got, "acquired data\n")
+		}
+	})
+
+	// Token with LeaseTTL=0 should use defaultLeaseTTLSec
+	t.Run("ok_token_default_lease", func(t *testing.T) {
+		ack := &Ack{Status: "ok", Token: "t1", LeaseTTL: 0, Fence: 0}
+		got := string(FormatResponse(ack, 33))
+		if got != "ok t1 33 0\n" {
+			t.Fatalf("got %q, want %q", got, "ok t1 33 0\n")
+		}
+	})
+
+	// Unknown status falls through to default formatting
+	t.Run("unknown_status", func(t *testing.T) {
+		ack := &Ack{Status: "something_custom"}
+		got := string(FormatResponse(ack, 33))
+		if got != "something_custom\n" {
+			t.Fatalf("got %q, want %q", got, "something_custom\n")
+		}
+	})
+}
+
+func TestReadLine_BinaryContent(t *testing.T) {
+	conn := &mockConn{}
+
+	t.Run("high_bytes", func(t *testing.T) {
+		// Line with high-byte characters (0x80-0xFF)
+		input := "\x80\x81\xfe\xff\n"
+		r := bufio.NewReader(strings.NewReader(input))
+		line, err := ReadLine(r, 5*time.Second, conn)
+		if err != nil {
+			t.Fatalf("high bytes should be accepted: %v", err)
+		}
+		if line != "\x80\x81\xfe\xff" {
+			t.Fatalf("line mismatch: got %q, want %q", line, "\x80\x81\xfe\xff")
+		}
+	})
+
+	t.Run("carriage_return_stripped", func(t *testing.T) {
+		// CR should be stripped everywhere, not just trailing
+		input := "he\rllo\r\n"
+		r := bufio.NewReader(strings.NewReader(input))
+		line, err := ReadLine(r, 5*time.Second, conn)
+		if err != nil {
+			t.Fatalf("line with CR should be accepted: %v", err)
+		}
+		if line != "hello" {
+			t.Fatalf("CR should be stripped: got %q, want %q", line, "hello")
+		}
+	})
+
+	t.Run("null_bytes", func(t *testing.T) {
+		input := "a\x00b\x00c\n"
+		r := bufio.NewReader(strings.NewReader(input))
+		line, err := ReadLine(r, 5*time.Second, conn)
+		if err != nil {
+			t.Fatalf("null bytes should be accepted: %v", err)
+		}
+		if line != "a\x00b\x00c" {
+			t.Fatalf("line mismatch: got %q, want %q", line, "a\x00b\x00c")
+		}
+	})
+
+	t.Run("only_cr_before_lf", func(t *testing.T) {
+		// A line that is purely \r\r\r\n should produce empty string.
+		input := "\r\r\r\n"
+		r := bufio.NewReader(strings.NewReader(input))
+		line, err := ReadLine(r, 5*time.Second, conn)
+		if err != nil {
+			t.Fatalf("CR-only line should be accepted: %v", err)
+		}
+		if line != "" {
+			t.Fatalf("expected empty line, got %q", line)
+		}
+	})
+
+	t.Run("mixed_binary", func(t *testing.T) {
+		// Mix of control chars, high bytes, normal chars
+		input := "\x01\x7f\x80\xffAB\n"
+		r := bufio.NewReader(strings.NewReader(input))
+		line, err := ReadLine(r, 5*time.Second, conn)
+		if err != nil {
+			t.Fatalf("mixed binary should be accepted: %v", err)
+		}
+		if line != "\x01\x7f\x80\xffAB" {
+			t.Fatalf("line mismatch: got %q, want %q", line, "\x01\x7f\x80\xffAB")
+		}
+	})
+}
+
+func TestReadRequest_EmptyArg(t *testing.T) {
+	// Commands that should succeed with empty arg
+	succeedEmpty := []string{
+		"e",           // enqueue: optional lease_ttl
+		"get",         // no arg needed
+		"kget",        // no arg needed
+		"kdel",        // no arg needed
+		"listen",      // group is optional
+		"unlisten",    // group is optional
+		"lpop",        // no arg needed
+		"rpop",        // no arg needed
+		"llen",        // no arg needed
+		"watch",       // no arg needed
+		"unwatch",     // no arg needed
+		"observe",     // no arg needed
+		"unobserve",   // no arg needed
+		"re",          // optional lease_ttl
+		"we",          // optional lease_ttl
+	}
+	for _, cmd := range succeedEmpty {
+		t.Run(cmd+"_empty_ok", func(t *testing.T) {
+			r := makeReader(cmd, "testkey", "")
+			_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+			if err != nil {
+				t.Fatalf("command %q with empty arg should succeed: %v", cmd, err)
+			}
+		})
+	}
+
+	// Commands that should fail with empty arg
+	failEmpty := []struct {
+		cmd  string
+		code int
+	}{
+		{"l", 8},      // requires timeout
+		{"r", 7},      // requires token
+		{"n", 8},      // requires token
+		{"w", 8},      // requires timeout
+		{"sl", 8},     // requires timeout + limit
+		{"sr", 7},     // requires token
+		{"sn", 8},     // requires token
+		{"se", 8},     // requires limit
+		{"sw", 8},     // requires timeout
+		{"incr", 8},   // requires delta
+		{"decr", 8},   // requires delta
+		{"cset", 8},   // requires value
+		{"kset", 8},   // requires value
+		{"kcas", 8},   // requires old\tnew\tttl
+		{"signal", 8}, // requires payload
+		{"lpush", 8},  // requires value
+		{"rpush", 8},  // requires value
+		{"lrange", 8}, // requires start stop
+		{"blpop", 8},  // requires timeout
+		{"brpop", 8},  // requires timeout
+		{"bwait", 8},  // requires count timeout
+		{"elect", 8},  // requires timeout
+		{"resign", 7}, // requires token
+		{"rl", 8},     // requires timeout
+		{"rr", 7},     // requires token
+		{"rn", 8},     // requires token
+		{"wl", 8},     // requires timeout
+		{"wr", 7},     // requires token
+		{"wn", 8},     // requires token
+		{"rw", 8},     // requires timeout
+		{"ww", 8},     // requires timeout
+	}
+	for _, tc := range failEmpty {
+		t.Run(tc.cmd+"_empty_fail", func(t *testing.T) {
+			r := makeReader(tc.cmd, "testkey", "")
+			_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+			if err == nil {
+				t.Fatalf("command %q with empty arg should fail", tc.cmd)
+			}
+			pe, ok := err.(*ProtocolError)
+			if !ok {
+				t.Fatalf("expected *ProtocolError, got %T: %v", err, err)
+			}
+			if pe.Code != tc.code {
+				t.Fatalf("command %q: expected error code %d, got %d: %s",
+					tc.cmd, tc.code, pe.Code, pe.Message)
+			}
+		})
+	}
+}
