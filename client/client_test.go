@@ -4703,3 +4703,266 @@ func TestSemaphore_LimitEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap-filling: SignalConn.Unlisten
+// ---------------------------------------------------------------------------
+
+func TestSignalConn_Unlisten(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	// Listen on a pattern.
+	if err := sc.Listen("events.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emit — should be received.
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	n, err := client.Emit(c2, "events.test", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "events.test" || sig.Payload != "hello" {
+			t.Fatalf("unexpected signal: %+v", sig)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for signal")
+	}
+
+	// Unlisten — should stop receiving.
+	if err := sc.Unlisten("events.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err = client.Emit(c2, "events.test", "world")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 deliveries after unlisten, got %d", n)
+	}
+
+	// Verify nothing arrives.
+	select {
+	case sig := <-sc.Signals():
+		t.Fatalf("unexpected signal after unlisten: %+v", sig)
+	case <-time.After(200 * time.Millisecond):
+		// Good — no signal received.
+	}
+}
+
+// TestSignalConn_UnlistenGroup tests unlisten with a queue group.
+func TestSignalConn_UnlistenGroup(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	if err := sc.Listen("events.grp", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sc.Unlisten("events.grp", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emit — should deliver to nobody.
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	n, err := client.Emit(c2, "events.grp", "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 deliveries after group unlisten, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: LeaderConn observe after elect (initial status notification)
+// ---------------------------------------------------------------------------
+
+func TestLeaderConn_ObserveAfterElect(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// First: elect a leader.
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	lc1 := client.NewLeaderConn(c1)
+	defer lc1.Close()
+
+	_, _, _, err = lc1.Elect("obs-after-key", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THEN observe — should get immediate "elected" notification.
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	lc2 := client.NewLeaderConn(c2)
+	defer lc2.Close()
+
+	if err := lc2.Observe("obs-after-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-lc2.Events():
+		if ev.Type != "elected" {
+			t.Fatalf("expected 'elected' event, got %q", ev.Type)
+		}
+		if ev.Key != "obs-after-key" {
+			t.Fatalf("expected key 'obs-after-key', got %q", ev.Key)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for initial elected notification")
+	}
+}
+
+// TestLeaderConn_ObserveResignFailover tests the full observe lifecycle:
+// observe → see elected → see resigned → see new leader elected (failover).
+func TestLeaderConn_ObserveResignFailover(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Observer
+	obsConn, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obsConn.Close()
+	obs := client.NewLeaderConn(obsConn)
+	defer obs.Close()
+
+	if err := obs.Observe("failover-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leader 1 elects
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	lc1 := client.NewLeaderConn(c1)
+	defer lc1.Close()
+
+	tok1, _, _, err := lc1.Elect("failover-key", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Observer should see "elected"
+	select {
+	case ev := <-obs.Events():
+		if ev.Type != "elected" {
+			t.Fatalf("expected elected, got %q", ev.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for elected event")
+	}
+
+	// Leader 2 waits in background
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	lc2 := client.NewLeaderConn(c2)
+	defer lc2.Close()
+
+	leader2Done := make(chan struct{})
+	go func() {
+		defer close(leader2Done)
+		lc2.Elect("failover-key", 10*time.Second)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Leader 1 resigns — should trigger resigned + failover elected events
+	if err := lc1.Resign("failover-key", tok1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Observer should see "resigned"
+	select {
+	case ev := <-obs.Events():
+		if ev.Type != "resigned" {
+			t.Fatalf("expected resigned, got %q", ev.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for resigned event")
+	}
+
+	// Observer should see "failover" (failover to leader 2)
+	select {
+	case ev := <-obs.Events():
+		if ev.Type != "failover" && ev.Type != "elected" {
+			t.Fatalf("expected failover event, got %q", ev.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for failover event")
+	}
+
+	<-leader2Done
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: WatchConn.Close
+// ---------------------------------------------------------------------------
+
+func TestWatchConn_Close(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wc := client.NewWatchConn(c)
+	if err := wc.Watch("closetest"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close should not panic or error.
+	if err := wc.Close(); err != nil {
+		t.Fatalf("WatchConn.Close error: %v", err)
+	}
+}

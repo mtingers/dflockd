@@ -5396,3 +5396,147 @@ func TestStats_ComprehensiveUnderLoad(t *testing.T) {
 		t.Errorf("barriers: got %d, want >= 1", len(stats.Barriers))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap-filling: LeaderHolder
+// ---------------------------------------------------------------------------
+
+func TestLeaderHolder_NoLeader(t *testing.T) {
+	lm := testManager()
+	connID := lm.LeaderHolder("nonexistent-election")
+	if connID != 0 {
+		t.Fatalf("expected 0 for no leader, got %d", connID)
+	}
+}
+
+func TestLeaderHolder_WithLeader(t *testing.T) {
+	lm := testManager()
+	tok, _, err := lm.AcquireWithFence(bg(), "leader-key", 5*time.Second, 5*time.Second, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok == "" {
+		t.Fatal("expected token")
+	}
+
+	connID := lm.LeaderHolder("leader-key")
+	if connID != 42 {
+		t.Fatalf("expected leader connID 42, got %d", connID)
+	}
+
+	// Release and verify no leader.
+	lm.Release("leader-key", tok)
+	connID = lm.LeaderHolder("leader-key")
+	if connID != 0 {
+		t.Fatalf("expected 0 after release, got %d", connID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: ResignLeader wrong token / nonexistent
+// ---------------------------------------------------------------------------
+
+func TestResignLeader_WrongTokenAndCorrectToken(t *testing.T) {
+	lm := testManager()
+	tok, _, err := lm.AcquireWithFence(bg(), "resign-wrong", 5*time.Second, 5*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Register as leader watcher (simulates server's elect handler)
+	ch := make(chan []byte, 4)
+	lm.RegisterLeaderWatcher("resign-wrong", 1, ch, nil)
+
+	// Wrong token should fail
+	ok := lm.ResignLeader("resign-wrong", "bogus-token", 1)
+	if ok {
+		t.Fatal("expected ResignLeader with wrong token to return false")
+	}
+
+	// Correct token should succeed
+	ok = lm.ResignLeader("resign-wrong", tok, 1)
+	if !ok {
+		t.Fatal("expected ResignLeader with correct token to return true")
+	}
+}
+
+func TestResignLeader_Nonexistent(t *testing.T) {
+	lm := testManager()
+	ok := lm.ResignLeader("no-such-key", "no-such-token", 99)
+	if ok {
+		t.Fatal("expected ResignLeader on nonexistent key to return false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: RegisterLeaderWatcherWithStatus (observe while leader exists)
+// ---------------------------------------------------------------------------
+
+func TestRegisterLeaderWatcherWithStatus_LeaderExists(t *testing.T) {
+	lm := testManager()
+
+	// Acquire lock (simulates elect)
+	tok, _, err := lm.AcquireWithFence(bg(), "obs-status", 5*time.Second, 5*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok == "" {
+		t.Fatal("expected token")
+	}
+
+	// Register watcher with status — should immediately receive "leader elected"
+	ch := make(chan []byte, 4)
+	lm.RegisterLeaderWatcherWithStatus("obs-status", 2, ch, nil)
+
+	select {
+	case msg := <-ch:
+		expected := "leader elected obs-status\n"
+		if string(msg) != expected {
+			t.Fatalf("expected %q, got %q", expected, string(msg))
+		}
+	default:
+		t.Fatal("expected immediate notification, got nothing")
+	}
+}
+
+func TestRegisterLeaderWatcherWithStatus_NoLeader(t *testing.T) {
+	lm := testManager()
+
+	// Register watcher with status — no leader exists, should NOT receive anything
+	ch := make(chan []byte, 4)
+	lm.RegisterLeaderWatcherWithStatus("obs-empty", 2, ch, nil)
+
+	select {
+	case msg := <-ch:
+		t.Fatalf("expected no notification, got %q", string(msg))
+	default:
+		// Good — no notification.
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap-filling: CleanupConnection with AutoReleaseOnDisconnect=false
+// ---------------------------------------------------------------------------
+
+func TestCleanup_AutoReleaseDisabled(t *testing.T) {
+	cfg := testConfig()
+	cfg.AutoReleaseOnDisconnect = false
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := NewLockManager(cfg, log)
+
+	tok, _, err := lm.AcquireWithFence(bg(), "no-auto-release", 5*time.Second, 5*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok == "" {
+		t.Fatal("expected token")
+	}
+
+	// CleanupConnection should be a no-op when auto-release is disabled.
+	lm.CleanupConnection(1)
+
+	// Lock should still be held.
+	connID := lm.LeaderHolder("no-auto-release")
+	if connID != 1 {
+		t.Fatalf("expected lock still held by conn 1, got %d", connID)
+	}
+}

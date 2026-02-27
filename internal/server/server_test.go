@@ -4996,3 +4996,123 @@ func TestIntegration_Auth_CommandBeforeAuth(t *testing.T) {
 		t.Fatalf("incr after auth: expected 'ok 1', got %q", resp)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap-filling: observe after elect (initial status notification)
+// ---------------------------------------------------------------------------
+
+func TestIntegration_Election_ObserveAfterElect(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// Elect a leader FIRST.
+	leaderConn := dialTest(t, addr)
+	defer leaderConn.Close()
+	resp := sendCmd(t, leaderConn, "elect", "obs-late", "5 10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("elect: expected ok, got %q", resp)
+	}
+
+	// THEN observe — should receive immediate "leader elected" notification.
+	obsConn := dialTest(t, addr)
+	defer obsConn.Close()
+	obsReader := bufio.NewReader(obsConn)
+
+	resp = connSendCmd(t, obsConn, obsReader, "observe", "obs-late", "")
+	if resp != "ok" {
+		t.Fatalf("observe: expected ok, got %q", resp)
+	}
+
+	// Read the initial notification.
+	obsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := obsReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read initial notification: %v", err)
+	}
+	line = strings.TrimRight(line, "\n\r")
+	if line != "leader elected obs-late" {
+		t.Fatalf("expected 'leader elected obs-late', got %q", line)
+	}
+}
+
+// TestIntegration_Election_ResignFailoverObserve tests the full resign-failover
+// cycle as seen by an observer: elected → resigned → elected (failover).
+func TestIntegration_Election_ResignFailoverObserve(t *testing.T) {
+	cleanup, addr, _ := startServer(t, testConfig())
+	defer cleanup()
+
+	// Observer
+	obsConn := dialTest(t, addr)
+	defer obsConn.Close()
+	obsReader := bufio.NewReader(obsConn)
+	resp := connSendCmd(t, obsConn, obsReader, "observe", "failover1", "")
+	if resp != "ok" {
+		t.Fatalf("observe: expected ok, got %q", resp)
+	}
+
+	// Leader 1 elects
+	l1Conn := dialTest(t, addr)
+	defer l1Conn.Close()
+	l1Reader := bufio.NewReader(l1Conn)
+	resp = connSendCmd(t, l1Conn, l1Reader, "elect", "failover1", "5 10")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("elect 1: expected ok, got %q", resp)
+	}
+	token1 := strings.Fields(resp)[1]
+
+	// Observer sees "elected"
+	obsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	line, err := obsReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read elected 1: %v", err)
+	}
+	if strings.TrimRight(line, "\n\r") != "leader elected failover1" {
+		t.Fatalf("expected elected event, got %q", line)
+	}
+
+	// Leader 2 blocks on elect (waits for leader 1 to resign)
+	l2Conn := dialTest(t, addr)
+	defer l2Conn.Close()
+	l2Reader := bufio.NewReader(l2Conn)
+	go func() {
+		msg := "elect\nfailover1\n5 10\n"
+		l2Conn.Write([]byte(msg))
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Leader 1 resigns
+	resp = connSendCmd(t, l1Conn, l1Reader, "resign", "failover1", token1)
+	if resp != "ok" {
+		t.Fatalf("resign: expected ok, got %q", resp)
+	}
+
+	// Observer sees "resigned"
+	line, err = obsReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read resigned: %v", err)
+	}
+	if strings.TrimRight(line, "\n\r") != "leader resigned failover1" {
+		t.Fatalf("expected resigned event, got %q", line)
+	}
+
+	// Observer sees "elected" (failover to leader 2)
+	line, err = obsReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read failover elected: %v", err)
+	}
+	trimmed := strings.TrimRight(line, "\n\r")
+	if trimmed != "leader elected failover1" && trimmed != "leader failover failover1" {
+		t.Fatalf("expected failover elected event, got %q", line)
+	}
+
+	// Leader 2 should have received its elect response.
+	l2Conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	l2line, err := l2Reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("leader 2 response: %v", err)
+	}
+	if !strings.HasPrefix(strings.TrimRight(l2line, "\n\r"), "ok ") {
+		t.Fatalf("leader 2: expected ok, got %q", l2line)
+	}
+}
