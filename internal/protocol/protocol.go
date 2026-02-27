@@ -131,6 +131,9 @@ func parseSeconds(s string, what string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if n < 0 {
+		return 0, &ProtocolError{Code: 4, Message: fmt.Sprintf("negative %s: %d", what, n)}
+	}
 	if n > maxSafeSeconds {
 		return 0, &ProtocolError{Code: 4, Message: fmt.Sprintf("%s too large: %d", what, n)}
 	}

@@ -804,6 +804,9 @@ func KVCAS(c *Conn, key, oldValue, newValue string, ttlSeconds int) (bool, error
 	if strings.Contains(oldValue, "\t") {
 		return false, fmt.Errorf("dflockd: oldValue contains tab")
 	}
+	if newValue == "" {
+		return false, fmt.Errorf("dflockd: newValue must not be empty")
+	}
 	if err := validateValue(newValue); err != nil {
 		return false, err
 	}
@@ -1572,7 +1575,13 @@ func (l *Lock) startRenew() {
 						return // Deliberately stopped; not a real failure.
 					}
 					// Clear token to prevent stale lock usage.
+					// Re-check ctx after acquiring mutex: stopRenew may
+					// have cancelled while we were waiting for the lock.
 					l.mu.Lock()
+					if ctx.Err() != nil {
+						l.mu.Unlock()
+						return
+					}
 					l.token = ""
 					l.fence = 0
 					l.lease = 0
@@ -1988,7 +1997,13 @@ func (s *Semaphore) startRenew() {
 						return // Deliberately stopped; not a real failure.
 					}
 					// Clear token to prevent stale semaphore usage.
+					// Re-check ctx after acquiring mutex: stopRenew may
+					// have cancelled while we were waiting for the lock.
 					s.mu.Lock()
+					if ctx.Err() != nil {
+						s.mu.Unlock()
+						return
+					}
 					s.token = ""
 					s.fence = 0
 					s.lease = 0
@@ -2860,7 +2875,13 @@ func (rw *RWLock) startRenew(cmd string) {
 					}
 					// Clear token state to prevent stale lock usage.
 					// Preserve rw.mode so Unlock sends the correct command.
+					// Re-check ctx after acquiring mutex: stopRenew may
+					// have cancelled while we were waiting for the lock.
 					rw.mu.Lock()
+					if ctx.Err() != nil {
+						rw.mu.Unlock()
+						return
+					}
 					rw.token = ""
 					rw.fence = 0
 					rw.lease = 0

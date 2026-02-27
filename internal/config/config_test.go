@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -93,5 +94,339 @@ func TestSecondsCeil(t *testing.T) {
 	}
 	if cfg.DefaultLeaseTTL.Seconds() != 7 {
 		t.Fatalf("expected 7s, got %v", cfg.DefaultLeaseTTL)
+	}
+}
+
+func TestLoad_AllFlagsParsed(t *testing.T) {
+	args := []string{
+		"--host", "0.0.0.0",
+		"--port", "9999",
+		"--default-lease-ttl", "60",
+		"--lease-sweep-interval", "5",
+		"--gc-interval", "10",
+		"--gc-max-idle", "120",
+		"--max-locks", "2048",
+		"--max-keys", "500",
+		"--max-list-length", "100",
+		"--max-connections", "50",
+		"--max-waiters", "25",
+		"--read-timeout", "30",
+		"--write-timeout", "10",
+		"--shutdown-timeout", "60",
+		"--auto-release-on-disconnect=false",
+		"--debug",
+	}
+	cfg, err := Load(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Host != "0.0.0.0" {
+		t.Errorf("host: got %q, want %q", cfg.Host, "0.0.0.0")
+	}
+	if cfg.Port != 9999 {
+		t.Errorf("port: got %d, want 9999", cfg.Port)
+	}
+	if cfg.DefaultLeaseTTL.Seconds() != 60 {
+		t.Errorf("default-lease-ttl: got %v, want 60s", cfg.DefaultLeaseTTL)
+	}
+	if cfg.LeaseSweepInterval.Seconds() != 5 {
+		t.Errorf("lease-sweep-interval: got %v, want 5s", cfg.LeaseSweepInterval)
+	}
+	if cfg.GCInterval.Seconds() != 10 {
+		t.Errorf("gc-interval: got %v, want 10s", cfg.GCInterval)
+	}
+	if cfg.GCMaxIdleTime.Seconds() != 120 {
+		t.Errorf("gc-max-idle: got %v, want 120s", cfg.GCMaxIdleTime)
+	}
+	if cfg.MaxLocks != 2048 {
+		t.Errorf("max-locks: got %d, want 2048", cfg.MaxLocks)
+	}
+	if cfg.MaxKeys != 500 {
+		t.Errorf("max-keys: got %d, want 500", cfg.MaxKeys)
+	}
+	if cfg.MaxListLength != 100 {
+		t.Errorf("max-list-length: got %d, want 100", cfg.MaxListLength)
+	}
+	if cfg.MaxConnections != 50 {
+		t.Errorf("max-connections: got %d, want 50", cfg.MaxConnections)
+	}
+	if cfg.MaxWaiters != 25 {
+		t.Errorf("max-waiters: got %d, want 25", cfg.MaxWaiters)
+	}
+	if cfg.ReadTimeout.Seconds() != 30 {
+		t.Errorf("read-timeout: got %v, want 30s", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout.Seconds() != 10 {
+		t.Errorf("write-timeout: got %v, want 10s", cfg.WriteTimeout)
+	}
+	if cfg.ShutdownTimeout.Seconds() != 60 {
+		t.Errorf("shutdown-timeout: got %v, want 60s", cfg.ShutdownTimeout)
+	}
+	if cfg.AutoReleaseOnDisconnect {
+		t.Error("auto-release-on-disconnect: got true, want false")
+	}
+	if !cfg.Debug {
+		t.Error("debug: got false, want true")
+	}
+}
+
+func TestLoad_EnvVarOverridesDefault(t *testing.T) {
+	t.Setenv("DFLOCKD_PORT", "7777")
+	t.Setenv("DFLOCKD_HOST", "0.0.0.0")
+	t.Setenv("DFLOCKD_MAX_LOCKS", "4096")
+	t.Setenv("DFLOCKD_MAX_KEYS", "1000")
+	t.Setenv("DFLOCKD_DEBUG", "true")
+
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 7777 {
+		t.Errorf("port: got %d, want 7777", cfg.Port)
+	}
+	if cfg.Host != "0.0.0.0" {
+		t.Errorf("host: got %q, want %q", cfg.Host, "0.0.0.0")
+	}
+	if cfg.MaxLocks != 4096 {
+		t.Errorf("max-locks: got %d, want 4096", cfg.MaxLocks)
+	}
+	if cfg.MaxKeys != 1000 {
+		t.Errorf("max-keys: got %d, want 1000", cfg.MaxKeys)
+	}
+	if !cfg.Debug {
+		t.Error("debug: got false, want true")
+	}
+}
+
+func TestLoad_FlagOverridesEnvVar(t *testing.T) {
+	t.Setenv("DFLOCKD_PORT", "7777")
+	t.Setenv("DFLOCKD_MAX_LOCKS", "4096")
+
+	cfg, err := Load([]string{"--port", "8888", "--max-locks", "512"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 8888 {
+		t.Errorf("port: got %d, want 8888 (flag should override env)", cfg.Port)
+	}
+	if cfg.MaxLocks != 512 {
+		t.Errorf("max-locks: got %d, want 512 (flag should override env)", cfg.MaxLocks)
+	}
+}
+
+func TestLoad_EnvVarBoolFormats(t *testing.T) {
+	tests := []struct {
+		envVal string
+		want   bool
+	}{
+		{"1", true},
+		{"yes", true},
+		{"true", true},
+		{"TRUE", true},
+		{"Yes", true},
+		{"0", false},
+		{"no", false},
+		{"false", false},
+		{"FALSE", false},
+		{"No", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.envVal, func(t *testing.T) {
+			t.Setenv("DFLOCKD_DEBUG", tc.envVal)
+			cfg, err := Load([]string{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Debug != tc.want {
+				t.Errorf("DFLOCKD_DEBUG=%q: got %v, want %v", tc.envVal, cfg.Debug, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_EnvVarInvalidIntFallsBack(t *testing.T) {
+	t.Setenv("DFLOCKD_PORT", "not_a_number")
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 6388 {
+		t.Errorf("port: got %d, want 6388 (default)", cfg.Port)
+	}
+}
+
+func TestLoad_EnvVarInvalidBoolFallsBack(t *testing.T) {
+	t.Setenv("DFLOCKD_DEBUG", "maybe")
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Debug {
+		t.Error("debug: got true, want false (default)")
+	}
+}
+
+func TestLoad_AdditionalValidationErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"max-keys negative", []string{"--max-keys", "-1"}, "max-keys"},
+		{"max-list-length negative", []string{"--max-list-length", "-1"}, "max-list-length"},
+		{"write-timeout negative", []string{"--write-timeout", "-1"}, "write-timeout"},
+		{"shutdown-timeout negative", []string{"--shutdown-timeout", "-1"}, "shutdown-timeout"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(tc.args)
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q should contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_PortBoundary(t *testing.T) {
+	cfg, err := Load([]string{"--port", "0"})
+	if err != nil {
+		t.Fatalf("port 0 should be valid: %v", err)
+	}
+	if cfg.Port != 0 {
+		t.Fatalf("port: got %d, want 0", cfg.Port)
+	}
+
+	cfg, err = Load([]string{"--port", "65535"})
+	if err != nil {
+		t.Fatalf("port 65535 should be valid: %v", err)
+	}
+	if cfg.Port != 65535 {
+		t.Fatalf("port: got %d, want 65535", cfg.Port)
+	}
+}
+
+func TestLoad_AuthTokenFlag(t *testing.T) {
+	cfg, err := Load([]string{"--auth-token", "mysecret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthToken != "mysecret" {
+		t.Fatalf("auth-token: got %q, want %q", cfg.AuthToken, "mysecret")
+	}
+}
+
+func TestLoad_AuthTokenEnvVar(t *testing.T) {
+	t.Setenv("DFLOCKD_AUTH_TOKEN", "envsecret")
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthToken != "envsecret" {
+		t.Fatalf("auth-token: got %q, want %q", cfg.AuthToken, "envsecret")
+	}
+}
+
+func TestLoad_AuthTokenEnvOverridesFlag(t *testing.T) {
+	t.Setenv("DFLOCKD_AUTH_TOKEN", "envwins")
+	cfg, err := Load([]string{"--auth-token", "flagvalue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthToken != "envwins" {
+		t.Fatalf("auth-token: got %q, want %q (env should take priority)", cfg.AuthToken, "envwins")
+	}
+}
+
+func TestLoad_AuthTokenFile(t *testing.T) {
+	tmpFile := t.TempDir() + "/token.txt"
+	if err := os.WriteFile(tmpFile, []byte("file-token\n  "), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load([]string{"--auth-token-file", tmpFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthToken != "file-token" {
+		t.Fatalf("auth-token: got %q, want %q (whitespace should be trimmed)", cfg.AuthToken, "file-token")
+	}
+}
+
+func TestLoad_AuthTokenFileMissing(t *testing.T) {
+	_, err := Load([]string{"--auth-token-file", "/nonexistent/path/token.txt"})
+	if err == nil {
+		t.Fatal("expected error for missing auth token file")
+	}
+	if !strings.Contains(err.Error(), "auth token file") {
+		t.Fatalf("error should mention auth token file: %v", err)
+	}
+}
+
+func TestLoad_AuthTokenFileEnvVar(t *testing.T) {
+	tmpFile := t.TempDir() + "/token.txt"
+	if err := os.WriteFile(tmpFile, []byte("env-file-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("DFLOCKD_AUTH_TOKEN_FILE", tmpFile)
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthToken != "env-file-token" {
+		t.Fatalf("auth-token: got %q, want %q", cfg.AuthToken, "env-file-token")
+	}
+}
+
+func TestLoad_VersionFlag(t *testing.T) {
+	cfg, err := Load([]string{"--version"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Version {
+		t.Fatal("version flag should be true")
+	}
+}
+
+func TestLoad_EnvDurationParsing(t *testing.T) {
+	t.Setenv("DFLOCKD_DEFAULT_LEASE_TTL_S", "120")
+	t.Setenv("DFLOCKD_READ_TIMEOUT_S", "45")
+
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultLeaseTTL.Seconds() != 120 {
+		t.Errorf("default-lease-ttl: got %v, want 120s", cfg.DefaultLeaseTTL)
+	}
+	if cfg.ReadTimeout.Seconds() != 45 {
+		t.Errorf("read-timeout: got %v, want 45s", cfg.ReadTimeout)
+	}
+}
+
+func TestLoad_AutoReleaseDefault(t *testing.T) {
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AutoReleaseOnDisconnect {
+		t.Error("auto-release-on-disconnect should default to true")
+	}
+}
+
+func TestLoad_AutoReleaseEnvVar(t *testing.T) {
+	t.Setenv("DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "false")
+	cfg, err := Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AutoReleaseOnDisconnect {
+		t.Error("auto-release-on-disconnect: got true, want false")
 	}
 }

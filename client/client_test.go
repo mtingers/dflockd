@@ -1851,3 +1851,983 @@ func TestClient_LRange(t *testing.T) {
 		t.Fatalf("expected [b], got %v", items)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Fencing token tests
+// ---------------------------------------------------------------------------
+
+func TestAcquireWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, lease, fence, err := client.AcquireWithFence(c, "fkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if lease <= 0 {
+		t.Fatalf("expected positive lease, got %d", lease)
+	}
+	if fence == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+
+	if err := client.Release(c, "fkey", token); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second acquire — fence should increase
+	_, _, fence2, err := client.AcquireWithFence(c, "fkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence2 <= fence {
+		t.Fatalf("fence should increase: %d -> %d", fence, fence2)
+	}
+}
+
+func TestRenewWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, _, fence, err := client.AcquireWithFence(c, "fkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, renewFence, err := client.RenewWithFence(c, "fkey", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence should be same on renew: %d vs %d", fence, renewFence)
+	}
+}
+
+func TestEnqueueWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	status, token, lease, fence, err := client.EnqueueWithFence(c, "fkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "acquired" {
+		t.Fatalf("expected acquired, got %q", status)
+	}
+	if token == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", token, lease, fence)
+	}
+}
+
+func TestWaitWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	token1, _, err := client.Acquire(c1, "fkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	status, _, _, _, err := client.EnqueueWithFence(c2, "fkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %q", status)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		client.Release(c1, "fkey", token1)
+	}()
+
+	token2, lease, fence, err := client.WaitWithFence(c2, "fkey", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token2 == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected wait result: token=%q lease=%d fence=%d", token2, lease, fence)
+	}
+}
+
+func TestSemAcquireWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, lease, fence, err := client.SemAcquireWithFence(c, "skey", 10*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", token, lease, fence)
+	}
+
+	remaining, renewFence, err := client.SemRenewWithFence(c, "skey", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence should match on renew: %d vs %d", fence, renewFence)
+	}
+}
+
+func TestSemEnqueueWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	status, token, lease, fence, err := client.SemEnqueueWithFence(c, "skey", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "acquired" {
+		t.Fatalf("expected acquired, got %q", status)
+	}
+	if token == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", token, lease, fence)
+	}
+}
+
+func TestSemWaitWithFence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	token1, _, err := client.SemAcquire(c1, "skey", 10*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	status, _, _, _, err := client.SemEnqueueWithFence(c2, "skey", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %q", status)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		client.SemRelease(c1, "skey", token1)
+	}()
+
+	token2, lease, fence, err := client.SemWaitWithFence(c2, "skey", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token2 == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", token2, lease, fence)
+	}
+}
+
+func TestLock_Fence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	l := &client.Lock{
+		Key:     "fkey",
+		Servers: []string{addr},
+	}
+	defer l.Close()
+
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if l.Fence() == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+	if l.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	if err := l.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemaphore_Fence(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s := &client.Semaphore{
+		Key:     "skey",
+		Limit:   3,
+		Servers: []string{addr},
+	}
+	defer s.Close()
+
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected acquire to succeed")
+	}
+	if s.Fence() == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+
+	if err := s.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KV Compare-and-Swap
+// ---------------------------------------------------------------------------
+
+func TestClient_KVCAS(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Set initial value
+	if err := client.KVSet(c, "caskey", "initial", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// CAS with correct old value
+	ok, err := client.KVCAS(c, "caskey", "initial", "updated", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected CAS to succeed")
+	}
+
+	// Verify the value changed
+	val, err := client.KVGet(c, "caskey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "updated" {
+		t.Fatalf("expected 'updated', got %q", val)
+	}
+}
+
+func TestClient_KVCAS_Conflict(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.KVSet(c, "caskey", "initial", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// CAS with wrong old value
+	ok, err := client.KVCAS(c, "caskey", "wrong", "updated", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected CAS to fail with wrong old value")
+	}
+}
+
+func TestClient_KVCAS_CreateIfAbsent(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// CAS with empty old value creates a new key
+	ok, err := client.KVCAS(c, "newkey", "", "created", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected CAS to create new key")
+	}
+
+	val, err := client.KVGet(c, "newkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "created" {
+		t.Fatalf("expected 'created', got %q", val)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Blocking list operations
+// ---------------------------------------------------------------------------
+
+func TestClient_BLPop(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Push first, then pop immediately
+	if _, err := client.RPush(c, "bq", "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := client.BLPop(c, "bq", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "hello" {
+		t.Fatalf("expected 'hello', got %q", val)
+	}
+}
+
+func TestClient_BLPop_Blocks(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	done := make(chan string, 1)
+	go func() {
+		val, _ := client.BLPop(c1, "bq", 5*time.Second)
+		done <- val
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	client.RPush(c2, "bq", "delayed")
+
+	select {
+	case val := <-done:
+		if val != "delayed" {
+			t.Fatalf("expected 'delayed', got %q", val)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("BLPop did not return after push")
+	}
+}
+
+func TestClient_BRPop(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	client.LPush(c, "bq", "a")
+	client.LPush(c, "bq", "b")
+
+	// BRPop should return the rightmost element
+	val, err := client.BRPop(c, "bq", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "a" {
+		t.Fatalf("expected 'a' (rightmost), got %q", val)
+	}
+}
+
+func TestClient_BLPop_Timeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// BLPop with 0 timeout on empty list should return ErrTimeout
+	_, err = client.BLPop(c, "emptyq", 0)
+	if !isTimeout(err) {
+		t.Fatalf("expected ErrTimeout, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RW Locks (low-level)
+// ---------------------------------------------------------------------------
+
+func TestClient_RLock_WLock(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Acquire read lock
+	token, lease, fence, err := client.RLock(c, "rwkey", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", token, lease, fence)
+	}
+
+	// Release read lock
+	if err := client.RUnlock(c, "rwkey", token); err != nil {
+		t.Fatal(err)
+	}
+
+	// Acquire write lock
+	wToken, wLease, wFence, err := client.WLock(c, "rwkey", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wToken == "" || wLease <= 0 || wFence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", wToken, wLease, wFence)
+	}
+	if wFence <= fence {
+		t.Fatalf("write fence %d should be > read fence %d", wFence, fence)
+	}
+
+	if err := client.WUnlock(c, "rwkey", wToken); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClient_RWRenew(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, _, fence, err := client.RLock(c, "rwkey", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, renewFence, err := client.RRenew(c, "rwkey", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence mismatch: %d vs %d", renewFence, fence)
+	}
+}
+
+func TestClient_RWEnqueue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Enqueue read lock (should acquire immediately)
+	status, token, lease, fence, err := client.REnqueue(c, "rwkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "acquired" {
+		t.Fatalf("expected acquired, got %q", status)
+	}
+	if token == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected values: token=%q lease=%d fence=%d", token, lease, fence)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RWLock high-level type
+// ---------------------------------------------------------------------------
+
+func TestRWLock_ReadLockUnlock(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	rw := &client.RWLock{
+		Key:     "rwkey",
+		Servers: []string{addr},
+	}
+	defer rw.Close()
+
+	ok, err := rw.RLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected RLock to succeed")
+	}
+	if rw.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if rw.Fence() == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+
+	if err := rw.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRWLock_WriteLockUnlock(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	rw := &client.RWLock{
+		Key:     "rwkey",
+		Servers: []string{addr},
+	}
+	defer rw.Close()
+
+	ok, err := rw.WLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected WLock to succeed")
+	}
+
+	if err := rw.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRWLock_ConcurrentReaders(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rw := &client.RWLock{
+				Key:     "rwkey",
+				Servers: []string{addr},
+			}
+			defer rw.Close()
+
+			ok, err := rw.RLock(context.Background())
+			if err != nil {
+				t.Errorf("RLock error: %v", err)
+				return
+			}
+			if !ok {
+				t.Error("expected RLock to succeed")
+				return
+			}
+
+			time.Sleep(50 * time.Millisecond)
+
+			if err := rw.Unlock(context.Background()); err != nil {
+				t.Errorf("Unlock error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// Barrier
+// ---------------------------------------------------------------------------
+
+func TestClient_BarrierWait(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	var wg sync.WaitGroup
+	results := make([]bool, 3)
+	errs := make([]error, 3)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c, err := client.Dial(addr)
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			defer c.Close()
+
+			ok, err := client.BarrierWait(c, "barrier1", 3, 5*time.Second)
+			results[idx] = ok
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < 3; i++ {
+		if errs[i] != nil {
+			t.Fatalf("participant %d error: %v", i, errs[i])
+		}
+		if !results[i] {
+			t.Fatalf("participant %d: expected barrier to trip", i)
+		}
+	}
+}
+
+func TestClient_BarrierWait_Timeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Only 1 of 3 participants — should timeout
+	ok, err := client.BarrierWait(c, "barrier_to", 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected barrier to NOT trip")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WatchConn
+// ---------------------------------------------------------------------------
+
+func TestClient_WatchConn_KVSet(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Watcher connection
+	wc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch := client.NewWatchConn(wc)
+	defer watch.Close()
+
+	if err := watch.Watch("kv.*"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Separate connection to trigger events
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := client.KVSet(c, "kv.test", "hello", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case evt := <-watch.Events():
+		if evt.Key != "kv.test" {
+			t.Fatalf("expected key kv.test, got %q", evt.Key)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no watch event received")
+	}
+}
+
+func TestClient_WatchConn_Unwatch(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	wc, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch := client.NewWatchConn(wc)
+	defer watch.Close()
+
+	if err := watch.Watch("kv.*"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := watch.Unwatch("kv.*"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not receive events after unwatching
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	client.KVSet(c, "kv.test", "hello", 0)
+
+	select {
+	case evt := <-watch.Events():
+		t.Fatalf("should not receive events after unwatch, got %+v", evt)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no event
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LeaderConn
+// ---------------------------------------------------------------------------
+
+func TestClient_LeaderConn_ElectResign(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc := client.NewLeaderConn(c)
+	defer lc.Close()
+
+	token, lease, fence, err := lc.Elect("leader1", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || lease <= 0 || fence == 0 {
+		t.Fatalf("unexpected: token=%q lease=%d fence=%d", token, lease, fence)
+	}
+
+	if err := lc.Resign("leader1", token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClient_LeaderConn_ObserveUnobserve(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Observer
+	obsC, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs := client.NewLeaderConn(obsC)
+	defer obs.Close()
+
+	if err := obs.Observe("leader1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leader
+	leaderC, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc := client.NewLeaderConn(leaderC)
+	defer lc.Close()
+
+	token, _, _, err := lc.Elect("leader1", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Observer should receive event
+	select {
+	case evt := <-obs.Events():
+		if evt.Type != "elected" {
+			t.Fatalf("expected elected, got %q", evt.Type)
+		}
+		if evt.Key != "leader1" {
+			t.Fatalf("expected key leader1, got %q", evt.Key)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no leader event received")
+	}
+
+	// Unobserve
+	if err := obs.Unobserve("leader1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resign — observer should NOT get event
+	lc.Resign("leader1", token)
+
+	select {
+	case evt := <-obs.Events():
+		t.Fatalf("should not receive events after unobserve, got %+v", evt)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no event
+	}
+}
+
+func TestClient_LeaderConn_Renew(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc := client.NewLeaderConn(c)
+	defer lc.Close()
+
+	token, _, fence, err := lc.Elect("leader1", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, renewFence, err := lc.Renew("leader1", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+	if renewFence != fence {
+		t.Fatalf("fence mismatch on renew: %d vs %d", renewFence, fence)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Election high-level type
+// ---------------------------------------------------------------------------
+
+func TestElection_CampaignResign(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	elected := make(chan struct{}, 1)
+	resigned := make(chan struct{}, 1)
+
+	e := &client.Election{
+		Key:     "election1",
+		Servers: []string{addr},
+		OnElected: func() {
+			elected <- struct{}{}
+		},
+		OnResigned: func() {
+			resigned <- struct{}{}
+		},
+	}
+	defer e.Close()
+
+	ok, err := e.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected to be elected")
+	}
+	if !e.IsLeader() {
+		t.Fatal("expected IsLeader() to be true")
+	}
+	if e.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if e.Fence() == 0 {
+		t.Fatal("expected non-zero fence")
+	}
+
+	select {
+	case <-elected:
+	case <-time.After(time.Second):
+		t.Fatal("OnElected not called")
+	}
+
+	if err := e.Resign(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if e.IsLeader() {
+		t.Fatal("expected IsLeader() to be false after resign")
+	}
+
+	select {
+	case <-resigned:
+	case <-time.After(time.Second):
+		t.Fatal("OnResigned not called")
+	}
+}
+
+func TestElection_CampaignContextCancel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// First connection holds leadership
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lc1 := client.NewLeaderConn(c1)
+	defer lc1.Close()
+
+	_, _, _, err = lc1.Elect("election1", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second election should block and then cancel
+	e := &client.Election{
+		Key:     "election1",
+		Servers: []string{addr},
+	}
+	defer e.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	ok, err := e.Campaign(ctx)
+	if ok {
+		t.Fatal("expected campaign to NOT succeed while another holds leadership")
+	}
+	if err == nil {
+		t.Fatal("expected context error")
+	}
+}
