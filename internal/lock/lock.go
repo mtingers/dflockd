@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1037,6 +1038,9 @@ func (lm *LockManager) Incr(key string, delta int64) (int64, error) {
 }
 
 func (lm *LockManager) Decr(key string, delta int64) (int64, error) {
+	if delta == math.MinInt64 {
+		return 0, fmt.Errorf("delta overflow: %d", delta)
+	}
 	return lm.Incr(key, -delta)
 }
 

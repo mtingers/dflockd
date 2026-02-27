@@ -9,29 +9,31 @@ import (
 	"time"
 )
 
-// Pre-computed response prefixes to avoid allocations on the hot path.
-var (
-	respOK               = []byte("ok\n")
-	respAcquired         = []byte("acquired\n")
-	respTimeout          = []byte("timeout\n")
-	respError            = []byte("error\n")
-	respErrorAuth        = []byte("error_auth\n")
-	respErrorMaxLocks    = []byte("error_max_locks\n")
-	respErrorMaxWaiters  = []byte("error_max_waiters\n")
-	respErrorLimitMismatch    = []byte("error_limit_mismatch\n")
-	respErrorNotEnqueued      = []byte("error_not_enqueued\n")
-	respErrorAlreadyEnqueued  = []byte("error_already_enqueued\n")
-	respErrorMaxKeys          = []byte("error_max_keys\n")
-	respErrorListFull         = []byte("error_list_full\n")
-	respErrorLeaseExpired     = []byte("error_lease_expired\n")
-	respErrorTypeMismatch     = []byte("error_type_mismatch\n")
-	respNil                   = []byte("nil\n")
-	respQueued                = []byte("queued\n")
-	respCASConflict           = []byte("cas_conflict\n")
-	respErrorBarrierCountMismatch = []byte("error_barrier_count_mismatch\n")
+// Pre-computed response strings to avoid repeated formatting.
+// These are string constants (immutable) so they are safe for concurrent use.
+// FormatResponse returns fresh []byte copies via []byte(...) conversion.
+const (
+	respOK                        = "ok\n"
+	respAcquired                  = "acquired\n"
+	respTimeout                   = "timeout\n"
+	respError                     = "error\n"
+	respErrorAuth                 = "error_auth\n"
+	respErrorMaxLocks             = "error_max_locks\n"
+	respErrorMaxWaiters           = "error_max_waiters\n"
+	respErrorLimitMismatch        = "error_limit_mismatch\n"
+	respErrorNotEnqueued          = "error_not_enqueued\n"
+	respErrorAlreadyEnqueued      = "error_already_enqueued\n"
+	respErrorMaxKeys              = "error_max_keys\n"
+	respErrorListFull             = "error_list_full\n"
+	respErrorLeaseExpired         = "error_lease_expired\n"
+	respErrorTypeMismatch         = "error_type_mismatch\n"
+	respNil                       = "nil\n"
+	respQueued                    = "queued\n"
+	respCASConflict               = "cas_conflict\n"
+	respErrorBarrierCountMismatch = "error_barrier_count_mismatch\n"
 
-	prefixOK       = []byte("ok ")
-	prefixAcquired = []byte("acquired ")
+	prefixOK       = "ok "
+	prefixAcquired = "acquired "
 )
 
 const MaxLineBytes = 256
@@ -765,7 +767,7 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 				lease = defaultLeaseTTLSec
 			}
 			// Build: "<status> <token> <lease> [<fence>]\n"
-			var prefix []byte
+			var prefix string
 			if ack.Status == "ok" {
 				prefix = prefixOK
 			} else {
@@ -782,7 +784,7 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			return buf
 		}
 		if ack.Extra != "" {
-			var prefix []byte
+			var prefix string
 			if ack.Status == "ok" {
 				prefix = prefixOK
 			} else {
@@ -795,44 +797,45 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			return buf
 		}
 		if ack.Status == "acquired" {
-			return respAcquired
+			return []byte(respAcquired)
 		}
-		return respOK
+		return []byte(respOK)
 	default:
-		// Use pre-computed slices for known statuses.
+		// Return fresh []byte copies from string constants so callers
+		// never share mutable state across goroutines.
 		switch ack.Status {
 		case "timeout":
-			return respTimeout
+			return []byte(respTimeout)
 		case "error":
-			return respError
+			return []byte(respError)
 		case "error_auth":
-			return respErrorAuth
+			return []byte(respErrorAuth)
 		case "error_max_locks":
-			return respErrorMaxLocks
+			return []byte(respErrorMaxLocks)
 		case "error_max_waiters":
-			return respErrorMaxWaiters
+			return []byte(respErrorMaxWaiters)
 		case "error_limit_mismatch":
-			return respErrorLimitMismatch
+			return []byte(respErrorLimitMismatch)
 		case "error_not_enqueued":
-			return respErrorNotEnqueued
+			return []byte(respErrorNotEnqueued)
 		case "error_already_enqueued":
-			return respErrorAlreadyEnqueued
+			return []byte(respErrorAlreadyEnqueued)
 		case "queued":
-			return respQueued
+			return []byte(respQueued)
 		case "error_max_keys":
-			return respErrorMaxKeys
+			return []byte(respErrorMaxKeys)
 		case "error_list_full":
-			return respErrorListFull
+			return []byte(respErrorListFull)
 		case "error_lease_expired":
-			return respErrorLeaseExpired
+			return []byte(respErrorLeaseExpired)
 		case "error_type_mismatch":
-			return respErrorTypeMismatch
+			return []byte(respErrorTypeMismatch)
 		case "cas_conflict":
-			return respCASConflict
+			return []byte(respCASConflict)
 		case "error_barrier_count_mismatch":
-			return respErrorBarrierCountMismatch
+			return []byte(respErrorBarrierCountMismatch)
 		case "nil":
-			return respNil
+			return []byte(respNil)
 		default:
 			return []byte(ack.Status + "\n")
 		}

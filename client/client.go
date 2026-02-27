@@ -2380,6 +2380,9 @@ func rwLock(c *Conn, cmd, key string, timeout time.Duration, opts ...Option) (st
 	if resp == "error_type_mismatch" {
 		return "", 0, 0, ErrTypeMismatch
 	}
+	if resp == "error_lease_expired" {
+		return "", 0, 0, ErrLeaseExpired
+	}
 	return parseOKTokenLeaseFence(resp, cmd)
 }
 
