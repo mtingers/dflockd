@@ -5859,3 +5859,442 @@ func TestList_CompactItems_TriggerAfterHalfWasted(t *testing.T) {
 		t.Fatalf("expected item60 after compaction, got %q", v)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// HasLeaderWatcherObserver — all 3 paths
+// ---------------------------------------------------------------------------
+
+func TestHasLeaderWatcherObserver(t *testing.T) {
+	lm := testManager()
+
+	// Path 1: No watcher at all for connID
+	if lm.HasLeaderWatcherObserver("lw-key", 99) {
+		t.Fatal("expected false when no watcher exists")
+	}
+
+	// Path 2: Watcher exists but observer=false (registered via RegisterAndNotifyLeader)
+	ch1 := make(chan []byte, 4)
+	lm.RegisterAndNotifyLeader("lw-key", "elected", 10, ch1, func() {})
+	if lm.HasLeaderWatcherObserver("lw-key", 10) {
+		t.Fatal("expected false for holder-only watcher (not observer)")
+	}
+
+	// Path 3: Watcher is an observer (registered via RegisterLeaderWatcherWithStatus)
+	ch2 := make(chan []byte, 4)
+	lm.RegisterLeaderWatcherWithStatus("lw-key", 20, ch2, func() {})
+	if !lm.HasLeaderWatcherObserver("lw-key", 20) {
+		t.Fatal("expected true for observer watcher")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RegisterLeaderWatcherWithStatus return value
+// ---------------------------------------------------------------------------
+
+func TestRegisterLeaderWatcherWithStatus_ReturnValue(t *testing.T) {
+	lm := testManager()
+
+	// Brand new registration → true
+	ch := make(chan []byte, 4)
+	added := lm.RegisterLeaderWatcherWithStatus("rw-key", 1, ch, func() {})
+	if !added {
+		t.Fatal("expected true for brand new observer registration")
+	}
+
+	// Re-register same connID as observer (already observer) → false
+	added = lm.RegisterLeaderWatcherWithStatus("rw-key", 1, ch, func() {})
+	if added {
+		t.Fatal("expected false when re-registering same connID already marked observer")
+	}
+
+	// Register holder-only first, then upgrade to observer → true
+	ch2 := make(chan []byte, 4)
+	lm.RegisterAndNotifyLeader("rw-key2", "elected", 2, ch2, func() {})
+	added = lm.RegisterLeaderWatcherWithStatus("rw-key2", 2, ch2, func() {})
+	if !added {
+		t.Fatal("expected true when upgrading holder-only watcher to observer")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UnregisterLeaderWatcher return value
+// ---------------------------------------------------------------------------
+
+func TestUnregisterLeaderWatcher_ReturnValue(t *testing.T) {
+	lm := testManager()
+
+	// No watcher exists → false
+	removed := lm.UnregisterLeaderWatcher("unreg-key", 99)
+	if removed {
+		t.Fatal("expected false when no watcher exists")
+	}
+
+	// Register then unregister → true
+	ch := make(chan []byte, 4)
+	lm.RegisterLeaderWatcherWithStatus("unreg-key", 1, ch, func() {})
+	removed = lm.UnregisterLeaderWatcher("unreg-key", 1)
+	if !removed {
+		t.Fatal("expected true when watcher existed and was removed")
+	}
+
+	// Second unregister of same → false
+	removed = lm.UnregisterLeaderWatcher("unreg-key", 1)
+	if removed {
+		t.Fatal("expected false on second unregister (already removed)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ResignLeader notifies watchers
+// ---------------------------------------------------------------------------
+
+func TestResignLeader_NotifiesWatchers(t *testing.T) {
+	lm := testManager()
+
+	// Acquire a lock
+	tok, _, err := lm.AcquireWithFence(bg(), "resign-w", 5*time.Second, 30*time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Register an observer watcher on a different connID
+	ch := make(chan []byte, 4)
+	lm.RegisterLeaderWatcherWithStatus("resign-w", 2, ch, func() {})
+	// Drain the initial "leader elected" notification
+	select {
+	case <-ch:
+	default:
+	}
+
+	// Resign
+	if !lm.ResignLeader("resign-w", tok, 1) {
+		t.Fatal("resign should succeed")
+	}
+
+	// Watcher should receive "leader resigned <key>"
+	select {
+	case msg := <-ch:
+		expected := "leader resigned resign-w\n"
+		if string(msg) != expected {
+			t.Fatalf("expected %q, got %q", expected, string(msg))
+		}
+	default:
+		t.Fatal("expected resigned notification, got nothing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GrantNextWaiter failover notification
+// ---------------------------------------------------------------------------
+
+func TestGrantNextWaiter_FailoverNotification(t *testing.T) {
+	lm := testManager()
+
+	// conn1 acquires the lock
+	tok1, _ := lm.Acquire(bg(), "fo-key", 5*time.Second, 30*time.Second, 1, 1)
+	if tok1 == "" {
+		t.Fatal("conn1 should acquire")
+	}
+
+	// conn2 enqueues as waiter
+	done := make(chan string, 1)
+	go func() {
+		tok, _ := lm.Acquire(bg(), "fo-key", 5*time.Second, 30*time.Second, 2, 1)
+		done <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Register observer watcher on conn3
+	ch := make(chan []byte, 4)
+	lm.RegisterLeaderWatcherWithStatus("fo-key", 3, ch, func() {})
+	// Drain "leader elected" if present
+	select {
+	case <-ch:
+	default:
+	}
+
+	// Release conn1's lock → grant to conn2 → failover notification
+	lm.Release("fo-key", tok1)
+	tok2 := <-done
+	if tok2 == "" {
+		t.Fatal("conn2 should have acquired")
+	}
+
+	// Observer should receive "leader failover fo-key"
+	select {
+	case msg := <-ch:
+		expected := "leader failover fo-key\n"
+		if string(msg) != expected {
+			t.Fatalf("expected %q, got %q", expected, string(msg))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected failover notification, timed out")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OnLockRelease callback — release path
+// ---------------------------------------------------------------------------
+
+func TestOnLockRelease_Callback(t *testing.T) {
+	lm := testManager()
+
+	released := make(chan string, 1)
+	lm.OnLockRelease = func(key string) {
+		released <- key
+	}
+
+	tok, _ := lm.Acquire(bg(), "cb-key", 5*time.Second, 30*time.Second, 1, 1)
+	if tok == "" {
+		t.Fatal("should acquire")
+	}
+
+	// Manually expire the lease so that a subsequent Acquire triggers eviction
+	lm.LockKeyForTest("cb-key")
+	lm.ResourceForTest("cb-key").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("cb-key")
+
+	// Another Acquire will call evictExpiredLocked which fires OnLockRelease
+	lm.Acquire(bg(), "cb-key", 0, 30*time.Second, 2, 1)
+
+	select {
+	case key := <-released:
+		if key != "cb-key" {
+			t.Fatalf("expected cb-key, got %s", key)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnLockRelease callback not fired")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OnLockRelease callback — lease expiry path
+// ---------------------------------------------------------------------------
+
+func TestOnLockRelease_LeaseExpiry(t *testing.T) {
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+
+	released := make(chan string, 1)
+	lm.OnLockRelease = func(key string) {
+		released <- key
+	}
+
+	tok, _ := lm.Acquire(bg(), "cb-exp", 5*time.Second, 1*time.Second, 1, 1)
+	if tok == "" {
+		t.Fatal("should acquire")
+	}
+
+	// Manually expire
+	lm.LockKeyForTest("cb-exp")
+	lm.ResourceForTest("cb-exp").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
+	lm.UnlockKeyForTest("cb-exp")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		lm.LeaseExpiryLoop(ctx)
+	}()
+
+	select {
+	case key := <-released:
+		if key != "cb-exp" {
+			t.Fatalf("expected cb-exp, got %s", key)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnLockRelease callback not fired by lease expiry")
+	}
+	cancel()
+	<-loopDone
+}
+
+// ---------------------------------------------------------------------------
+// KVCAS with TTL
+// ---------------------------------------------------------------------------
+
+func TestKVCAS_WithTTL(t *testing.T) {
+	lm := testManager()
+	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
+
+	// Create via CAS with a 1-second TTL
+	ok, err := lm.KVCAS("cas-ttl", "", "hello", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("CAS should succeed on absent key")
+	}
+
+	// Should be readable immediately
+	val, found := lm.KVGet("cas-ttl")
+	if !found || val != "hello" {
+		t.Fatalf("expected hello, got %q (found=%v)", val, found)
+	}
+
+	// Force expiry by setting ExpiresAt to the past
+	lm.LockKeyForTest("cas-ttl")
+	sh := lm.ResourceForTest("cas-ttl") // ResourceForTest looks at resources, we need kvStore
+	_ = sh
+	lm.UnlockKeyForTest("cas-ttl")
+
+	// Use the LeaseExpiryLoop to sweep KV TTLs (it sweeps expired KV too)
+	// Or just wait — KVGet does lazy expiry. Force it:
+	// Manually expire by accessing internals through the shard.
+	// Since we don't have a KV-specific test helper, just sleep past the TTL
+	// and rely on lazy expiry in KVGet.
+	// Set short TTL: create a new one with ttl=0 first, then create the real one.
+	lm.KVDel("cas-ttl")
+
+	// Re-create with extremely short effective TTL by directly manipulating shard
+	ok2, err2 := lm.KVCAS("cas-ttl2", "", "world", 1)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if !ok2 {
+		t.Fatal("CAS should succeed")
+	}
+
+	// Use LeaseExpiryLoop which also sweeps KV entries
+	// Manually expire via shard access:
+	idx := shardIndex("cas-ttl2")
+	lm.LockKeyForTest("cas-ttl2")
+	lm.UnlockKeyForTest("cas-ttl2")
+	// Access shard directly (same package)
+	s := &lm.shards[idx]
+	s.mu.Lock()
+	if e, ok := s.kvStore["cas-ttl2"]; ok {
+		e.ExpiresAt = time.Now().Add(-1 * time.Second)
+	}
+	s.mu.Unlock()
+
+	// KVGet does lazy expiry
+	_, found = lm.KVGet("cas-ttl2")
+	if found {
+		t.Fatal("expected key to be expired and not found")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Barrier idle GC
+// ---------------------------------------------------------------------------
+
+func TestBarrier_IdleGC(t *testing.T) {
+	lm := testManager()
+	lm.cfg.GCInterval = 50 * time.Millisecond
+	lm.cfg.GCMaxIdleTime = 0
+
+	// Create barrier state without tripping it (1 of 3 participants, then timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	lm.BarrierWait(ctx, "b-idle", 3, 50*time.Millisecond, 1)
+	cancel()
+
+	// Force LastActivity to the past
+	idx := shardIndex("b-idle")
+	s := &lm.shards[idx]
+	s.mu.Lock()
+	if bs, ok := s.barriers["b-idle"]; ok {
+		bs.LastActivity = time.Now().Add(-100 * time.Second)
+	}
+	s.mu.Unlock()
+
+	gcCtx, gcCancel := context.WithCancel(context.Background())
+	go lm.GCLoop(gcCtx)
+	time.Sleep(200 * time.Millisecond)
+	gcCancel()
+
+	// Barrier should have been GC'd
+	s.mu.Lock()
+	_, exists := s.barriers["b-idle"]
+	s.mu.Unlock()
+	if exists {
+		t.Fatal("idle barrier should have been GC'd")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GC does NOT prune list with active pop waiters
+// ---------------------------------------------------------------------------
+
+func TestGC_ListWithPopWaiters_NotPruned(t *testing.T) {
+	lm := testManager()
+	lm.cfg.GCInterval = 50 * time.Millisecond
+	lm.cfg.GCMaxIdleTime = 0
+
+	// Create a BLPop waiter on an empty list
+	blpopDone := make(chan struct{})
+	blpopCtx, blpopCancel := context.WithCancel(context.Background())
+	go func() {
+		defer close(blpopDone)
+		lm.BLPop(blpopCtx, "list-gc", 30*time.Second, 1)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Force LastActivity to the past so GC considers it idle
+	idx := shardIndex("list-gc")
+	s := &lm.shards[idx]
+	s.mu.Lock()
+	if ls, ok := s.lists["list-gc"]; ok {
+		ls.LastActivity = time.Now().Add(-100 * time.Second)
+	}
+	s.mu.Unlock()
+
+	// Run GC
+	gcCtx, gcCancel := context.WithCancel(context.Background())
+	go lm.GCLoop(gcCtx)
+	time.Sleep(200 * time.Millisecond)
+	gcCancel()
+
+	// List should NOT have been pruned (has active pop waiters)
+	s.mu.Lock()
+	_, exists := s.lists["list-gc"]
+	s.mu.Unlock()
+	if !exists {
+		t.Fatal("list with active pop waiters should not be GC'd")
+	}
+
+	// Cleanup
+	blpopCancel()
+	<-blpopDone
+}
+
+// ---------------------------------------------------------------------------
+// removeLeaderHolderWatcher preserves observer flag
+// ---------------------------------------------------------------------------
+
+func TestRemoveLeaderHolderWatcher_ObserverPreserved(t *testing.T) {
+	lm := testManager()
+
+	// Register holder watcher via RegisterAndNotifyLeader (observer=false)
+	ch := make(chan []byte, 4)
+	lm.RegisterAndNotifyLeader("rh-key", "elected", 1, ch, func() {})
+
+	// Also register as observer via RegisterLeaderWatcherWithStatus (sets observer=true)
+	lm.RegisterLeaderWatcherWithStatus("rh-key", 1, ch, func() {})
+	// Drain any notifications
+	for len(ch) > 0 {
+		<-ch
+	}
+
+	// Now simulate what happens when a lock is released: removeLeaderHolderWatcher
+	// is called. Since observer=true, the watcher should be preserved.
+	// We can trigger this by acquiring and releasing a lock.
+	tok, _ := lm.Acquire(bg(), "rh-key", 5*time.Second, 30*time.Second, 1, 1)
+	if tok == "" {
+		t.Fatal("should acquire")
+	}
+	// Register holder watcher again (this is what elect does after acquire)
+	lm.RegisterAndNotifyLeader("rh-key", "elected", 1, ch, func() {})
+	// Drain notifications
+	for len(ch) > 0 {
+		<-ch
+	}
+
+	// Release the lock — this calls removeLeaderHolderWatcher internally
+	lm.Release("rh-key", tok)
+
+	// The observer watcher should still be there
+	if !lm.HasLeaderWatcherObserver("rh-key", 1) {
+		t.Fatal("observer watcher should be preserved after removeLeaderHolderWatcher")
+	}
+}

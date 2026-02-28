@@ -594,3 +594,119 @@ func TestWatch_ConcurrentStats(t *testing.T) {
 	wg.Wait()
 	// No panics or races = pass
 }
+
+// ---------------------------------------------------------------------------
+// Watch return-value tests
+// ---------------------------------------------------------------------------
+
+func TestWatch_ReturnValue_NewVsDuplicate(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 10)
+
+	added, err := m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !added {
+		t.Fatal("first Watch should return true (new subscription)")
+	}
+
+	// Duplicate: same connID + pattern
+	added, err = m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
+	if err != nil {
+		t.Fatalf("unexpected error on duplicate: %v", err)
+	}
+	if added {
+		t.Fatal("duplicate Watch should return false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Watch with invalid pattern returns (false, error)
+// ---------------------------------------------------------------------------
+
+func TestWatch_ReturnValue_InvalidPattern(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 10)
+
+	added, err := m.Watch(&Watcher{ConnID: 1, Pattern: "a.>.b", WriteCh: ch, CancelConn: func() {}})
+	if err == nil {
+		t.Fatal("expected error for invalid pattern a.>.b")
+	}
+	if added {
+		t.Fatal("added should be false when pattern is invalid")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unwatch return value
+// ---------------------------------------------------------------------------
+
+func TestUnwatch_ReturnValue(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 10)
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: func() {}})
+
+	removed := m.Unwatch("mykey", 1)
+	if !removed {
+		t.Fatal("Unwatch should return true when watcher existed")
+	}
+
+	removed = m.Unwatch("mykey", 1)
+	if removed {
+		t.Fatal("Unwatch should return false when watcher did not exist")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Notify with CancelConn=nil and a full buffer must not panic
+// ---------------------------------------------------------------------------
+
+func TestNotify_NilCancelConn_FullBuffer(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 1) // buffer of 1
+	m.Watch(&Watcher{ConnID: 1, Pattern: "mykey", WriteCh: ch, CancelConn: nil})
+
+	// Fill the buffer.
+	m.Notify("kset", "mykey")
+
+	// Second notify hits the full-buffer path with CancelConn == nil.
+	// This must not panic.
+	done := make(chan struct{})
+	go func() {
+		m.Notify("kset", "mykey")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: no panic, no block.
+	case <-time.After(time.Second):
+		t.Fatal("Notify blocked with nil CancelConn on full buffer")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stats after removing the last wildcard watcher
+// ---------------------------------------------------------------------------
+
+func TestStats_AfterRemovingLastWildcardWatcher(t *testing.T) {
+	m := NewManager()
+	ch := make(chan []byte, 10)
+	m.Watch(&Watcher{ConnID: 1, Pattern: "prefix.*", WriteCh: ch, CancelConn: func() {}})
+
+	stats := m.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 stat entry, got %d", len(stats))
+	}
+	if stats[0].Pattern != "prefix.*" || stats[0].Watchers != 1 {
+		t.Fatalf("unexpected stats: %+v", stats[0])
+	}
+
+	m.Unwatch("prefix.*", 1)
+
+	stats = m.Stats()
+	if len(stats) != 0 {
+		t.Fatalf("expected 0 stat entries after removing last wildcard watcher, got %d", len(stats))
+	}
+}

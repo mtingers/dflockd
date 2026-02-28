@@ -1026,3 +1026,113 @@ func TestUnlistenAll_WildcardGroups_MultipleConns(t *testing.T) {
 		t.Errorf("expected 2 wildGroups remaining, got %d", len(m.wildGroups))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Listen return-value tests
+// ---------------------------------------------------------------------------
+
+func TestListen_ReturnValue_NewVsDuplicate(t *testing.T) {
+	m := NewManager()
+	l := makeListener(1, "ch")
+
+	added, err := m.Listen(l)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !added {
+		t.Fatal("first Listen should return true (new subscription)")
+	}
+
+	// Duplicate: same connID + pattern + group
+	l2 := makeListener(1, "ch")
+	added, err = m.Listen(l2)
+	if err != nil {
+		t.Fatalf("unexpected error on duplicate: %v", err)
+	}
+	if added {
+		t.Fatal("duplicate Listen should return false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Listen with invalid pattern
+// ---------------------------------------------------------------------------
+
+func TestListen_InvalidPattern(t *testing.T) {
+	m := NewManager()
+	l := &Listener{
+		ConnID:  1,
+		Pattern: "a.>.b",
+		WriteCh: make(chan []byte, 1),
+	}
+	added, err := m.Listen(l)
+	if err == nil {
+		t.Fatal("expected error for invalid pattern a.>.b")
+	}
+	if added {
+		t.Fatal("added should be false when pattern is invalid")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unlisten return value
+// ---------------------------------------------------------------------------
+
+func TestUnlisten_ReturnValue(t *testing.T) {
+	m := NewManager()
+	l := makeListener(1, "ch")
+	m.Listen(l)
+
+	removed := m.Unlisten("ch", 1, "")
+	if !removed {
+		t.Fatal("Unlisten should return true when listener existed")
+	}
+
+	removed = m.Unlisten("ch", 1, "")
+	if removed {
+		t.Fatal("Unlisten should return false when listener did not exist")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UnlistenAll with unregistered connID must not panic
+// ---------------------------------------------------------------------------
+
+func TestUnlistenAll_NoRegistrations(t *testing.T) {
+	m := NewManager()
+	// connID 999 was never registered — should be a no-op, not a panic.
+	m.UnlistenAll(999)
+}
+
+// ---------------------------------------------------------------------------
+// Signal to listener with CancelConn=nil and a full buffer (nil guard)
+// ---------------------------------------------------------------------------
+
+func TestSignal_NilCancelConn_FullBuffer(t *testing.T) {
+	m := NewManager()
+	l := &Listener{
+		ConnID:     1,
+		Pattern:    "ch",
+		WriteCh:    make(chan []byte, 1),
+		CancelConn: nil, // intentionally nil
+	}
+	m.Listen(l)
+
+	// Fill the buffer.
+	m.Signal("ch", "first")
+
+	// Second signal hits the full-buffer path with CancelConn == nil.
+	// This must not panic.
+	done := make(chan struct{})
+	go func() {
+		m.Signal("ch", "second")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: no panic, no block.
+	case <-time.After(time.Second):
+		t.Fatal("Signal blocked with nil CancelConn on full buffer")
+	}
+}

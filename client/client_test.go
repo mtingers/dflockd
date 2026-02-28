@@ -5191,3 +5191,284 @@ func TestClient_ErrMaxKeys_Sentinel(t *testing.T) {
 		t.Fatalf("expected ErrMaxKeys, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Coverage gap tests
+// ---------------------------------------------------------------------------
+
+func TestLock_Wait_ErrNotQueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	l := &client.Lock{
+		Key:     "wait-nq",
+		Servers: []string{addr},
+	}
+	// Call Wait without prior Enqueue — conn is nil, should return ErrNotQueued.
+	ok, err := l.Wait(context.Background(), 5*time.Second)
+	if err != client.ErrNotQueued {
+		t.Fatalf("expected ErrNotQueued, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false")
+	}
+}
+
+func TestSemaphore_Wait_ErrNotQueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s := &client.Semaphore{
+		Key:     "sem-wait-nq",
+		Limit:   1,
+		Servers: []string{addr},
+	}
+	// Call Wait without prior Enqueue — conn is nil, should return ErrNotQueued.
+	ok, err := s.Wait(context.Background(), 5*time.Second)
+	if err != client.ErrNotQueued {
+		t.Fatalf("expected ErrNotQueued, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false")
+	}
+}
+
+func TestAuthenticate_EmptyToken(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.Authenticate(c, "")
+	if err == nil {
+		t.Fatal("expected error for empty token")
+	}
+	if err.Error() != "dflockd: empty auth token" {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestAuthenticate_NewlineInToken(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.Authenticate(c, "bad\ntoken")
+	if err == nil {
+		t.Fatal("expected error for token with newline")
+	}
+}
+
+func TestKVSet_TabInValue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.KVSet(c, "tabkey", "has\ttab", 0)
+	if err == nil {
+		t.Fatal("expected error for value with tab")
+	}
+	if err.Error() != "dflockd: value contains tab" {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestKVCAS_EmptyNewValue(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.KVCAS(c, "caskey", "old", "", 0)
+	if err == nil {
+		t.Fatal("expected error for empty newValue")
+	}
+	if err.Error() != "dflockd: newValue must not be empty" {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestKVCAS_TabInValues(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Tab in oldValue
+	_, err = client.KVCAS(c, "caskey", "old\told", "new", 0)
+	if err == nil {
+		t.Fatal("expected error for tab in oldValue")
+	}
+	if err.Error() != "dflockd: oldValue contains tab" {
+		t.Fatalf("unexpected error for oldValue tab: %v", err)
+	}
+
+	// Tab in newValue
+	_, err = client.KVCAS(c, "caskey", "old", "new\tnew", 0)
+	if err == nil {
+		t.Fatal("expected error for tab in newValue")
+	}
+	if err.Error() != "dflockd: newValue contains tab" {
+		t.Fatalf("unexpected error for newValue tab: %v", err)
+	}
+}
+
+func TestRWLock_Close_NoUnlock(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	rw := &client.RWLock{
+		Key:     "rw-close",
+		Servers: []string{addr},
+	}
+
+	ok, err := rw.RLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected RLock to succeed")
+	}
+	if rw.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// Close without Unlock — should not panic and should clear state.
+	if err := rw.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if rw.Token() != "" {
+		t.Fatal("token should be cleared after Close")
+	}
+	if rw.Fence() != 0 {
+		t.Fatal("fence should be cleared after Close")
+	}
+}
+
+func TestElection_Close_NoResign(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	e := &client.Election{
+		Key:     "elect-close",
+		Servers: []string{addr},
+	}
+
+	ok, err := e.Campaign(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected Campaign to succeed")
+	}
+	if !e.IsLeader() {
+		t.Fatal("expected to be leader")
+	}
+
+	// Close without Resign — should not panic and should clear state.
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if e.IsLeader() {
+		t.Fatal("expected not leader after Close")
+	}
+	if e.Token() != "" {
+		t.Fatal("token should be cleared after Close")
+	}
+}
+
+func TestSignalConn_UnlistenUnregistered(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	// Unlisten for a pattern never listened to — should not panic or error.
+	if err := sc.Unlisten("never.listened"); err != nil {
+		t.Fatalf("Unlisten on unregistered pattern failed: %v", err)
+	}
+}
+
+func TestWatchConn_UnwatchUnregistered(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc := client.NewWatchConn(c)
+	defer wc.Close()
+
+	// Unwatch for a pattern never watched — should not panic or error.
+	if err := wc.Unwatch("never.watched"); err != nil {
+		t.Fatalf("Unwatch on unregistered pattern failed: %v", err)
+	}
+}
+
+func TestSemaphore_Enqueue_ContextCancel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// s1 fills capacity so s2's Enqueue returns "queued"
+	s1 := &client.Semaphore{
+		Key:            "sem-eq-cancel",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("s1 acquire failed")
+	}
+	defer s1.Release(context.Background())
+
+	// s2 enqueues normally, then Wait with cancelled context
+	s2 := &client.Semaphore{
+		Key:     "sem-eq-cancel",
+		Limit:   1,
+		Servers: []string{addr},
+	}
+	status, err := s2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// Now call Wait with a context that we cancel mid-operation.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, waitErr := s2.Wait(ctx, 30*time.Second)
+		if waitErr == nil {
+			t.Error("expected error from cancelled context")
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Semaphore.Wait did not return after context cancellation")
+	}
+}

@@ -1756,24 +1756,32 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// closeIfOurs closes s.conn only if it hasn't been replaced by a
+	// concurrent Acquire call while the mutex was released.
+	closeIfOurs := func() {
+		if s.conn == conn {
+			s.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if errors.Is(err, ErrTimeout) {
-			s.closeConn()
+			closeIfOurs()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			s.closeConn()
+			closeIfOurs()
 			return false, ctx.Err()
 		}
-		s.closeConn()
+		closeIfOurs()
 		return false, err
 	}
 
 	if ctx.Err() != nil {
 		SemRelease(conn, s.Key, token)
 		close(done)
-		s.closeConn()
+		closeIfOurs()
 		return false, ctx.Err()
 	}
 	close(done)
@@ -1815,13 +1823,19 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	closeIfOurs := func() {
+		if s.conn == conn {
+			s.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if ctx.Err() != nil {
-			s.closeConn()
+			closeIfOurs()
 			return "", ctx.Err()
 		}
-		s.closeConn()
+		closeIfOurs()
 		return "", err
 	}
 
@@ -1830,7 +1844,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 			SemRelease(conn, s.Key, token)
 		}
 		close(done)
-		s.closeConn()
+		closeIfOurs()
 		return "", ctx.Err()
 	}
 	close(done)
@@ -1870,24 +1884,30 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	closeIfOurs := func() {
+		if s.conn == conn {
+			s.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if errors.Is(err, ErrTimeout) {
-			s.closeConn()
+			closeIfOurs()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			s.closeConn()
+			closeIfOurs()
 			return false, ctx.Err()
 		}
-		s.closeConn()
+		closeIfOurs()
 		return false, err
 	}
 
 	if ctx.Err() != nil {
 		SemRelease(conn, s.Key, token)
 		close(done)
-		s.closeConn()
+		closeIfOurs()
 		return false, ctx.Err()
 	}
 	close(done)
@@ -2729,17 +2749,25 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
+	// closeIfOurs closes rw.conn only if it hasn't been replaced by a
+	// concurrent acquire call while the mutex was released.
+	closeIfOurs := func() {
+		if rw.conn == conn {
+			rw.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if errors.Is(err, ErrTimeout) {
-			rw.closeConn()
+			closeIfOurs()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			rw.closeConn()
+			closeIfOurs()
 			return false, ctx.Err()
 		}
-		rw.closeConn()
+		closeIfOurs()
 		return false, err
 	}
 
@@ -2751,7 +2779,7 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 			RUnlock(conn, rw.Key, token)
 		}
 		close(done)
-		rw.closeConn()
+		closeIfOurs()
 		return false, ctx.Err()
 	}
 	close(done)

@@ -785,3 +785,47 @@ func TestLoad_WriteTimeoutZero(t *testing.T) {
 		t.Fatalf("write-timeout: got %v, want 0", cfg.WriteTimeout)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// envOrDuration: large negative value clamped
+// ---------------------------------------------------------------------------
+
+func TestEnvOrDuration_LargeNegativeValueClamped(t *testing.T) {
+	largeNeg := fmt.Sprintf("%d", -(maxSafeSeconds + 1))
+	t.Setenv("DFLOCKD_TEST_LARGE_NEG_DUR", largeNeg)
+	d := envOrDuration("DFLOCKD_TEST_LARGE_NEG_DUR", 5)
+	if d >= 0 {
+		t.Fatalf("expected negative clamped duration, got %v", d)
+	}
+	expected := time.Duration(-maxSafeSeconds) * time.Second
+	if d != expected {
+		t.Errorf("expected clamped duration %v, got %v", expected, d)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// --auth-token-file flag takes precedence over DFLOCKD_AUTH_TOKEN_FILE env var
+// ---------------------------------------------------------------------------
+
+func TestLoad_AuthTokenFile_PrecedenceOverEnv(t *testing.T) {
+	// Create two distinct token files.
+	flagFile := t.TempDir() + "/flag_token.txt"
+	if err := os.WriteFile(flagFile, []byte("flag-wins"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	envFile := t.TempDir() + "/env_token.txt"
+	if err := os.WriteFile(envFile, []byte("env-loses"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("DFLOCKD_AUTH_TOKEN_FILE", envFile)
+
+	cfg, err := Load([]string{"--auth-token-file", flagFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthToken != "flag-wins" {
+		t.Fatalf("auth-token: got %q, want %q (--auth-token-file flag should take precedence over env var)",
+			cfg.AuthToken, "flag-wins")
+	}
+}

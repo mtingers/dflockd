@@ -5436,3 +5436,446 @@ func TestIntegration_MaxSubscriptions_SpuriousUnobserve(t *testing.T) {
 		t.Fatal("spurious unobserve should NOT free a subscription slot")
 	}
 }
+
+// ===========================================================================
+// Coverage gap-filling tests
+// ===========================================================================
+
+func TestIntegration_UnknownCommand(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "boguscmd", "somekey", "somearg")
+	if resp != "error" {
+		t.Fatalf("expected 'error' for unknown command, got %q", resp)
+	}
+}
+
+func TestIntegration_ResignBadToken(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Elect a leader
+	resp := connSendCmd(t, conn, reader, "elect", "resign_bad", "5 10")
+	parts := strings.Fields(resp)
+	if len(parts) < 4 || parts[0] != "ok" {
+		t.Fatalf("elect: expected ok, got %q", resp)
+	}
+
+	// Resign with wrong token
+	resp = connSendCmd(t, conn, reader, "resign", "resign_bad", "wrong-token")
+	if resp != "error" {
+		t.Fatalf("expected 'error' for resign with wrong token, got %q", resp)
+	}
+}
+
+func TestIntegration_ElectTimeout(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// conn1 holds the election key with a long timeout
+	conn1 := dialTest(t, addr)
+	defer conn1.Close()
+	reader1 := bufio.NewReader(conn1)
+
+	resp := connSendCmd(t, conn1, reader1, "elect", "elect_to", "10 30")
+	parts := strings.Fields(resp)
+	if len(parts) < 4 || parts[0] != "ok" {
+		t.Fatalf("elect conn1: expected ok, got %q", resp)
+	}
+
+	// conn2 tries to elect with timeout=0 -- should timeout immediately
+	conn2 := dialTest(t, addr)
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+
+	resp = connSendCmd(t, conn2, reader2, "elect", "elect_to", "0 10")
+	if resp != "timeout" {
+		t.Fatalf("expected 'timeout' for elect with timeout=0, got %q", resp)
+	}
+}
+
+func TestIntegration_RWRelease_WrongToken(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Acquire a read lock
+	resp := connSendCmd(t, conn, reader, "rl", "rwrel_bad", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 4 || parts[0] != "ok" {
+		t.Fatalf("rl: expected ok, got %q", resp)
+	}
+
+	// Try to release with wrong token via rr
+	resp = connSendCmd(t, conn, reader, "rr", "rwrel_bad", "wrong-token")
+	if resp != "error" {
+		t.Fatalf("expected 'error' for rr with wrong token, got %q", resp)
+	}
+}
+
+func TestIntegration_RWRenew_BadToken(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Try rn with a bogus token (no lock held)
+	resp := connSendCmd(t, conn, reader, "rn", "rwren_bad", "bogus-token-123")
+	if resp != "error" {
+		t.Fatalf("expected 'error' for rn with bogus token, got %q", resp)
+	}
+}
+
+func TestIntegration_RWWait_NotEnqueued(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Send rw without prior re
+	resp := connSendCmd(t, conn, reader, "rw", "rwwait_noenq", "5")
+	if resp != "error_not_enqueued" {
+		t.Fatalf("expected 'error_not_enqueued', got %q", resp)
+	}
+}
+
+func TestIntegration_RWEnqueue_AlreadyEnqueued(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// First re should succeed (immediate acquire since no contention)
+	resp := connSendCmd(t, conn, reader, "re", "rw_dup_enq", "10")
+	parts := strings.Fields(resp)
+	if parts[0] != "acquired" {
+		t.Fatalf("first re: expected acquired, got %q", resp)
+	}
+
+	// Second re on same key from same connection should get error_already_enqueued
+	resp = connSendCmd(t, conn, reader, "re", "rw_dup_enq", "10")
+	if resp != "error_already_enqueued" {
+		t.Fatalf("expected 'error_already_enqueued', got %q", resp)
+	}
+}
+
+func TestIntegration_BRPop_Timeout(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// brpop on empty list with timeout=0 should return nil immediately
+	resp := connSendCmd(t, conn, reader, "brpop", "brpop_empty", "0")
+	if resp != "nil" {
+		t.Fatalf("expected 'nil' for brpop timeout, got %q", resp)
+	}
+}
+
+func TestIntegration_Decr_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Create one counter via incr
+	resp := connSendCmd(t, conn, reader, "incr", "ctr_existing", "1")
+	if resp != "ok 1" {
+		t.Fatalf("incr: expected 'ok 1', got %q", resp)
+	}
+
+	// Try decr on a different key -- should hit max keys
+	resp = connSendCmd(t, conn, reader, "decr", "ctr_new", "1")
+	if resp != "error_max_keys" {
+		t.Fatalf("expected 'error_max_keys', got %q", resp)
+	}
+}
+
+func TestIntegration_Cset_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Create one counter
+	resp := connSendCmd(t, conn, reader, "incr", "cset_existing", "1")
+	if resp != "ok 1" {
+		t.Fatalf("incr: expected 'ok 1', got %q", resp)
+	}
+
+	// Try cset on a different key -- should hit max keys
+	resp = connSendCmd(t, conn, reader, "cset", "cset_new", "42")
+	if resp != "error_max_keys" {
+		t.Fatalf("expected 'error_max_keys', got %q", resp)
+	}
+}
+
+func TestIntegration_KSet_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Create one KV entry
+	resp := connSendCmd(t, conn, reader, "kset", "kv_existing", "hello")
+	if resp != "ok" {
+		t.Fatalf("kset: expected 'ok', got %q", resp)
+	}
+
+	// Try kset on a different key -- should hit max keys
+	resp = connSendCmd(t, conn, reader, "kset", "kv_new", "world")
+	if resp != "error_max_keys" {
+		t.Fatalf("expected 'error_max_keys', got %q", resp)
+	}
+}
+
+func TestIntegration_LPush_ListFull(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxListLength = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Push one item
+	resp := connSendCmd(t, conn, reader, "lpush", "lpush_full", "a")
+	if resp != "ok 1" {
+		t.Fatalf("lpush: expected 'ok 1', got %q", resp)
+	}
+
+	// Try lpush to same list -- should be full
+	resp = connSendCmd(t, conn, reader, "lpush", "lpush_full", "b")
+	if resp != "error_list_full" {
+		t.Fatalf("expected 'error_list_full', got %q", resp)
+	}
+}
+
+func TestIntegration_LPush_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Create one list
+	resp := connSendCmd(t, conn, reader, "lpush", "list_existing", "a")
+	if resp != "ok 1" {
+		t.Fatalf("lpush: expected 'ok 1', got %q", resp)
+	}
+
+	// Try lpush on a different key -- should hit max keys
+	resp = connSendCmd(t, conn, reader, "lpush", "list_new", "b")
+	if resp != "error_max_keys" {
+		t.Fatalf("expected 'error_max_keys', got %q", resp)
+	}
+}
+
+func TestIntegration_RPush_MaxKeys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Create one list
+	resp := connSendCmd(t, conn, reader, "rpush", "rlist_existing", "a")
+	if resp != "ok 1" {
+		t.Fatalf("rpush: expected 'ok 1', got %q", resp)
+	}
+
+	// Try rpush on a different key -- should hit max keys
+	resp = connSendCmd(t, conn, reader, "rpush", "rlist_new", "b")
+	if resp != "error_max_keys" {
+		t.Fatalf("expected 'error_max_keys', got %q", resp)
+	}
+}
+
+func TestIntegration_Stats_SignalChannels(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Set up a signal listener
+	resp := connSendCmd(t, conn, reader, "listen", "stats.sig.*", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	// Call stats
+	resp = connSendCmd(t, conn, reader, "stats", "_", "")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("stats: expected 'ok <json>', got %q", resp)
+	}
+	jsonStr := strings.TrimPrefix(resp, "ok ")
+
+	var stats lock.Stats
+	if err := json.Unmarshal([]byte(jsonStr), &stats); err != nil {
+		t.Fatalf("stats JSON: %v\njson: %s", err, jsonStr)
+	}
+
+	// Verify signal_channels data appears
+	if len(stats.SignalChannels) == 0 {
+		t.Fatal("expected signal_channels to be populated, got empty")
+	}
+	found := false
+	for _, sc := range stats.SignalChannels {
+		if sc.Pattern == "stats.sig.*" && sc.Listeners > 0 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected signal_channels to contain pattern 'stats.sig.*', got %+v", stats.SignalChannels)
+	}
+}
+
+func TestIntegration_Stats_WatchChannels(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Set up a watcher
+	resp := connSendCmd(t, conn, reader, "watch", "stats.watch.*", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+
+	// Call stats
+	resp = connSendCmd(t, conn, reader, "stats", "_", "")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("stats: expected 'ok <json>', got %q", resp)
+	}
+	jsonStr := strings.TrimPrefix(resp, "ok ")
+
+	var stats lock.Stats
+	if err := json.Unmarshal([]byte(jsonStr), &stats); err != nil {
+		t.Fatalf("stats JSON: %v\njson: %s", err, jsonStr)
+	}
+
+	// Verify watch_channels data appears
+	if len(stats.WatchChannels) == 0 {
+		t.Fatal("expected watch_channels to be populated, got empty")
+	}
+	found := false
+	for _, wc := range stats.WatchChannels {
+		if wc.Pattern == "stats.watch.*" && wc.Watchers > 0 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected watch_channels to contain pattern 'stats.watch.*', got %+v", stats.WatchChannels)
+	}
+}
+
+func TestIntegration_Drain_ZeroTimeout(t *testing.T) {
+	cfg := testConfig()
+	cfg.ShutdownTimeout = 0
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunOnListener(ctx, ln)
+	}()
+
+	// Connect a client and acquire a lock
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "l", "drain_key", "10")
+	parts := strings.Fields(resp)
+	if len(parts) != 4 || parts[0] != "ok" {
+		t.Fatalf("lock: expected ok, got %q", resp)
+	}
+
+	// Close the client connection so the server can drain cleanly
+	conn.Close()
+
+	// Give server time to detect disconnect
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel context to trigger shutdown with ShutdownTimeout=0
+	// (drain path: wg.Wait without force-close)
+	cancel()
+
+	// Server should drain and exit cleanly
+	select {
+	case <-done:
+		// success -- clean drain completed
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not shut down within expected time with ShutdownTimeout=0")
+	}
+}
