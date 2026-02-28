@@ -822,11 +822,24 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "error"}
 
 	case "observe":
-		s.lm.RegisterLeaderWatcherWithStatus(req.Key, connID, cs.writeCh, cs.cancelConn)
+		if max := s.cfg.MaxSubscriptions; max > 0 && cs.subscriptions >= max {
+			// Pre-check: at the limit. Only allow through if this would be
+			// a duplicate (idempotent) registration.
+			if !s.lm.HasLeaderWatcherObserver(req.Key, connID) {
+				return &protocol.Ack{Status: "error"}
+			}
+		}
+		if s.lm.RegisterLeaderWatcherWithStatus(req.Key, connID, cs.writeCh, cs.cancelConn) {
+			cs.subscriptions++
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	case "unobserve":
-		s.lm.UnregisterLeaderWatcher(req.Key, connID)
+		if s.lm.UnregisterLeaderWatcher(req.Key, connID) {
+			if cs.subscriptions > 0 {
+				cs.subscriptions--
+			}
+		}
 		return &protocol.Ack{Status: "ok"}
 	}
 

@@ -2200,15 +2200,36 @@ func (lm *LockManager) removeLeaderHolderWatcher(sh *shard, key string, connID u
 	}
 }
 
-// UnregisterLeaderWatcher removes a leader change watcher.
-func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
+// HasLeaderWatcherObserver returns true if connID has an observer registration
+// for the given key (i.e. an observe command was previously issued).
+func (lm *LockManager) HasLeaderWatcherObserver(key string, connID uint64) bool {
 	sh := lm.shardFor(key)
 	lm.connMu.Lock()
 	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	defer lm.connMu.Unlock()
 	if watchers, ok := sh.leaderWatchers[key]; ok {
-		delete(watchers, connID)
-		if len(watchers) == 0 {
-			delete(sh.leaderWatchers, key)
+		if lw, exists := watchers[connID]; exists {
+			return lw.observer
+		}
+	}
+	return false
+}
+
+// UnregisterLeaderWatcher removes a leader change watcher.
+// Returns true if a watcher was actually removed.
+func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) bool {
+	sh := lm.shardFor(key)
+	lm.connMu.Lock()
+	sh.mu.Lock()
+	removed := false
+	if watchers, ok := sh.leaderWatchers[key]; ok {
+		if _, exists := watchers[connID]; exists {
+			removed = true
+			delete(watchers, connID)
+			if len(watchers) == 0 {
+				delete(sh.leaderWatchers, key)
+			}
 		}
 	}
 	if keys, ok := lm.connLeaderKeys[connID]; ok {
@@ -2219,6 +2240,7 @@ func (lm *LockManager) UnregisterLeaderWatcher(key string, connID uint64) {
 	}
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
+	return removed
 }
 
 // UnregisterAllLeaderWatchers removes all leader change watchers for a connection.
@@ -2343,7 +2365,7 @@ func (lm *LockManager) ResignLeader(key, token string, connID uint64) bool {
 // RegisterLeaderWatcherWithStatus atomically registers a watcher and, if a
 // leader currently exists, sends the initial "leader elected" notification
 // while still holding the lock to prevent TOCTOU races with resign/failover.
-func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64, writeCh chan []byte, cancelConn func()) {
+func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64, writeCh chan []byte, cancelConn func()) bool {
 	sh := lm.shardFor(key)
 	lm.connMu.Lock()
 	sh.mu.Lock()
@@ -2353,11 +2375,16 @@ func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64
 		watchers = make(map[uint64]*leaderWatcher)
 		sh.leaderWatchers[key] = watchers
 	}
+	added := false
 	if existing, ok := watchers[connID]; ok {
 		// Already registered (e.g. via elect) — just mark as also an observer.
+		if !existing.observer {
+			added = true // upgrading holder-only to observer counts as new
+		}
 		existing.observer = true
 	} else {
 		watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: true}
+		added = true
 	}
 
 	keys := lm.connLeaderKeys[connID]
@@ -2387,6 +2414,7 @@ func (lm *LockManager) RegisterLeaderWatcherWithStatus(key string, connID uint64
 
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
+	return added
 }
 
 // ---------------------------------------------------------------------------

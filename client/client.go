@@ -1292,17 +1292,25 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// closeIfOurs closes l.conn only if it hasn't been replaced by a
+	// concurrent Acquire call while the mutex was released.
+	closeIfOurs := func() {
+		if l.conn == conn {
+			l.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if errors.Is(err, ErrTimeout) {
-			l.closeConn()
+			closeIfOurs()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			l.closeConn()
+			closeIfOurs()
 			return false, ctx.Err()
 		}
-		l.closeConn()
+		closeIfOurs()
 		return false, err
 	}
 
@@ -1312,7 +1320,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 		// out from under us.
 		Release(conn, l.Key, token)
 		close(done)
-		l.closeConn()
+		closeIfOurs()
 		return false, ctx.Err()
 	}
 	close(done)
@@ -1355,13 +1363,19 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	closeIfOurs := func() {
+		if l.conn == conn {
+			l.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if ctx.Err() != nil {
-			l.closeConn()
+			closeIfOurs()
 			return "", ctx.Err()
 		}
-		l.closeConn()
+		closeIfOurs()
 		return "", err
 	}
 
@@ -1370,7 +1384,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 			Release(conn, l.Key, token)
 		}
 		close(done)
-		l.closeConn()
+		closeIfOurs()
 		return "", ctx.Err()
 	}
 	close(done)
@@ -1411,24 +1425,30 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	closeIfOurs := func() {
+		if l.conn == conn {
+			l.closeConn()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if errors.Is(err, ErrTimeout) {
-			l.closeConn()
+			closeIfOurs()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			l.closeConn()
+			closeIfOurs()
 			return false, ctx.Err()
 		}
-		l.closeConn()
+		closeIfOurs()
 		return false, err
 	}
 
 	if ctx.Err() != nil {
 		Release(conn, l.Key, token)
 		close(done)
-		l.closeConn()
+		closeIfOurs()
 		return false, ctx.Err()
 	}
 	close(done)
@@ -3438,24 +3458,32 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// closeIfOurs closes e.lc only if it hasn't been replaced by a
+	// concurrent Campaign call while the mutex was released.
+	closeIfOurs := func() {
+		if e.lc == lc {
+			e.closeLC()
+		}
+	}
+
 	if err != nil {
 		close(done)
 		if errors.Is(err, ErrTimeout) {
-			e.closeLC()
+			closeIfOurs()
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			e.closeLC()
+			closeIfOurs()
 			return false, ctx.Err()
 		}
-		e.closeLC()
+		closeIfOurs()
 		return false, err
 	}
 
 	if ctx.Err() != nil {
 		lc.Resign(e.Key, token)
 		close(done)
-		e.closeLC()
+		closeIfOurs()
 		return false, ctx.Err()
 	}
 
@@ -3522,15 +3550,16 @@ func (e *Election) Resign(ctx context.Context) error {
 	}
 
 	e.mu.Lock()
-	e.isLeader = false
-	// Only close the LeaderConn we actually used for the resign call.
-	// A concurrent Campaign() may have replaced e.lc in the meantime.
+	// Only clear state and close the LeaderConn we actually used for the
+	// resign call. A concurrent Campaign() may have replaced e.lc and set
+	// new leadership state in the meantime — don't clobber it.
 	if e.lc == lc {
+		e.isLeader = false
 		e.closeLC()
+		e.token = ""
+		e.fence = 0
+		e.lease = 0
 	}
-	e.token = ""
-	e.fence = 0
-	e.lease = 0
 	onResigned := e.OnResigned
 	e.mu.Unlock()
 

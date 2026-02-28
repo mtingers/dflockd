@@ -181,6 +181,9 @@ func Load(args []string) (*Config, error) {
 			if flagVal > maxSafeSeconds {
 				flagVal = maxSafeSeconds
 			}
+			if flagVal < -maxSafeSeconds {
+				flagVal = -maxSafeSeconds
+			}
 			return time.Duration(flagVal) * time.Second
 		}
 		return envOrDuration(envKey, flagVal)

@@ -5293,3 +5293,146 @@ func TestIntegration_SpuriousUnwatchDoesNotDeflateCounter(t *testing.T) {
 		t.Fatal("spurious unwatch should NOT free a subscription slot")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression: observe must respect MaxSubscriptions, unobserve must free slot
+// ---------------------------------------------------------------------------
+
+func TestIntegration_MaxSubscriptions_Observe(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// First two observes should succeed.
+	resp := connSendCmd(t, conn, reader, "observe", "election1", "")
+	if resp != "ok" {
+		t.Fatalf("observe 1: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "observe", "election2", "")
+	if resp != "ok" {
+		t.Fatalf("observe 2: expected ok, got %q", resp)
+	}
+
+	// Third should be rejected.
+	resp = connSendCmd(t, conn, reader, "observe", "election3", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("observe 3: expected error, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_UnobserveFreesSlot(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Use the one subscription slot
+	resp := connSendCmd(t, conn, reader, "observe", "election1", "")
+	if resp != "ok" {
+		t.Fatalf("observe: expected ok, got %q", resp)
+	}
+
+	// Second observe should be rejected
+	resp = connSendCmd(t, conn, reader, "observe", "election2", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("observe 2: expected error, got %q", resp)
+	}
+
+	// Unobserve should free the slot
+	connSendCmd(t, conn, reader, "unobserve", "election1", "")
+
+	// Now another observe should succeed
+	resp = connSendCmd(t, conn, reader, "observe", "election3", "")
+	if resp != "ok" {
+		t.Fatalf("observe after unobserve: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_ObserveMixed(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Mix watch and observe — both should count toward the same limit.
+	resp := connSendCmd(t, conn, reader, "watch", "key1", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "observe", "election1", "")
+	if resp != "ok" {
+		t.Fatalf("observe: expected ok, got %q", resp)
+	}
+
+	// Third should be rejected (either type).
+	resp = connSendCmd(t, conn, reader, "observe", "election2", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("observe 3: expected error, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "watch", "key2", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatalf("watch 3: expected error, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_DuplicateObserveNoop(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// First observe should succeed.
+	resp := connSendCmd(t, conn, reader, "observe", "election1", "")
+	if resp != "ok" {
+		t.Fatalf("observe 1: expected ok, got %q", resp)
+	}
+
+	// Duplicate observe for same key should succeed (idempotent, no new slot).
+	resp = connSendCmd(t, conn, reader, "observe", "election1", "")
+	if resp != "ok" {
+		t.Fatalf("duplicate observe: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_MaxSubscriptions_SpuriousUnobserve(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Use the one subscription slot
+	resp := connSendCmd(t, conn, reader, "observe", "election1", "")
+	if resp != "ok" {
+		t.Fatalf("observe: expected ok, got %q", resp)
+	}
+
+	// Spurious unobserve for a different key should NOT free a slot
+	connSendCmd(t, conn, reader, "unobserve", "no-such-election", "")
+
+	// This should fail — the slot should still be occupied
+	resp = connSendCmd(t, conn, reader, "observe", "election2", "")
+	if !strings.HasPrefix(resp, "error") {
+		t.Fatal("spurious unobserve should NOT free a subscription slot")
+	}
+}
