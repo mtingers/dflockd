@@ -3480,6 +3480,10 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 
 	token, lease, fence, err := lc.Elect(e.Key, e.acquireTimeout(), e.opts()...)
 
+	// Signal done immediately to prevent the cancellation goroutine from
+	// closing the connection while we may still need it for Resign.
+	close(done)
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -3492,7 +3496,6 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if errors.Is(err, ErrTimeout) {
 			closeIfOurs()
 			return false, nil
@@ -3507,12 +3510,9 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 
 	if ctx.Err() != nil {
 		lc.Resign(e.Key, token)
-		close(done)
 		closeIfOurs()
 		return false, ctx.Err()
 	}
-
-	close(done)
 
 	e.token = token
 	e.lease = lease
