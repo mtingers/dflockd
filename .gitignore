@@ -17,3 +17,6 @@ dflockd
 /bench
 /bench-redis
 /soak
+
+# mkdocs build output
+site/
