@@ -917,8 +917,9 @@ func (lm *LockManager) Release(key, token string) bool {
 }
 
 // RenewWithFence renews the lease and returns the existing fence (no increment).
-// Returns (remaining seconds, fence, ok).
-func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration) (int, uint64, bool) {
+// Returns ErrLeaseExpired when the lease has already expired, or a generic
+// error when the key or token is not found.
+func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration) (int, uint64, error) {
 	sh := lm.shardFor(key)
 
 	lm.connMu.Lock()
@@ -928,7 +929,7 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 	if st == nil {
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return 0, 0, false
+		return 0, 0, errors.New("key not found")
 	}
 
 	now := time.Now()
@@ -938,7 +939,7 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 	if !ok {
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return 0, 0, false
+		return 0, 0, errors.New("token not found")
 	}
 
 	// If already expired, reject and evict
@@ -962,7 +963,7 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 		if lm.OnLockRelease != nil {
 			lm.OnLockRelease(key)
 		}
-		return 0, 0, false
+		return 0, 0, ErrLeaseExpired
 	}
 
 	// Reset lease
@@ -976,7 +977,7 @@ func (lm *LockManager) RenewWithFence(key, token string, leaseTTL time.Duration)
 	fence := h.fence
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
-	return remaining, fence, true
+	return remaining, fence, nil
 }
 
 // Renew renews the lease if the token matches (commands "n" and "sn").
@@ -1751,7 +1752,7 @@ func (lm *LockManager) RWRelease(key, token string) bool {
 }
 
 // RWRenew renews a read or write lock lease.
-func (lm *LockManager) RWRenew(key, token string, leaseTTL time.Duration) (int, uint64, bool) {
+func (lm *LockManager) RWRenew(key, token string, leaseTTL time.Duration) (int, uint64, error) {
 	return lm.RenewWithFence(key, token, leaseTTL)
 }
 

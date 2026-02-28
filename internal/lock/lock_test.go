@@ -2653,8 +2653,8 @@ func TestFencingToken_RenewReturnsFence(t *testing.T) {
 		t.Fatal("fence1 should be > 0")
 	}
 
-	_, fence2, ok := lm.RenewWithFence("k1", tok, 60*time.Second)
-	if !ok {
+	_, fence2, err := lm.RenewWithFence("k1", tok, 60*time.Second)
+	if err != nil {
 		t.Fatal("renew should succeed")
 	}
 	if fence2 != fence1 {
@@ -3019,8 +3019,8 @@ func TestRWLock_RenewMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, ok := lm.RWRenew("rw1", tokR, 60*time.Second)
-	if !ok {
+	_, _, err = lm.RWRenew("rw1", tokR, 60*time.Second)
+	if err != nil {
 		t.Fatal("RWRenew on read lock should succeed")
 	}
 
@@ -3031,8 +3031,8 @@ func TestRWLock_RenewMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, ok = lm.RWRenew("rw1", tokW, 60*time.Second)
-	if !ok {
+	_, _, err = lm.RWRenew("rw1", tokW, 60*time.Second)
+	if err != nil {
 		t.Fatal("RWRenew on write lock should succeed")
 	}
 }
@@ -3412,8 +3412,8 @@ func TestRWLock_LeaseExpiry(t *testing.T) {
 	lm.UnlockKeyForTest("k1")
 
 	// Renew should fail
-	_, _, ok := lm.RWRenew("k1", tok, 30*time.Second)
-	if ok {
+	_, _, err = lm.RWRenew("k1", tok, 30*time.Second)
+	if err == nil {
 		t.Fatal("renew should fail after expiry")
 	}
 }
@@ -3881,8 +3881,8 @@ func TestRWLock_RenewReturnsFence(t *testing.T) {
 		t.Fatal("acquire failed")
 	}
 
-	remaining, renewFence, ok := lm.RWRenew("k1", tok, 60*time.Second)
-	if !ok {
+	remaining, renewFence, err := lm.RWRenew("k1", tok, 60*time.Second)
+	if err != nil {
 		t.Fatal("renew should succeed")
 	}
 	if remaining <= 0 {
@@ -5728,16 +5728,16 @@ func TestRenewWithFence_WrongToken(t *testing.T) {
 	lm := testManager()
 	lm.AcquireWithFence(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 
-	_, _, ok := lm.RenewWithFence("k1", "wrong-token", 60*time.Second)
-	if ok {
+	_, _, err := lm.RenewWithFence("k1", "wrong-token", 60*time.Second)
+	if err == nil {
 		t.Fatal("RenewWithFence with wrong token should fail")
 	}
 }
 
 func TestRenewWithFence_NonexistentKey(t *testing.T) {
 	lm := testManager()
-	_, _, ok := lm.RenewWithFence("no-key", "no-token", 60*time.Second)
-	if ok {
+	_, _, err := lm.RenewWithFence("no-key", "no-token", 60*time.Second)
+	if err == nil {
 		t.Fatal("RenewWithFence on nonexistent key should fail")
 	}
 }
@@ -5756,9 +5756,9 @@ func TestRenewWithFence_ExpiredLease(t *testing.T) {
 	// Wait for lease to expire
 	time.Sleep(200 * time.Millisecond)
 
-	_, _, ok := lm.RenewWithFence("k1", tok, 60*time.Second)
-	if ok {
-		t.Fatal("RenewWithFence on expired lease should fail")
+	_, _, err = lm.RenewWithFence("k1", tok, 60*time.Second)
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("RenewWithFence on expired lease should return ErrLeaseExpired, got %v", err)
 	}
 }
 
@@ -5771,9 +5771,9 @@ func TestRenewWithFence_PreservesFenceAfterRenew(t *testing.T) {
 
 	// Renew multiple times — fence should remain the same
 	for i := 0; i < 5; i++ {
-		remaining, fence, ok := lm.RenewWithFence("k1", tok, 30*time.Second)
-		if !ok {
-			t.Fatalf("renew %d failed", i)
+		remaining, fence, err := lm.RenewWithFence("k1", tok, 30*time.Second)
+		if err != nil {
+			t.Fatalf("renew %d failed: %v", i, err)
 		}
 		if fence != fence1 {
 			t.Fatalf("renew %d: fence changed from %d to %d", i, fence1, fence)

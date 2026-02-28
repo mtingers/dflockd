@@ -374,8 +374,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "error"}
 
 	case "n", "sn":
-		remaining, fence, ok := s.lm.RenewWithFence(req.Key, req.Token, req.LeaseTTL)
-		if !ok {
+		remaining, fence, err := s.lm.RenewWithFence(req.Key, req.Token, req.LeaseTTL)
+		if err != nil {
+			if errors.Is(err, lock.ErrLeaseExpired) {
+				return &protocol.Ack{Status: "error_lease_expired"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d %d", remaining, fence)}
@@ -681,8 +684,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "error"}
 
 	case "rn", "wn":
-		remaining, fence, ok := s.lm.RWRenew(req.Key, req.Token, req.LeaseTTL)
-		if !ok {
+		remaining, fence, err := s.lm.RWRenew(req.Key, req.Token, req.LeaseTTL)
+		if err != nil {
+			if errors.Is(err, lock.ErrLeaseExpired) {
+				return &protocol.Ack{Status: "error_lease_expired"}
+			}
 			return &protocol.Ack{Status: "error"}
 		}
 		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d %d", remaining, fence)}

@@ -3562,8 +3562,14 @@ func (e *Election) Resign(ctx context.Context) error {
 	lc := e.lc
 	key := e.Key
 
-	// Drop the lock during the blocking network call so that accessors
-	// (IsLeader, Token, Fence) are not blocked.
+	// Clear leadership state before dropping the lock so concurrent
+	// readers (IsLeader, Token, Fence) see the resign immediately
+	// rather than observing stale values during the network call.
+	e.isLeader = false
+	e.token = ""
+	e.fence = 0
+	e.lease = 0
+	onResigned := e.OnResigned
 	e.mu.Unlock()
 
 	var err error
@@ -3575,17 +3581,11 @@ func (e *Election) Resign(ctx context.Context) error {
 	}
 
 	e.mu.Lock()
-	// Only clear state and close the LeaderConn we actually used for the
-	// resign call. A concurrent Campaign() may have replaced e.lc and set
-	// new leadership state in the meantime — don't clobber it.
+	// Only close the LeaderConn we actually used for the resign call.
+	// A concurrent Campaign() may have replaced e.lc in the meantime.
 	if e.lc == lc {
-		e.isLeader = false
 		e.closeLC()
-		e.token = ""
-		e.fence = 0
-		e.lease = 0
 	}
-	onResigned := e.OnResigned
 	e.mu.Unlock()
 
 	if wasLeader && onResigned != nil {
