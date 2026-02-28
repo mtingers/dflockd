@@ -2,34 +2,36 @@
 
 A lightweight distributed lock server using a simple line-based TCP protocol with FIFO ordering, automatic lease expiry, and background renewal.
 
-## Features
+## What is dflockd?
 
-- **Strict FIFO ordering** — waiters are granted locks in the order they enqueue, per key
-- **Two-phase lock acquisition** — split enqueue and wait to notify external systems between joining the queue and blocking
-- **Automatic lease expiry** — held locks expire if not renewed, preventing deadlocks
-- **Disconnect cleanup** — locks are released automatically when a client disconnects
-- **Zero dependencies** — single Go binary
-- **Go client library** — high-level `Lock` type with automatic renewal and sharding, plus low-level protocol API
-- **Runtime stats** — query active connections, held locks, semaphores, and idle entries via the `stats` command
-- **Built-in benchmarking** — `cmd/bench` measures lock throughput and latency under concurrent load
-- **Pub/sub signals with queue groups** — fire-and-forget signals with wildcard patterns; optional queue groups for unicast round-robin delivery (task queues) alongside fan-out (audit logging)
-- **Simple wire protocol** — line-based UTF-8 over TCP, easy to integrate from any language
+dflockd is a standalone TCP server that provides distributed coordination primitives. Clients communicate using a minimal 3-line text protocol, making it easy to integrate from any language or even from the command line using `nc` or `telnet`.
 
-## Quick example
+## Feature Matrix
 
-```bash
-# Acquire a lock with 10s timeout
-printf 'l\nmy-key\n10\n' | nc localhost 6388
-# Response: ok <token> <lease_ttl>
+| Feature | Protocol Commands | Go Client API |
+|---------|-------------------|---------------|
+| Exclusive Locks | `l`, `r`, `n`, `e`, `w` | `Lock`, `Acquire`, `Release`, `Renew`, `Enqueue`, `Wait` |
+| Semaphores | `sl`, `sr`, `sn`, `se`, `sw` | `Semaphore`, `SemAcquire`, `SemRelease`, `SemRenew` |
+| Read-Write Locks | `rl`, `wl`, `rr`, `wr`, `rn`, `wn`, `re`, `we`, `rw`, `ww` | `RWLock`, `RLock`, `WLock`, `RUnlock`, `WUnlock` |
+| Leader Election | `elect`, `resign`, `observe`, `unobserve` | `LeaderConn`, `Elect`, `Resign`, `Observe` |
+| Atomic Counters | `incr`, `decr`, `get`, `cset` | `Incr`, `Decr`, `GetCounter`, `SetCounter` |
+| KV Store | `kset`, `kget`, `kdel`, `kcas` | `KVSet`, `KVGet`, `KVDel`, `KVCAS` |
+| Lists/Queues | `lpush`, `rpush`, `lpop`, `rpop`, `llen`, `lrange`, `blpop`, `brpop` | `LPush`, `RPush`, `LPop`, `RPop`, `LLen`, `LRange`, `BLPop`, `BRPop` |
+| Pub/Sub Signaling | `listen`, `unlisten`, `signal` | `SignalConn`, `Listen`, `Unlisten`, `Emit` |
+| Key Watch | `watch`, `unwatch` | `WatchConn`, `Watch`, `Unwatch` |
+| Barriers | `bwait` | `BarrierWait` |
+| Authentication | `auth` | `Authenticate` |
+| Stats | `stats` | `Stats` |
 
-# Release (substitute your token)
-printf 'r\nmy-key\n<token>\n' | nc localhost 6388
-# Response: ok
-```
+## Key Design Decisions
 
-## Getting started
+- **FIFO ordering** -- waiters are granted locks in the order they enqueued
+- **Lease-based expiry** -- locks auto-expire if the holder disconnects or fails to renew
+- **Fencing tokens** -- monotonically increasing tokens to detect stale holders
+- **Auto-release on disconnect** -- configurable; releases all locks held by a disconnected client
+- **64-way internal sharding** -- low-contention concurrent access across keys
+- **Simple text protocol** -- 3 lines per request (command, key, argument), one-line response
 
-- [Installation](getting-started/installation.md) — build from source or `go install`
-- [Quick Start](getting-started/quickstart.md) — run the server and acquire your first lock
-- [Examples](getting-started/examples.md) — TCP protocol examples and Go client usage
-- [Go Client](client.md) — `client` package with automatic renewal, sharding, and two-phase locking
+## Getting Started
+
+Head to the [Installation](getting-started/installation.md) guide, then try the [Quick Start](getting-started/quickstart.md).

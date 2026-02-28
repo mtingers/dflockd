@@ -1,130 +1,153 @@
 # Architecture Overview
 
-## Overview
-
-dflockd is a single-process Go server that manages named locks with FIFO ordering, automatic lease expiry, and garbage collection of idle state.
+## System Architecture
 
 ```
-┌───────────┐    TCP     ┌─────────────────────────────────────┐
-│ Go client │◄──────────►│            dflockd server           │
-│ (client/) │  line-     │                                     │
-│           │  based     │  ┌──────────┐  ┌────────────────┐   │
-└───────────┘  UTF-8     │  │  Lock    │  │  Background    │   │
-                         │  │  State   │  │  Goroutines    │   │
-┌───────────┐            │  │          │  │                │   │
-│ TCP client│◄──────────►│  │  key →   │  │  • lease       │   │
-│ (any lang)│            │  │   owner  │  │    expiry      │   │
-└───────────┘            │  │   waiter │  │  • lock GC     │   │
-                         │  │   queue  │  │                │   │
-                         │  └──────────┘  └────────────────┘   │
-                         └─────────────────────────────────────┘
+                 ┌─────────────┐
+                 │  TCP Client  │
+                 └──────┬──────┘
+                        │
+                 ┌──────▼──────┐
+                 │   Server    │
+                 │  (server/)  │
+                 └──────┬──────┘
+                        │
+          ┌─────────────┼─────────────┐
+          │             │             │
+    ┌─────▼─────┐ ┌────▼─────┐ ┌────▼─────┐
+    │   Lock    │ │  Signal  │ │  Watch   │
+    │ Manager   │ │ Manager  │ │ Manager  │
+    │  (lock/)  │ │(signal/) │ │ (watch/) │
+    └───────────┘ └──────────┘ └──────────┘
 ```
 
-An in-repo Go client (`github.com/mtingers/dflockd/client`) provides a high-level `Lock` type with automatic lease renewal and CRC32-based sharding, as well as low-level protocol functions. External clients exist for [Python](https://github.com/mtingers/dflockd-client-py) and [TypeScript](https://github.com/mtingers/dflockd-client-ts). Any TCP client that speaks the line-based protocol can also interact with the server directly.
+## Internal Packages
 
-## Lock state
+| Package | Responsibility |
+|---------|---------------|
+| `cmd/dflockd` | Entry point, signal handling, server startup |
+| `internal/server` | TCP listener, connection handling, command dispatch, auth, TLS |
+| `internal/lock` | Lock manager: locks, semaphores, RW locks, counters, KV, lists, barriers, elections |
+| `internal/protocol` | Wire protocol parsing, request/response formatting |
+| `internal/signal` | Pub/sub signal delivery, pattern matching, queue groups |
+| `internal/watch` | Key change notifications, pattern matching |
+| `internal/config` | Flag parsing, env var resolution, validation |
+| `client` | Go client library (high-level types + low-level protocol functions) |
 
-Each named lock key maintains a `LockState`:
+## 64-Way Sharding
 
-- **owner_token** — the UUID token of the current holder (or empty if free)
-- **owner_conn_id** — connection ID of the current holder
-- **lease_expires_at** — timestamp when the lease expires
-- **waiters** — FIFO queue of pending acquire requests
-- **last_activity** — timestamp of the most recent operation (used for GC)
-
-## FIFO acquire flow
-
-1. A client sends a lock request for key `K` with timeout `T` and optional lease TTL.
-2. If `K` is free and has no waiters, the lock is granted immediately (fast path).
-3. Otherwise, the client is appended to the waiter queue and blocks until:
-    - The lock is granted (previous holder released or lease expired), or
-    - The timeout `T` elapses (client receives `timeout`).
-4. When a lock is released or expires, the next waiter in FIFO order is granted the lock.
-
-## Two-phase acquire flow
-
-The two-phase flow splits acquisition into enqueue (`e`) and wait (`w`), allowing application logic between joining the queue and blocking:
-
-1. A client sends an enqueue request (`e`) for key `K` with optional lease TTL.
-2. If `K` is free and has no waiters, the lock is granted immediately (fast path). The server returns `acquired <token> <lease>` and the client can begin renewal.
-3. Otherwise, the client is appended to the waiter queue and the server returns `queued` immediately (non-blocking).
-4. The client performs application logic (e.g. notifying an external system).
-5. The client sends a wait request (`w`) for key `K` with timeout `T`.
-6. If the lock was already acquired (fast path), the server resets the lease and returns `ok <token> <lease>`.
-7. Otherwise, the client blocks until the lock is granted or timeout elapses.
-8. On success, the lease is reset to `now + lease_ttl_s`, giving the client the full TTL from the moment `w` returns.
-
-The two-phase flow uses an `EnqueuedState` tracked per `(conn_id, key)`. This state is cleaned up on disconnect, timeout, or successful wait.
-
-## Background goroutines
-
-### Lease expiry loop
-
-Runs every `LEASE_SWEEP_INTERVAL_S` seconds (default: 1s). For each held lock:
-
-- If the lease has expired, the owner is evicted and the lock passes to the next FIFO waiter.
-- This prevents deadlocks from crashed or hung clients.
-
-### Lock garbage collection
-
-Runs every `GC_LOOP_SLEEP` seconds (default: 5s). Prunes lock state entries where:
-
-- No owner is holding the lock
-- No waiters are queued
-- The key has been idle longer than `GC_MAX_UNUSED_TIME` (default: 60s)
-
-This prevents unbounded memory growth from transient keys.
-
-## Connection cleanup
-
-When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), the server performs cleanup when a TCP connection closes (graceful or abrupt):
-
-1. Cleans up any two-phase enqueued state for the connection, cancelling pending waiters and removing them from lock queues.
-2. Cancels any pending waiter futures belonging to that connection.
-3. Releases any locks held by that connection.
-4. Transfers released locks to the next FIFO waiter, if any.
-
-If disabled, locks from disconnected clients are only freed when their lease expires.
-
-## Signal system
-
-The signal manager (`internal/signal`) provides a pub/sub signaling layer with optional queue groups for work distribution.
-
-### Data structures
+The `LockManager` partitions state across 64 shards using FNV-1a hashing on the key:
 
 ```
-Manager
-├── exact         map[channel] → map[connID] → *Listener     (non-grouped)
-├── wildcards     []*Listener                                  (non-grouped)
-├── exactGroups   map[channel] → map[groupName] → *queueGroup (grouped)
-├── wildGroups    []*wildGroupEntry                            (grouped)
-└── connListeners map[connID] → []*listenerEntry              (reverse index)
+key → FNV-1a hash → hash % 64 → shard index
 ```
 
-### Queue groups
+Each shard has its own `sync.Mutex`, so operations on different keys rarely contend. A single shard holds:
 
-Queue groups enable unicast delivery: within a named group, only **one** member receives each signal via atomic round-robin. Different groups each get one delivery. Non-grouped listeners still receive individually.
+- `resources` -- lock/semaphore/RW lock state (`ResourceState`)
+- `counters` -- atomic counter values
+- `kvStore` -- KV entries with optional TTL
+- `lists` -- list/queue data with blocking pop waiters
+- `barriers` -- barrier participant tracking
+- `leaderWatchers` -- leader election observers
+
+Global state (connection-level tracking) uses a separate `connMu` mutex.
+
+## Lease Expiry
+
+Locks, semaphores, and RW locks use lease-based expiry to handle client failures:
+
+1. On acquire, the server records `leaseExpires = now + leaseTTL`
+2. A background **lease sweep loop** runs every `--lease-sweep-interval` (default 1s)
+3. Expired holders are removed and the next FIFO waiter is granted the lock
+4. Clients must periodically **renew** their lease before it expires
+
+The high-level Go client types (`Lock`, `Semaphore`, `RWLock`) automatically run a background renewal goroutine at `renewRatio * leaseTTL` intervals (default 50% of lease TTL).
+
+## Garbage Collection
+
+A background GC loop runs every `--gc-interval` (default 5s) and prunes:
+
+- Lock/semaphore resources with no holders and no waiters that have been idle for `--gc-max-idle` (default 60s)
+- Expired KV entries
+- Empty counter state past the idle threshold
+- Empty list state past the idle threshold
+- Tripped or stale barrier state past the idle threshold
+
+## Fencing Tokens
+
+Every lock acquisition returns a **fencing token** -- a globally monotonic `uint64` counter. Fencing tokens prevent stale-holder bugs:
+
+1. Client A acquires lock, gets fence=1
+2. Client A's lease expires (network partition)
+3. Client B acquires lock, gets fence=2
+4. Client A's delayed write arrives at the storage system
+5. Storage system rejects the write because fence=1 < current fence=2
+
+The fencing token is incremented atomically (`atomic.Uint64`) across all shards.
+
+## Two-Phase Locking
+
+The enqueue/wait pattern allows non-blocking queue entry:
 
 ```
-Signal on "tasks.email"
-         │
-         ├──► D (non-grouped)          → receives
-         ├──► group "worker-pool" [A,B] → one of A/B receives (round-robin)
-         └──► group "audit" [C]         → C receives
-                                          ─────────
-                                          3 deliveries total
+Phase 1: Enqueue
+  → Returns "acquired" (immediate) or "queued" (FIFO position reserved)
+
+Phase 2: Wait (only if queued)
+  → Blocks until lock is granted or timeout
+  → Returns token + lease + fence on success
 ```
 
-The round-robin counter uses `atomic.Uint64` for lock-free increment under `RLock`, so signal dispatch never takes a write lock. Deduplication ensures a connection appearing in multiple paths receives at most one copy.
+This is useful when a client wants to check queue position or perform other work between enqueue and wait.
 
-### Disconnect cleanup
+## FIFO Ordering
 
-When a connection closes, `UnlistenAll(connID)` iterates the connection's reverse index and removes it from all non-grouped and grouped structures. Empty queue groups and wildcard entries are pruned inline.
+Waiters are granted locks in strict FIFO order. The implementation uses a slice with a head pointer (`WaiterHead`) to avoid shifting:
 
-## Concurrency model
+- New waiters append to the end
+- Grants pop from `WaiterHead`
+- When more than half the slice is consumed, the waiters are compacted
 
-Lock state is distributed across 64 shards, keyed by `fnv32(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map, so operations on different keys rarely contend. A separate `connMu` mutex protects connection-level tracking (`connOwned`, `connEnqueued`).
+## Connection Management
 
-**Lock ordering protocol:** `connMu` is always acquired before any shard lock. Two shard locks are never held simultaneously. This prevents deadlocks while allowing high concurrency across keys.
+Each TCP connection gets:
 
-Each client connection is handled in its own goroutine. On the fast path (uncontended acquire), only the relevant shard lock and `connMu` are held briefly. Background loops (lease expiry, GC) iterate shards sequentially, locking one at a time.
+- A unique `connID` (monotonically increasing `atomic.Uint64`)
+- A per-connection write channel for async push delivery (signals, watch events, leader events)
+- A per-connection context that cancels on server shutdown
+
+When a connection disconnects:
+
+1. All owned locks/semaphores/RW locks are released (if `--auto-release-on-disconnect` is true)
+2. All signal listeners are cleaned up
+3. All watch registrations are removed
+4. All enqueued waiters are dequeued
+5. All leader election observations are unregistered
+
+## Signal Delivery
+
+The signal manager supports:
+
+- **Exact matching**: channel name maps directly to listeners
+- **Wildcard matching**: `*` (single token) and `>` (trailing tokens)
+- **Queue groups**: within a named group, signals are delivered round-robin to one member
+
+Signals are delivered asynchronously via buffered channels. Slow consumers (full write channel) are disconnected to prevent backpressure.
+
+## Watch Delivery
+
+The watch manager fires on key state changes (KV set/delete, lock acquire/release). It supports the same wildcard pattern syntax as signals. Watch events are delivered via `watch <event_type> <key>\n` push messages.
+
+## Connection Limits
+
+The server enforces `--max-connections` using atomic compare-and-swap on an `int64` counter, preventing TOCTOU races in the accept loop.
+
+## Graceful Shutdown
+
+On `SIGINT` or `SIGTERM`:
+
+1. The listener stops accepting new connections
+2. Existing connections are allowed to drain for `--shutdown-timeout`
+3. If the timeout expires, all remaining connections are force-closed
+4. Background loops (lease sweep, GC) exit via context cancellation

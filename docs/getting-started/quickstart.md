@@ -1,70 +1,171 @@
 # Quick Start
 
-## 1. Start the server
+## Start the Server
 
 ```bash
-./dflockd
+dflockd
 ```
 
-The server listens on `0.0.0.0:6388` by default. See [Server Configuration](../server.md) for tuning options.
+By default, the server listens on `127.0.0.1:6388`.
 
-## 2. Acquire a lock
+## Acquire a Lock via Go Client
 
-Using netcat (or any TCP client):
+```go
+package main
 
-```bash
-printf 'l\nmy-key\n10\n' | nc localhost 6388
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    lock := &client.Lock{
+        Key:     "my-resource",
+        Servers: []string{"127.0.0.1:6388"},
+    }
+
+    ok, err := lock.Acquire(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timeout acquiring lock")
+    }
+    defer lock.Release(context.Background())
+
+    fmt.Println("Lock acquired! Doing work...")
+}
 ```
 
-This sends a lock request for key `my-key` with a 10-second acquire timeout. On success, the server responds:
+## Acquire a Lock via Raw TCP
+
+Every request is exactly 3 lines: **command**, **key**, **argument**.
 
 ```
-ok <token> 33
-```
-
-The token is a unique identifier for this lock hold, and `33` is the lease TTL in seconds.
-
-## 3. Release a lock
-
-```bash
-printf 'r\nmy-key\n<token>\n' | nc localhost 6388
-```
-
-Replace `<token>` with the token returned from step 2. The server responds:
-
-```
-ok
-```
-
-## 4. Interactive session
-
-For an interactive session, use netcat without piping:
-
-```bash
-nc localhost 6388
-```
-
-Then type each line of the protocol manually:
-
-```
+$ nc localhost 6388
 l
 my-key
 10
 ```
 
-The server responds with `ok <token> <lease_ttl>`. To release, type:
+The server responds with:
+
+```
+acquired abc123def456... 33 1
+```
+
+This means: lock acquired, token is `abc123def456...`, lease TTL is 33 seconds, fencing token is 1.
+
+Release the lock:
 
 ```
 r
 my-key
-<token>
+abc123def456...
 ```
 
-## What happens under the hood
+Response:
 
-1. The client opens a TCP connection to the server.
-2. It sends a lock request with the key and timeout.
-3. The server grants the lock immediately if it's free, or enqueues the client in FIFO order.
-4. Once acquired, the client is responsible for renewing the lease before it expires (using the `n` command).
-5. On release (or disconnect), the server frees the lock and grants it to the next FIFO waiter.
-6. Background goroutines handle lease expiry sweeps and garbage collection of idle lock state.
+```
+ok
+```
+
+## Two-Phase Locking
+
+For non-blocking queue entry, use enqueue + wait:
+
+=== "Go Client"
+
+    ```go
+    lock := &client.Lock{
+        Key:     "my-resource",
+        Servers: []string{"127.0.0.1:6388"},
+    }
+
+    status, err := lock.Enqueue(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if status == "queued" {
+        ok, err := lock.Wait(context.Background(), 30*time.Second)
+        if err != nil {
+            log.Fatal(err)
+        }
+        if !ok {
+            log.Fatal("timeout waiting for lock")
+        }
+    }
+
+    defer lock.Release(context.Background())
+    fmt.Println("Lock acquired!")
+    ```
+
+=== "Raw TCP"
+
+    ```
+    e
+    my-key
+
+    ```
+
+    Response: `queued` or `acquired <token> <lease> <fence>`
+
+    If queued, wait:
+
+    ```
+    w
+    my-key
+    30
+    ```
+
+    Response: `ok <token> <lease> <fence>` or `timeout`
+
+## Use a Semaphore
+
+```go
+sem := &client.Semaphore{
+    Key:     "worker-pool",
+    Limit:   5, // allow 5 concurrent holders
+    Servers: []string{"127.0.0.1:6388"},
+}
+
+ok, err := sem.Acquire(context.Background())
+if err != nil {
+    log.Fatal(err)
+}
+if !ok {
+    log.Fatal("timeout")
+}
+defer sem.Release(context.Background())
+```
+
+## Use Atomic Counters
+
+```go
+conn, _ := client.Dial("127.0.0.1:6388")
+defer conn.Close()
+
+val, _ := client.Incr(conn, "page-views", 1)
+fmt.Println("Counter:", val)
+```
+
+## Use the KV Store
+
+```go
+conn, _ := client.Dial("127.0.0.1:6388")
+defer conn.Close()
+
+client.KVSet(conn, "config:timeout", "30", 0) // no TTL
+val, _ := client.KVGet(conn, "config:timeout")
+fmt.Println("Value:", val) // "30"
+```
+
+## Next Steps
+
+- [Server Configuration](../server/configuration.md) -- all flags, env vars, and defaults
+- [Wire Protocol](../server/protocol.md) -- complete command reference
+- [Go Client](../client/go.md) -- high-level types and examples

@@ -1,40 +1,46 @@
 # Installation
 
-## Requirements
+## Go Install
 
-- Go 1.23+ (for building from source)
-
-## Install with `go install`
+Requires Go 1.23 or later.
 
 ```bash
 go install github.com/mtingers/dflockd/cmd/dflockd@latest
 ```
 
-See [GOPATH documentation](https://go.dev/wiki/GOPATH) for more information
-on how this works.
+This places the `dflockd` binary in your `$GOBIN` (usually `~/go/bin`).
 
-## Build from source
+## Build from Source
 
 ```bash
 git clone https://github.com/mtingers/dflockd.git
 cd dflockd
-make build
+go build -o dflockd ./cmd/dflockd
 ```
 
-## Verify installation
-
-Start the server to confirm everything is working:
+To embed a version string:
 
 ```bash
-# If installed with go install
-dflockd
-
-# If built from source
-./dflockd
+go build -ldflags "-X main.version=1.0.0" -o dflockd ./cmd/dflockd
 ```
 
-You should see log output indicating the server is listening:
+## Docker
 
+```bash
+docker build -t dflockd .
+docker run -p 6388:6388 dflockd
 ```
-INFO dflockd: listening on ('0.0.0.0', 6388)
+
+## Go Client Library
+
+To use dflockd from a Go application, add the client package:
+
+```bash
+go get github.com/mtingers/dflockd/client
+```
+
+## Verify
+
+```bash
+dflockd --version
 ```

@@ -56,12 +56,12 @@ nav:
   - Getting Started:
     - Installation: getting-started/installation.md
     - Quick Start: getting-started/quickstart.md
-    - Examples: getting-started/examples.md
   - Server:
-    - Configuration: server.md
+    - Configuration: server/configuration.md
+    - Wire Protocol: server/protocol.md
   - Client:
-    - Go Client: client.md
+    - Go Client: client/go.md
+    - Low-Level API: client/lowlevel.md
   - Architecture:
     - Overview: architecture/overview.md
-    - Wire Protocol: architecture/protocol.md
   - Changelog: changelog.md
