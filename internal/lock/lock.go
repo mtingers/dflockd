@@ -26,7 +26,6 @@ var (
 	ErrWaiterClosed    = errors.New("waiter channel closed")
 	ErrMaxKeys         = errors.New("max keys reached")
 	ErrListFull        = errors.New("list at max length")
-	ErrCASConflict          = errors.New("cas conflict")
 	ErrBarrierCountMismatch = errors.New("barrier count mismatch")
 )
 

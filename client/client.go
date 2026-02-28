@@ -30,7 +30,6 @@ var (
 	ErrMaxKeys        = errors.New("dflockd: max keys reached")
 	ErrNotFound       = errors.New("dflockd: not found")
 	ErrListFull       = errors.New("dflockd: list full")
-	ErrCASConflict    = errors.New("dflockd: cas conflict")
 	ErrBarrierCountMismatch = errors.New("dflockd: barrier count mismatch")
 )
 

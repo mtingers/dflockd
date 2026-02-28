@@ -5083,3 +5083,111 @@ func TestClient_SetCounter_ThenIncr(t *testing.T) {
 		t.Fatalf("expected 105, got %d", val)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Sentinel error validation: ErrMaxWaiters
+// ---------------------------------------------------------------------------
+
+func TestClient_ErrMaxWaiters_Sentinel(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxWaiters = 1
+	_, addr := startServer(t, cfg)
+
+	// Acquire the lock so that subsequent acquires will queue as waiters
+	c1, _ := client.Dial(addr)
+	defer c1.Close()
+	_, _, _, err := client.AcquireWithFence(c1, "mwkey", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fill the one waiter slot
+	c2, _ := client.Dial(addr)
+	defer c2.Close()
+	go func() {
+		client.AcquireWithFence(c2, "mwkey", 10*time.Second)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	// Third acquire should fail with ErrMaxWaiters
+	c3, _ := client.Dial(addr)
+	defer c3.Close()
+	_, _, _, err = client.AcquireWithFence(c3, "mwkey", 1*time.Second)
+	if !errors.Is(err, client.ErrMaxWaiters) {
+		t.Fatalf("expected ErrMaxWaiters, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel error validation: ErrLeaseExpired
+// ---------------------------------------------------------------------------
+
+func TestClient_RenewAfterExpiry_ReturnsError(t *testing.T) {
+	cfg := testConfig()
+	cfg.DefaultLeaseTTL = 1 * time.Second
+	cfg.LeaseSweepInterval = 100 * time.Millisecond
+	_, addr := startServer(t, cfg)
+
+	c, _ := client.Dial(addr)
+	defer c.Close()
+
+	tok, _, _, err := client.AcquireWithFence(c, "lekey", 5*time.Second, client.WithLeaseTTL(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for lease to expire
+	time.Sleep(1500 * time.Millisecond)
+
+	// Server sends generic "error" for expired renew — client wraps as ErrServer
+	_, err = client.Renew(c, "lekey", tok)
+	if err == nil {
+		t.Fatal("expected error on renew after lease expiry")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel error validation: KVCAS returns (false, nil) on conflict
+// ---------------------------------------------------------------------------
+
+func TestClient_KVCAS_ConflictSentinel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, _ := client.Dial(addr)
+	defer c.Close()
+
+	// Create key
+	ok, err := client.KVCAS(c, "caskey2", "", "val1", 0)
+	if err != nil || !ok {
+		t.Fatalf("create: ok=%v err=%v", ok, err)
+	}
+
+	// CAS with wrong old value should return (false, nil), not an error
+	ok, err = client.KVCAS(c, "caskey2", "wrong", "val2", 0)
+	if err != nil {
+		t.Fatalf("conflict should not return error, got %v", err)
+	}
+	if ok {
+		t.Fatal("conflict should return false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel error validation: ErrMaxKeys via client
+// ---------------------------------------------------------------------------
+
+func TestClient_ErrMaxKeys_Sentinel(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxKeys = 1
+	_, addr := startServer(t, cfg)
+
+	c, _ := client.Dial(addr)
+	defer c.Close()
+
+	if err := client.KVSet(c, "mk1", "v1", 0); err != nil {
+		t.Fatal(err)
+	}
+	err := client.KVSet(c, "mk2", "v2", 0)
+	if !errors.Is(err, client.ErrMaxKeys) {
+		t.Fatalf("expected ErrMaxKeys, got %v", err)
+	}
+}
