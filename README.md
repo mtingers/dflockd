@@ -17,7 +17,6 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 - **Fencing Tokens** for safe resource access across failures
 - **Two-Phase Locking** (enqueue/wait) for non-blocking queue entry
 - **TLS** and **token-based authentication**
-- **64-way internal sharding** for low-contention concurrency
 
 ## Quick Start
 

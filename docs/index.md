@@ -1,10 +1,48 @@
 # dflockd
 
-A lightweight distributed lock server using a simple line-based TCP protocol with FIFO ordering, automatic lease expiry, and background renewal.
+A lightweight distributed lock server with a simple TCP protocol.
 
 ## What is dflockd?
 
-dflockd is a standalone TCP server that provides distributed coordination primitives. Clients communicate using a minimal 3-line text protocol, making it easy to integrate from any language or even from the command line using `nc` or `telnet`.
+dflockd coordinates access to shared resources across processes and machines. It runs as a single TCP server and speaks a plain-text, line-based protocol -- no special client library required. Connect with `nc`, `telnet`, or the included Go client.
+
+## Why dflockd?
+
+- **Dead simple protocol.** Every request is 3 lines (command, key, argument). Every response is 1 line. You can debug with netcat.
+- **Locks that don't get stuck.** Leases auto-expire when holders crash or disconnect. No manual cleanup.
+- **Fair queuing.** Waiters get the lock in the order they asked for it (FIFO).
+- **Fencing tokens.** Every acquisition returns a monotonically increasing token so downstream systems can reject stale writes.
+- **Batteries included.** Beyond locks you get semaphores, read-write locks, leader election, counters, a KV store, queues, pub/sub, key-change watches, and barriers -- all through the same connection.
+- **Secure by default.** Optional TLS and shared-secret authentication.
+
+## Features
+
+**Coordination**
+
+- **Distributed Locks** -- exclusive access with automatic lease renewal and FIFO ordering
+- **Semaphores** -- bounded concurrency (e.g. limit a worker pool to N)
+- **Read-Write Locks** -- many readers or one writer
+- **Leader Election** -- elect a leader, get notified on failover
+- **Barriers** -- block until N participants arrive
+
+**Data**
+
+- **Atomic Counters** -- increment, decrement, get, and compare-and-set
+- **KV Store** -- set/get/delete with optional TTL and atomic compare-and-swap
+- **Lists / Queues** -- push, pop (blocking and non-blocking), range queries
+
+**Messaging**
+
+- **Pub/Sub Signaling** -- subscribe to channels with wildcard patterns and optional queue groups for load-balanced delivery
+- **Key Watch** -- get notified when any key changes (set, delete, acquire, release, ...)
+
+**Safety & Operations**
+
+- **Fencing Tokens** -- monotonic counters to prevent stale-holder writes
+- **Two-Phase Locking** -- enqueue without blocking, then wait separately
+- **Auto-Release on Disconnect** -- configurable; cleans up after crashed clients
+- **TLS & Authentication** -- encrypted transport and shared-secret auth
+- **Graceful Shutdown** -- drains connections before stopping
 
 ## Feature Matrix
 
@@ -22,15 +60,6 @@ dflockd is a standalone TCP server that provides distributed coordination primit
 | Barriers | `bwait` | `BarrierWait` |
 | Authentication | `auth` | `Authenticate` |
 | Stats | `stats` | `Stats` |
-
-## Key Design Decisions
-
-- **FIFO ordering** -- waiters are granted locks in the order they enqueued
-- **Lease-based expiry** -- locks auto-expire if the holder disconnects or fails to renew
-- **Fencing tokens** -- monotonically increasing tokens to detect stale holders
-- **Auto-release on disconnect** -- configurable; releases all locks held by a disconnected client
-- **64-way internal sharding** -- low-contention concurrent access across keys
-- **Simple text protocol** -- 3 lines per request (command, key, argument), one-line response
 
 ## Getting Started
 
