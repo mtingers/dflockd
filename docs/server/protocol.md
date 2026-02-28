@@ -16,6 +16,8 @@ dflockd uses a simple line-based TCP protocol. Every request is exactly **3 line
 
 Each line is terminated by `\n`. Lines are limited to 256 bytes. Carriage returns (`\r`) are stripped.
 
+Timeouts and lease TTLs are specified in **seconds** as integers. When `[<lease_ttl>]` is omitted, the server's default lease TTL is used (33 seconds unless configured otherwise via `--default-lease-ttl`).
+
 ## Response Format
 
 ```
@@ -29,7 +31,7 @@ Responses are a single line. The first word is a status code, optionally followe
 | Status | Meaning |
 |--------|---------|
 | `ok` | Success (may include additional fields) |
-| `acquired` | Lock/semaphore acquired (may include token, lease, fence) |
+| `acquired` | Enqueue immediately acquired lock/semaphore (includes token, lease, fence) |
 | `queued` | Enqueued in FIFO wait queue |
 | `timeout` | Operation timed out |
 | `nil` | Key/value not found |
@@ -53,9 +55,9 @@ Responses are a single line. The first word is a status code, optionally followe
 
 | Command | Key | Argument | Response | Description |
 |---------|-----|----------|----------|-------------|
-| `l` | `<lock_name>` | `<timeout> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Acquire lock (blocking) |
+| `l` | `<lock_name>` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire lock (blocking) |
 | `r` | `<lock_name>` | `<token>` | `ok` | Release lock |
-| `n` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew lease |
+| `n` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` or `error_lease_expired` | Renew lease |
 | `e` | `<lock_name>` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue (non-blocking) |
 | `w` | `<lock_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after enqueue |
 
@@ -63,9 +65,9 @@ Responses are a single line. The first word is a status code, optionally followe
 
 | Command | Key | Argument | Response | Description |
 |---------|-----|----------|----------|-------------|
-| `sl` | `<sem_name>` | `<timeout> <limit> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Acquire semaphore slot (blocking) |
+| `sl` | `<sem_name>` | `<timeout> <limit> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire semaphore slot (blocking) |
 | `sr` | `<sem_name>` | `<token>` | `ok` | Release semaphore slot |
-| `sn` | `<sem_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew semaphore lease |
+| `sn` | `<sem_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` or `error_lease_expired` | Renew semaphore lease |
 | `se` | `<sem_name>` | `<limit> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for semaphore (non-blocking) |
 | `sw` | `<sem_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after semaphore enqueue |
 
@@ -77,8 +79,8 @@ Responses are a single line. The first word is a status code, optionally followe
 | `wl` | `<lock_name>` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire write lock |
 | `rr` | `<lock_name>` | `<token>` | `ok` | Release read lock |
 | `wr` | `<lock_name>` | `<token>` | `ok` | Release write lock |
-| `rn` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew read lock lease |
-| `wn` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew write lock lease |
+| `rn` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` or `error_lease_expired` | Renew read lock lease |
+| `wn` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` or `error_lease_expired` | Renew write lock lease |
 | `re` | `<lock_name>` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for read lock |
 | `we` | `<lock_name>` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for write lock |
 | `rw` | `<lock_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after read enqueue |
@@ -145,7 +147,7 @@ sig <channel> <payload>\n
 watch <event_type> <key>\n
 ```
 
-Event types include: `kset`, `kdel`, `acquire`, `release`, etc.
+Event types: `acquire`, `release`, `incr`, `decr`, `cset`, `kset`, `kdel`, `kcas`, `lpush`, `rpush`, `lpop`, `rpop`, `blpop`, `brpop`, `elect`, `resign`.
 
 ### Barriers
 
@@ -157,7 +159,7 @@ Event types include: `kset`, `kdel`, `acquire`, `release`, etc.
 
 | Command | Key | Argument | Response | Description |
 |---------|-----|----------|----------|-------------|
-| `elect` | `<election_name>` | `<timeout> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Run for leader (blocking) |
+| `elect` | `<election_name>` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Run for leader (blocking) |
 | `resign` | `<election_name>` | `<token>` | `ok` | Step down as leader |
 | `observe` | `<election_name>` | _(empty)_ | `ok` | Subscribe to leader events |
 | `unobserve` | `<election_name>` | _(empty)_ | `ok` | Unsubscribe from leader events |
@@ -205,9 +207,8 @@ Rules:
 | Code | Meaning |
 |------|---------|
 | 3 | Invalid command |
-| 4 | Invalid argument (bad integer, overflow) |
+| 4 | Invalid argument (bad integer, negative timeout, overflow) |
 | 5 | Invalid key (empty or contains whitespace) |
-| 6 | Negative timeout |
 | 7 | Empty token |
 | 8 | Malformed argument |
 | 9 | Invalid lease TTL (must be > 0) |
