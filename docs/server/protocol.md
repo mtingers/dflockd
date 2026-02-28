@@ -16,6 +16,9 @@ dflockd uses a simple line-based TCP protocol. Every request is exactly **3 line
 
 Each line is terminated by `\n`. Lines are limited to 256 bytes. Carriage returns (`\r`) are stripped.
 
+!!! info "Key is always line 2"
+    The **key** (line 2) is present in every request. The command tables below only show the **argument** (line 3) since the key is always the same positional field.
+
 ## Response Format
 
 ```
@@ -95,12 +98,14 @@ Responses are a single line. The first word is a status code, optionally followe
 
 ### KV Store
 
+The KV key is the standard protocol key (line 2). For example, to set `mykey` to `hello` with a 60s TTL: send `kset`, `mykey`, `hello\t60`.
+
 | Command | Argument | Response | Description |
 |---------|----------|----------|-------------|
-| `kset` | `<value>\t<ttl>` | `ok` | Set key-value pair (TTL in seconds, 0 = no expiry) |
-| `kget` | _(empty)_ | `ok <value>` or `nil` | Get value by key |
+| `kset` | `<value>\t<ttl>` | `ok` | Set value for key (TTL in seconds, 0 = no expiry) |
+| `kget` | _(empty)_ | `ok <value>` or `nil` | Get value for key |
 | `kdel` | _(empty)_ | `ok` | Delete key |
-| `kcas` | `<old>\t<new>\t<ttl>` | `ok` or `cas_conflict` | Compare-and-swap |
+| `kcas` | `<old>\t<new>\t<ttl>` | `ok` or `cas_conflict` | Compare-and-swap value for key |
 
 !!! note "Tab separator"
     `kset` and `kcas` use a tab character (`\t`) to separate value from TTL, since values may contain spaces. Values must not contain tab characters.
