@@ -2726,7 +2726,7 @@ func TestBLPop_Timeout(t *testing.T) {
 	defer cancel()
 
 	val, err := lm.BLPop(ctx, "list1", 1*time.Millisecond, 1)
-	if err != nil && err != context.DeadlineExceeded {
+	if err != nil && err != context.DeadlineExceeded && !errors.Is(err, ErrTimeout) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if val != "" {

@@ -606,6 +606,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "blpop":
 		val, err := s.lm.BLPop(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
+			if errors.Is(err, lock.ErrTimeout) {
+				return &protocol.Ack{Status: "nil"}
+			}
 			if errors.Is(err, lock.ErrWaiterClosed) {
 				return nil // connection closing, skip response
 			}
@@ -616,9 +619,6 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 				return &protocol.Ack{Status: "error_max_keys"}
 			}
 			return &protocol.Ack{Status: "error"}
-		}
-		if val == "" {
-			return &protocol.Ack{Status: "nil"}
 		}
 		s.wm.Notify("blpop", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: val}
@@ -626,6 +626,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 	case "brpop":
 		val, err := s.lm.BRPop(ctx, req.Key, req.AcquireTimeout, connID)
 		if err != nil {
+			if errors.Is(err, lock.ErrTimeout) {
+				return &protocol.Ack{Status: "nil"}
+			}
 			if errors.Is(err, lock.ErrWaiterClosed) {
 				return nil // connection closing, skip response
 			}
@@ -636,9 +639,6 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 				return &protocol.Ack{Status: "error_max_keys"}
 			}
 			return &protocol.Ack{Status: "error"}
-		}
-		if val == "" {
-			return &protocol.Ack{Status: "nil"}
 		}
 		s.wm.Notify("brpop", req.Key)
 		return &protocol.Ack{Status: "ok", Extra: val}

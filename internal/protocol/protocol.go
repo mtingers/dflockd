@@ -211,9 +211,6 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
 			lt, err := parseSeconds(parts[1], "lease_ttl")
@@ -284,9 +281,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
@@ -302,9 +297,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		limit, err := parseInt(parts[1], "limit")
 		if err != nil {
 			return nil, err
@@ -401,9 +394,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
@@ -456,8 +447,8 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 				return nil, &ProtocolError{Code: 8, Message: "kset: value must not contain tab characters"}
 			}
 			n, err := parseSeconds(ttlPart, "kset TTL")
-			if err != nil || n < 0 {
-				return nil, &ProtocolError{Code: 8, Message: "kset: invalid TTL after tab"}
+			if err != nil {
+				return nil, err
 			}
 			req.TTLSeconds = n
 		} else {
@@ -540,9 +531,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
@@ -560,9 +549,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
 			lt, err := parseSeconds(parts[1], "lease_ttl")
@@ -637,9 +624,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
@@ -668,8 +653,8 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		ttl := 0
 		if ttlStr != "" {
 			n, err := parseSeconds(ttlStr, "kcas TTL")
-			if err != nil || n < 0 {
-				return nil, &ProtocolError{Code: 8, Message: "kcas: invalid TTL"}
+			if err != nil {
+				return nil, err
 			}
 			ttl = n
 		}
@@ -701,9 +686,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
@@ -722,9 +705,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
+
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
 			lt, err := parseSeconds(parts[1], "lease_ttl")

@@ -27,6 +27,7 @@ var (
 	ErrMaxKeys         = errors.New("max keys reached")
 	ErrListFull        = errors.New("list at max length")
 	ErrBarrierCountMismatch = errors.New("barrier count mismatch")
+	ErrTimeout              = errors.New("timeout")
 )
 
 // tokenBuf amortises crypto/rand syscalls by buffering 4096 bytes (256 tokens)
@@ -251,7 +252,9 @@ func removeWaiterFromState(st *ResourceState, target *waiter) {
 // resource state, closing their channels unless already tracked in the
 // closed set. Operates on the active portion [WaiterHead:].
 func removeWaitersByConn(st *ResourceState, connID uint64, closed map[chan string]struct{}) {
-	n := st.WaiterHead
+	// Compact surviving waiters down to index 0, reclaiming the dead
+	// [0:WaiterHead) slots that would otherwise leak permanently.
+	n := 0
 	for i := st.WaiterHead; i < len(st.Waiters); i++ {
 		w := st.Waiters[i]
 		if w.connID == connID {
@@ -268,6 +271,7 @@ func removeWaitersByConn(st *ResourceState, connID uint64, closed map[chan strin
 		st.Waiters[i] = nil
 	}
 	st.Waiters = st.Waiters[:n]
+	st.WaiterHead = 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,9 +1292,12 @@ func (lm *LockManager) LPush(key, value string) (int, error) {
 		return 0, ErrListFull
 	}
 	// Prepend: grow by one, shift right, insert at front.
+	// Reset itemsStart since append may reallocate the backing array,
+	// invalidating the compaction debt tracked from prior LPop calls.
 	ls.Items = append(ls.Items, "")
 	copy(ls.Items[1:], ls.Items)
 	ls.Items[0] = value
+	ls.itemsStart = 0
 	ls.LastActivity = time.Now()
 	return len(ls.Items), nil
 }
@@ -1429,7 +1436,7 @@ func (lm *LockManager) BLPop(ctx context.Context, key string, timeout time.Durat
 }
 
 // BRPop blocks until an item is available at the right of the list, or timeout.
-// Returns ("", nil) on timeout.
+// Returns ("", ErrTimeout) on timeout.
 func (lm *LockManager) BRPop(ctx context.Context, key string, timeout time.Duration, connID uint64) (string, error) {
 	return lm.blockingPop(ctx, key, timeout, connID, false)
 }
@@ -1529,7 +1536,7 @@ func (lm *LockManager) blockingPop(ctx context.Context, key string, timeout time
 		}
 		lm.removeListWaiter(sh, key, w)
 		sh.mu.Unlock()
-		return "", nil
+		return "", ErrTimeout
 	}
 }
 
@@ -2132,6 +2139,10 @@ func (lm *LockManager) RegisterLeaderWatcher(key string, connID uint64, writeCh 
 // RegisterAndNotifyLeader atomically registers a watcher and notifies
 // observers of a leader change.
 func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uint64, writeCh chan []byte, cancelConn func()) {
+	type target struct {
+		ch         chan []byte
+		cancelConn func()
+	}
 	sh := lm.shardFor(key)
 	lm.connMu.Lock()
 	sh.mu.Lock()
@@ -2145,21 +2156,13 @@ func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uin
 		existingObserver = existing.observer
 	}
 	watchers[connID] = &leaderWatcher{ch: writeCh, cancelConn: cancelConn, observer: existingObserver}
-	// Notify all pre-existing watchers (excluding the new leader).
-	// Note: an observer that registered between AcquireWithFence and this call
-	// may receive a duplicate "elected" notification (once from
-	// RegisterLeaderWatcherWithStatus, once from here). This is benign —
-	// "leader elected" is idempotent.
-	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
+	// Snapshot targets for notification outside the lock.
+	targets := make([]target, 0, len(watchers))
 	for cid, lw := range watchers {
 		if cid == connID {
 			continue
 		}
-		select {
-		case lw.ch <- msg:
-		default:
-			lw.cancelConn()
-		}
+		targets = append(targets, target{ch: lw.ch, cancelConn: lw.cancelConn})
 	}
 	keys := lm.connLeaderKeys[connID]
 	if keys == nil {
@@ -2169,6 +2172,17 @@ func (lm *LockManager) RegisterAndNotifyLeader(key, eventType string, connID uin
 	keys[key] = struct{}{}
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
+
+	// Deliver notifications outside locks to avoid calling cancelConn
+	// while holding connMu+sh.mu.
+	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
+	for _, t := range targets {
+		select {
+		case t.ch <- msg:
+		default:
+			t.cancelConn()
+		}
+	}
 }
 
 // removeLeaderHolderWatcher removes a leader watcher for an expired/released
@@ -2206,14 +2220,15 @@ func (lm *LockManager) HasLeaderWatcherObserver(key string, connID uint64) bool 
 	sh := lm.shardFor(key)
 	lm.connMu.Lock()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	defer lm.connMu.Unlock()
+	var result bool
 	if watchers, ok := sh.leaderWatchers[key]; ok {
 		if lw, exists := watchers[connID]; exists {
-			return lw.observer
+			result = lw.observer
 		}
 	}
-	return false
+	sh.mu.Unlock()
+	lm.connMu.Unlock()
+	return result
 }
 
 // UnregisterLeaderWatcher removes a leader change watcher.
@@ -2269,23 +2284,34 @@ func (lm *LockManager) UnregisterAllLeaderWatchers(connID uint64) {
 // excludeConnID allows skipping the connection that triggered the event
 // (pass 0 to notify all watchers). Disconnects slow consumers.
 func (lm *LockManager) NotifyLeaderChange(key, eventType string, excludeConnID uint64) {
+	type target struct {
+		ch         chan []byte
+		cancelConn func()
+	}
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	watchers, ok := sh.leaderWatchers[key]
 	if !ok {
+		sh.mu.Unlock()
 		return
 	}
-	// msg is shared read-only across all recipients.
-	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
+	// Snapshot watchers under the lock, deliver outside to avoid
+	// calling cancelConn while holding sh.mu.
+	targets := make([]target, 0, len(watchers))
 	for connID, lw := range watchers {
 		if connID == excludeConnID {
 			continue
 		}
+		targets = append(targets, target{ch: lw.ch, cancelConn: lw.cancelConn})
+	}
+	sh.mu.Unlock()
+
+	msg := []byte(fmt.Sprintf("leader %s %s\n", eventType, key))
+	for _, t := range targets {
 		select {
-		case lw.ch <- msg:
+		case t.ch <- msg:
 		default:
-			lw.cancelConn()
+			t.cancelConn()
 		}
 	}
 }
@@ -2427,9 +2453,9 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 		return
 	}
 
+	// Phase 1: snapshot and delete connection-level tracking under connMu.
 	lm.connMu.Lock()
 
-	// Snapshot enqueued keys and owned keys+tokens for this connection.
 	var enqueuedKeys []string
 	for ck := range lm.connEnqueued {
 		if ck.ConnID == connID {
@@ -2444,7 +2470,6 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 	var ownedEntries []ownedEntry
 	if owned, ok := lm.connOwned[connID]; ok {
 		for key, tokens := range owned {
-			// Copy the token set
 			cp := make(map[string]struct{}, len(tokens))
 			for t := range tokens {
 				cp[t] = struct{}{}
@@ -2452,12 +2477,18 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 			ownedEntries = append(ownedEntries, ownedEntry{key: key, tokens: cp})
 		}
 	}
+	delete(lm.connOwned, connID)
+
+	lm.connMu.Unlock()
 
 	closed := make(map[chan string]struct{})
 
-	// Clean up two-phase enqueued state — group by shard to avoid lock juggling.
+	// Phase 2: clean up two-phase enqueued state. connEnqueued entries are
+	// keyed by connID, so no other goroutine will create new entries for a
+	// disconnected connection. We hold connMu per-key briefly.
 	for _, key := range enqueuedKeys {
 		sh := lm.shardFor(key)
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		ck := connKey{ConnID: connID, Key: key}
 		es := lm.connEnqueued[ck]
@@ -2472,27 +2503,27 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 			}
 		}
 		sh.mu.Unlock()
+		lm.connMu.Unlock()
 	}
 
-	// Cancel pending waiters from single-phase acquire path.
-	// We must iterate all shards since we don't track which shards
-	// have waiters for a given connID.
+	// Phase 3: cancel pending waiters from single-phase acquire path.
+	// Only shard locks needed — no connMu-protected data accessed.
 	for i := range lm.shards {
 		sh := &lm.shards[i]
 		sh.mu.Lock()
 		for key, st := range sh.resources {
 			removeWaitersByConn(st, connID, closed)
-			// Unblock waiters that were queued behind the removed waiter
-			// (e.g. readers behind a removed writer in RW locks).
 			lm.grantNextLocked(key, st)
 		}
 		sh.mu.Unlock()
 	}
 
-	// Release owned slots.
+	// Phase 4: release owned slots. Needs connMu for removeLeaderHolderWatcher
+	// which accesses connLeaderKeys. Hold connMu+sh.mu per-key.
 	var releasedKeys []string
 	for _, entry := range ownedEntries {
 		sh := lm.shardFor(entry.key)
+		lm.connMu.Lock()
 		sh.mu.Lock()
 		st := sh.resources[entry.key]
 		if st != nil {
@@ -2518,16 +2549,15 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 			}
 		}
 		sh.mu.Unlock()
+		lm.connMu.Unlock()
 	}
-	delete(lm.connOwned, connID)
 
-	// Clean up list pop waiters for this connection.
+	// Phase 5: clean up list pop waiters and barrier participants.
+	// Only shard locks needed.
 	for i := range lm.shards {
 		sh := &lm.shards[i]
 		sh.mu.Lock()
 		for key, ls := range sh.lists {
-			// Remove pop waiters for this connection by compacting the
-			// active region, preserving order for other connections.
 			n := ls.PopWaiterHead
 			for j := ls.PopWaiterHead; j < len(ls.PopWaiters); j++ {
 				w := ls.PopWaiters[j]
@@ -2542,15 +2572,11 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				ls.PopWaiters[j] = nil
 			}
 			ls.PopWaiters = ls.PopWaiters[:n]
-			// Remove the list if it's empty and all pop waiters are gone.
 			if len(ls.Items) == 0 && ls.PopWaiterHead >= len(ls.PopWaiters) {
 				delete(sh.lists, key)
 				lm.keyTotal.Add(-1)
 			}
 		}
-		// Clean up barrier participants for this connection.
-		// When a participant disconnects, the barrier can never trip
-		// (count can't be reached), so cancel it to wake remaining waiters.
 		for key, bs := range sh.barriers {
 			removed := false
 			for i := len(bs.Participants) - 1; i >= 0; i-- {
@@ -2562,10 +2588,8 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 				}
 			}
 			if removed && !bs.Tripped && bs.Cancelled != nil {
-				// Signal remaining participants that barrier is unreachable
 				select {
 				case <-bs.Cancelled:
-					// already cancelled
 				default:
 					close(bs.Cancelled)
 				}
@@ -2578,6 +2602,9 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 		sh.mu.Unlock()
 	}
 
+	// Phase 6: clean up leader watcher keys for this connection.
+	lm.connMu.Lock()
+	delete(lm.connLeaderKeys, connID)
 	lm.connMu.Unlock()
 
 	// Notify watchers of released keys outside of locks.

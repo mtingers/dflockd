@@ -1289,6 +1289,10 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 	token, lease, fence, err := AcquireWithFence(conn, l.Key, l.acquireTimeout(), l.opts()...)
 
+	// Signal done immediately to prevent the cancellation goroutine from
+	// closing the connection while we may still need it for Release.
+	close(done)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1301,7 +1305,6 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if errors.Is(err, ErrTimeout) {
 			closeIfOurs()
 			return false, nil
@@ -1315,15 +1318,11 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	if ctx.Err() != nil {
-		// Lock acquired but context cancelled — release BEFORE signalling
-		// done so the cancellation goroutine cannot close the connection
-		// out from under us.
+		// Lock acquired but context cancelled — release before closing.
 		Release(conn, l.Key, token)
-		close(done)
 		closeIfOurs()
 		return false, ctx.Err()
 	}
-	close(done)
 
 	l.token = token
 	l.lease = lease
@@ -1360,6 +1359,8 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 
 	status, token, lease, fence, err := EnqueueWithFence(conn, l.Key, l.opts()...)
 
+	close(done)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1370,7 +1371,6 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if ctx.Err() != nil {
 			closeIfOurs()
 			return "", ctx.Err()
@@ -1383,11 +1383,9 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		if status == "acquired" {
 			Release(conn, l.Key, token)
 		}
-		close(done)
 		closeIfOurs()
 		return "", ctx.Err()
 	}
-	close(done)
 
 	if status == "acquired" {
 		l.token = token
@@ -1422,6 +1420,8 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	token, lease, fence, err := WaitWithFence(conn, l.Key, timeout)
 
+	close(done)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1432,7 +1432,6 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if errors.Is(err, ErrTimeout) {
 			closeIfOurs()
 			return false, nil
@@ -1447,11 +1446,9 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	if ctx.Err() != nil {
 		Release(conn, l.Key, token)
-		close(done)
 		closeIfOurs()
 		return false, ctx.Err()
 	}
-	close(done)
 
 	l.token = token
 	l.lease = lease
@@ -1753,6 +1750,10 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 
 	token, lease, fence, err := SemAcquireWithFence(conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
 
+	// Signal done immediately to prevent the cancellation goroutine from
+	// closing the connection while we may still need it for SemRelease.
+	close(done)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1765,7 +1766,6 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if errors.Is(err, ErrTimeout) {
 			closeIfOurs()
 			return false, nil
@@ -1780,11 +1780,9 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 
 	if ctx.Err() != nil {
 		SemRelease(conn, s.Key, token)
-		close(done)
 		closeIfOurs()
 		return false, ctx.Err()
 	}
-	close(done)
 
 	s.token = token
 	s.lease = lease
@@ -1820,6 +1818,8 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 
 	status, token, lease, fence, err := SemEnqueueWithFence(conn, s.Key, s.Limit, s.opts()...)
 
+	close(done)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1830,7 +1830,6 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if ctx.Err() != nil {
 			closeIfOurs()
 			return "", ctx.Err()
@@ -1843,11 +1842,9 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		if status == "acquired" {
 			SemRelease(conn, s.Key, token)
 		}
-		close(done)
 		closeIfOurs()
 		return "", ctx.Err()
 	}
-	close(done)
 
 	if status == "acquired" {
 		s.token = token
@@ -1881,6 +1878,8 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	token, lease, fence, err := SemWaitWithFence(conn, s.Key, timeout)
 
+	close(done)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1891,7 +1890,6 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	}
 
 	if err != nil {
-		close(done)
 		if errors.Is(err, ErrTimeout) {
 			closeIfOurs()
 			return false, nil
@@ -1906,11 +1904,9 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	if ctx.Err() != nil {
 		SemRelease(conn, s.Key, token)
-		close(done)
 		closeIfOurs()
 		return false, ctx.Err()
 	}
-	close(done)
 
 	s.token = token
 	s.lease = lease
@@ -2746,6 +2742,10 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 
 	token, lease, fence, err := rwLock(conn, cmd, rw.Key, rw.acquireTimeout(), rw.opts()...)
 
+	// Signal done immediately to prevent the cancellation goroutine from
+	// closing the connection while we may still need it for unlock.
+	close(done)
+
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -2758,7 +2758,6 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 	}
 
 	if err != nil {
-		close(done)
 		if errors.Is(err, ErrTimeout) {
 			closeIfOurs()
 			return false, nil
@@ -2778,11 +2777,9 @@ func (rw *RWLock) acquire(ctx context.Context, cmd string) (bool, error) {
 		} else {
 			RUnlock(conn, rw.Key, token)
 		}
-		close(done)
 		closeIfOurs()
 		return false, ctx.Err()
 	}
-	close(done)
 
 	rw.token = token
 	rw.fence = fence
