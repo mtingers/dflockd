@@ -104,10 +104,10 @@ func MatchPattern(pattern, channel string) bool {
 // Listen registers a listener for the pattern specified in listener.Pattern.
 // Duplicate subscriptions (same connID + pattern + group) are ignored.
 // Returns an error if the pattern is invalid (e.g. ">" not as last token).
-func (m *Manager) Listen(listener *Listener) error {
+func (m *Manager) Listen(listener *Listener) (bool, error) {
 	pattern := listener.Pattern
 	if err := validatePattern(pattern); err != nil {
-		return err
+		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -115,7 +115,7 @@ func (m *Manager) Listen(listener *Listener) error {
 	// Check for duplicate subscription (same connID + pattern + group)
 	for _, e := range m.connListeners[listener.ConnID] {
 		if e.pattern == pattern && e.group == listener.Group {
-			return nil // already subscribed
+			return false, nil // already subscribed
 		}
 	}
 
@@ -174,11 +174,12 @@ func (m *Manager) Listen(listener *Listener) error {
 		group:   group,
 		isWild:  wild,
 	})
-	return nil
+	return true, nil
 }
 
 // Unlisten removes a listener for a specific pattern, connID, and group.
-func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
+// Returns true if a listener was actually removed.
+func (m *Manager) Unlisten(pattern string, connID uint64, group string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -248,11 +249,13 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 
 	// Update reverse index
 	entries := m.connListeners[connID]
+	removed := false
 	for i, e := range entries {
 		if e.pattern == pattern && e.group == group {
 			copy(entries[i:], entries[i+1:])
 			entries[len(entries)-1] = nil
 			entries = entries[:len(entries)-1]
+			removed = true
 			break
 		}
 	}
@@ -261,6 +264,7 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) {
 	} else {
 		m.connListeners[connID] = entries
 	}
+	return removed
 }
 
 // deliverToGroup delivers a message to one member of a queue group via round-robin.

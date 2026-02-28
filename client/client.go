@@ -3491,9 +3491,10 @@ func (e *Election) Resign(ctx context.Context) error {
 		e.token = ""
 		e.fence = 0
 		e.lease = 0
+		onResigned := e.OnResigned
 		e.mu.Unlock()
-		if wasLeader && e.OnResigned != nil {
-			go e.OnResigned()
+		if wasLeader && onResigned != nil {
+			go onResigned()
 		}
 		if wasLeader {
 			return fmt.Errorf("dflockd: connection lost, server-side resign skipped (lease will expire)")
@@ -3523,14 +3524,19 @@ func (e *Election) Resign(ctx context.Context) error {
 
 	e.mu.Lock()
 	e.isLeader = false
-	e.closeLC()
+	// Only close the LeaderConn we actually used for the resign call.
+	// A concurrent Campaign() may have replaced e.lc in the meantime.
+	if e.lc == lc {
+		e.closeLC()
+	}
 	e.token = ""
 	e.fence = 0
 	e.lease = 0
+	onResigned := e.OnResigned
 	e.mu.Unlock()
 
-	if wasLeader && e.OnResigned != nil {
-		go e.OnResigned()
+	if wasLeader && onResigned != nil {
+		go onResigned()
 	}
 
 	return err

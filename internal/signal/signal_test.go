@@ -958,14 +958,14 @@ func TestUnlistenAll_WildcardGroups_NoSkip(t *testing.T) {
 			Group:   group,
 			WriteCh: make(chan []byte, 4),
 		}
-		if err := m.Listen(l); err != nil {
+		if _, err := m.Listen(l); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// Also add a non-grouped wildcard to verify it's cleaned up too.
 	l := makeListener(42, "events.*")
-	if err := m.Listen(l); err != nil {
+	if _, err := m.Listen(l); err != nil {
 		t.Fatal(err)
 	}
 

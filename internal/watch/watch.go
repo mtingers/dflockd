@@ -83,9 +83,9 @@ func matchPattern(pattern, key string) bool {
 }
 
 // Watch registers a watcher. Duplicate (connID, pattern) is ignored.
-func (m *Manager) Watch(w *Watcher) error {
+func (m *Manager) Watch(w *Watcher) (bool, error) {
 	if err := validatePattern(w.Pattern); err != nil {
-		return err
+		return false, err
 	}
 
 	m.mu.Lock()
@@ -94,7 +94,7 @@ func (m *Manager) Watch(w *Watcher) error {
 	// Check for duplicate
 	for _, e := range m.connWatchers[w.ConnID] {
 		if e.pattern == w.Pattern {
-			return nil
+			return false, nil
 		}
 	}
 
@@ -114,11 +114,12 @@ func (m *Manager) Watch(w *Watcher) error {
 		pattern: w.Pattern,
 		isWild:  wild,
 	})
-	return nil
+	return true, nil
 }
 
 // Unwatch removes a watcher for a specific pattern and connID.
-func (m *Manager) Unwatch(pattern string, connID uint64) {
+// Returns true if a watcher was actually removed.
+func (m *Manager) Unwatch(pattern string, connID uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -142,11 +143,13 @@ func (m *Manager) Unwatch(pattern string, connID uint64) {
 	}
 
 	entries := m.connWatchers[connID]
+	removed := false
 	for i, e := range entries {
 		if e.pattern == pattern {
 			copy(entries[i:], entries[i+1:])
 			entries[len(entries)-1] = watcherEntry{} // zero tail for GC
 			entries = entries[:len(entries)-1]
+			removed = true
 			break
 		}
 	}
@@ -155,6 +158,7 @@ func (m *Manager) Unwatch(pattern string, connID uint64) {
 	} else {
 		m.connWatchers[connID] = entries
 	}
+	return removed
 }
 
 // UnwatchAll removes all watchers for a given connection.

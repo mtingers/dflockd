@@ -5181,3 +5181,115 @@ func TestServer_Run_PortAlreadyBound(t *testing.T) {
 		t.Fatalf("expected listen error, got: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression: duplicate listen/watch should NOT inflate subscription counter,
+// and unlisten/unwatch on nonexistent pattern should NOT deflate it.
+// ---------------------------------------------------------------------------
+
+func TestIntegration_DuplicateListenDoesNotInflateCounter(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	_, addr, _ := startServer(t, cfg)
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Listen to a pattern
+	resp := connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	// Duplicate listen should succeed but NOT use a subscription slot
+	resp = connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("duplicate listen: expected ok, got %q", resp)
+	}
+
+	// Second distinct subscription should still work (not blocked by duplicate)
+	resp = connSendCmd(t, conn, reader, "listen", "ch2", "")
+	if resp != "ok" {
+		t.Fatalf("listen ch2: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_DuplicateWatchDoesNotInflateCounter(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	_, addr, _ := startServer(t, cfg)
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Watch a key
+	resp := connSendCmd(t, conn, reader, "watch", "k1", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+
+	// Duplicate watch should NOT use a subscription slot
+	resp = connSendCmd(t, conn, reader, "watch", "k1", "")
+	if resp != "ok" {
+		t.Fatalf("duplicate watch: expected ok, got %q", resp)
+	}
+
+	// Second distinct subscription should still work
+	resp = connSendCmd(t, conn, reader, "watch", "k2", "")
+	if resp != "ok" {
+		t.Fatalf("watch k2: expected ok, got %q", resp)
+	}
+}
+
+func TestIntegration_SpuriousUnlistenDoesNotDeflateCounter(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 1
+	_, addr, _ := startServer(t, cfg)
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Use the one subscription slot
+	resp := connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	// Spurious unlisten on a nonexistent pattern should NOT free a slot
+	connSendCmd(t, conn, reader, "unlisten", "no-such-ch", "")
+
+	// This should fail — the slot should still be occupied by ch1
+	resp = connSendCmd(t, conn, reader, "listen", "ch2", "")
+	if resp == "ok" {
+		// If we get here, the counter was incorrectly deflated by the spurious unlisten
+		t.Fatal("spurious unlisten should NOT free a subscription slot")
+	}
+}
+
+func TestIntegration_SpuriousUnwatchDoesNotDeflateCounter(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 1
+	_, addr, _ := startServer(t, cfg)
+
+	conn := dialTest(t, addr)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Use the one subscription slot
+	resp := connSendCmd(t, conn, reader, "watch", "k1", "")
+	if resp != "ok" {
+		t.Fatalf("watch: expected ok, got %q", resp)
+	}
+
+	// Spurious unwatch should NOT free a slot
+	connSendCmd(t, conn, reader, "unwatch", "no-such-key", "")
+
+	// This should fail — the slot should still be occupied
+	resp = connSendCmd(t, conn, reader, "watch", "k2", "")
+	if resp == "ok" {
+		t.Fatal("spurious unwatch should NOT free a subscription slot")
+	}
+}

@@ -3453,16 +3453,12 @@ func TestDecr_MinInt64Delta(t *testing.T) {
 
 func TestDecr_MinInt64Value(t *testing.T) {
 	lm := testManager()
-	// Set counter to MinInt64 and decrement by 1
-	// In Go, this wraps around (integer overflow is defined behavior)
+	// Set counter to MinInt64 and decrement by 1 — should be rejected
+	// as underflow now that Incr has overflow protection.
 	lm.SetCounter("k1", math.MinInt64)
-	val, err := lm.Decr("k1", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Go wraps: MinInt64 + (-1) = MaxInt64
-	if val != math.MaxInt64 {
-		t.Fatalf("expected MaxInt64 from wrap, got %d", val)
+	_, err := lm.Decr("k1", 1)
+	if err == nil {
+		t.Fatal("expected underflow error for MinInt64 - 1")
 	}
 }
 
@@ -5785,5 +5781,81 @@ func TestRenewWithFence_PreservesFenceAfterRenew(t *testing.T) {
 		if remaining <= 0 {
 			t.Fatalf("renew %d: remaining should be positive, got %d", i, remaining)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: Incr overflow/underflow detection
+// ---------------------------------------------------------------------------
+
+func TestIncr_OverflowMaxInt64(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", math.MaxInt64)
+	_, err := lm.Incr("c1", 1)
+	if err == nil {
+		t.Fatal("expected overflow error for MaxInt64 + 1")
+	}
+	// Counter value should be unchanged
+	v := lm.GetCounter("c1")
+	if v != math.MaxInt64 {
+		t.Fatalf("counter should be unchanged, got %d", v)
+	}
+}
+
+func TestIncr_UnderflowMinInt64(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", math.MinInt64)
+	_, err := lm.Incr("c1", -1)
+	if err == nil {
+		t.Fatal("expected underflow error for MinInt64 + (-1)")
+	}
+	v := lm.GetCounter("c1")
+	if v != math.MinInt64 {
+		t.Fatalf("counter should be unchanged, got %d", v)
+	}
+}
+
+func TestIncr_LargePositiveDelta(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", 1)
+	_, err := lm.Incr("c1", math.MaxInt64)
+	if err == nil {
+		t.Fatal("expected overflow error for 1 + MaxInt64")
+	}
+}
+
+func TestIncr_BoundaryNoOverflow(t *testing.T) {
+	lm := testManager()
+	lm.SetCounter("c1", math.MaxInt64-1)
+	val, err := lm.Incr("c1", 1)
+	if err != nil {
+		t.Fatalf("MaxInt64-1 + 1 should not overflow: %v", err)
+	}
+	if val != math.MaxInt64 {
+		t.Fatalf("expected MaxInt64, got %d", val)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: compactItems triggers at correct threshold
+// ---------------------------------------------------------------------------
+
+func TestList_CompactItems_TriggerAfterHalfWasted(t *testing.T) {
+	lm := testManager()
+	// Push many items to build up a big backing array
+	for i := 0; i < 100; i++ {
+		lm.RPush("q1", fmt.Sprintf("item%d", i))
+	}
+	// Pop more than half — compaction should trigger during a subsequent LPop
+	for i := 0; i < 60; i++ {
+		lm.LPop("q1")
+	}
+	// Remaining 40 items should still be correct
+	if lm.LLen("q1") != 40 {
+		t.Fatalf("expected 40 items, got %d", lm.LLen("q1"))
+	}
+	v, ok := lm.LPop("q1")
+	if !ok || v != "item60" {
+		t.Fatalf("expected item60 after compaction, got %q", v)
 	}
 }

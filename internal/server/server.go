@@ -522,16 +522,20 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			WriteCh:    cs.writeCh,
 			CancelConn: cs.cancelConn,
 		}
-		if err := s.sig.Listen(listener); err != nil {
+		added, err := s.sig.Listen(listener)
+		if err != nil {
 			return &protocol.Ack{Status: "error"}
 		}
-		cs.subscriptions++
+		if added {
+			cs.subscriptions++
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	case "unlisten":
-		s.sig.Unlisten(req.Key, connID, req.Group)
-		if cs.subscriptions > 0 {
-			cs.subscriptions--
+		if s.sig.Unlisten(req.Key, connID, req.Group) {
+			if cs.subscriptions > 0 {
+				cs.subscriptions--
+			}
 		}
 		return &protocol.Ack{Status: "ok"}
 
@@ -739,16 +743,20 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			WriteCh:    cs.writeCh,
 			CancelConn: cs.cancelConn,
 		}
-		if err := s.wm.Watch(w); err != nil {
+		added, err := s.wm.Watch(w)
+		if err != nil {
 			return &protocol.Ack{Status: "error"}
 		}
-		cs.subscriptions++
+		if added {
+			cs.subscriptions++
+		}
 		return &protocol.Ack{Status: "ok"}
 
 	case "unwatch":
-		s.wm.Unwatch(req.Key, connID)
-		if cs.subscriptions > 0 {
-			cs.subscriptions--
+		if s.wm.Unwatch(req.Key, connID) {
+			if cs.subscriptions > 0 {
+				cs.subscriptions--
+			}
 		}
 		return &protocol.Ack{Status: "ok"}
 

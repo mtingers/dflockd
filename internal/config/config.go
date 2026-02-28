@@ -88,6 +88,9 @@ func envOrDuration(envKey string, flagVal int) time.Duration {
 	if n > maxSafeSeconds {
 		n = maxSafeSeconds
 	}
+	if n < -maxSafeSeconds {
+		n = -maxSafeSeconds
+	}
 	return time.Duration(n) * time.Second
 }
 
@@ -175,6 +178,9 @@ func Load(args []string) (*Config, error) {
 	}
 	resolveDuration := func(flagName, envKey string, flagVal int) time.Duration {
 		if setFlags[flagName] {
+			if flagVal > maxSafeSeconds {
+				flagVal = maxSafeSeconds
+			}
 			return time.Duration(flagVal) * time.Second
 		}
 		return envOrDuration(envKey, flagVal)

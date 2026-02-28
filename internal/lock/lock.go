@@ -139,7 +139,7 @@ type listState struct {
 // left-pops. Without this, FIFO (RPush + LPop) patterns leak memory because
 // the backing array grows monotonically while the slice window slides forward.
 func (ls *listState) compactItems() {
-	if ls.itemsStart > 0 && ls.itemsStart > cap(ls.Items) {
+	if ls.itemsStart > 0 && ls.itemsStart > len(ls.Items) {
 		// After reslicing, cap(ls.Items) reflects remaining capacity from
 		// the current start, not the original allocation. Use itemsStart
 		// to track total wasted slots.
@@ -1065,6 +1065,14 @@ func (lm *LockManager) Incr(key string, delta int64) (int64, error) {
 		cs = &counterState{LastActivity: time.Now()}
 		sh.counters[key] = cs
 		lm.keyTotal.Add(1)
+	}
+	// Overflow check: if delta > 0 and result would exceed MaxInt64,
+	// or if delta < 0 and result would go below MinInt64, reject.
+	if delta > 0 && cs.Value > math.MaxInt64-delta {
+		return cs.Value, fmt.Errorf("counter overflow: %d + %d", cs.Value, delta)
+	}
+	if delta < 0 && cs.Value < math.MinInt64-delta {
+		return cs.Value, fmt.Errorf("counter underflow: %d + %d", cs.Value, delta)
 	}
 	cs.Value += delta
 	cs.LastActivity = time.Now()

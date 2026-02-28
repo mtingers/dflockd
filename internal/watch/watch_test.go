@@ -151,7 +151,7 @@ func TestWatch_PatternValidation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := m.Watch(&Watcher{ConnID: 1, Pattern: tc.pattern, WriteCh: ch, CancelConn: func() {}})
+			_, err := m.Watch(&Watcher{ConnID: 1, Pattern: tc.pattern, WriteCh: ch, CancelConn: func() {}})
 			if tc.wantErr && err == nil {
 				t.Errorf("expected error for pattern %q", tc.pattern)
 			}
