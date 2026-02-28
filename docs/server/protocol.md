@@ -10,14 +10,11 @@ dflockd uses a simple line-based TCP protocol. Every request is exactly **3 line
 <argument>\n
 ```
 
-- **command** -- the operation to perform (see below)
-- **key** -- the resource key (no whitespace allowed)
-- **argument** -- command-specific argument (may be empty)
+- **command** (line 1) -- the operation to perform (see below)
+- **key** (line 2) -- the resource key (no whitespace allowed)
+- **argument** (line 3) -- command-specific argument (may be empty)
 
 Each line is terminated by `\n`. Lines are limited to 256 bytes. Carriage returns (`\r`) are stripped.
-
-!!! info "Key is always line 2"
-    The **key** (line 2) is present in every request. The command tables below only show the **argument** (line 3) since the key is always the same positional field.
 
 ## Response Format
 
@@ -54,82 +51,80 @@ Responses are a single line. The first word is a status code, optionally followe
 
 ### Exclusive Locks
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `l` | `<timeout> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Acquire lock (blocking) |
-| `r` | `<token>` | `ok` | Release lock |
-| `n` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew lease |
-| `e` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue (non-blocking) |
-| `w` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after enqueue |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `l` | `<lock_name>` | `<timeout> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Acquire lock (blocking) |
+| `r` | `<lock_name>` | `<token>` | `ok` | Release lock |
+| `n` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew lease |
+| `e` | `<lock_name>` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue (non-blocking) |
+| `w` | `<lock_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after enqueue |
 
 ### Semaphores
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `sl` | `<timeout> <limit> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Acquire semaphore slot (blocking) |
-| `sr` | `<token>` | `ok` | Release semaphore slot |
-| `sn` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew semaphore lease |
-| `se` | `<limit> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for semaphore (non-blocking) |
-| `sw` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after semaphore enqueue |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `sl` | `<sem_name>` | `<timeout> <limit> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Acquire semaphore slot (blocking) |
+| `sr` | `<sem_name>` | `<token>` | `ok` | Release semaphore slot |
+| `sn` | `<sem_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew semaphore lease |
+| `se` | `<sem_name>` | `<limit> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for semaphore (non-blocking) |
+| `sw` | `<sem_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after semaphore enqueue |
 
 ### Read-Write Locks
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `rl` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire read lock |
-| `wl` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire write lock |
-| `rr` | `<token>` | `ok` | Release read lock |
-| `wr` | `<token>` | `ok` | Release write lock |
-| `rn` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew read lock lease |
-| `wn` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew write lock lease |
-| `re` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for read lock |
-| `we` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for write lock |
-| `rw` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after read enqueue |
-| `ww` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after write enqueue |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `rl` | `<lock_name>` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire read lock |
+| `wl` | `<lock_name>` | `<timeout> [<lease_ttl>]` | `ok <token> <lease> <fence>` or `timeout` | Acquire write lock |
+| `rr` | `<lock_name>` | `<token>` | `ok` | Release read lock |
+| `wr` | `<lock_name>` | `<token>` | `ok` | Release write lock |
+| `rn` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew read lock lease |
+| `wn` | `<lock_name>` | `<token> [<lease_ttl>]` | `ok <remaining> <fence>` | Renew write lock lease |
+| `re` | `<lock_name>` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for read lock |
+| `we` | `<lock_name>` | `[<lease_ttl>]` | `acquired <token> <lease> <fence>` or `queued` | Enqueue for write lock |
+| `rw` | `<lock_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after read enqueue |
+| `ww` | `<lock_name>` | `<timeout>` | `ok <token> <lease> <fence>` or `timeout` | Wait after write enqueue |
 
 ### Atomic Counters
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `incr` | `<delta>` | `ok <new_value>` | Increment counter by delta |
-| `decr` | `<delta>` | `ok <new_value>` | Decrement counter by delta |
-| `get` | _(empty)_ | `ok <value>` | Get counter value (0 if nonexistent) |
-| `cset` | `<value>` | `ok` | Set counter to specific value |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `incr` | `<counter_name>` | `<delta>` | `ok <new_value>` | Increment counter by delta |
+| `decr` | `<counter_name>` | `<delta>` | `ok <new_value>` | Decrement counter by delta |
+| `get` | `<counter_name>` | _(empty)_ | `ok <value>` | Get counter value (0 if nonexistent) |
+| `cset` | `<counter_name>` | `<value>` | `ok` | Set counter to specific value |
 
 ### KV Store
 
-The KV key is the standard protocol key (line 2). For example, to set `mykey` to `hello` with a 60s TTL: send `kset`, `mykey`, `hello\t60`.
-
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `kset` | `<value>\t<ttl>` | `ok` | Set value for key (TTL in seconds, 0 = no expiry) |
-| `kget` | _(empty)_ | `ok <value>` or `nil` | Get value for key |
-| `kdel` | _(empty)_ | `ok` | Delete key |
-| `kcas` | `<old>\t<new>\t<ttl>` | `ok` or `cas_conflict` | Compare-and-swap value for key |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `kset` | `<key>` | `<value>\t<ttl>` | `ok` | Set value (TTL in seconds, 0 = no expiry) |
+| `kget` | `<key>` | _(empty)_ | `ok <value>` or `nil` | Get value |
+| `kdel` | `<key>` | _(empty)_ | `ok` | Delete key |
+| `kcas` | `<key>` | `<old>\t<new>\t<ttl>` | `ok` or `cas_conflict` | Compare-and-swap |
 
 !!! note "Tab separator"
     `kset` and `kcas` use a tab character (`\t`) to separate value from TTL, since values may contain spaces. Values must not contain tab characters.
 
 ### Lists / Queues
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `lpush` | `<value>` | `ok <length>` | Prepend to list |
-| `rpush` | `<value>` | `ok <length>` | Append to list |
-| `lpop` | _(empty)_ | `ok <value>` or `nil` | Pop from left |
-| `rpop` | _(empty)_ | `ok <value>` or `nil` | Pop from right |
-| `llen` | _(empty)_ | `ok <length>` | Get list length |
-| `lrange` | `<start> <stop>` | `ok <json_array>` | Get range (0-based, negative from end, inclusive) |
-| `blpop` | `<timeout>` | `ok <value>` or `nil` | Blocking left pop |
-| `brpop` | `<timeout>` | `ok <value>` or `nil` | Blocking right pop |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `lpush` | `<list_name>` | `<value>` | `ok <length>` | Prepend to list |
+| `rpush` | `<list_name>` | `<value>` | `ok <length>` | Append to list |
+| `lpop` | `<list_name>` | _(empty)_ | `ok <value>` or `nil` | Pop from left |
+| `rpop` | `<list_name>` | _(empty)_ | `ok <value>` or `nil` | Pop from right |
+| `llen` | `<list_name>` | _(empty)_ | `ok <length>` | Get list length |
+| `lrange` | `<list_name>` | `<start> <stop>` | `ok <json_array>` | Get range (0-based, negative from end, inclusive) |
+| `blpop` | `<list_name>` | `<timeout>` | `ok <value>` or `nil` | Blocking left pop |
+| `brpop` | `<list_name>` | `<timeout>` | `ok <value>` or `nil` | Blocking right pop |
 
 ### Pub/Sub Signaling
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `listen` | `[<group>]` | `ok` | Subscribe to channel/pattern (optional queue group) |
-| `unlisten` | `[<group>]` | `ok` | Unsubscribe from channel/pattern |
-| `signal` | `<payload>` | `ok <receiver_count>` | Send signal to a channel (no wildcards) |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `listen` | `<channel_or_pattern>` | `[<group>]` | `ok` | Subscribe to channel/pattern (optional queue group) |
+| `unlisten` | `<channel_or_pattern>` | `[<group>]` | `ok` | Unsubscribe from channel/pattern |
+| `signal` | `<channel>` | `<payload>` | `ok <receiver_count>` | Send signal to a channel (no wildcards) |
 
 **Push format** (delivered asynchronously to listeners):
 
@@ -139,10 +134,10 @@ sig <channel> <payload>\n
 
 ### Key Watch
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `watch` | _(empty)_ | `ok` | Subscribe to key/pattern change events |
-| `unwatch` | _(empty)_ | `ok` | Unsubscribe from key/pattern |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `watch` | `<key_or_pattern>` | _(empty)_ | `ok` | Subscribe to key/pattern change events |
+| `unwatch` | `<key_or_pattern>` | _(empty)_ | `ok` | Unsubscribe from key/pattern |
 
 **Push format** (delivered asynchronously to watchers):
 
@@ -154,18 +149,18 @@ Event types include: `kset`, `kdel`, `acquire`, `release`, etc.
 
 ### Barriers
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `bwait` | `<count> <timeout>` | `ok` or `timeout` | Wait for N participants to arrive |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `bwait` | `<barrier_name>` | `<count> <timeout>` | `ok` or `timeout` | Wait for N participants to arrive |
 
 ### Leader Election
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `elect` | `<timeout> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Run for leader (blocking) |
-| `resign` | `<token>` | `ok` | Step down as leader |
-| `observe` | _(empty)_ | `ok` | Subscribe to leader events for key |
-| `unobserve` | _(empty)_ | `ok` | Unsubscribe from leader events |
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `elect` | `<election_name>` | `<timeout> [<lease_ttl>]` | `acquired <token> <lease> <fence>` or `timeout` | Run for leader (blocking) |
+| `resign` | `<election_name>` | `<token>` | `ok` | Step down as leader |
+| `observe` | `<election_name>` | _(empty)_ | `ok` | Subscribe to leader events |
+| `unobserve` | `<election_name>` | _(empty)_ | `ok` | Unsubscribe from leader events |
 
 **Push format** (delivered to observers and the elected leader):
 
@@ -177,19 +172,15 @@ Events: `elected`, `resigned`, `failover`
 
 ### Authentication
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `auth` | `<token>` | `ok` or `error_auth` | Authenticate connection |
-
-The key field is ignored for `auth` (conventionally `_`).
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `auth` | `_` _(ignored)_ | `<token>` | `ok` or `error_auth` | Authenticate connection |
 
 ### Stats
 
-| Command | Argument | Response | Description |
-|---------|----------|----------|-------------|
-| `stats` | — | `ok <json>` | Server statistics (JSON) |
-
-Both key and argument are ignored for `stats`.
+| Command | Key | Argument | Response | Description |
+|---------|-----|----------|----------|-------------|
+| `stats` | `_` _(ignored)_ | `_` _(ignored)_ | `ok <json>` | Server statistics (JSON) |
 
 ## Pattern Syntax (Signal and Watch)
 
