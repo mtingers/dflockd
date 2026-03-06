@@ -923,12 +923,19 @@ type IdleInfo struct {
 	IdleS float64 `json:"idle_s"`
 }
 
+type SignalChannelInfo struct {
+	Pattern   string `json:"pattern"`
+	Group     string `json:"group,omitempty"`
+	Listeners int    `json:"listeners"`
+}
+
 type Stats struct {
-	Connections    int64      `json:"connections"`
-	Locks          []LockInfo `json:"locks"`
-	Semaphores     []SemInfo  `json:"semaphores"`
-	IdleLocks      []IdleInfo `json:"idle_locks"`
-	IdleSemaphores []IdleInfo `json:"idle_semaphores"`
+	Connections    int64              `json:"connections"`
+	Locks          []LockInfo         `json:"locks"`
+	Semaphores     []SemInfo          `json:"semaphores"`
+	IdleLocks      []IdleInfo         `json:"idle_locks"`
+	IdleSemaphores []IdleInfo         `json:"idle_semaphores"`
+	SignalChannels []SignalChannelInfo `json:"signal_channels"`
 }
 
 // Stats returns a snapshot of the current lock manager state.

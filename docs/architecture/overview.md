@@ -2,7 +2,7 @@
 
 ## Overview
 
-dflockd is a single-process Go server that manages named locks with FIFO ordering, automatic lease expiry, and garbage collection of idle state.
+dflockd is a single-process Go server that manages named locks with FIFO ordering, automatic lease expiry, garbage collection of idle state, and pub/sub signal delivery.
 
 ```
 ┌───────────┐    TCP     ┌─────────────────────────────────────┐
@@ -16,7 +16,13 @@ dflockd is a single-process Go server that manages named locks with FIFO orderin
 │ (any lang)│            │  │   owner  │  │    expiry      │   │
 └───────────┘            │  │   waiter │  │  • lock GC     │   │
                          │  │   queue  │  │                │   │
-                         │  └──────────┘  └────────────────┘   │
+                         │  ├──────────┤  └────────────────┘   │
+                         │  │  Signal  │                       │
+                         │  │  Manager │                       │
+                         │  │          │                       │
+                         │  │  pattern→│                       │
+                         │  │  listener│                       │
+                         │  └──────────┘                       │
                          └─────────────────────────────────────┘
 ```
 
@@ -74,6 +80,40 @@ Runs every `GC_LOOP_SLEEP` seconds (default: 5s). Prunes lock state entries wher
 - The key has been idle longer than `GC_MAX_UNUSED_TIME` (default: 60s)
 
 This prevents unbounded memory growth from transient keys.
+
+## Signal manager
+
+The signal manager (`internal/signal`) handles pub/sub message delivery with pattern matching and optional queue groups.
+
+### Pattern matching
+
+Signal patterns use NATS-style wildcards:
+
+- `*` — matches exactly one dot-separated token (e.g. `events.*.login` matches `events.user.login`)
+- `>` — matches one or more trailing tokens (e.g. `events.>` matches `events.user.login`, `events.order.created`)
+
+Literal channel names (no wildcards) are used when publishing signals.
+
+### Queue groups
+
+Listeners can join a named queue group via the `listen` command's group argument. Within a group, each signal is delivered to exactly one member via round-robin. This enables load-balanced signal processing across multiple consumers.
+
+Multiple queue groups on the same pattern are independent — each group receives its own delivery. Non-grouped listeners always receive every matching signal.
+
+### Delivery
+
+When a signal is published:
+
+1. Exact non-grouped listeners on the channel receive the signal (deduplicated per connection)
+2. Exact queue groups on the channel each deliver to one member
+3. Wildcard non-grouped listeners matching the channel receive the signal (deduplicated against exact deliveries)
+4. Wildcard queue groups matching the channel each deliver to one member
+
+If a listener's write buffer is full, its connection is cancelled (slow consumer eviction).
+
+### Cleanup
+
+All signal subscriptions for a connection are automatically removed on disconnect via `UnlistenAll`.
 
 ## Connection cleanup
 

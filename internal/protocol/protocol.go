@@ -45,6 +45,8 @@ type Request struct {
 	LeaseTTL       time.Duration
 	Token          string
 	Limit          int
+	Value          string // signal payload
+	Group          string // listen/unlisten: queue group name
 }
 
 type Ack struct {
@@ -131,6 +133,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 
 	switch cmd {
 	case "l", "r", "n", "e", "w", "sl", "sr", "sn", "se", "sw":
+	case "listen", "unlisten", "signal":
 	case "auth":
 		argStr := strings.TrimSpace(arg)
 		return &Request{Cmd: "auth", Token: argStr}, nil
@@ -353,6 +356,23 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 			Key:            key,
 			AcquireTimeout: time.Duration(timeout) * time.Second,
 		}, nil
+
+	case "listen":
+		group := strings.TrimSpace(arg)
+		return &Request{Cmd: cmd, Key: key, Group: group}, nil
+
+	case "unlisten":
+		group := strings.TrimSpace(arg)
+		return &Request{Cmd: cmd, Key: key, Group: group}, nil
+
+	case "signal":
+		if arg == "" {
+			return nil, &ProtocolError{Code: 8, Message: "signal arg must be: <payload>"}
+		}
+		if strings.Contains(key, "*") || strings.Contains(key, ">") {
+			return nil, &ProtocolError{Code: 5, Message: "signal channel must not contain wildcards"}
+		}
+		return &Request{Cmd: cmd, Key: key, Value: arg}, nil
 	}
 
 	return nil, &ProtocolError{Code: 3, Message: fmt.Sprintf("invalid cmd %q", cmd)}

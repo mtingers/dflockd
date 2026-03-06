@@ -1246,6 +1246,332 @@ func TestLockAcquireReleaseAuth(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Signal tests
+// ---------------------------------------------------------------------------
+
+func TestSignalConn_ListenAndEmit(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Subscriber
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c1)
+	defer sc.Close()
+
+	if err := sc.Listen("events.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Publisher
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	n, err := client.Emit(c2, "events.test", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+
+	// Receive signal
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "events.test" {
+			t.Fatalf("expected channel 'events.test', got %q", sig.Channel)
+		}
+		if sig.Payload != "hello" {
+			t.Fatalf("expected payload 'hello', got %q", sig.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signal")
+	}
+}
+
+func TestSignalConn_WildcardPattern(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c1)
+	defer sc.Close()
+
+	if err := sc.Listen("events.>"); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	n, err := client.Emit(c2, "events.user.login", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "events.user.login" {
+			t.Fatalf("expected channel 'events.user.login', got %q", sig.Channel)
+		}
+		if sig.Payload != "alice" {
+			t.Fatalf("expected payload 'alice', got %q", sig.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signal")
+	}
+}
+
+func TestSignalConn_Unlisten(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c1)
+	defer sc.Close()
+
+	if err := sc.Listen("events.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Unlisten("events.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	n, err := client.Emit(c2, "events.test", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 deliveries after unlisten, got %d", n)
+	}
+}
+
+func TestSignalConn_EmitFromSignalConn(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Use same SignalConn for both subscribe and publish
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	if err := sc.Listen("events.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := sc.Emit("events.test", "self-emit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "events.test" || sig.Payload != "self-emit" {
+			t.Fatalf("unexpected signal: %+v", sig)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signal")
+	}
+}
+
+func TestSignalConn_QueueGroup(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Two subscribers in same group
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc1 := client.NewSignalConn(c1)
+	defer sc1.Close()
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc2 := client.NewSignalConn(c2)
+	defer sc2.Close()
+
+	if err := sc1.Listen("events.test", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc2.Listen("events.test", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish
+	pub, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	n, err := client.Emit(pub, "events.test", "job1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 delivery (queue group), got %d", n)
+	}
+
+	// Exactly one should receive
+	received := 0
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case <-sc1.Signals():
+			received++
+		case <-sc2.Signals():
+			received++
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	if received != 1 {
+		t.Fatalf("expected exactly 1 delivery across group, got %d", received)
+	}
+}
+
+func TestSignalConn_Close(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+
+	if err := sc.Listen("events.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Signals channel should be closed
+	_, ok := <-sc.Signals()
+	if ok {
+		t.Fatal("expected Signals() channel to be closed after Close()")
+	}
+}
+
+func TestSignalConn_MultipleSignals(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c1)
+	defer sc.Close()
+
+	if err := sc.Listen("events.>"); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	for i := 0; i < 5; i++ {
+		payload := fmt.Sprintf("msg-%d", i)
+		n, err := client.Emit(c2, "events.test", payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("expected 1 delivery, got %d", n)
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		select {
+		case sig := <-sc.Signals():
+			expected := fmt.Sprintf("msg-%d", i)
+			if sig.Payload != expected {
+				t.Fatalf("signal %d: expected payload %q, got %q", i, expected, sig.Payload)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for signal %d", i)
+		}
+	}
+}
+
+func TestSignalConn_InvalidPattern(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	// Empty pattern
+	err = sc.Listen("")
+	if err == nil {
+		t.Fatal("expected error for empty pattern")
+	}
+
+	// Pattern with space
+	err = sc.Listen("bad pattern")
+	if err == nil {
+		t.Fatal("expected error for pattern with space")
+	}
+}
+
+func TestSignalConn_EmitInvalidChannel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Empty channel
+	_, err = client.Emit(c, "", "hello")
+	if err == nil {
+		t.Fatal("expected error for empty channel")
+	}
+
+	// Payload with newline
+	_, err = client.Emit(c, "events.test", "bad\npayload")
+	if err == nil {
+		t.Fatal("expected error for payload with newline")
+	}
+}
+
 func TestSemaphoreAcquireReleaseAuth(t *testing.T) {
 	addr := startAuthServer(t, testConfig(), "secret123")
 

@@ -1257,6 +1257,227 @@ func (s *Semaphore) Token() string {
 	return s.token
 }
 
+// ---------------------------------------------------------------------------
+// Signaling
+// ---------------------------------------------------------------------------
+
+// Signal represents a received signal from a channel.
+type Signal struct {
+	Channel string
+	Payload string
+}
+
+// SignalConn wraps a Conn for signal operations, providing a background
+// reader that separates push signals from command responses.
+type SignalConn struct {
+	conn   *Conn
+	sigCh  chan Signal
+	respCh chan string
+	done   chan struct{}
+}
+
+// NewSignalConn creates a SignalConn from an existing Conn.
+// It starts a background goroutine that reads lines from the connection
+// and routes "sig ..." push messages to sigCh and command responses to respCh.
+func NewSignalConn(c *Conn) *SignalConn {
+	sc := &SignalConn{
+		conn:   c,
+		sigCh:  make(chan Signal, 64),
+		respCh: make(chan string, 1),
+		done:   make(chan struct{}),
+	}
+	go sc.readLoop()
+	return sc
+}
+
+func (sc *SignalConn) readLoop() {
+	defer close(sc.done)
+	for {
+		line, err := sc.conn.readLine()
+		if err != nil {
+			close(sc.sigCh)
+			return
+		}
+		if strings.HasPrefix(line, "sig ") {
+			rest := line[4:]
+			idx := strings.Index(rest, " ")
+			if idx < 0 {
+				continue
+			}
+			sig := Signal{
+				Channel: rest[:idx],
+				Payload: rest[idx+1:],
+			}
+			select {
+			case sc.sigCh <- sig:
+			default:
+			}
+		} else {
+			// Command responses must not be dropped — sendCmd serializes
+			// commands so at most one response is expected at a time.
+			// Blocking here is safe because the channel drains promptly.
+			sc.respCh <- line
+		}
+	}
+}
+
+func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
+	sc.conn.mu.Lock()
+	defer sc.conn.mu.Unlock()
+	// Drain any stale response.
+	select {
+	case <-sc.respCh:
+	default:
+	}
+	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
+	if _, err := sc.conn.conn.Write([]byte(msg)); err != nil {
+		return "", err
+	}
+	select {
+	case resp, ok := <-sc.respCh:
+		if !ok {
+			return "", fmt.Errorf("dflockd: connection closed")
+		}
+		return resp, nil
+	case <-sc.done:
+		select {
+		case resp, ok := <-sc.respCh:
+			if ok {
+				return resp, nil
+			}
+		default:
+		}
+		return "", fmt.Errorf("dflockd: connection closed")
+	}
+}
+
+// ListenOption configures optional parameters for Listen/Unlisten.
+type ListenOption func(*listenOptions)
+
+type listenOptions struct {
+	group string
+}
+
+// WithGroup sets the queue group for a Listen or Unlisten call.
+// Within a group, only one member receives each signal via round-robin.
+func WithGroup(group string) ListenOption {
+	return func(o *listenOptions) { o.group = group }
+}
+
+func validateValue(value string) error {
+	if strings.ContainsAny(value, "\n\r") {
+		return fmt.Errorf("dflockd: value contains newline")
+	}
+	return nil
+}
+
+func validateArg(name, value string) error {
+	if strings.ContainsAny(value, "\n\r") {
+		return fmt.Errorf("dflockd: %s contains newline", name)
+	}
+	return nil
+}
+
+// Listen subscribes to signals matching the given pattern.
+func (sc *SignalConn) Listen(pattern string, opts ...ListenOption) error {
+	if err := validateKey(pattern); err != nil {
+		return fmt.Errorf("dflockd: invalid pattern: %w", err)
+	}
+	var lo listenOptions
+	for _, o := range opts {
+		o(&lo)
+	}
+	if err := validateArg("group", lo.group); err != nil {
+		return err
+	}
+	resp, err := sc.sendCmd("listen", pattern, lo.group)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: listen: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Unlisten unsubscribes from signals matching the given pattern.
+func (sc *SignalConn) Unlisten(pattern string, opts ...ListenOption) error {
+	if err := validateKey(pattern); err != nil {
+		return fmt.Errorf("dflockd: invalid pattern: %w", err)
+	}
+	var lo listenOptions
+	for _, o := range opts {
+		o(&lo)
+	}
+	if err := validateArg("group", lo.group); err != nil {
+		return err
+	}
+	resp, err := sc.sendCmd("unlisten", pattern, lo.group)
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("%w: unlisten: %s", ErrServer, resp)
+	}
+	return nil
+}
+
+// Emit sends a signal on a channel (must be literal, no wildcards).
+// Returns the number of listeners that received the signal.
+func (sc *SignalConn) Emit(channel, payload string) (int, error) {
+	if err := validateKey(channel); err != nil {
+		return 0, fmt.Errorf("dflockd: invalid channel: %w", err)
+	}
+	if err := validateValue(payload); err != nil {
+		return 0, err
+	}
+	resp, err := sc.sendCmd("signal", channel, payload)
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "signal")
+}
+
+// Signals returns a read-only channel that receives signals pushed by the server.
+func (sc *SignalConn) Signals() <-chan Signal {
+	return sc.sigCh
+}
+
+// Close closes the underlying connection and waits for the read loop to exit.
+func (sc *SignalConn) Close() error {
+	err := sc.conn.Close()
+	<-sc.done
+	return err
+}
+
+// Emit sends a signal on a channel using a regular (non-SignalConn) connection.
+// Returns the number of listeners that received the signal.
+func Emit(c *Conn, channel, payload string) (int, error) {
+	if err := validateKey(channel); err != nil {
+		return 0, err
+	}
+	if err := validateValue(payload); err != nil {
+		return 0, err
+	}
+	resp, err := c.sendRecv("signal", channel, payload)
+	if err != nil {
+		return 0, err
+	}
+	return parseOKInt(resp, "signal")
+}
+
+func parseOKInt(resp, cmd string) (int, error) {
+	parts := strings.Fields(resp)
+	if len(parts) == 2 && parts[0] == "ok" {
+		n, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s: bad value %q", ErrServer, cmd, parts[1])
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
+}
+
 // startRenew launches a background goroutine that renews the semaphore lease.
 // If renewal fails, the OnRenewError callback is invoked (if set)
 // and the goroutine exits.

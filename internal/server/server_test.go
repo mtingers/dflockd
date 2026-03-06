@@ -89,6 +89,17 @@ func dialAndSendCmd(t *testing.T, addr, cmd, key, arg string) (net.Conn, string)
 	return conn, resp
 }
 
+// readLine reads a single newline-terminated line from reader with a deadline.
+func readLine(t *testing.T, conn net.Conn, reader *bufio.Reader, timeout time.Duration) string {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read line: %v", err)
+	}
+	return strings.TrimRight(line, "\r\n")
+}
+
 // connSendCmd is like sendCmd but uses a per-connection bufio.Reader for
 // multi-command sessions on the same connection. The caller must create the
 // reader once and reuse it across calls.
@@ -1907,6 +1918,465 @@ func TestIntegration_MaxWaitersRegression(t *testing.T) {
 	resp = connSendCmd(t, conn3, reader3, "e", "k1", "")
 	if resp != "error_max_waiters" {
 		t.Fatalf("c3: expected error_max_waiters, got %q", resp)
+	}
+}
+
+// ===========================================================================
+// Signal integration tests
+// ===========================================================================
+
+func TestIntegration_SignalBasicDelivery(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Subscriber
+	sub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	subR := bufio.NewReader(sub)
+
+	resp := connSendCmd(t, sub, subR, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	// Publisher (separate connection)
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "hello")
+	if resp != "ok 1" {
+		t.Fatalf("signal: expected 'ok 1', got %q", resp)
+	}
+
+	// Subscriber should receive push message
+	line := readLine(t, sub, subR, 2*time.Second)
+	if line != "sig events.test hello" {
+		t.Fatalf("expected 'sig events.test hello', got %q", line)
+	}
+}
+
+func TestIntegration_SignalWildcardDelivery(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	sub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	subR := bufio.NewReader(sub)
+
+	resp := connSendCmd(t, sub, subR, "listen", "events.>", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.user.login", "alice")
+	if resp != "ok 1" {
+		t.Fatalf("signal: expected 'ok 1', got %q", resp)
+	}
+
+	line := readLine(t, sub, subR, 2*time.Second)
+	if line != "sig events.user.login alice" {
+		t.Fatalf("expected 'sig events.user.login alice', got %q", line)
+	}
+}
+
+func TestIntegration_SignalSingleTokenWildcard(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	sub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	subR := bufio.NewReader(sub)
+
+	resp := connSendCmd(t, sub, subR, "listen", "events.*.login", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	// Should match
+	resp = connSendCmd(t, pub, pubR, "signal", "events.user.login", "data")
+	if resp != "ok 1" {
+		t.Fatalf("signal match: expected 'ok 1', got %q", resp)
+	}
+	line := readLine(t, sub, subR, 2*time.Second)
+	if line != "sig events.user.login data" {
+		t.Fatalf("expected push, got %q", line)
+	}
+
+	// Should NOT match (wrong suffix)
+	resp = connSendCmd(t, pub, pubR, "signal", "events.user.logout", "data")
+	if resp != "ok 0" {
+		t.Fatalf("signal no match: expected 'ok 0', got %q", resp)
+	}
+}
+
+func TestIntegration_SignalUnlisten(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	sub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	subR := bufio.NewReader(sub)
+
+	resp := connSendCmd(t, sub, subR, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	resp = connSendCmd(t, sub, subR, "unlisten", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("unlisten: expected ok, got %q", resp)
+	}
+
+	// Signal should deliver to 0 listeners
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("signal after unlisten: expected 'ok 0', got %q", resp)
+	}
+}
+
+func TestIntegration_SignalQueueGroup(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Two subscribers in the same group
+	sub1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub1.Close()
+	sub1R := bufio.NewReader(sub1)
+	resp := connSendCmd(t, sub1, sub1R, "listen", "events.test", "workers")
+	if resp != "ok" {
+		t.Fatalf("listen sub1: expected ok, got %q", resp)
+	}
+
+	sub2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub2.Close()
+	sub2R := bufio.NewReader(sub2)
+	resp = connSendCmd(t, sub2, sub2R, "listen", "events.test", "workers")
+	if resp != "ok" {
+		t.Fatalf("listen sub2: expected ok, got %q", resp)
+	}
+
+	// Publish — should deliver to exactly 1 member
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "msg1")
+	if resp != "ok 1" {
+		t.Fatalf("signal: expected 'ok 1', got %q", resp)
+	}
+}
+
+func TestIntegration_SignalNoWildcardsInPublish(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "signal", "events.*", "hello")
+	if resp != "error" {
+		t.Fatalf("expected error for wildcard publish, got %q", resp)
+	}
+
+	resp = connSendCmd(t, conn, reader, "signal", "events.>", "hello")
+	if resp != "error" {
+		t.Fatalf("expected error for > publish, got %q", resp)
+	}
+}
+
+func TestIntegration_SignalMaxSubscriptions(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxSubscriptions = 2
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("listen 1: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, conn, reader, "listen", "ch2", "")
+	if resp != "ok" {
+		t.Fatalf("listen 2: expected ok, got %q", resp)
+	}
+	// Third should fail
+	resp = connSendCmd(t, conn, reader, "listen", "ch3", "")
+	if resp != "error" {
+		t.Fatalf("listen 3: expected error, got %q", resp)
+	}
+}
+
+func TestIntegration_SignalDisconnectCleanup(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Subscribe and then disconnect
+	sub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subR := bufio.NewReader(sub)
+	resp := connSendCmd(t, sub, subR, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+	sub.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// Publish — should deliver to 0 (subscriber disconnected)
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "hello")
+	if resp != "ok 0" {
+		t.Fatalf("signal after disconnect: expected 'ok 0', got %q", resp)
+	}
+}
+
+func TestIntegration_SignalStatsIncludesChannels(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "listen", "events.>", "")
+	if resp != "ok" {
+		t.Fatalf("listen: expected ok, got %q", resp)
+	}
+
+	statsResp := connSendCmd(t, conn, reader, "stats", "_", "_")
+	if !strings.HasPrefix(statsResp, "ok ") {
+		t.Fatalf("expected 'ok {...}', got %q", statsResp)
+	}
+	jsonPart := strings.TrimPrefix(statsResp, "ok ")
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonPart), &result); err != nil {
+		t.Fatalf("stats JSON unmarshal failed: %v", err)
+	}
+	channels, ok := result["signal_channels"]
+	if !ok {
+		t.Fatal("stats should include 'signal_channels' field")
+	}
+	arr, ok := channels.([]interface{})
+	if !ok || len(arr) == 0 {
+		t.Fatalf("expected non-empty signal_channels, got %v", channels)
+	}
+	entry := arr[0].(map[string]interface{})
+	if entry["pattern"] != "events.>" {
+		t.Fatalf("expected pattern 'events.>', got %v", entry["pattern"])
+	}
+	if entry["listeners"] != float64(1) {
+		t.Fatalf("expected 1 listener, got %v", entry["listeners"])
+	}
+}
+
+func TestIntegration_SignalDedup(t *testing.T) {
+	// A connection subscribed to both exact and wildcard should only receive once.
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	sub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	subR := bufio.NewReader(sub)
+
+	// Subscribe to both exact and wildcard
+	resp := connSendCmd(t, sub, subR, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen exact: expected ok, got %q", resp)
+	}
+	resp = connSendCmd(t, sub, subR, "listen", "events.*", "")
+	if resp != "ok" {
+		t.Fatalf("listen wild: expected ok, got %q", resp)
+	}
+
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	// Signal should count as 1 delivery (deduped)
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "hello")
+	if resp != "ok 1" {
+		t.Fatalf("signal: expected 'ok 1' (deduped), got %q", resp)
+	}
+
+	// Should get exactly one push
+	line := readLine(t, sub, subR, 2*time.Second)
+	if line != "sig events.test hello" {
+		t.Fatalf("expected push, got %q", line)
+	}
+
+	// Verify no second push arrives (use short timeout)
+	sub.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err = subR.ReadString('\n')
+	if err == nil {
+		t.Fatal("expected no second push (dedup), but got one")
+	}
+}
+
+func TestIntegration_SignalMultipleListeners(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Two independent subscribers (non-grouped)
+	sub1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub1.Close()
+	sub1R := bufio.NewReader(sub1)
+	resp := connSendCmd(t, sub1, sub1R, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen sub1: expected ok, got %q", resp)
+	}
+
+	sub2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub2.Close()
+	sub2R := bufio.NewReader(sub2)
+	resp = connSendCmd(t, sub2, sub2R, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen sub2: expected ok, got %q", resp)
+	}
+
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "hello")
+	if resp != "ok 2" {
+		t.Fatalf("signal: expected 'ok 2', got %q", resp)
+	}
+
+	// Both should receive
+	line1 := readLine(t, sub1, sub1R, 2*time.Second)
+	if line1 != "sig events.test hello" {
+		t.Fatalf("sub1: expected push, got %q", line1)
+	}
+	line2 := readLine(t, sub2, sub2R, 2*time.Second)
+	if line2 != "sig events.test hello" {
+		t.Fatalf("sub2: expected push, got %q", line2)
+	}
+}
+
+func TestIntegration_SignalDuplicateSubscription(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	resp := connSendCmd(t, conn, reader, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen 1: expected ok, got %q", resp)
+	}
+	// Duplicate — should be ok but not counted as additional subscription
+	resp = connSendCmd(t, conn, reader, "listen", "events.test", "")
+	if resp != "ok" {
+		t.Fatalf("listen 2: expected ok, got %q", resp)
+	}
+
+	// Signal should still deliver only once
+	pub, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	pubR := bufio.NewReader(pub)
+
+	resp = connSendCmd(t, pub, pubR, "signal", "events.test", "data")
+	if resp != "ok 1" {
+		t.Fatalf("signal: expected 'ok 1', got %q", resp)
 	}
 }
 

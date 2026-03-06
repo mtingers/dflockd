@@ -19,6 +19,7 @@ type Config struct {
 	MaxLocks                int
 	MaxConnections          int
 	MaxWaiters              int
+	MaxSubscriptions        int
 	ReadTimeout             time.Duration
 	WriteTimeout            time.Duration
 	ShutdownTimeout         time.Duration
@@ -122,6 +123,7 @@ func Load(args []string) (*Config, error) {
 	maxLocks := fs.Int("max-locks", 1024, "Maximum number of unique lock keys")
 	maxConnections := fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
 	maxWaiters := fs.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
+	maxSubscriptions := fs.Int("max-subscriptions", 0, "Maximum watch+listen registrations per connection (0 = unlimited)")
 	readTimeout := fs.Int("read-timeout", 23, "Client read timeout (seconds)")
 	writeTimeout := fs.Int("write-timeout", 5, "Client write timeout (seconds)")
 	shutdownTimeout := fs.Int("shutdown-timeout", 30, "Graceful shutdown drain timeout (seconds, 0 = wait forever)")
@@ -183,6 +185,7 @@ func Load(args []string) (*Config, error) {
 		MaxLocks:                resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks),
 		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
 		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
+		MaxSubscriptions:        resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions),
 		ReadTimeout:             resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout),
 		WriteTimeout:            resolveDuration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout),
 		ShutdownTimeout:         resolveDuration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout),
@@ -230,6 +233,9 @@ func (c *Config) validate() error {
 	}
 	if c.MaxWaiters < 0 {
 		return fmt.Errorf("--max-waiters must be >= 0 (got %d)", c.MaxWaiters)
+	}
+	if c.MaxSubscriptions < 0 {
+		return fmt.Errorf("--max-subscriptions must be >= 0 (got %d)", c.MaxSubscriptions)
 	}
 	if c.GCMaxIdleTime <= 0 {
 		return fmt.Errorf("--gc-max-idle must be > 0 (got %s)", c.GCMaxIdleTime)

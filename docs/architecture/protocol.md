@@ -271,6 +271,119 @@ sn
 - Success: `ok <seconds_remaining>\n`
 - Token mismatch, unknown key, or already expired: `error\n`
 
+## Signal Commands
+
+### Listen (`listen`)
+
+Subscribe to signals matching a pattern. Patterns support NATS-style wildcards: `*` matches a single dot-separated token, `>` matches one or more trailing tokens. Optionally join a queue group for load-balanced delivery.
+
+**Request:**
+```
+listen
+<pattern>
+[<group>]
+```
+
+The 3rd line is an optional queue group name. If empty, the listener receives all matching signals individually. If set, only one member of the group receives each signal (round-robin).
+
+**Response:**
+
+- Success: `ok\n`
+- Error (e.g. max subscriptions reached): `error\n`
+
+**Examples:**
+```
+listen
+events.user.login
+
+```
+→ `ok` (subscribe to exact channel)
+
+```
+listen
+events.*.login
+
+```
+→ `ok` (subscribe with single-token wildcard)
+
+```
+listen
+events.>
+
+```
+→ `ok` (subscribe to all events.* channels)
+
+```
+listen
+events.>
+workers
+```
+→ `ok` (subscribe with queue group "workers")
+
+### Unlisten (`unlisten`)
+
+Remove a signal subscription. The pattern and group must match the original `listen` call.
+
+**Request:**
+```
+unlisten
+<pattern>
+[<group>]
+```
+
+**Response:**
+
+- Success: `ok\n`
+
+**Example:**
+```
+unlisten
+events.>
+
+```
+→ `ok`
+
+### Signal (`signal`)
+
+Publish a signal to a literal channel (no wildcards allowed). The payload is delivered to all matching listeners.
+
+**Request:**
+```
+signal
+<channel>
+<payload>
+```
+
+The channel must not contain `*` or `>`. The payload is the 3rd line and must be non-empty.
+
+**Response:**
+
+- Success: `ok <num_delivered>\n`
+- Error (e.g. wildcards in channel): `error\n`
+
+**Example:**
+```
+signal
+events.user.login
+{"user":"alice","time":"2025-01-01T00:00:00Z"}
+```
+→ `ok 3` (delivered to 3 listeners)
+
+### Push messages
+
+Signals are delivered to subscribed clients as asynchronous push messages outside the normal request-response flow:
+
+```
+sig <channel> <payload>\n
+```
+
+For example:
+```
+sig events.user.login {"user":"alice"}
+```
+
+Push messages can arrive at any time on a connection that has active `listen` subscriptions. Client libraries must distinguish `sig ...` push lines from command responses.
+
 ## Stats Command
 
 ### Stats (`stats`)
@@ -307,6 +420,10 @@ The JSON payload contains:
 | `idle_locks` | array | Lock entries with no owner (awaiting GC) |
 | `idle_locks[].key` | string | Lock key |
 | `idle_locks[].idle_s` | float | Seconds since last activity |
+| `signal_channels` | array | Active signal subscriptions |
+| `signal_channels[].pattern` | string | Subscription pattern |
+| `signal_channels[].group` | string | Queue group name (omitted if non-grouped) |
+| `signal_channels[].listeners` | int | Number of listeners on this pattern/group |
 | `idle_semaphores` | array | Semaphore entries with no holders (awaiting GC) |
 | `idle_semaphores[].key` | string | Semaphore key |
 | `idle_semaphores[].idle_s` | float | Seconds since last activity |
@@ -317,7 +434,7 @@ stats
 _
 
 ```
-→ `ok {"connections":2,"locks":[{"key":"my-job","owner_conn_id":3,"lease_expires_in_s":25.4,"waiters":1}],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}`
+→ `ok {"connections":2,"locks":[{"key":"my-job","owner_conn_id":3,"lease_expires_in_s":25.4,"waiters":1}],"semaphores":[],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}`
 
 ## Protocol constraints
 
@@ -336,7 +453,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, or `stats`) |
+| 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, `listen`, `unlisten`, `signal`, or `stats`) |
 | 4 | Invalid integer in argument |
 | 5 | Empty key |
 | 6 | Negative timeout |
@@ -367,7 +484,10 @@ In addition to the protocol error codes above (which close the connection), the 
 - Locks are granted in **strict FIFO order** per key.
 - Semaphore slots are granted in **strict FIFO order** per key, up to the configured limit.
 - If a lease expires without renewal, the lock/slot automatically passes to the next waiter.
-- When a connection closes, all locks and semaphore slots held by that connection are released and transferred to waiters.
+- When a connection closes, all locks and semaphore slots held by that connection are released and transferred to waiters. All signal subscriptions are removed.
+- Signal patterns support `*` (single token) and `>` (one or more trailing tokens) wildcards.
+- Signal channels (for publishing) must be literal — no wildcards.
+- Queue group members receive signals via round-robin. If all members' buffers are full, the primary member is disconnected (slow consumer eviction).
 - The server prunes idle lock and semaphore state (no owner/holders, no waiters) after a configurable idle period.
 - Lock keys and semaphore keys share the same `--max-locks` budget.
 
@@ -396,6 +516,22 @@ In addition to the protocol error codes above (which close the connection), the 
 ← ok abc123def456... 33\n
 
 → r\nmy-key\nabc123def456...\n
+← ok\n
+```
+
+## Signal example session
+
+```
+→ listen\nevents.>\n\n
+← ok\n
+
+→ signal\nevents.user.login\n{"user":"alice"}\n
+← ok 1\n
+
+(on the subscribed connection, asynchronously:)
+← sig events.user.login {"user":"alice"}\n
+
+→ unlisten\nevents.>\n\n
 ← ok\n
 ```
 

@@ -60,6 +60,30 @@ my-key
 <token>
 ```
 
+## 5. Subscribe to signals
+
+dflockd also supports pub/sub signals with pattern matching:
+
+```bash
+# Terminal 1: subscribe
+nc localhost 6388
+listen
+events.>
+
+# Response: ok
+# Signals arrive as: sig <channel> <payload>
+```
+
+```bash
+# Terminal 2: publish
+printf 'signal\nevents.hello\nworld\n' | nc localhost 6388
+# Response: ok 1
+```
+
+Terminal 1 receives: `sig events.hello world`
+
+See [Examples](examples.md) for more signal patterns, queue groups, and Go client usage.
+
 ## What happens under the hood
 
 1. The client opens a TCP connection to the server.

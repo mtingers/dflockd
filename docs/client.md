@@ -1,6 +1,6 @@
 # Go Client
 
-The `client` package (`github.com/mtingers/dflockd/client`) provides a Go client for dflockd with two API levels: low-level protocol functions and a high-level `Lock` type with automatic lease renewal and sharding.
+The `client` package (`github.com/mtingers/dflockd/client`) provides a Go client for dflockd with high-level types (`Lock`, `Semaphore`, `SignalConn`) and low-level protocol functions.
 
 ## Installation
 
@@ -352,6 +352,105 @@ if errors.Is(err, client.ErrTimeout) {
 | `ErrAlreadyQueued` | The server returned `error_already_enqueued` (connection already enqueued for this key) |
 | `ErrLeaseExpired` | The server returned `error_lease_expired` (lease expired before the grant was consumed) |
 | `ErrAuth` | The server returned `error_auth` (authentication failed or wrong token) |
+
+## Signal API: `SignalConn`
+
+The `SignalConn` type wraps a `*Conn` and provides pub/sub signal operations. It runs a background goroutine that separates asynchronous `sig ...` push messages from command responses.
+
+### Creating a SignalConn
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+sc := client.NewSignalConn(c)
+defer sc.Close()
+```
+
+If the server requires authentication, call `Authenticate` on the `*Conn` before wrapping:
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+if err := client.Authenticate(c, "my-secret-token"); err != nil {
+    log.Fatal(err)
+}
+sc := client.NewSignalConn(c)
+defer sc.Close()
+```
+
+### Subscribing to signals
+
+```go
+// Listen for exact channel
+err := sc.Listen("events.user.login")
+
+// Listen with single-token wildcard
+err = sc.Listen("events.*.login")
+
+// Listen with multi-token wildcard
+err = sc.Listen("events.>")
+
+// Listen with a queue group (load-balanced delivery)
+err = sc.Listen("events.>", client.WithGroup("workers"))
+```
+
+Patterns support NATS-style wildcards:
+
+- `*` — matches exactly one dot-separated token
+- `>` — matches one or more trailing tokens (must be the last token)
+
+### Receiving signals
+
+```go
+for sig := range sc.Signals() {
+    fmt.Printf("channel=%s payload=%s\n", sig.Channel, sig.Payload)
+}
+```
+
+`Signals()` returns a read-only channel of `Signal` structs. The channel is closed when the connection is closed or an error occurs.
+
+### Publishing signals
+
+```go
+// Via SignalConn
+n, err := sc.Emit("events.user.login", `{"user":"alice"}`)
+fmt.Printf("delivered to %d listeners\n", n)
+
+// Or via a regular Conn (no subscription needed for publishing)
+n, err = client.Emit(c, "events.user.login", `{"user":"alice"}`)
+```
+
+The channel must be a literal name — no wildcards allowed.
+
+### Unsubscribing
+
+```go
+err := sc.Unlisten("events.>")
+
+// With queue group
+err = sc.Unlisten("events.>", client.WithGroup("workers"))
+```
+
+### Closing
+
+```go
+err := sc.Close()
+```
+
+`Close` closes the underlying connection and waits for the background read loop to exit.
+
+### Signal struct
+
+```go
+type Signal struct {
+    Channel string // the literal channel the signal was published to
+    Payload string // the signal payload
+}
+```
 
 ## Sharding
 

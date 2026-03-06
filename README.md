@@ -47,6 +47,7 @@ All settings can be passed as CLI flags or environment variables. Environment va
 | `--max-locks`                                                      | `DFLOCKD_MAX_LOCKS`                  | `1024`    | Maximum number of unique lock keys     |
 | `--max-connections`                                                | `DFLOCKD_MAX_CONNECTIONS`            | `0`       | Maximum concurrent connections (0 = unlimited) |
 | `--max-waiters`                                                    | `DFLOCKD_MAX_WAITERS`                | `0`       | Maximum waiters per lock/semaphore key (0 = unlimited) |
+| `--max-subscriptions`                                              | `DFLOCKD_MAX_SUBSCRIPTIONS`          | `0`       | Maximum signal subscriptions per connection (0 = unlimited) |
 | `--read-timeout`                                                   | `DFLOCKD_READ_TIMEOUT_S`             | `23`      | Client read timeout (seconds)          |
 | `--write-timeout`                                                  | `DFLOCKD_WRITE_TIMEOUT_S`            | `5`       | Client write timeout (seconds)         |
 | `--shutdown-timeout`                                               | `DFLOCKD_SHUTDOWN_TIMEOUT_S`         | `30`      | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
@@ -240,7 +241,33 @@ sw\n<key>\n<timeout_s>\n
 
 Response: `ok <token> <lease_ttl>\n` | `timeout\n` | `error\n`
 
-**Stats (`stats`)** — query server runtime state (connections, locks, semaphores, idle entries).
+**Listen (`listen`)** — subscribe to signals matching a pattern (supports `*` single-token and `>` multi-token wildcards).
+
+```
+listen\n<pattern>\n[<group>]\n
+```
+
+Response: `ok\n` | `error\n`
+
+**Unlisten (`unlisten`)** — unsubscribe from a signal pattern.
+
+```
+unlisten\n<pattern>\n[<group>]\n
+```
+
+Response: `ok\n`
+
+**Signal (`signal`)** — publish a signal to a literal channel (no wildcards).
+
+```
+signal\n<channel>\n<payload>\n
+```
+
+Response: `ok <num_delivered>\n` | `error\n`
+
+Signals are delivered asynchronously as push messages: `sig <channel> <payload>\n`
+
+**Stats (`stats`)** — query server runtime state (connections, locks, semaphores, signal channels, idle entries).
 
 ```
 stats\n_\n\n
@@ -248,7 +275,7 @@ stats\n_\n\n
 
 Response: `ok <json>\n`
 
-The JSON payload includes `connections`, `locks`, `semaphores`, `idle_locks`, and `idle_semaphores`. Key and arg lines are read but ignored.
+The JSON payload includes `connections`, `locks`, `semaphores`, `signal_channels`, `idle_locks`, and `idle_semaphores`. Key and arg lines are read but ignored.
 
 ### Example session with netcat
 
@@ -300,6 +327,23 @@ a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
 ok
 ```
 
+### Signal example
+
+```bash
+# Terminal 1: subscribe to signals
+$ nc localhost 6388
+listen
+events.>
+
+ok
+# Signals arrive asynchronously:
+# sig events.user.login {"user":"alice"}
+
+# Terminal 2: publish a signal
+$ printf 'signal\nevents.user.login\n{"user":"alice"}\n' | nc localhost 6388
+# Response: ok 1
+```
+
 ### Stats example
 
 ```bash
@@ -307,7 +351,39 @@ $ nc localhost 6388
 stats
 _
 
-ok {"connections":1,"locks":[],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}
+ok {"connections":1,"locks":[],"semaphores":[],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
+```
+
+### Go signal quick start
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    c, err := client.Dial("127.0.0.1:6388")
+    if err != nil {
+        log.Fatal(err)
+    }
+    sc := client.NewSignalConn(c)
+    defer sc.Close()
+
+    // Subscribe to all events
+    if err := sc.Listen("events.>"); err != nil {
+        log.Fatal(err)
+    }
+
+    // Receive signals
+    for sig := range sc.Signals() {
+        fmt.Printf("channel=%s payload=%s\n", sig.Channel, sig.Payload)
+    }
+}
 ```
 
 ### Go semaphore quick start

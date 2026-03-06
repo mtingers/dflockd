@@ -163,6 +163,73 @@ func main() {
 }
 ```
 
+### Signals: subscribe and receive
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    c, err := client.Dial("127.0.0.1:6388")
+    if err != nil {
+        log.Fatal(err)
+    }
+    sc := client.NewSignalConn(c)
+    defer sc.Close()
+
+    if err := sc.Listen("events.>"); err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println("listening for events...")
+    for sig := range sc.Signals() {
+        fmt.Printf("  channel=%s payload=%s\n", sig.Channel, sig.Payload)
+    }
+}
+```
+
+### Signals: publish
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+defer c.Close()
+
+n, err := client.Emit(c, "events.user.login", `{"user":"alice"}`)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("delivered to %d listeners\n", n)
+```
+
+### Signals: queue groups
+
+```go
+c, err := client.Dial("127.0.0.1:6388")
+if err != nil {
+    log.Fatal(err)
+}
+sc := client.NewSignalConn(c)
+defer sc.Close()
+
+// Multiple consumers in the "workers" group — each signal delivered to one member
+if err := sc.Listen("jobs.>", client.WithGroup("workers")); err != nil {
+    log.Fatal(err)
+}
+
+for sig := range sc.Signals() {
+    fmt.Printf("processing job: %s\n", sig.Payload)
+}
+```
+
 ### Connecting with authentication
 
 ```go
@@ -254,6 +321,50 @@ go run ./cmd/bench --servers 10.0.0.1:6388,10.0.0.2:6388,10.0.0.3:6388
 Keys are sharded across servers using CRC32, matching the client library's default.
 
 ## TCP protocol examples
+
+## Signal subscribe and publish
+
+Subscribe to signals matching a wildcard pattern, then publish from another terminal:
+
+```bash
+# Terminal 1: subscribe to all events
+nc localhost 6388
+listen
+events.>
+
+# Response: ok
+# Signals arrive asynchronously:
+# sig events.user.login {"user":"alice"}
+# sig events.order.created {"id":42}
+```
+
+```bash
+# Terminal 2: publish a signal
+printf 'signal\nevents.user.login\n{"user":"alice"}\n' | nc localhost 6388
+# Response: ok 1
+```
+
+## Signal with queue group
+
+```bash
+# Terminal 1: subscribe to group "workers"
+nc localhost 6388
+listen
+jobs.>
+workers
+# Response: ok
+
+# Terminal 2: subscribe to same group
+nc localhost 6388
+listen
+jobs.>
+workers
+# Response: ok
+
+# Terminal 3: publish — only one of Terminal 1/2 receives each signal
+printf 'signal\njobs.process\ntask-data\n' | nc localhost 6388
+# Response: ok 1
+```
 
 ## Basic lock and release
 
@@ -360,7 +471,7 @@ nc localhost 6388
 stats
 _
 
-# Response: ok {"connections":1,"locks":[],"semaphores":[],"idle_locks":[],"idle_semaphores":[]}
+# Response: ok {"connections":1,"locks":[],"semaphores":[],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
 ```
 
 With locks and semaphores held:
@@ -381,7 +492,7 @@ worker-pool
 stats
 _
 
-# Response: ok {"connections":1,"locks":[{"key":"my-key","owner_conn_id":1,"lease_expires_in_s":32.5,"waiters":0}],"semaphores":[{"key":"worker-pool","limit":3,"holders":1,"waiters":0}],"idle_locks":[],"idle_semaphores":[]}
+# Response: ok {"connections":1,"locks":[{"key":"my-key","owner_conn_id":1,"lease_expires_in_s":32.5,"waiters":0}],"semaphores":[{"key":"worker-pool","limit":3,"holders":1,"waiters":0}],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
 ```
 
 One-liner with printf:

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,19 +18,28 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
+	"github.com/mtingers/dflockd/internal/signal"
 )
+
+type connState struct {
+	id            uint64
+	writeCh       chan []byte
+	cancelConn    func()
+	subscriptions int
+}
 
 type Server struct {
 	lm        *lock.LockManager
 	cfg       *config.Config
 	log       *slog.Logger
+	sig       *signal.Manager
 	connSeq   atomic.Uint64
 	connCount atomic.Int64
 	conns     sync.Map // net.Conn → struct{}
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{lm: lm, cfg: cfg, log: log}
+	return &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager()}
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -153,7 +163,7 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 		conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 	}
 	_, err := conn.Write(data)
-	if s.cfg.WriteTimeout > 0 {
+	if s.cfg.WriteTimeout > 0 && err == nil {
 		conn.SetWriteDeadline(time.Time{})
 	}
 	return err
@@ -167,11 +177,44 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	// shuts down, allowing in-progress lock waits to be interrupted.
 	connCtx, connCancel := context.WithCancel(ctx)
 
+	// writeCh is used by the signal push writer goroutine.
+	writeCh := make(chan []byte, 64)
+	var writeMu sync.Mutex
+
+	cs := &connState{
+		id:         connID,
+		writeCh:    writeCh,
+		cancelConn: connCancel,
+	}
+
+	// Push writer goroutine: drains writeCh and sends async messages
+	// (signal notifications) to the client.
+	var pushWg sync.WaitGroup
+	pushWg.Add(1)
+	go func() {
+		defer pushWg.Done()
+		for msg := range writeCh {
+			writeMu.Lock()
+			err := s.writeResponse(conn, msg)
+			writeMu.Unlock()
+			if err != nil {
+				connCancel()
+				// Drain remaining messages to unblock senders.
+				for range writeCh {
+				}
+				return
+			}
+		}
+	}()
+
 	defer func() {
 		connCancel()
+		s.sig.UnlistenAll(connID)
 		s.conns.Delete(conn)
 		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
+		close(writeCh)
+		pushWg.Wait()
 		conn.Close()
 		s.log.Debug("client closed", "peer", peer, "conn_id", connID)
 	}()
@@ -180,17 +223,23 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	defaultLeaseTTL := s.cfg.DefaultLeaseTTL
 	defaultLeaseTTLSec := int(defaultLeaseTTL.Seconds())
 
+	writeResp := func(ack *protocol.Ack) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return s.writeResponse(conn, protocol.FormatResponse(ack, defaultLeaseTTLSec))
+	}
+
 	if s.cfg.AuthToken != "" {
 		req, err := protocol.ReadRequest(reader, s.cfg.ReadTimeout, conn, defaultLeaseTTL)
 		if err != nil || req.Cmd != "auth" ||
 			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
 			s.log.Warn("auth failed", "peer", peer, "conn_id", connID)
-			s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error_auth"}, defaultLeaseTTLSec))
+			writeResp(&protocol.Ack{Status: "error_auth"})
 			// Small delay to slow down brute-force attempts.
 			time.Sleep(100 * time.Millisecond)
 			return
 		}
-		if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec)); err != nil {
+		if err := writeResp(&protocol.Ack{Status: "ok"}); err != nil {
 			s.log.Debug("write error during auth, disconnecting", "peer", peer, "err", err)
 			return
 		}
@@ -206,7 +255,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 					break
 				}
 				s.log.Warn("protocol error", "peer", peer, "code", pe.Code, "msg", pe.Message)
-				if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "error"}, defaultLeaseTTLSec)); err != nil {
+				if err := writeResp(&protocol.Ack{Status: "error"}); err != nil {
 					s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 					break
 				}
@@ -223,20 +272,32 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 			break
 		}
 
-		ack := s.handleRequest(connCtx, req, connID)
-		if err := s.writeResponse(conn, protocol.FormatResponse(ack, defaultLeaseTTLSec)); err != nil {
+		ack := s.handleRequest(connCtx, req, cs)
+		if ack == nil {
+			break
+		}
+		if err := writeResp(ack); err != nil {
 			s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
 			break
 		}
 	}
 }
 
-func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
+func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *connState) *protocol.Ack {
+	connID := cs.id
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
 
 	switch req.Cmd {
 	case "stats":
 		st := s.lm.Stats(s.connCount.Load())
+		sigStats := s.sig.Stats()
+		for _, si := range sigStats {
+			st.SignalChannels = append(st.SignalChannels, lock.SignalChannelInfo{
+				Pattern:   si.Pattern,
+				Group:     si.Group,
+				Listeners: si.Listeners,
+			})
+		}
 		data, err := json.Marshal(st)
 		if err != nil {
 			return &protocol.Ack{Status: "error"}
@@ -325,6 +386,38 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, connI
 			return &protocol.Ack{Status: "timeout"}
 		}
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
+
+	case "listen":
+		if max := s.cfg.MaxSubscriptions; max > 0 && cs.subscriptions >= max {
+			return &protocol.Ack{Status: "error"}
+		}
+		listener := &signal.Listener{
+			ConnID:     connID,
+			Pattern:    req.Key,
+			Group:      req.Group,
+			WriteCh:    cs.writeCh,
+			CancelConn: cs.cancelConn,
+		}
+		added, err := s.sig.Listen(listener)
+		if err != nil {
+			return &protocol.Ack{Status: "error"}
+		}
+		if added {
+			cs.subscriptions++
+		}
+		return &protocol.Ack{Status: "ok"}
+
+	case "unlisten":
+		if s.sig.Unlisten(req.Key, connID, req.Group) {
+			if cs.subscriptions > 0 {
+				cs.subscriptions--
+			}
+		}
+		return &protocol.Ack{Status: "ok"}
+
+	case "signal":
+		n := s.sig.Signal(req.Key, req.Value)
+		return &protocol.Ack{Status: "ok", Extra: strconv.Itoa(n)}
 	}
 
 	s.log.Warn("unknown command in handleRequest", "cmd", req.Cmd, "conn", connID)

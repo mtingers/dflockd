@@ -29,6 +29,7 @@
 | `--max-locks` | `1024` | Maximum number of unique lock keys |
 | `--max-connections` | `0` | Maximum concurrent connections (0 = unlimited) |
 | `--max-waiters` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
+| `--max-subscriptions` | `0` | Maximum signal subscriptions per connection (0 = unlimited) |
 | `--read-timeout` | `23` | Client read timeout (seconds) |
 | `--write-timeout` | `5` | Client write timeout (seconds) |
 | `--shutdown-timeout` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
@@ -55,6 +56,7 @@ All settings can be configured via environment variables. CLI flags take precede
 | `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
 | `DFLOCKD_MAX_CONNECTIONS` | `0` | Maximum concurrent connections (0 = unlimited) |
 | `DFLOCKD_MAX_WAITERS` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
+| `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Maximum signal subscriptions per connection (0 = unlimited) |
 | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
 | `DFLOCKD_WRITE_TIMEOUT_S` | `5` | Client write timeout (seconds) |
 | `DFLOCKD_SHUTDOWN_TIMEOUT_S` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
@@ -113,6 +115,10 @@ The `max-connections` setting caps the total number of concurrent TCP connection
 ### Max waiters
 
 The `max-waiters` setting caps the number of pending waiters **per key** for both locks and semaphores. When the limit is reached, new acquire or enqueue requests for that key return `error_max_waiters`. This prevents unbounded memory growth from waiter queues on a single contended key. Set to `0` (the default) for unlimited waiters.
+
+### Max subscriptions
+
+The `max-subscriptions` setting caps the number of signal subscriptions (listen registrations) per connection. When the limit is reached, additional `listen` commands return `error`. Set to `0` (the default) for unlimited subscriptions.
 
 ### Auto release on disconnect
 
@@ -197,6 +203,7 @@ The response includes:
 - **connections** — number of currently connected TCP clients
 - **locks** — held locks with key, owner connection ID, seconds until lease expires, and waiter count
 - **semaphores** — semaphores with at least one holder, showing key, limit, holder count, and waiter count
+- **signal_channels** — active signal subscriptions with pattern, optional group name, and listener count
 - **idle_locks** / **idle_semaphores** — entries with no owner/holders (cached state awaiting GC), with seconds since last activity
 
 See [Wire Protocol](architecture/protocol.md#stats-stats) for the full JSON schema.
