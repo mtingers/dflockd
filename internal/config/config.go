@@ -230,5 +230,8 @@ func (c *Config) validate() error {
 	if c.GCMaxIdleTime <= 0 {
 		return fmt.Errorf("--gc-max-idle must be > 0 (got %s)", c.GCMaxIdleTime)
 	}
+	if strings.ContainsAny(c.AuthToken, "\n\r") {
+		return fmt.Errorf("auth token must not contain newline characters")
+	}
 	return nil
 }

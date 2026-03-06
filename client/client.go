@@ -148,6 +148,9 @@ func (c *Conn) readLine() (string, error) {
 // Authenticate sends an auth command with the given token. Returns nil on
 // success, ErrAuth if the server rejects the token.
 func Authenticate(c *Conn, token string) error {
+	if strings.ContainsAny(token, "\n\r") {
+		return fmt.Errorf("dflockd: auth token contains newline")
+	}
 	resp, err := c.sendRecv("auth", "_", token)
 	if err != nil {
 		return err
