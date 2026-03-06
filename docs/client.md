@@ -73,6 +73,7 @@ l := &client.Lock{
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew (e.g. 0.5 = renew at half the lease) |
 | `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
 | `AuthToken` | `""` | If non-empty, authenticate with this token after connecting |
+| `OnRenewError` | `nil` | Optional callback invoked when background lease renewal fails |
 
 ### Single-phase acquire
 
@@ -268,6 +269,7 @@ s := &client.Semaphore{
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew |
 | `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
 | `AuthToken` | `""` | If non-empty, authenticate with this token after connecting |
+| `OnRenewError` | `nil` | Optional callback invoked when background lease renewal fails |
 
 ### Single-phase acquire
 
@@ -347,6 +349,8 @@ if errors.Is(err, client.ErrTimeout) {
 | `ErrServer` | The server returned an unexpected error response |
 | `ErrNotQueued` | A `Wait`/`SemWait` was attempted without a prior `Enqueue`/`SemEnqueue` |
 | `ErrLimitMismatch` | The server returned `error_limit_mismatch` (semaphore limit doesn't match existing key) |
+| `ErrAlreadyQueued` | The server returned `error_already_enqueued` (connection already enqueued for this key) |
+| `ErrLeaseExpired` | The server returned `error_lease_expired` (lease expired before the grant was consumed) |
 | `ErrAuth` | The server returned `error_auth` (authentication failed or wrong token) |
 
 ## Sharding

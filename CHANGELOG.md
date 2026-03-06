@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.10.1] - 2026-03-06
+
+### Fixed
+
+- **Server: reject stale tokens** — tokens whose leases expired before the waiter consumed them are now correctly rejected instead of silently accepted
+- **Server: TOCTOU race in max connections** — closed a time-of-check/time-of-use race in max connections enforcement where concurrent accepts could exceed the limit
+- **Server: reject auth tokens with newlines** — auth tokens containing newline characters are now rejected at config validation to prevent silent protocol failures
+- **Server: data race in resource counting** — fixed a data race in lock/semaphore resource counting and added missing client error handling for `ErrWaiterClosed`
+- **Config: TLS pair validation** — `validate()` now rejects configurations where only one of `--tls-cert` / `--tls-key` is provided, catching the error before server startup
+- **Config: empty auth token file** — `loadAuthToken` now returns an error when `--auth-token-file` points to an empty file instead of silently proceeding with no auth
+
+### Documentation
+
+- **Protocol spec**: corrected undocumented error responses — `error_already_enqueued` for enqueue commands, `error_not_enqueued` and `error_lease_expired` for wait commands (previously documented as generic `error`)
+- **Protocol spec**: added "Semantic error responses" table listing all 7 named error statuses
+- **Server docs**: fixed precedence claim (CLI flags take precedence over env vars, not the reverse), removed nonexistent `--no-auto-release-on-disconnect` flag variant, added missing `--version` flag
+- **Client docs**: added `OnRenewError` field to Lock and Semaphore tables, added `ErrAlreadyQueued` and `ErrLeaseExpired` to error sentinel table
+- **Installation docs**: added pre-built binaries section with GitHub Releases link, fixed example log output to match Go slog format and correct default address
+- **Quickstart docs**: fixed default address from `0.0.0.0:6388` to `127.0.0.1:6388`
+
+[v1.10.1]: https://github.com/mtingers/dflockd/releases/tag/v1.10.1
+
 ## [v1.10.0] - 2026-02-24
 
 ### Changed

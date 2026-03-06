@@ -36,12 +36,13 @@
 | `--tls-key` | *(unset)* | Path to TLS private key PEM file |
 | `--auth-token` | *(unset)* | Shared secret for client authentication (visible in process list; prefer `--auth-token-file`) |
 | `--auth-token-file` | *(unset)* | Path to file containing the auth token (one line, trailing whitespace stripped) |
-| `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
+| `--auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
+| `--version` | `false` | Print version and exit |
 | `--debug` | `false` | Enable debug logging |
 
 ## Environment variables
 
-All settings can be configured via environment variables. Environment variables take precedence over CLI flags.
+All settings can be configured via environment variables. CLI flags take precedence over environment variables when explicitly set; otherwise the environment variable is used, falling back to the built-in default.
 
 | Variable | Default | Description |
 |---|---|---|

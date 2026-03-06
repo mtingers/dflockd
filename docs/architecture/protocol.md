@@ -90,7 +90,7 @@ The 3rd line is an optional positive integer. If empty, the server default lease
 - Queued: `queued\n`
 - Max locks reached: `error_max_locks\n`
 - Max waiters reached: `error_max_waiters\n`
-- Already enqueued: `error\n`
+- Already enqueued: `error_already_enqueued\n`
 
 **Example:**
 ```
@@ -117,7 +117,8 @@ The 3rd line is a required integer >= 0 (same semantics as acquire timeout).
 
 - Success: `ok <token> <lease_ttl>\n`
 - Timeout: `timeout\n`
-- Not enqueued: `error\n`
+- Not enqueued: `error_not_enqueued\n`
+- Lease expired before consumption: `error_lease_expired\n`
 
 **Example:**
 ```
@@ -218,7 +219,7 @@ se
 - Max locks reached: `error_max_locks\n`
 - Limit mismatch: `error_limit_mismatch\n`
 - Max waiters reached: `error_max_waiters\n`
-- Already enqueued: `error\n`
+- Already enqueued: `error_already_enqueued\n`
 
 ### Semaphore Wait (`sw`) — two-phase step 2
 
@@ -235,7 +236,8 @@ sw
 
 - Success: `ok <token> <lease_ttl>\n`
 - Timeout: `timeout\n`
-- Not enqueued: `error\n`
+- Not enqueued: `error_not_enqueued\n`
+- Lease expired before consumption: `error_lease_expired\n`
 
 ### Semaphore Release (`sr`)
 
@@ -345,6 +347,20 @@ Protocol violations cause the server to respond with `error\n` and close the con
 | 11 | Client disconnected |
 | 12 | Line too long (exceeds 256 bytes) |
 | 13 | Zero or negative semaphore limit |
+
+### Semantic error responses
+
+In addition to the protocol error codes above (which close the connection), the following named error responses are returned inline without closing the connection:
+
+| Response | Meaning |
+|---|---|
+| `error_auth` | Authentication failed (connection is closed) |
+| `error_max_locks` | Server lock+semaphore key limit reached |
+| `error_max_waiters` | Waiter queue full for this key |
+| `error_limit_mismatch` | Semaphore limit doesn't match existing key |
+| `error_already_enqueued` | Connection already has a pending enqueue for this key |
+| `error_not_enqueued` | Wait called without a prior enqueue for this key |
+| `error_lease_expired` | Lock/slot lease expired before the waiter consumed the grant |
 
 ## Behavior
 

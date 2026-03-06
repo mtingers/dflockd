@@ -102,7 +102,11 @@ func loadAuthToken(flagToken, flagTokenFile string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("reading auth token file %q: %w", path, err)
 		}
-		return strings.TrimSpace(string(data)), nil
+		tok := strings.TrimSpace(string(data))
+		if tok == "" {
+			return "", fmt.Errorf("auth token file %q is empty", path)
+		}
+		return tok, nil
 	}
 	return "", nil
 }
@@ -229,6 +233,9 @@ func (c *Config) validate() error {
 	}
 	if c.GCMaxIdleTime <= 0 {
 		return fmt.Errorf("--gc-max-idle must be > 0 (got %s)", c.GCMaxIdleTime)
+	}
+	if (c.TLSCert != "") != (c.TLSKey != "") {
+		return fmt.Errorf("both --tls-cert and --tls-key must be provided together")
 	}
 	if strings.ContainsAny(c.AuthToken, "\n\r") {
 		return fmt.Errorf("auth token must not contain newline characters")

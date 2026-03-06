@@ -13,6 +13,8 @@ wheels/
 
 .env
 
+site/
+
 dflockd
 /bench
 /bench-redis
