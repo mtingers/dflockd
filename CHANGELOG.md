@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.1] - 2026-03-06
+
+### Fixed
+
+- Slow consumer eviction now closes the TCP connection, ensuring blocked consumers are promptly disconnected
+- Signal dedup map no longer marks a connection as delivered when its write buffer is full, preventing missed wildcard delivery
+- Reject whitespace-only signal payloads that previously bypassed validation
+- Validate wildcard patterns on `unlisten` to match `listen` behavior
+
+[v1.11.1]: https://github.com/mtingers/dflockd/releases/tag/v1.11.1
+
 ## [v1.11.0] - 2026-03-06
 
 ### Added
