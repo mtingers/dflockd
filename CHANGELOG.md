@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.0] - 2026-03-06
+
+### Added
+
+- **Pub/sub signal system** — publish messages to named channels with asynchronous push delivery to subscribed connections
+- NATS-style wildcard pattern matching: `*` (single token) and `>` (one or more trailing tokens)
+- Optional queue groups for load-balanced signal delivery (round-robin across group members)
+- Slow consumer eviction: connections with full write buffers are disconnected to prevent back-pressure
+- Protocol commands: `listen` (subscribe with optional group), `unlisten` (unsubscribe), `signal` (publish to literal channel)
+- Asynchronous push messages (`sig <channel> <payload>\n`) delivered outside the request-response flow
+- `--max-subscriptions` flag and `DFLOCKD_MAX_SUBSCRIPTIONS` env var to cap signal subscriptions per connection (default: 0 = unlimited)
+- `signal_channels` field in `stats` JSON response showing active subscriptions with pattern, group, and listener count
+- Go client `SignalConn` type with `Listen`, `Unlisten`, `Emit`, `Signals()`, and `Close` methods
+- `WithGroup` listen option for queue group membership
+- Package-level `Emit` function for publishing signals without a `SignalConn`
+- Signal subscriptions automatically cleaned up on client disconnect
+- 38 unit tests for signal manager (pattern matching, queue groups, dedup, cleanup, concurrency)
+- 12 server integration tests (protocol parsing, push delivery, disconnect cleanup, stats, max subscriptions, wildcard rejection, dedup)
+- 9 client integration tests (SignalConn lifecycle, Listen/Unlisten/Emit, queue groups, input validation)
+- Documentation across README, protocol spec, server config, client API, architecture overview, examples, and quickstart
+
+[v1.11.0]: https://github.com/mtingers/dflockd/releases/tag/v1.11.0
+
 ## [v1.10.1] - 2026-03-06
 
 ### Fixed
