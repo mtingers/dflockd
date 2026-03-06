@@ -190,7 +190,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 			time.Sleep(100 * time.Millisecond)
 			return
 		}
-		s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec))
+		if err := s.writeResponse(conn, protocol.FormatResponse(&protocol.Ack{Status: "ok"}, defaultLeaseTTLSec)); err != nil {
+			s.log.Debug("write error during auth, disconnecting", "peer", peer, "err", err)
+			return
+		}
 	}
 
 	for {

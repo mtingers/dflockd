@@ -372,10 +372,15 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		}
 		sh.mu.Lock()
 		if s := sh.resources[key]; s != nil {
-			s.LastActivity = time.Now()
+			if _, ok := s.Holders[token]; ok {
+				s.LastActivity = time.Now()
+				sh.mu.Unlock()
+				return token, nil
+			}
 		}
+		// Token was granted but its lease expired before we received it.
 		sh.mu.Unlock()
-		return token, nil
+		return "", ErrLeaseExpired
 
 	case <-ctx.Done():
 		sh.mu.Lock()
@@ -385,10 +390,13 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := sh.resources[key]; s != nil {
-					s.LastActivity = time.Now()
+					if _, ok := s.Holders[token]; ok {
+						s.LastActivity = time.Now()
+						sh.mu.Unlock()
+						return token, nil
+					}
 				}
-				sh.mu.Unlock()
-				return token, nil
+				// Token was granted but expired; fall through to cleanup.
 			}
 		default:
 		}
@@ -407,10 +415,13 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := sh.resources[key]; s != nil {
-					s.LastActivity = time.Now()
+					if _, ok := s.Holders[token]; ok {
+						s.LastActivity = time.Now()
+						sh.mu.Unlock()
+						return token, nil
+					}
 				}
-				sh.mu.Unlock()
-				return token, nil
+				// Token was granted but expired; fall through to cleanup.
 			}
 		default:
 		}
@@ -554,12 +565,16 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		if st := sh.resources[key]; st != nil {
 			if h, hOK := st.Holders[token]; hOK {
 				h.leaseExpires = time.Now().Add(leaseTTL)
+				st.LastActivity = time.Now()
+				sh.mu.Unlock()
+				lm.connMu.Unlock()
+				return token, leaseSec, nil
 			}
-			st.LastActivity = time.Now()
 		}
+		// Token was granted but its lease expired before we received it.
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return token, leaseSec, nil
+		return "", 0, ErrLeaseExpired
 
 	case <-ctx.Done():
 		lm.connMu.Lock()
@@ -571,12 +586,13 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 				if st := sh.resources[key]; st != nil {
 					if h, hOK := st.Holders[token]; hOK {
 						h.leaseExpires = time.Now().Add(leaseTTL)
+						st.LastActivity = time.Now()
+						sh.mu.Unlock()
+						lm.connMu.Unlock()
+						return token, leaseSec, nil
 					}
-					st.LastActivity = time.Now()
 				}
-				sh.mu.Unlock()
-				lm.connMu.Unlock()
-				return token, leaseSec, nil
+				// Token was granted but expired; fall through to cleanup.
 			}
 		default:
 		}
@@ -599,12 +615,13 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 				if st := sh.resources[key]; st != nil {
 					if h, hOK := st.Holders[token]; hOK {
 						h.leaseExpires = time.Now().Add(leaseTTL)
+						st.LastActivity = time.Now()
+						sh.mu.Unlock()
+						lm.connMu.Unlock()
+						return token, leaseSec, nil
 					}
-					st.LastActivity = time.Now()
 				}
-				sh.mu.Unlock()
-				lm.connMu.Unlock()
-				return token, leaseSec, nil
+				// Token was granted but expired; fall through to cleanup.
 			}
 		default:
 		}
