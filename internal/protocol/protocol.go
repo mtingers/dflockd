@@ -366,7 +366,7 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		return &Request{Cmd: cmd, Key: key, Group: group}, nil
 
 	case "signal":
-		if arg == "" {
+		if strings.TrimSpace(arg) == "" {
 			return nil, &ProtocolError{Code: 8, Message: "signal arg must be: <payload>"}
 		}
 		if strings.Contains(key, "*") || strings.Contains(key, ">") {

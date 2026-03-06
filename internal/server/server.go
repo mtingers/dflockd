@@ -177,6 +177,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	// shuts down, allowing in-progress lock waits to be interrupted.
 	connCtx, connCancel := context.WithCancel(ctx)
 
+	// cancelConn cancels the per-connection context AND closes the TCP
+	// connection. Closing the conn interrupts any blocking ReadRequest,
+	// ensuring slow consumers (whose WriteCh is full) are promptly torn
+	// down rather than lingering until ReadTimeout fires. All three
+	// operations are idempotent and safe to call concurrently.
+	cancelConn := func() {
+		connCancel()
+		conn.Close()
+	}
+
 	// writeCh is used by the signal push writer goroutine.
 	writeCh := make(chan []byte, 64)
 	var writeMu sync.Mutex
@@ -184,7 +194,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	cs := &connState{
 		id:         connID,
 		writeCh:    writeCh,
-		cancelConn: connCancel,
+		cancelConn: cancelConn,
 	}
 
 	// Push writer goroutine: drains writeCh and sends async messages
@@ -198,7 +208,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 			err := s.writeResponse(conn, msg)
 			writeMu.Unlock()
 			if err != nil {
-				connCancel()
+				cancelConn()
 				// Drain remaining messages to unblock senders.
 				for range writeCh {
 				}
@@ -208,14 +218,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}()
 
 	defer func() {
-		connCancel()
+		cancelConn()
 		s.sig.UnlistenAll(connID)
 		s.conns.Delete(conn)
 		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
 		close(writeCh)
 		pushWg.Wait()
-		conn.Close()
 		s.log.Debug("client closed", "peer", peer, "conn_id", connID)
 	}()
 
@@ -408,7 +417,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok"}
 
 	case "unlisten":
-		if s.sig.Unlisten(req.Key, connID, req.Group) {
+		removed, err := s.sig.Unlisten(req.Key, connID, req.Group)
+		if err != nil {
+			return &protocol.Ack{Status: "error"}
+		}
+		if removed {
 			if cs.subscriptions > 0 {
 				cs.subscriptions--
 			}

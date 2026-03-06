@@ -1083,12 +1083,18 @@ func TestUnlisten_ReturnValue(t *testing.T) {
 	l := makeListener(1, "ch")
 	m.Listen(l)
 
-	removed := m.Unlisten("ch", 1, "")
+	removed, err := m.Unlisten("ch", 1, "")
+	if err != nil {
+		t.Fatalf("Unlisten returned error: %v", err)
+	}
 	if !removed {
 		t.Fatal("Unlisten should return true when listener existed")
 	}
 
-	removed = m.Unlisten("ch", 1, "")
+	removed, err = m.Unlisten("ch", 1, "")
+	if err != nil {
+		t.Fatalf("Unlisten returned error: %v", err)
+	}
 	if removed {
 		t.Fatal("Unlisten should return false when listener did not exist")
 	}

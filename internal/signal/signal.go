@@ -179,7 +179,11 @@ func (m *Manager) Listen(listener *Listener) (bool, error) {
 
 // Unlisten removes a listener for a specific pattern, connID, and group.
 // Returns true if a listener was actually removed.
-func (m *Manager) Unlisten(pattern string, connID uint64, group string) bool {
+// Returns an error if the pattern is invalid.
+func (m *Manager) Unlisten(pattern string, connID uint64, group string) (bool, error) {
+	if err := validatePattern(pattern); err != nil {
+		return false, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -264,7 +268,7 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) bool {
 	} else {
 		m.connListeners[connID] = entries
 	}
-	return removed
+	return removed, nil
 }
 
 // deliverToGroup delivers a message to one member of a queue group via round-robin.
@@ -325,13 +329,13 @@ func (m *Manager) Signal(channel, payload string) int {
 			select {
 			case l.WriteCh <- msg:
 				count++
+				if delivered != nil {
+					delivered[connID] = struct{}{}
+				}
 			default:
 				if l.CancelConn != nil {
 					l.CancelConn()
 				}
-			}
-			if delivered != nil {
-				delivered[connID] = struct{}{}
 			}
 		}
 	}
@@ -358,12 +362,12 @@ func (m *Manager) Signal(channel, payload string) int {
 				select {
 				case l.WriteCh <- msg:
 					count++
+					delivered[l.ConnID] = struct{}{}
 				default:
 					if l.CancelConn != nil {
 						l.CancelConn()
 					}
 				}
-				delivered[l.ConnID] = struct{}{}
 			}
 		}
 	}
