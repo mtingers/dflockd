@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/config"
@@ -111,13 +112,14 @@ type shard struct {
 }
 
 type LockManager struct {
-	shards       [numShards]shard
-	connMu       sync.Mutex // protects connOwned and connEnqueued
-	connOwned    map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
-	connEnqueued map[connKey]*enqueuedState
-	cfg          *config.Config
-	log          *slog.Logger
-	tokBuf       tokenBuf
+	shards        [numShards]shard
+	resourceTotal atomic.Int64   // total resources across all shards (avoids data race on map reads)
+	connMu        sync.Mutex     // protects connOwned and connEnqueued
+	connOwned     map[uint64]map[string]map[string]struct{} // connID → key → set of tokens
+	connEnqueued  map[connKey]*enqueuedState
+	cfg           *config.Config
+	log           *slog.Logger
+	tokBuf        tokenBuf
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
@@ -276,14 +278,10 @@ func (lm *LockManager) evictExpiredLocked(key string, st *ResourceState) {
 	}
 }
 
-// resourceCount returns total number of resources across all shards.
-// Caller must ensure no concurrent modification (or accept approximate count).
+// resourceCount returns total number of resources across all shards using
+// the atomic counter, which is safe to read without holding shard locks.
 func (lm *LockManager) resourceCount() int {
-	total := 0
-	for i := range lm.shards {
-		total += len(lm.shards[i].resources)
-	}
-	return total
+	return int(lm.resourceTotal.Load())
 }
 
 func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*ResourceState, error) {
@@ -303,6 +301,7 @@ func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*Res
 		LastActivity: time.Now(),
 	}
 	sh.resources[key] = st
+	lm.resourceTotal.Add(1)
 	return st, nil
 }
 
@@ -875,6 +874,9 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 					lm.log.Debug("GC: pruning unused state", "key", key)
 					delete(sh.resources, key)
 				}
+				if len(expired) > 0 {
+					lm.resourceTotal.Add(-int64(len(expired)))
+				}
 				sh.mu.Unlock()
 			}
 		}
@@ -1062,6 +1064,7 @@ func (lm *LockManager) ResetForTest() {
 		lm.shards[i].resources = make(map[string]*ResourceState)
 		lm.shards[i].mu.Unlock()
 	}
+	lm.resourceTotal.Store(0)
 	lm.connOwned = make(map[uint64]map[string]map[string]struct{})
 	lm.connEnqueued = make(map[connKey]*enqueuedState)
 }

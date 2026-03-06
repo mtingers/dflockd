@@ -290,6 +290,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	if resp == "error_already_enqueued" {
 		return "", "", 0, ErrAlreadyQueued
 	}
+	if resp == "error_limit_mismatch" {
+		return "", "", 0, ErrLimitMismatch
+	}
 
 	parts := strings.Fields(resp)
 	if len(parts) == 3 && parts[0] == "acquired" {
@@ -502,6 +505,9 @@ func parseAcquireResponse(resp string) (string, int, error) {
 	}
 	if resp == "error_max_waiters" {
 		return "", 0, ErrMaxWaiters
+	}
+	if resp == "error_limit_mismatch" {
+		return "", 0, ErrLimitMismatch
 	}
 	return parseOKTokenLease(resp, "acquire")
 }

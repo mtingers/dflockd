@@ -20,7 +20,8 @@ var (
 	respErrorLimitMismatch    = []byte("error_limit_mismatch\n")
 	respErrorNotEnqueued      = []byte("error_not_enqueued\n")
 	respErrorAlreadyEnqueued  = []byte("error_already_enqueued\n")
-	respQueued           = []byte("queued\n")
+	respErrorLeaseExpired    = []byte("error_lease_expired\n")
+	respQueued               = []byte("queued\n")
 
 	prefixOK       = []byte("ok ")
 	prefixAcquired = []byte("acquired ")
@@ -413,6 +414,8 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			return respErrorNotEnqueued
 		case "error_already_enqueued":
 			return respErrorAlreadyEnqueued
+		case "error_lease_expired":
+			return respErrorLeaseExpired
 		case "queued":
 			return respQueued
 		default:
