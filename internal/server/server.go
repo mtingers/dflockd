@@ -106,6 +106,8 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 			conn.Close()
 			continue
 		}
+		s.connCount.Add(1)
+		s.conns.Store(conn, struct{}{})
 		connID := s.connSeq.Add(1)
 		wg.Add(1)
 		go func() {
@@ -160,8 +162,6 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	peer := conn.RemoteAddr().String()
 	s.log.Debug("client connected", "peer", peer, "conn_id", connID)
-	s.connCount.Add(1)
-	s.conns.Store(conn, struct{}{})
 
 	// Create a per-connection context that is cancelled when the server
 	// shuts down, allowing in-progress lock waits to be interrupted.
