@@ -236,18 +236,23 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
 		st.Waiters[st.WaiterHead] = nil // avoid memory leak
 		st.WaiterHead++
 		token := lm.newToken()
-		select {
-		case w.ch <- token:
-			st.Holders[token] = &holder{
-				connID:       w.connID,
-				leaseExpires: time.Now().Add(w.leaseTTL),
+		// Non-blocking send: if the channel is full the waiter is
+		// skipped.  Closed channels are not expected here (callers
+		// always remove the waiter from the queue before closing its
+		// channel), but we defend against it to avoid a panic.
+		func() {
+			defer func() { recover() }()
+			select {
+			case w.ch <- token:
+				st.Holders[token] = &holder{
+					connID:       w.connID,
+					leaseExpires: time.Now().Add(w.leaseTTL),
+				}
+				st.LastActivity = time.Now()
+				lm.connAddOwned(w.connID, key, token)
+			default:
 			}
-			st.LastActivity = time.Now()
-			lm.connAddOwned(w.connID, key, token)
-		default:
-			// Channel closed or full — skip this waiter
-			continue
-		}
+		}()
 	}
 	st.compactWaiters()
 }
@@ -947,6 +952,7 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		Semaphores:     []SemInfo{},
 		IdleLocks:      []IdleInfo{},
 		IdleSemaphores: []IdleInfo{},
+		SignalChannels: []SignalChannelInfo{},
 	}
 
 	for i := range lm.shards {

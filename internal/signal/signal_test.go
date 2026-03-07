@@ -1142,3 +1142,195 @@ func TestSignal_NilCancelConn_FullBuffer(t *testing.T) {
 		t.Fatal("Signal blocked with nil CancelConn on full buffer")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// validatePattern edge cases
+// ---------------------------------------------------------------------------
+
+func TestValidatePattern_StarSubstring(t *testing.T) {
+	err := validatePattern("c*.test")
+	if err == nil {
+		t.Fatal("expected error for 'c*' as a token")
+	}
+}
+
+func TestValidatePattern_GTSubstring(t *testing.T) {
+	err := validatePattern("c>.test")
+	if err == nil {
+		t.Fatal("expected error for 'c>' as a token")
+	}
+}
+
+func TestValidatePattern_GTMiddle(t *testing.T) {
+	err := validatePattern("a.>.b")
+	if err == nil {
+		t.Fatal("expected error for '>' not as last token")
+	}
+}
+
+func TestValidatePattern_Valid(t *testing.T) {
+	for _, pat := range []string{"a.b.c", "a.*", "a.>", "*.b.>", "*.*.*"} {
+		if err := validatePattern(pat); err != nil {
+			t.Errorf("validatePattern(%q) unexpected error: %v", pat, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unlisten: grouped exact path (not yet covered)
+// ---------------------------------------------------------------------------
+
+func TestUnlisten_GroupedExact_RemoveMember(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	b := makeGroupListener(2, "ch", "g1")
+	m.Listen(a)
+	m.Listen(b)
+
+	removed, err := m.Unlisten("ch", 1, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("expected removed=true")
+	}
+
+	// Only B should remain
+	n := m.Signal("ch", "data")
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+	_, ok := recvWithin(b.WriteCh, timeout)
+	if !ok {
+		t.Fatal("B should receive")
+	}
+	_, ok = recvWithin(a.WriteCh, timeout)
+	if ok {
+		t.Fatal("A should not receive after unlisten")
+	}
+}
+
+func TestUnlisten_GroupedExact_LastMember(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	m.Listen(a)
+
+	m.Unlisten("ch", 1, "g1")
+
+	// Group should be fully cleaned up
+	n := m.Signal("ch", "data")
+	if n != 0 {
+		t.Fatalf("expected 0 deliveries after removing last group member, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unlisten: grouped wildcard path
+// ---------------------------------------------------------------------------
+
+func TestUnlisten_GroupedWildcard_RemoveMember(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch.*", "g1")
+	b := makeGroupListener(2, "ch.*", "g1")
+	m.Listen(a)
+	m.Listen(b)
+
+	removed, err := m.Unlisten("ch.*", 1, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("expected removed=true")
+	}
+
+	n := m.Signal("ch.x", "data")
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+	_, ok := recvWithin(b.WriteCh, timeout)
+	if !ok {
+		t.Fatal("B should receive")
+	}
+	_, ok = recvWithin(a.WriteCh, timeout)
+	if ok {
+		t.Fatal("A should not receive after unlisten")
+	}
+}
+
+func TestUnlisten_GroupedWildcard_LastMember(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch.*", "g1")
+	m.Listen(a)
+
+	m.Unlisten("ch.*", 1, "g1")
+
+	n := m.Signal("ch.x", "data")
+	if n != 0 {
+		t.Fatalf("expected 0 deliveries, got %d", n)
+	}
+	if len(m.wildGroups) != 0 {
+		t.Fatalf("expected 0 wildGroups, got %d", len(m.wildGroups))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unlisten: non-existent pattern/connID (no-op)
+// ---------------------------------------------------------------------------
+
+func TestUnlisten_NonExistent(t *testing.T) {
+	m := NewManager()
+	removed, err := m.Unlisten("ch", 999, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed {
+		t.Fatal("expected removed=false for non-existent listener")
+	}
+}
+
+func TestUnlisten_NonExistentGroup(t *testing.T) {
+	m := NewManager()
+	a := makeGroupListener(1, "ch", "g1")
+	m.Listen(a)
+
+	removed, err := m.Unlisten("ch", 1, "g2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed {
+		t.Fatal("expected removed=false for wrong group")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unlisten: invalid pattern returns error
+// ---------------------------------------------------------------------------
+
+func TestUnlisten_InvalidPattern(t *testing.T) {
+	m := NewManager()
+	_, err := m.Unlisten("a.>.b", 1, "")
+	if err == nil {
+		t.Fatal("expected error for invalid pattern")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stats: wildcard grouped entries
+// ---------------------------------------------------------------------------
+
+func TestStats_WildcardGrouped(t *testing.T) {
+	m := NewManager()
+	m.Listen(makeGroupListener(1, "ch.*", "g1"))
+	m.Listen(makeGroupListener(2, "ch.*", "g1"))
+
+	stats := m.Stats()
+	found := false
+	for _, ci := range stats {
+		if ci.Pattern == "ch.*" && ci.Group == "g1" && ci.Listeners == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected wildcard group stat entry, got %+v", stats)
+	}
+}

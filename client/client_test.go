@@ -1598,3 +1598,777 @@ func TestSemaphoreAcquireReleaseAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Edge case: release/renew with wrong token
+// ---------------------------------------------------------------------------
+
+func TestReleaseInvalidToken(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Acquire a lock, then try to release with a bogus token.
+	_, _, err = client.Acquire(c, "k", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Release(c, "k", "bogus-token")
+	if err == nil {
+		t.Fatal("expected error releasing with wrong token")
+	}
+}
+
+func TestRenewInvalidToken(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.Renew(c, "k", "bogus-token")
+	if err == nil {
+		t.Fatal("expected error renewing with wrong token")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: empty payload via Emit
+// ---------------------------------------------------------------------------
+
+func TestEmitEmptyPayload(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.Emit(c, "ch", "")
+	if err == nil {
+		t.Fatal("expected error for empty payload")
+	}
+}
+
+func TestSignalConn_EmitEmptyPayload(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	_, err = sc.Emit("ch", "")
+	if err == nil {
+		t.Fatal("expected error for empty payload")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: emit to wildcard channel
+// ---------------------------------------------------------------------------
+
+func TestEmitWildcardChannel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Server rejects wildcard in signal channel
+	_, err = client.Emit(c, "events.*", "hello")
+	if err == nil {
+		t.Fatal("expected error for wildcard channel")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: authenticate with newline in token
+// ---------------------------------------------------------------------------
+
+func TestAuthenticate_NewlineToken(t *testing.T) {
+	addr := startAuthServer(t, testConfig(), "secret123")
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.Authenticate(c, "bad\ntoken")
+	if err == nil {
+		t.Fatal("expected error for token with newline")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Lock.Wait without Enqueue (no connection)
+// ---------------------------------------------------------------------------
+
+func TestLockWait_NoConn(t *testing.T) {
+	l := &client.Lock{
+		Key:     "k",
+		Servers: []string{"127.0.0.1:6388"},
+	}
+	ok, err := l.Wait(context.Background(), 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if ok {
+		t.Fatal("expected false")
+	}
+}
+
+func TestSemaphoreWait_NoConn(t *testing.T) {
+	s := &client.Semaphore{
+		Key:     "k",
+		Limit:   1,
+		Servers: []string{"127.0.0.1:6388"},
+	}
+	ok, err := s.Wait(context.Background(), 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if ok {
+		t.Fatal("expected false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Lock and Semaphore with custom LeaseTTL field
+// ---------------------------------------------------------------------------
+
+func TestLockWithLeaseTTLField(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	l := &client.Lock{
+		Key:            "lease-field",
+		AcquireTimeout: 10 * time.Second,
+		LeaseTTL:       45,
+		Servers:        []string{addr},
+	}
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("acquire failed")
+	}
+	defer l.Release(context.Background())
+}
+
+func TestSemaphoreWithLeaseTTLField(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	s := &client.Semaphore{
+		Key:            "lease-field-sem",
+		Limit:          2,
+		AcquireTimeout: 10 * time.Second,
+		LeaseTTL:       45,
+		Servers:        []string{addr},
+	}
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("acquire failed")
+	}
+	defer s.Release(context.Background())
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Lock with custom ShardFunc
+// ---------------------------------------------------------------------------
+
+func TestLockCustomShardFunc(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	l := &client.Lock{
+		Key:            "shard-key",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		ShardFunc:      func(key string, n int) int { return 0 },
+	}
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("acquire failed")
+	}
+	if err := l.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: CRC32Shard with 0 servers
+// ---------------------------------------------------------------------------
+
+func TestCRC32Shard_ZeroServers(t *testing.T) {
+	idx := client.CRC32Shard("key", 0)
+	if idx != 0 {
+		t.Fatalf("expected 0 for 0 servers, got %d", idx)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Wait/SemWait error paths (not enqueued, lease expired)
+// ---------------------------------------------------------------------------
+
+func TestWaitNotEnqueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.Wait(c, "k", 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSemWaitNotEnqueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.SemWait(c, "k", 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: double enqueue
+// ---------------------------------------------------------------------------
+
+func TestEnqueueAlreadyEnqueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// c1 holds the lock
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	_, _, err = client.Acquire(c1, "k", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// c2 enqueues, then tries to enqueue again
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	status, _, _, err := client.Enqueue(c2, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	_, _, _, err = client.Enqueue(c2, "k")
+	if err != client.ErrAlreadyQueued {
+		t.Fatalf("expected ErrAlreadyQueued, got %v", err)
+	}
+}
+
+func TestSemEnqueueAlreadyEnqueued(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	_, _, err = client.SemAcquire(c1, "k", 10*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	status, _, _, err := client.SemEnqueue(c2, "k", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	_, _, _, err = client.SemEnqueue(c2, "k", 1)
+	if err != client.ErrAlreadyQueued {
+		t.Fatalf("expected ErrAlreadyQueued, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Lock.Wait timeout
+// ---------------------------------------------------------------------------
+
+func TestLockWaitTimeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	l1 := &client.Lock{
+		Key:            "wait-timeout",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("l1 acquire failed")
+	}
+	defer l1.Release(context.Background())
+
+	l2 := &client.Lock{
+		Key:     "wait-timeout",
+		Servers: []string{addr},
+	}
+	status, err := l2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	ok, err = l2.Wait(context.Background(), 1*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false on timeout")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Semaphore two-phase enqueue + wait
+// ---------------------------------------------------------------------------
+
+func TestSemaphoreTwoPhaseEnqueueWait(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s1 := &client.Semaphore{
+		Key:            "sem-2ph",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("s1 acquire failed")
+	}
+
+	s2 := &client.Semaphore{
+		Key:     "sem-2ph",
+		Limit:   1,
+		Servers: []string{addr},
+	}
+	status, err := s2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s1.Release(context.Background())
+	}()
+
+	ok, err = s2.Wait(context.Background(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("s2 wait timed out")
+	}
+	if s2.Token() == "" {
+		t.Fatal("expected non-empty token")
+	}
+	if err := s2.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Semaphore.Wait timeout
+// ---------------------------------------------------------------------------
+
+func TestSemaphoreWaitTimeout(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s1 := &client.Semaphore{
+		Key:            "sem-wait-timeout",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("s1 acquire failed")
+	}
+	defer s1.Release(context.Background())
+
+	s2 := &client.Semaphore{
+		Key:     "sem-wait-timeout",
+		Limit:   1,
+		Servers: []string{addr},
+	}
+	status, err := s2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	ok, err = s2.Wait(context.Background(), 1*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected nil error on timeout, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false on timeout")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: OnRenewError callback
+// ---------------------------------------------------------------------------
+
+func TestLockOnRenewError(t *testing.T) {
+	cfg := testConfig()
+	cfg.DefaultLeaseTTL = 2 * time.Second
+	_, addr := startServer(t, cfg)
+
+	renewErrCh := make(chan error, 1)
+	l := &client.Lock{
+		Key:            "renew-err",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+		RenewRatio:     0.25, // renew every 0.5s on a 2s lease
+		OnRenewError:   func(err error) { renewErrCh <- err },
+	}
+
+	ok, err := l.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("acquire failed")
+	}
+
+	// Force the server to forget the lock by releasing it directly.
+	// The renewal goroutine should hit an error on its next tick.
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Release(c, "renew-err", l.Token())
+	c.Close()
+
+	select {
+	case err := <-renewErrCh:
+		if err == nil {
+			t.Fatal("expected non-nil error in OnRenewError")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OnRenewError callback")
+	}
+	l.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: SignalConn listen/unlisten with queue group
+// ---------------------------------------------------------------------------
+
+func TestSignalConn_UnlistenGroup(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c1)
+	defer sc.Close()
+
+	if err := sc.Listen("events.test", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Unlisten("events.test", client.WithGroup("workers")); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	n, err := client.Emit(c2, "events.test", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 deliveries after unlisten with group, got %d", n)
+	}
+}
+
+func TestSignalConn_ListenGroupNewline(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c)
+	defer sc.Close()
+
+	err = sc.Listen("events.test", client.WithGroup("bad\ngroup"))
+	if err == nil {
+		t.Fatal("expected error for group with newline")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Renew with custom lease TTL option
+// ---------------------------------------------------------------------------
+
+func TestRenewCustomLeaseTTL(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, _, err := client.Acquire(c, "k", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, err := client.Renew(c, "k", token, client.WithLeaseTTL(60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+}
+
+func TestSemRenewCustomLeaseTTL(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	token, _, err := client.SemAcquire(c, "k", 10*time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, err := client.SemRenew(c, "k", token, client.WithLeaseTTL(60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 {
+		t.Fatalf("expected positive remaining, got %d", remaining)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: key validation on sem operations
+// ---------------------------------------------------------------------------
+
+func TestSemAcquireEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.SemAcquire(c, "", 1*time.Second, 1)
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestSemReleaseEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.SemRelease(c, "", "tok")
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestSemRenewEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.SemRenew(c, "", "tok")
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestSemEnqueueEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, _, err = client.SemEnqueue(c, "", 1)
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestSemWaitEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.SemWait(c, "", 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestWaitEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = client.Wait(c, "", 1*time.Second)
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestEnqueueEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, _, err = client.Enqueue(c, "")
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestReleaseEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	err = client.Release(c, "", "tok")
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestRenewEmptyKey(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, err = client.Renew(c, "", "tok")
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: Semaphore context cancel during Enqueue
+// ---------------------------------------------------------------------------
+
+func TestSemaphoreEnqueue_ContextCancel(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s1 := &client.Semaphore{
+		Key:            "sem-eq-cancel",
+		Limit:          1,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s1.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatal("s1 acquire failed")
+	}
+	defer s1.Release(context.Background())
+
+	s2 := &client.Semaphore{
+		Key:     "sem-eq-cancel",
+		Limit:   1,
+		Servers: []string{addr},
+	}
+	// Enqueue should succeed (non-blocking)
+	status, err := s2.Enqueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("expected queued, got %s", status)
+	}
+
+	// Wait with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := s2.Wait(ctx, 30*time.Second)
+		if err == nil {
+			t.Error("expected error from cancelled context")
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait did not return after context cancellation")
+	}
+}

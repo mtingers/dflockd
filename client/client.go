@@ -221,6 +221,9 @@ func Release(c *Conn, key, token string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := validateValue(token); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("r", key, token)
 	if err != nil {
 		return err
@@ -234,6 +237,9 @@ func Release(c *Conn, key, token string) error {
 // Renew sends a renew ("n") command and returns the remaining lease seconds.
 func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
 	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	if err := validateValue(token); err != nil {
 		return 0, err
 	}
 	var o options
@@ -367,6 +373,9 @@ func SemRelease(c *Conn, key, token string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := validateValue(token); err != nil {
+		return err
+	}
 	resp, err := c.sendRecv("sr", key, token)
 	if err != nil {
 		return err
@@ -380,6 +389,9 @@ func SemRelease(c *Conn, key, token string) error {
 // SemRenew sends a semaphore renew ("sn") command and returns the remaining lease seconds.
 func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
 	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	if err := validateValue(token); err != nil {
 		return 0, err
 	}
 	var o options
@@ -667,8 +679,10 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			l.conn.Close()
-			l.conn = nil
+			conn.Close()
+			if l.conn == conn {
+				l.conn = nil
+			}
 			return false, nil
 		}
 		// If context was cancelled, the conn.Close in the cancellation
@@ -677,12 +691,16 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 		// both done and ctx.Done() are ready). Always close to avoid a
 		// leaked FD; double-close on net.Conn is harmless.
 		if ctx.Err() != nil {
-			l.conn.Close()
-			l.conn = nil
+			conn.Close()
+			if l.conn == conn {
+				l.conn = nil
+			}
 			return false, ctx.Err()
 		}
-		l.conn.Close()
-		l.conn = nil
+		conn.Close()
+		if l.conn == conn {
+			l.conn = nil
+		}
 		return false, err
 	}
 
@@ -691,8 +709,10 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	// Don't attempt Release — the cancellation goroutine may have already
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		l.conn.Close()
-		l.conn = nil
+		conn.Close()
+		if l.conn == conn {
+			l.conn = nil
+		}
 		return false, ctx.Err()
 	}
 
@@ -733,20 +753,26 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 
 	if err != nil {
 		if ctx.Err() != nil {
-			l.conn.Close()
-			l.conn = nil
+			conn.Close()
+			if l.conn == conn {
+				l.conn = nil
+			}
 			return "", ctx.Err()
 		}
-		l.conn.Close()
-		l.conn = nil
+		conn.Close()
+		if l.conn == conn {
+			l.conn = nil
+		}
 		return "", err
 	}
 
 	// Don't attempt Release — the cancellation goroutine may have already
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		l.conn.Close()
-		l.conn = nil
+		conn.Close()
+		if l.conn == conn {
+			l.conn = nil
+		}
 		return "", ctx.Err()
 	}
 
@@ -788,25 +814,33 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			l.conn.Close()
-			l.conn = nil
+			conn.Close()
+			if l.conn == conn {
+				l.conn = nil
+			}
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			l.conn.Close()
-			l.conn = nil
+			conn.Close()
+			if l.conn == conn {
+				l.conn = nil
+			}
 			return false, ctx.Err()
 		}
-		l.conn.Close()
-		l.conn = nil
+		conn.Close()
+		if l.conn == conn {
+			l.conn = nil
+		}
 		return false, err
 	}
 
 	// Don't attempt Release — the cancellation goroutine may have already
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		l.conn.Close()
-		l.conn = nil
+		conn.Close()
+		if l.conn == conn {
+			l.conn = nil
+		}
 		return false, ctx.Err()
 	}
 
@@ -1058,25 +1092,33 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			s.conn.Close()
-			s.conn = nil
+			conn.Close()
+			if s.conn == conn {
+				s.conn = nil
+			}
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			s.conn.Close()
-			s.conn = nil
+			conn.Close()
+			if s.conn == conn {
+				s.conn = nil
+			}
 			return false, ctx.Err()
 		}
-		s.conn.Close()
-		s.conn = nil
+		conn.Close()
+		if s.conn == conn {
+			s.conn = nil
+		}
 		return false, err
 	}
 
 	// Don't attempt SemRelease — the cancellation goroutine may have already
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		s.conn.Close()
-		s.conn = nil
+		conn.Close()
+		if s.conn == conn {
+			s.conn = nil
+		}
 		return false, ctx.Err()
 	}
 
@@ -1116,20 +1158,26 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 
 	if err != nil {
 		if ctx.Err() != nil {
-			s.conn.Close()
-			s.conn = nil
+			conn.Close()
+			if s.conn == conn {
+				s.conn = nil
+			}
 			return "", ctx.Err()
 		}
-		s.conn.Close()
-		s.conn = nil
+		conn.Close()
+		if s.conn == conn {
+			s.conn = nil
+		}
 		return "", err
 	}
 
 	// Don't attempt SemRelease — the cancellation goroutine may have already
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		s.conn.Close()
-		s.conn = nil
+		conn.Close()
+		if s.conn == conn {
+			s.conn = nil
+		}
 		return "", ctx.Err()
 	}
 
@@ -1170,25 +1218,33 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
-			s.conn.Close()
-			s.conn = nil
+			conn.Close()
+			if s.conn == conn {
+				s.conn = nil
+			}
 			return false, nil
 		}
 		if ctx.Err() != nil {
-			s.conn.Close()
-			s.conn = nil
+			conn.Close()
+			if s.conn == conn {
+				s.conn = nil
+			}
 			return false, ctx.Err()
 		}
-		s.conn.Close()
-		s.conn = nil
+		conn.Close()
+		if s.conn == conn {
+			s.conn = nil
+		}
 		return false, err
 	}
 
 	// Don't attempt SemRelease — the cancellation goroutine may have already
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
-		s.conn.Close()
-		s.conn = nil
+		conn.Close()
+		if s.conn == conn {
+			s.conn = nil
+		}
 		return false, ctx.Err()
 	}
 
@@ -1365,6 +1421,9 @@ func WithGroup(group string) ListenOption {
 }
 
 func validateValue(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("dflockd: empty value")
+	}
 	if strings.ContainsAny(value, "\n\r") {
 		return fmt.Errorf("dflockd: value contains newline")
 	}
