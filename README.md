@@ -136,15 +136,15 @@ $ go run ./cmd/bench --workers 100 --rounds 500
 bench: 100 workers x 500 rounds (key_prefix="bench", conns/worker=1)
 
   total ops : 50000
-  wall time : 0.575s
-  throughput: 86922.7 ops/s
+  wall time : 0.570s
+  throughput: 87674.8 ops/s
 
-  mean      : 1.116 ms
-  min       : 0.037 ms
-  max       : 21.251 ms
-  p50       : 0.895 ms
-  p99       : 5.112 ms
-  stdev     : 0.942 ms
+  mean      : 1.098 ms
+  min       : 0.033 ms
+  max       : 21.646 ms
+  p50       : 0.824 ms
+  p99       : 5.607 ms
+  stdev     : 1.118 ms
 
 ```
 
