@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- Performance benchmarks: standardized all runs to 1,000 rounds per worker, added Rounds column to table
+- Performance benchmarks: added throughput/latency/memory charts (PNG+SVG), added Server RSS column, standardized to 1,000 rounds per worker
 
 [v1.11.8]: https://github.com/mtingers/dflockd/releases/tag/v1.11.8
 
