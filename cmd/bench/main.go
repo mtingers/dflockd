@@ -118,6 +118,7 @@ func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRoun
 	for i := range conns {
 		c, err := client.Dial(addr)
 		if err != nil {
+			warmupWg.Done() // unblock barrier so main doesn't hang
 			return nil, fmt.Errorf("dial: %w", err)
 		}
 		conns[i] = c
@@ -139,12 +140,15 @@ func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRoun
 		c := conns[i%len(conns)]
 		token, _, err := client.Acquire(c, key, acquireTimeout, opts...)
 		if err != nil {
+			warmupWg.Done()
 			return nil, fmt.Errorf("warmup acquire: %w", err)
 		}
 		if token == "" {
+			warmupWg.Done()
 			return nil, fmt.Errorf("warmup acquire timed out")
 		}
 		if err := client.Release(c, key, token); err != nil {
+			warmupWg.Done()
 			return nil, fmt.Errorf("warmup release: %w", err)
 		}
 	}
