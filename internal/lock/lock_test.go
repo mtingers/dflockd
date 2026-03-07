@@ -1799,21 +1799,21 @@ func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
-	lm.LockShardForTest("k1")
+	lm.LockShardForTest("s1")
 	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockShardForTest("k1")
+		lm.UnlockShardForTest("s1")
 		t.Fatal("connEnqueued should exist before release")
 	}
-	lm.UnlockShardForTest("k1")
+	lm.UnlockShardForTest("s1")
 
 	lm.Release("s1", tok)
 
-	lm.LockShardForTest("k1")
+	lm.LockShardForTest("s1")
 	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockShardForTest("k1")
+		lm.UnlockShardForTest("s1")
 		t.Fatal("connEnqueued should be cleaned up after release")
 	}
-	lm.UnlockShardForTest("k1")
+	lm.UnlockShardForTest("s1")
 }
 
 func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
@@ -1854,12 +1854,12 @@ func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
 		t.Fatal("renew should fail on expired lease")
 	}
 
-	lm.LockShardForTest("k1")
+	lm.LockShardForTest("s1")
 	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockShardForTest("k1")
+		lm.UnlockShardForTest("s1")
 		t.Fatal("connEnqueued should be cleaned up after expired renew")
 	}
-	lm.UnlockShardForTest("k1")
+	lm.UnlockShardForTest("s1")
 }
 
 func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
@@ -1909,9 +1909,9 @@ func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.LockShardForTest("k1")
+	lm.LockShardForTest("s1")
 	exists := lm.ConnEnqueuedForTest(eqKey) != nil
-	lm.UnlockShardForTest("k1")
+	lm.UnlockShardForTest("s1")
 	if exists {
 		t.Fatal("connEnqueued should be cleaned up by expiry loop")
 	}
