@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.4] - 2026-03-07
+
+### Documentation
+
+- **Simplified and deduplicated docs** — removed ~880 lines of redundant content across README, examples, protocol spec, and server config with no information loss
+- **README**: trimmed from 468 to 111 lines; removed duplicated protocol reference, TLS/auth/benchmark sections, and extra Go quick starts; kept config table, one Go example, and client library links
+- **Examples**: replaced duplicated Go client examples with a cross-link to the client reference; kept concise TCP protocol examples for each command type; removed benchmarking section
+- **Protocol spec**: removed trailing example sessions and interoperability section (duplicated from examples page and landing page)
+- **Server config**: merged separate CLI flags and environment variables tables into a single combined table; trimmed auto-release section
+
+[v1.11.4]: https://github.com/mtingers/dflockd/releases/tag/v1.11.4
+
 ## [v1.11.3] - 2026-03-07
 
 ### Documentation

@@ -16,63 +16,32 @@
 ./dflockd --debug
 ```
 
-## CLI flags
+## Configuration
 
-| Flag | Default | Description |
-|---|---|---|
-| `--host` | `127.0.0.1` | Bind address |
-| `--port` | `6388` | Bind port |
-| `--default-lease-ttl` | `33` | Default lock lease duration (seconds) |
-| `--lease-sweep-interval` | `1` | How often to check for expired leases (seconds) |
-| `--gc-interval` | `5` | How often to prune idle lock state (seconds) |
-| `--gc-max-idle` | `60` | Seconds before idle lock state is pruned |
-| `--max-locks` | `1024` | Maximum number of unique lock keys |
-| `--max-connections` | `0` | Maximum concurrent connections (0 = unlimited) |
-| `--max-waiters` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
-| `--max-subscriptions` | `0` | Maximum signal subscriptions per connection (0 = unlimited) |
-| `--read-timeout` | `23` | Client read timeout (seconds) |
-| `--write-timeout` | `5` | Client write timeout (seconds) |
-| `--shutdown-timeout` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
-| `--tls-cert` | *(unset)* | Path to TLS certificate PEM file |
-| `--tls-key` | *(unset)* | Path to TLS private key PEM file |
-| `--auth-token` | *(unset)* | Shared secret for client authentication (visible in process list; prefer `--auth-token-file`) |
-| `--auth-token-file` | *(unset)* | Path to file containing the auth token (one line, trailing whitespace stripped) |
-| `--auto-release-on-disconnect` | `true` | Release locks when a client disconnects |
-| `--version` | `false` | Print version and exit |
-| `--debug` | `false` | Enable debug logging |
+CLI flags take precedence over environment variables when explicitly set; otherwise the environment variable is used, falling back to the built-in default. Boolean env vars accept `1`, `yes`, or `true` (case-insensitive).
 
-## Environment variables
-
-All settings can be configured via environment variables. CLI flags take precedence over environment variables when explicitly set; otherwise the environment variable is used, falling back to the built-in default.
-
-| Variable | Default | Description |
-|---|---|---|
-| `DFLOCKD_HOST` | `127.0.0.1` | Bind address |
-| `DFLOCKD_PORT` | `6388` | Bind port |
-| `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lock lease duration (seconds) |
-| `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | How often to check for expired leases |
-| `DFLOCKD_GC_LOOP_SLEEP` | `5` | How often to prune idle lock state |
-| `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle lock state is pruned |
-| `DFLOCKD_MAX_LOCKS` | `1024` | Maximum number of unique lock keys |
-| `DFLOCKD_MAX_CONNECTIONS` | `0` | Maximum concurrent connections (0 = unlimited) |
-| `DFLOCKD_MAX_WAITERS` | `0` | Maximum waiters per lock/semaphore key (0 = unlimited) |
-| `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Maximum signal subscriptions per connection (0 = unlimited) |
-| `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
-| `DFLOCKD_WRITE_TIMEOUT_S` | `5` | Client write timeout (seconds) |
-| `DFLOCKD_SHUTDOWN_TIMEOUT_S` | `30` | Graceful shutdown drain timeout (seconds, 0 = wait forever) |
-| `DFLOCKD_TLS_CERT` | *(unset)* | Path to TLS certificate PEM file |
-| `DFLOCKD_TLS_KEY` | *(unset)* | Path to TLS private key PEM file |
-| `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for client authentication |
-| `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | Path to file containing the auth token |
-| `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `1` | Release locks when a client disconnects |
-| `DFLOCKD_DEBUG` | *(unset)* | Enable debug logging (`1`, `yes`, or `true`) |
-
-```bash
-# Example: configure via environment
-export DFLOCKD_PORT=7000
-export DFLOCKD_MAX_LOCKS=2048
-./dflockd
-```
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--host` | `DFLOCKD_HOST` | `127.0.0.1` | Bind address |
+| `--port` | `DFLOCKD_PORT` | `6388` | Bind port |
+| `--default-lease-ttl` | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lease duration (seconds) |
+| `--lease-sweep-interval` | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | Lease expiry check interval (seconds) |
+| `--gc-interval` | `DFLOCKD_GC_LOOP_SLEEP` | `5` | Idle state GC interval (seconds) |
+| `--gc-max-idle` | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle state is pruned |
+| `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max unique lock+semaphore keys |
+| `--max-connections` | `DFLOCKD_MAX_CONNECTIONS` | `0` | Max concurrent connections (0 = unlimited) |
+| `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Max waiters per key (0 = unlimited) |
+| `--max-subscriptions` | `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Max signal subscriptions per connection (0 = unlimited) |
+| `--read-timeout` | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
+| `--write-timeout` | `DFLOCKD_WRITE_TIMEOUT_S` | `5` | Client write timeout (seconds) |
+| `--shutdown-timeout` | `DFLOCKD_SHUTDOWN_TIMEOUT_S` | `30` | Graceful shutdown timeout (seconds, 0 = wait forever) |
+| `--tls-cert` | `DFLOCKD_TLS_CERT` | *(unset)* | TLS certificate PEM file |
+| `--tls-key` | `DFLOCKD_TLS_KEY` | *(unset)* | TLS private key PEM file |
+| `--auth-token` | `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for authentication |
+| `--auth-token-file` | `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | File containing the auth token |
+| `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release locks on disconnect |
+| `--version` | — | | Print version and exit |
+| `--debug` | `DFLOCKD_DEBUG` | `false` | Enable debug logging |
 
 ## Tuning guide
 
@@ -122,17 +91,10 @@ The `max-subscriptions` setting caps the number of signal subscriptions (listen 
 
 ### Auto release on disconnect
 
-When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), the server automatically releases any locks held by a client when its TCP connection closes — whether gracefully or due to a crash. Pending waiters from that connection are also cancelled. The released lock is transferred to the next FIFO waiter, if any.
-
-Accepts `1`, `yes`, or `true` (case-insensitive) to enable; any other value disables it.
-
-```bash
-# Disable auto-release (locks persist until lease expiry)
-export DFLOCKD_AUTO_RELEASE_ON_DISCONNECT=0
-```
+When enabled (the default), the server automatically releases any locks held by a client when its TCP connection closes — whether gracefully or due to a crash. Pending waiters from that connection are also cancelled. The released lock is transferred to the next FIFO waiter, if any.
 
 !!! warning
-    Disabling this means locks from disconnected clients will only be freed when their lease expires. This increases the window where a lock is held by a dead client.
+    Disabling this means locks from disconnected clients will only be freed when their lease expires.
 
 ## TLS
 
