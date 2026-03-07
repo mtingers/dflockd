@@ -18,14 +18,18 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 ## Quick example
 
 ```bash
-# Acquire a lock with 10s timeout
-printf 'l\nmy-key\n10\n' | nc localhost 6388
-# Response: ok <token> <lease_ttl>
-
-# Release (substitute your token)
-printf 'r\nmy-key\n<token>\n' | nc localhost 6388
-# Response: ok
+$ nc localhost 6388
+l
+my-key
+10
+ok abc123... 33
+r
+my-key
+abc123...
+ok
 ```
+
+Locks are auto-released on disconnect, so the connection must stay open.
 
 ## Getting started
 

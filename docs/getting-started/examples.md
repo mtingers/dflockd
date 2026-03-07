@@ -10,17 +10,28 @@ Each request is 3 newline-terminated lines: `command\nkey\narg\n`. See the [wire
 
 ### Lock and release
 
+The connection must stay open — locks are auto-released on disconnect by default.
+
 ```bash
-# Acquire (10s timeout)
-printf 'l\nmy-key\n10\n' | nc localhost 6388
+nc localhost 6388
+l
+my-key
+10
 # → ok abc123def456... 33
 
-# Release
-printf 'r\nmy-key\nabc123def456...\n' | nc localhost 6388
+r
+my-key
+abc123def456...
 # → ok
+```
 
-# Custom lease TTL (60s)
-printf 'l\nmy-key\n10 60\n' | nc localhost 6388
+Custom lease TTL (60s):
+
+```bash
+nc localhost 6388
+l
+my-key
+10 60
 # → ok abc123def456... 60
 ```
 
@@ -66,12 +77,15 @@ my-key
 ### Semaphore
 
 ```bash
-# Acquire a slot (limit=3, 10s timeout)
-printf 'sl\nworker-pool\n10 3\n' | nc localhost 6388
+nc localhost 6388
+sl
+worker-pool
+10 3
 # → ok abc123def456... 33
 
-# Release
-printf 'sr\nworker-pool\nabc123def456...\n' | nc localhost 6388
+sr
+worker-pool
+abc123def456...
 # → ok
 ```
 

@@ -8,57 +8,25 @@
 
 The server listens on `127.0.0.1:6388` by default. See [Server Configuration](../server.md) for tuning options.
 
-## 2. Acquire a lock
+## 2. Acquire and release a lock
 
-Using netcat (or any TCP client):
-
-```bash
-printf 'l\nmy-key\n10\n' | nc localhost 6388
-```
-
-This sends a lock request for key `my-key` with a 10-second acquire timeout. On success, the server responds:
-
-```
-ok <token> 33
-```
-
-The token is a unique identifier for this lock hold, and `33` is the lease TTL in seconds.
-
-## 3. Release a lock
+Using an interactive netcat session (the connection must stay open — locks are auto-released on disconnect):
 
 ```bash
-printf 'r\nmy-key\n<token>\n' | nc localhost 6388
-```
-
-Replace `<token>` with the token returned from step 2. The server responds:
-
-```
-ok
-```
-
-## 4. Interactive session
-
-For an interactive session, use netcat without piping:
-
-```bash
-nc localhost 6388
-```
-
-Then type each line of the protocol manually:
-
-```
+$ nc localhost 6388
 l
 my-key
 10
-```
-
-The server responds with `ok <token> <lease_ttl>`. To release, type:
-
-```
+ok abc123... 33
 r
 my-key
-<token>
+abc123...
+ok
 ```
+
+- `l` is the lock command, `my-key` is the lock key, `10` is the acquire timeout in seconds.
+- The server responds with `ok <token> <lease_ttl>`. The token identifies this lock hold; `33` is the lease TTL in seconds.
+- `r` releases the lock using the token from the acquire response.
 
 ## 5. Subscribe to signals
 

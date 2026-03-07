@@ -20,16 +20,18 @@ go install github.com/mtingers/dflockd/cmd/dflockd@latest
 ## Usage
 
 ```bash
-# Acquire a lock (10s timeout)
-printf 'l\nmy-key\n10\n' | nc localhost 6388
-# → ok <token> 33
-
-# Release
-printf 'r\nmy-key\n<token>\n' | nc localhost 6388
-# → ok
+$ nc localhost 6388
+l
+my-key
+10
+ok abc123... 33
+r
+my-key
+abc123...
+ok
 ```
 
-Each request is 3 newline-terminated UTF-8 lines (`command\nkey\narg\n`). See the [protocol reference](https://mtingers.github.io/dflockd/architecture/protocol/) for all commands.
+Each request is 3 newline-terminated UTF-8 lines (`command\nkey\narg\n`). The connection must stay open — locks are auto-released on disconnect. See the [protocol reference](https://mtingers.github.io/dflockd/architecture/protocol/) for all commands.
 
 ## Configuration
 

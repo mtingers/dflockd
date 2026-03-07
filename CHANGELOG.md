@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.5] - 2026-03-07
+
+### Fixed
+
+- **Docs: incorrect `nc` examples** — `printf | nc` examples for lock acquire+release were misleading because the connection closes on pipe exit, triggering auto-release before the release command could run. All multi-step examples now use interactive `nc` sessions with persistent connections. Fire-and-forget commands (stats, signal publish) still use `printf | nc` correctly.
+
+[v1.11.5]: https://github.com/mtingers/dflockd/releases/tag/v1.11.5
+
 ## [v1.11.4] - 2026-03-07
 
 ### Documentation
