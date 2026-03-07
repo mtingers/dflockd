@@ -33,6 +33,7 @@ func main() {
 	servers := flag.String("servers", "127.0.0.1:6388", "comma-separated host:port pairs")
 	leaseTTL := flag.Int("lease", 10, "lease TTL in seconds")
 	connections := flag.Int("connections", 0, "connections per worker (0 = 1 persistent conn per worker)")
+	warmup := flag.Int("warmup", 10, "warmup rounds per worker (not measured)")
 	flag.Parse()
 
 	addrs := strings.Split(*servers, ",")
@@ -56,8 +57,10 @@ func main() {
 
 	results := make([]result, *workers)
 	var wg sync.WaitGroup
+	var warmupWg sync.WaitGroup // tracks warmup completion
+	startCh := make(chan struct{})   // closed to signal "go measure"
 
-	wallStart := time.Now()
+	warmupWg.Add(*workers)
 
 	for i := range *workers {
 		wg.Add(1)
@@ -65,10 +68,15 @@ func main() {
 			defer wg.Done()
 			workerKey := fmt.Sprintf("%s_%d", *key, rand.IntN(9900000)+100000)
 			addr := addrs[id%len(addrs)]
-			lats, err := worker(workerKey, addr, *rounds, *timeout, *leaseTTL, connsPerWorker)
+			lats, err := worker(workerKey, addr, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
 			results[id] = result{latencies: lats, err: err}
 		}(i)
 	}
+
+	// Wait for all workers to finish warmup, then start measurement.
+	warmupWg.Wait()
+	wallStart := time.Now()
+	close(startCh)
 
 	wg.Wait()
 	wall := time.Since(wallStart).Seconds()
@@ -104,7 +112,7 @@ func main() {
 	fmt.Printf("  stdev     : %.3f ms\n", sd*1000)
 }
 
-func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns int) ([]float64, error) {
+func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
 	// Open persistent connection(s) up front.
 	conns := make([]*client.Conn, numConns)
 	for i := range conns {
@@ -125,6 +133,25 @@ func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns int) ([]flo
 	if leaseTTL > 0 {
 		opts = append(opts, client.WithLeaseTTL(leaseTTL))
 	}
+
+	// Warmup: run unmeasured rounds to let the server and runtime stabilize.
+	for i := range warmupRounds {
+		c := conns[i%len(conns)]
+		token, _, err := client.Acquire(c, key, acquireTimeout, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("warmup acquire: %w", err)
+		}
+		if token == "" {
+			return nil, fmt.Errorf("warmup acquire timed out")
+		}
+		if err := client.Release(c, key, token); err != nil {
+			return nil, fmt.Errorf("warmup release: %w", err)
+		}
+	}
+
+	// Signal warmup done and wait for all workers to be ready.
+	warmupWg.Done()
+	<-startCh
 
 	latencies := make([]float64, 0, rounds)
 	for i := range rounds {

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.13.0] - 2026-03-07
+
+### Performance
+
+- **Eliminate global `connMu` bottleneck** — moved per-connection tracking (`connOwned`, `connEnqueued`) from a single global mutex into each of the 64 shards, protected by the existing shard locks. All hot-path operations (`Acquire`, `Release`, `Renew`, `Enqueue`, `Wait`) now only acquire one shard lock instead of two mutexes. Throughput at 500 workers improved +7% (87K → 93K ops/s) and p50 latency at 200 workers improved -10%.
+- **Benchmark warmup** — added `--warmup` flag (default 10 rounds) with a barrier so all workers finish warmup before measurement begins, eliminating cold-start noise from results
+
+### Added
+
+- `GOGC` / `GOMEMLIMIT` tuning guidance in server docs for latency-sensitive deployments
+
+[v1.13.0]: https://github.com/mtingers/dflockd/releases/tag/v1.13.0
+
 ## [v1.12.0] - 2026-03-07
 
 ### Performance

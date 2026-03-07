@@ -37,14 +37,14 @@ Each request is 3 newline-terminated UTF-8 lines (`command\nkey\narg\n`). The co
 
 Each operation is one lock acquire + release over a persistent TCP connection. Measured on an Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost.
 
-| Workers | Rounds | Ops | Throughput | Mean | p50 | p99 | Server RSS |
-|---|---|---|---|---|---|---|---|
-| 1 | 1,000 | 1,000 | 14,258 ops/s | 0.069 ms | 0.054 ms | 0.207 ms | 11.3 MB |
-| 10 | 1,000 | 10,000 | 48,104 ops/s | 0.205 ms | 0.187 ms | 0.486 ms | 16.2 MB |
-| 50 | 1,000 | 50,000 | 85,266 ops/s | 0.572 ms | 0.459 ms | 2.473 ms | 18.4 MB |
-| 100 | 1,000 | 100,000 | 87,543 ops/s | 1.115 ms | 0.871 ms | 5.154 ms | 19.2 MB |
-| 200 | 1,000 | 200,000 | 87,243 ops/s | 2.222 ms | 1.859 ms | 8.715 ms | 21.8 MB |
-| 500 | 1,000 | 500,000 | 83,856 ops/s | 5.802 ms | 6.032 ms | 14.173 ms | 30.6 MB |
+| Workers | Rounds | Ops | Throughput | Mean | p50 | p99 |
+|---|---|---|---|---|---|---|
+| 1 | 1,000 | 1,000 | 14,030 ops/s | 0.071 ms | 0.055 ms | 0.223 ms |
+| 10 | 1,000 | 10,000 | 49,974 ops/s | 0.199 ms | 0.191 ms | 0.430 ms |
+| 50 | 1,000 | 50,000 | 95,741 ops/s | 0.504 ms | 0.386 ms | 2.977 ms |
+| 100 | 1,000 | 100,000 | 92,948 ops/s | 1.042 ms | 0.766 ms | 6.606 ms |
+| 200 | 1,000 | 200,000 | 92,895 ops/s | 2.079 ms | 1.503 ms | 13.354 ms |
+| 500 | 1,000 | 500,000 | 93,460 ops/s | 5.172 ms | 4.295 ms | 29.387 ms |
 
 All workers use unique keys (no contention). Run your own benchmarks with `go run ./cmd/bench --help`.
 

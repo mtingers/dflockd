@@ -314,12 +314,12 @@ func TestFIFOEnqueue_Immediate(t *testing.T) {
 	if lease != 30 {
 		t.Fatalf("expected lease 30, got %d", lease)
 	}
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("should be in connEnqueued")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestFIFOEnqueue_Queued(t *testing.T) {
@@ -339,13 +339,13 @@ func TestFIFOEnqueue_Queued(t *testing.T) {
 	if lease != 0 {
 		t.Fatal("lease should be 0 when queued")
 	}
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	es := lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"})
 	if es == nil || es.waiter == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("should have waiter in connEnqueued")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestFIFOEnqueue_DoubleEnqueue(t *testing.T) {
@@ -391,12 +391,12 @@ func TestFIFOWait_FastPath(t *testing.T) {
 	if ttl != 30 {
 		t.Fatalf("expected ttl 30, got %d", ttl)
 	}
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("should be removed from connEnqueued")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestFIFOWait_QueuedThenWait(t *testing.T) {
@@ -616,20 +616,20 @@ func TestCleanup_EnqueuedWaiter(t *testing.T) {
 	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
 	lm.Enqueue("k1", 30*time.Second, 2, 1)
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("should be enqueued")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 
 	lm.CleanupConnection(2)
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("should be cleaned up")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 	lm.LockKeyForTest("k1")
 	if len(lm.ResourceForTest("k1").Waiters) != 0 {
 		lm.UnlockKeyForTest("k1")
@@ -646,12 +646,12 @@ func TestCleanup_FastPath(t *testing.T) {
 	}
 
 	lm.CleanupConnection(1)
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("should be cleaned up")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 	lm.LockKeyForTest("k1")
 	if len(lm.ResourceForTest("k1").Holders) != 0 {
 		lm.UnlockKeyForTest("k1")
@@ -1555,12 +1555,12 @@ func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
 	}
 
 	// The enqueued waiter should still be tracked (it will get granted the lock)
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("enqueued state for conn1 should still exist")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 // ===========================================================================
@@ -1601,12 +1601,12 @@ func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
 	lm.UnlockKeyForTest("k1")
 
 	// connEnqueued should be cleaned up
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should be deleted")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
@@ -1777,21 +1777,21 @@ func TestFIFORelease_CleansConnEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should exist before release")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 
 	lm.Release("k1", tok)
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should be cleaned up after release")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
@@ -1799,21 +1799,21 @@ func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
 	eqKey := connKey{ConnID: 1, Key: "s1"}
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should exist before release")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 
 	lm.Release("s1", tok)
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should be cleaned up after release")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
@@ -1832,12 +1832,12 @@ func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
 		t.Fatal("renew should fail on expired lease")
 	}
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should be cleaned up after expired renew")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
@@ -1854,12 +1854,12 @@ func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
 		t.Fatal("renew should fail on expired lease")
 	}
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should be cleaned up after expired renew")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
@@ -1869,12 +1869,12 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 	_, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
 	eqKey := connKey{ConnID: 1, Key: "k1"}
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockConnMuForTest()
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connEnqueued should exist")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 
 	// Expire
 	lm.LockKeyForTest("k1")
@@ -1886,9 +1886,9 @@ func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	exists := lm.ConnEnqueuedForTest(eqKey) != nil
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 	if exists {
 		t.Fatal("connEnqueued should be cleaned up by expiry loop")
 	}
@@ -1909,9 +1909,9 @@ func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	lm.LockConnMuForTest()
+	lm.LockShardForTest("k1")
 	exists := lm.ConnEnqueuedForTest(eqKey) != nil
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 	if exists {
 		t.Fatal("connEnqueued should be cleaned up by expiry loop")
 	}
@@ -1929,12 +1929,12 @@ func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
 	}
 
 	// Verify connOwned is set
-	lm.LockConnMuForTest()
-	if lm.ConnOwnedForTest(1) == nil {
-		lm.UnlockConnMuForTest()
+	lm.LockShardForTest("k1")
+	if lm.ConnOwnedForTest(1, "k1") == nil {
+		lm.UnlockShardForTest("k1")
 		t.Fatal("connOwned should have conn 1")
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 	lm.LockKeyForTest("k1")
 	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
 	lm.UnlockKeyForTest("k1")
@@ -1942,14 +1942,14 @@ func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
 	lm.Wait(bg(), "k1", 5*time.Second, 1)
 
 	// connOwned for this key should be cleaned up
-	lm.LockConnMuForTest()
-	if owned := lm.ConnOwnedForTest(1); owned != nil {
+	lm.LockShardForTest("k1")
+	if owned := lm.ConnOwnedForTest(1, "k1"); owned != nil {
 		if _, hasKey := owned["k1"]; hasKey {
-			lm.UnlockConnMuForTest()
+			lm.UnlockShardForTest("k1")
 			t.Fatal("connOwned should not have k1 after expired wait")
 		}
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("k1")
 }
 
 func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
@@ -1965,16 +1965,16 @@ func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
 
 	lm.Wait(bg(), "s1", 5*time.Second, 1)
 
-	lm.LockConnMuForTest()
-	if m := lm.ConnOwnedForTest(1); m != nil {
+	lm.LockShardForTest("s1")
+	if m := lm.ConnOwnedForTest(1, "s1"); m != nil {
 		if tokens, ok := m["s1"]; ok {
 			if _, ok := tokens[tok]; ok {
-				lm.UnlockConnMuForTest()
+				lm.UnlockShardForTest("s1")
 				t.Fatal("connOwned should not have the expired token")
 			}
 		}
 	}
-	lm.UnlockConnMuForTest()
+	lm.UnlockShardForTest("s1")
 }
 
 // ---------------------------------------------------------------------------
