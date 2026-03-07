@@ -36,7 +36,7 @@ func TestLoad_ValidationErrors(t *testing.T) {
 		{"default-lease-ttl=0", []string{"--default-lease-ttl", "0"}, "default-lease-ttl"},
 		{"lease-sweep-interval=0", []string{"--lease-sweep-interval", "0"}, "lease-sweep-interval"},
 		{"gc-interval=0", []string{"--gc-interval", "0"}, "gc-interval"},
-		{"gc-max-idle=0", []string{"--gc-max-idle", "0"}, "gc-max-idle"},
+		{"gc-max-idle=-1", []string{"--gc-max-idle", "-1"}, "gc-max-idle"},
 		{"read-timeout=0", []string{"--read-timeout", "0"}, "read-timeout"},
 		{"port negative", []string{"--port", "-1"}, "port"},
 		{"port too high", []string{"--port", "99999"}, "port"},
@@ -80,6 +80,12 @@ func TestLoad_ValidEdgeCases(t *testing.T) {
 	_, err = Load([]string{"--max-waiters", "0"})
 	if err != nil {
 		t.Fatalf("max-waiters=0 should be valid: %v", err)
+	}
+
+	// gc-max-idle=0 is valid (prune immediately)
+	_, err = Load([]string{"--gc-max-idle", "0"})
+	if err != nil {
+		t.Fatalf("gc-max-idle=0 should be valid: %v", err)
 	}
 }
 

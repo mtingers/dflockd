@@ -237,8 +237,8 @@ func (c *Config) validate() error {
 	if c.MaxSubscriptions < 0 {
 		return fmt.Errorf("--max-subscriptions must be >= 0 (got %d)", c.MaxSubscriptions)
 	}
-	if c.GCMaxIdleTime <= 0 {
-		return fmt.Errorf("--gc-max-idle must be > 0 (got %s)", c.GCMaxIdleTime)
+	if c.GCMaxIdleTime < 0 {
+		return fmt.Errorf("--gc-max-idle must be >= 0 (got %s)", c.GCMaxIdleTime)
 	}
 	if (c.TLSCert != "") != (c.TLSKey != "") {
 		return fmt.Errorf("both --tls-cert and --tls-key must be provided together")

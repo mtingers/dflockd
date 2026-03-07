@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.13.2] - 2026-03-07
+
+### Fixed
+
+- **Config: `--gc-max-idle 0` rejected despite being documented as valid** — validation used `<= 0` instead of `< 0`, preventing the "prune immediately" setting documented in the v1.8.1 changelog from being configured via CLI or environment variable
+
+[v1.13.2]: https://github.com/mtingers/dflockd/releases/tag/v1.13.2
+
 ## [v1.13.1] - 2026-03-07
 
 ### Fixed
