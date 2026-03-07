@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.2] - 2026-03-07
+
+### Fixed
+
+- **Client: protocol injection via unvalidated tokens** — `Release`, `Renew`, `SemRelease`, and `SemRenew` now validate token parameters, preventing embedded newlines from injecting arbitrary protocol commands
+- **Client: nil pointer panic on concurrent operations** — error paths in `Lock.Acquire`, `Lock.Enqueue`, `Lock.Wait`, `Semaphore.Acquire`, `Semaphore.Enqueue`, and `Semaphore.Wait` now use a captured connection reference with an identity guard, preventing a nil pointer dereference when concurrent callers replace the connection
+- **Client: whitespace-only payload validation** — `validateValue` now rejects whitespace-only strings, matching the server-side validation behavior
+- **Server: closed-channel panic in waiter grant** — `grantNextWaiterLocked` now defends against a closed-channel panic when notifying waiters whose connections have already been torn down
+- **Server: null JSON field in stats** — `SignalChannels` in the stats response is now initialized to an empty slice, preventing `null` in JSON output when no signal subscriptions exist
+
+### Tests
+
+- Added edge-case tests for token validation, whitespace payloads, and protocol parsing in `client/client_test.go`, `internal/protocol/protocol_test.go`, and `internal/signal/signal_test.go`
+
+[v1.11.2]: https://github.com/mtingers/dflockd/releases/tag/v1.11.2
+
 ## [v1.11.1] - 2026-03-06
 
 ### Fixed
