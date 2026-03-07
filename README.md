@@ -33,6 +33,21 @@ ok
 
 Each request is 3 newline-terminated UTF-8 lines (`command\nkey\narg\n`). The connection must stay open — locks are auto-released on disconnect. See the [protocol reference](https://mtingers.github.io/dflockd/architecture/protocol/) for all commands.
 
+## Performance
+
+Each operation is one lock acquire + release over a persistent TCP connection. Measured on an Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost.
+
+| Workers | Ops | Throughput | Mean | p50 | p99 |
+|---|---|---|---|---|---|
+| 1 | 5,000 | 21,404 ops/s | 0.047 ms | 0.043 ms | 0.161 ms |
+| 10 | 10,000 | 45,980 ops/s | 0.215 ms | 0.204 ms | 0.462 ms |
+| 50 | 25,000 | 81,798 ops/s | 0.591 ms | 0.458 ms | 2.648 ms |
+| 100 | 50,000 | 87,093 ops/s | 1.115 ms | 0.892 ms | 5.094 ms |
+| 200 | 50,000 | 84,276 ops/s | 2.128 ms | 1.747 ms | 7.638 ms |
+| 500 | 50,000 | 77,781 ops/s | 5.512 ms | 5.110 ms | 14.755 ms |
+
+All workers use unique keys (no contention). Run your own benchmarks with `go run ./cmd/bench --help`.
+
 ## Configuration
 
 CLI flags take precedence over environment variables.
