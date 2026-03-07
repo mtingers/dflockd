@@ -394,6 +394,7 @@ Query server runtime state: active connections, held locks, held semaphores, pen
 ```
 stats
 _
+
 ```
 
 The key and arg lines can be any value (they are discarded).
@@ -442,7 +443,7 @@ _
 |---|---|
 | Max line length | 256 bytes |
 | Encoding | UTF-8 |
-| Key | Non-empty string (within line limit) |
+| Key | Non-empty string without whitespace (within line limit) |
 | Token | UUID hex string (32 chars) |
 | Timeout | Integer >= 0 |
 | Lease TTL | Integer > 0 |
@@ -455,7 +456,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 |---|---|
 | 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, `listen`, `unlisten`, `signal`, or `stats`) |
 | 4 | Invalid integer in argument |
-| 5 | Empty key |
+| 5 | Invalid key (empty, contains whitespace, or wildcards in signal channel) |
 | 6 | Negative timeout |
 | 7 | Empty token |
 | 8 | Wrong argument count |

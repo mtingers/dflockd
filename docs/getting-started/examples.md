@@ -163,6 +163,41 @@ func main() {
 }
 ```
 
+### Connecting with authentication
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/mtingers/dflockd/client"
+)
+
+func main() {
+    l := &client.Lock{
+        Key:            "my-resource",
+        AcquireTimeout: 10 * time.Second,
+        Servers:        []string{"127.0.0.1:6388"},
+        AuthToken:      "my-secret-token",
+    }
+
+    ok, err := l.Acquire(context.Background())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if !ok {
+        log.Fatal("timed out")
+    }
+    defer l.Release(context.Background())
+
+    fmt.Println("authenticated and acquired lock")
+}
+```
+
 ### Signals: subscribe and receive
 
 ```go
@@ -230,39 +265,216 @@ for sig := range sc.Signals() {
 }
 ```
 
-### Connecting with authentication
+## TCP protocol examples
 
-```go
-package main
+### Basic lock and release
 
-import (
-    "context"
-    "fmt"
-    "log"
-    "time"
+Acquire a lock with a 10-second timeout, then release it:
 
-    "github.com/mtingers/dflockd/client"
-)
+```bash
+# Terminal 1: Acquire a lock
+printf 'l\nmy-key\n10\n' | nc localhost 6388
+# Response: ok abc123def456... 33
+```
 
-func main() {
-    l := &client.Lock{
-        Key:            "my-resource",
-        AcquireTimeout: 10 * time.Second,
-        Servers:        []string{"127.0.0.1:6388"},
-        AuthToken:      "my-secret-token",
-    }
+```bash
+# Terminal 2: Release the lock (substitute your token)
+printf 'r\nmy-key\nabc123def456...\n' | nc localhost 6388
+# Response: ok
+```
 
-    ok, err := l.Acquire(context.Background())
-    if err != nil {
-        log.Fatal(err)
-    }
-    if !ok {
-        log.Fatal("timed out")
-    }
-    defer l.Release(context.Background())
+### Lock with custom lease TTL
 
-    fmt.Println("authenticated and acquired lock")
-}
+Specify a custom lease TTL (60 seconds) after the timeout:
+
+```bash
+printf 'l\nmy-key\n10 60\n' | nc localhost 6388
+# Response: ok abc123def456... 60
+```
+
+### Renewing a lease
+
+After acquiring a lock, renew the lease before it expires:
+
+```bash
+# In an interactive netcat session:
+nc localhost 6388
+# Acquire:
+l
+my-key
+10
+# Response: ok abc123def456... 33
+
+# Renew (before lease expires):
+n
+my-key
+abc123def456...
+# Response: ok 32
+```
+
+### FIFO lock ordering
+
+Multiple clients competing for the same lock are granted access in FIFO order. Open three terminals and run them in quick succession:
+
+```bash
+# Terminal 1
+printf 'l\nfoo\n30\n' | nc localhost 6388
+# Granted immediately: ok <token1> 33
+```
+
+```bash
+# Terminal 2 (while terminal 1 holds the lock)
+printf 'l\nfoo\n30\n' | nc localhost 6388
+# Blocks until terminal 1's lease expires or lock is released
+# Then granted: ok <token2> 33
+```
+
+```bash
+# Terminal 3 (while terminal 1 holds the lock)
+printf 'l\nfoo\n30\n' | nc localhost 6388
+# Blocks until terminal 2 releases
+# Then granted: ok <token3> 33
+```
+
+Terminal 2 is always granted before terminal 3, regardless of timing — strict FIFO order is maintained.
+
+### Two-phase lock acquisition
+
+Split enqueue and wait to perform application logic between joining the queue and blocking:
+
+```bash
+# Interactive session
+nc localhost 6388
+
+# Step 1: Enqueue for the lock
+e
+my-key
+
+# Response: "acquired <token> 33" (if free) or "queued" (if contended)
+
+# ... perform application logic here (e.g. notify external system) ...
+
+# Step 2: Wait for the lock (10s timeout)
+w
+my-key
+10
+# Response: ok <token> 33
+```
+
+If the lock was free at enqueue time, it is acquired immediately (fast path) and `w` returns `ok` without blocking. The lease is reset to the full TTL from the moment `w` returns.
+
+### Scripted two-phase example
+
+```bash
+#!/bin/bash
+# two-phase.sh — enqueue, do work, then wait
+
+exec 3<>/dev/tcp/localhost/6388
+
+# Enqueue
+printf 'e\nmy-key\n\n' >&3
+read -r response <&3
+echo "enqueue: $response"
+
+# Application logic between enqueue and wait
+echo "notifying external system..."
+sleep 1
+
+# Wait for lock
+printf 'w\nmy-key\n10\n' >&3
+read -r response <&3
+echo "wait: $response"
+
+# Extract token and release
+token=$(echo "$response" | awk '{print $2}')
+printf 'r\nmy-key\n%s\n' "$token" >&3
+read -r response <&3
+echo "release: $response"
+
+exec 3>&-
+```
+
+### Querying server stats
+
+The `stats` command returns a JSON snapshot of the server's current state — active connections, held locks, semaphores, and idle entries awaiting garbage collection.
+
+```bash
+nc localhost 6388
+stats
+_
+
+# Response: ok {"connections":1,"locks":[],"semaphores":[],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
+```
+
+With locks and semaphores held:
+
+```bash
+# In an interactive session, acquire a lock and semaphore first, then check stats:
+nc localhost 6388
+l
+my-key
+10
+# Response: ok abc123def456... 33
+
+sl
+worker-pool
+10 3
+# Response: ok 789abc012def... 33
+
+stats
+_
+
+# Response: ok {"connections":1,"locks":[{"key":"my-key","owner_conn_id":1,"lease_expires_in_s":32.5,"waiters":0}],"semaphores":[{"key":"worker-pool","limit":3,"holders":1,"waiters":0}],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
+```
+
+One-liner with printf:
+
+```bash
+printf 'stats\n_\n\n' | nc localhost 6388
+```
+
+### Signal subscribe and publish
+
+Subscribe to signals matching a wildcard pattern, then publish from another terminal:
+
+```bash
+# Terminal 1: subscribe to all events
+nc localhost 6388
+listen
+events.>
+
+# Response: ok
+# Signals arrive asynchronously:
+# sig events.user.login {"user":"alice"}
+# sig events.order.created {"id":42}
+```
+
+```bash
+# Terminal 2: publish a signal
+printf 'signal\nevents.user.login\n{"user":"alice"}\n' | nc localhost 6388
+# Response: ok 1
+```
+
+### Signal with queue group
+
+```bash
+# Terminal 1: subscribe to group "workers"
+nc localhost 6388
+listen
+jobs.>
+workers
+# Response: ok
+
+# Terminal 2: subscribe to same group
+nc localhost 6388
+listen
+jobs.>
+workers
+# Response: ok
+
+# Terminal 3: publish — only one of Terminal 1/2 receives each signal
+printf 'signal\njobs.process\ntask-data\n' | nc localhost 6388
+# Response: ok 1
 ```
 
 ## Benchmarking
@@ -319,215 +531,3 @@ go run ./cmd/bench --servers 10.0.0.1:6388,10.0.0.2:6388,10.0.0.3:6388
 ```
 
 Keys are sharded across servers using CRC32, matching the client library's default.
-
-## TCP protocol examples
-
-## Signal subscribe and publish
-
-Subscribe to signals matching a wildcard pattern, then publish from another terminal:
-
-```bash
-# Terminal 1: subscribe to all events
-nc localhost 6388
-listen
-events.>
-
-# Response: ok
-# Signals arrive asynchronously:
-# sig events.user.login {"user":"alice"}
-# sig events.order.created {"id":42}
-```
-
-```bash
-# Terminal 2: publish a signal
-printf 'signal\nevents.user.login\n{"user":"alice"}\n' | nc localhost 6388
-# Response: ok 1
-```
-
-## Signal with queue group
-
-```bash
-# Terminal 1: subscribe to group "workers"
-nc localhost 6388
-listen
-jobs.>
-workers
-# Response: ok
-
-# Terminal 2: subscribe to same group
-nc localhost 6388
-listen
-jobs.>
-workers
-# Response: ok
-
-# Terminal 3: publish — only one of Terminal 1/2 receives each signal
-printf 'signal\njobs.process\ntask-data\n' | nc localhost 6388
-# Response: ok 1
-```
-
-## Basic lock and release
-
-Acquire a lock with a 10-second timeout, then release it:
-
-```bash
-# Terminal 1: Acquire a lock
-printf 'l\nmy-key\n10\n' | nc localhost 6388
-# Response: ok abc123def456... 33
-```
-
-```bash
-# Terminal 2: Release the lock (substitute your token)
-printf 'r\nmy-key\nabc123def456...\n' | nc localhost 6388
-# Response: ok
-```
-
-## Lock with custom lease TTL
-
-Specify a custom lease TTL (60 seconds) after the timeout:
-
-```bash
-printf 'l\nmy-key\n10 60\n' | nc localhost 6388
-# Response: ok abc123def456... 60
-```
-
-## Renewing a lease
-
-After acquiring a lock, renew the lease before it expires:
-
-```bash
-# In an interactive netcat session:
-nc localhost 6388
-# Acquire:
-l
-my-key
-10
-# Response: ok abc123def456... 33
-
-# Renew (before lease expires):
-n
-my-key
-abc123def456...
-# Response: ok 32
-```
-
-## FIFO lock ordering
-
-Multiple clients competing for the same lock are granted access in FIFO order. Open three terminals and run them in quick succession:
-
-```bash
-# Terminal 1
-printf 'l\nfoo\n30\n' | nc localhost 6388
-# Granted immediately: ok <token1> 33
-```
-
-```bash
-# Terminal 2 (while terminal 1 holds the lock)
-printf 'l\nfoo\n30\n' | nc localhost 6388
-# Blocks until terminal 1's lease expires or lock is released
-# Then granted: ok <token2> 33
-```
-
-```bash
-# Terminal 3 (while terminal 1 holds the lock)
-printf 'l\nfoo\n30\n' | nc localhost 6388
-# Blocks until terminal 2 releases
-# Then granted: ok <token3> 33
-```
-
-Terminal 2 is always granted before terminal 3, regardless of timing — strict FIFO order is maintained.
-
-## Two-phase lock acquisition
-
-Split enqueue and wait to perform application logic between joining the queue and blocking:
-
-```bash
-# Interactive session
-nc localhost 6388
-
-# Step 1: Enqueue for the lock
-e
-my-key
-
-# Response: "acquired <token> 33" (if free) or "queued" (if contended)
-
-# ... perform application logic here (e.g. notify external system) ...
-
-# Step 2: Wait for the lock (10s timeout)
-w
-my-key
-10
-# Response: ok <token> 33
-```
-
-If the lock was free at enqueue time, it is acquired immediately (fast path) and `w` returns `ok` without blocking. The lease is reset to the full TTL from the moment `w` returns.
-
-## Querying server stats
-
-The `stats` command returns a JSON snapshot of the server's current state — active connections, held locks, semaphores, and idle entries awaiting garbage collection.
-
-```bash
-nc localhost 6388
-stats
-_
-
-# Response: ok {"connections":1,"locks":[],"semaphores":[],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
-```
-
-With locks and semaphores held:
-
-```bash
-# In an interactive session, acquire a lock and semaphore first, then check stats:
-nc localhost 6388
-l
-my-key
-10
-# Response: ok abc123def456... 33
-
-sl
-worker-pool
-10 3
-# Response: ok 789abc012def... 33
-
-stats
-_
-
-# Response: ok {"connections":1,"locks":[{"key":"my-key","owner_conn_id":1,"lease_expires_in_s":32.5,"waiters":0}],"semaphores":[{"key":"worker-pool","limit":3,"holders":1,"waiters":0}],"signal_channels":[],"idle_locks":[],"idle_semaphores":[]}
-```
-
-One-liner with printf:
-
-```bash
-printf 'stats\n_\n\n' | nc localhost 6388
-```
-
-## Scripted two-phase example
-
-```bash
-#!/bin/bash
-# two-phase.sh — enqueue, do work, then wait
-
-exec 3<>/dev/tcp/localhost/6388
-
-# Enqueue
-printf 'e\nmy-key\n\n' >&3
-read -r response <&3
-echo "enqueue: $response"
-
-# Application logic between enqueue and wait
-echo "notifying external system..."
-sleep 1
-
-# Wait for lock
-printf 'w\nmy-key\n10\n' >&3
-read -r response <&3
-echo "wait: $response"
-
-# Extract token and release
-token=$(echo "$response" | awk '{print $2}')
-printf 'r\nmy-key\n%s\n' "$token" >&3
-read -r response <&3
-echo "release: $response"
-
-exec 3>&-
-```

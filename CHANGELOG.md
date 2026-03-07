@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.3] - 2026-03-07
+
+### Documentation
+
+- **README**: fixed CLI/env var precedence description (CLI flags take precedence, not env vars), removed nonexistent `--no-auto-release-on-disconnect` flag, added doc links for Python and TypeScript client libraries
+- **Landing page**: added Client libraries section with doc links for Go, Python, and TypeScript; reorganized Reference section
+- **Architecture overview**: fixed hash function name (`fnv32a` not `fnv32`), updated Lock state → Resource state with correct `ResourceState` struct fields (limit, holders, waiters, last_activity)
+- **Protocol spec**: fixed key constraint (must not contain whitespace), updated error code 5 description, added missing empty line in stats request example
+- **Examples**: reordered TCP examples logically (basic → custom lease → renew → FIFO → two-phase → stats → signals), moved auth example next to TLS, moved benchmarking to end
+
+[v1.11.3]: https://github.com/mtingers/dflockd/releases/tag/v1.11.3
+
 ## [v1.11.2] - 2026-03-07
 
 ### Fixed

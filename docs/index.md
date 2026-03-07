@@ -32,4 +32,16 @@ printf 'r\nmy-key\n<token>\n' | nc localhost 6388
 - [Installation](getting-started/installation.md) — build from source or `go install`
 - [Quick Start](getting-started/quickstart.md) — run the server and acquire your first lock
 - [Examples](getting-started/examples.md) — TCP protocol examples and Go client usage
-- [Go Client](client.md) — `client` package with automatic renewal, sharding, two-phase locking, and signals
+
+## Client libraries
+
+- [Go](client.md) — in-repo `client` package with automatic renewal, sharding, two-phase locking, and signals ([docs](client.md))
+- [Python](https://github.com/mtingers/dflockd-client-py) — async/sync client with `DistributedLock` context manager ([docs](https://mtingers.github.io/dflockd-client-py/))
+- [TypeScript](https://github.com/mtingers/dflockd-client-ts) — TypeScript/JavaScript client ([docs](https://mtingers.github.io/dflockd-client-ts/))
+
+## Reference
+
+- [Server Configuration](server.md) — CLI flags, environment variables, TLS, authentication, and tuning
+- [Wire Protocol](architecture/protocol.md) — line-based TCP protocol specification, commands, and error codes
+- [Architecture](architecture/overview.md) — server internals, lock state, concurrency model, and signal delivery
+- [Changelog](changelog.md) — release history

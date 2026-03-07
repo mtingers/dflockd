@@ -28,15 +28,16 @@ dflockd is a single-process Go server that manages named locks with FIFO orderin
 
 An in-repo Go client (`github.com/mtingers/dflockd/client`) provides a high-level `Lock` type with automatic lease renewal and CRC32-based sharding, as well as low-level protocol functions. External clients exist for [Python](https://github.com/mtingers/dflockd-client-py) and [TypeScript](https://github.com/mtingers/dflockd-client-ts). Any TCP client that speaks the line-based protocol can also interact with the server directly.
 
-## Lock state
+## Resource state
 
-Each named lock key maintains a `LockState`:
+Each named key (lock or semaphore) maintains a `ResourceState`:
 
-- **owner_token** — the UUID token of the current holder (or empty if free)
-- **owner_conn_id** — connection ID of the current holder
-- **lease_expires_at** — timestamp when the lease expires
+- **limit** — maximum concurrent holders (`1` for locks, `N` for semaphores)
+- **holders** — map of active holder tokens to their connection ID and lease expiry
 - **waiters** — FIFO queue of pending acquire requests
 - **last_activity** — timestamp of the most recent operation (used for GC)
+
+A lock is simply a resource with `limit = 1`.
 
 ## FIFO acquire flow
 
@@ -128,7 +129,7 @@ If disabled, locks from disconnected clients are only freed when their lease exp
 
 ## Concurrency model
 
-Lock state is distributed across 64 shards, keyed by `fnv32(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map, so operations on different keys rarely contend. A separate `connMu` mutex protects connection-level tracking (`connOwned`, `connEnqueued`).
+Lock state is distributed across 64 shards, keyed by `fnv32a(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map, so operations on different keys rarely contend. A separate `connMu` mutex protects connection-level tracking (`connOwned`, `connEnqueued`).
 
 **Lock ordering protocol:** `connMu` is always acquired before any shard lock. Two shard locks are never held simultaneously. This prevents deadlocks while allowing high concurrency across keys.
 

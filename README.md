@@ -34,7 +34,7 @@ The server listens on `127.0.0.1:6388` by default.
 
 ## Configuration
 
-All settings can be passed as CLI flags or environment variables. Environment variables take precedence.
+All settings can be passed as CLI flags or environment variables. CLI flags take precedence over environment variables when explicitly set; otherwise the environment variable is used, falling back to the built-in default.
 
 | Flag                                                               | Env var                              | Default   | Description                            |
 | ------------------------------------------------------------------ | ------------------------------------ | --------- | -------------------------------------- |
@@ -55,7 +55,7 @@ All settings can be passed as CLI flags or environment variables. Environment va
 | `--tls-key`                                                        | `DFLOCKD_TLS_KEY`                    | *(unset)* | Path to TLS private key PEM file       |
 | `--auth-token`                                                     | `DFLOCKD_AUTH_TOKEN`                 | *(unset)* | Shared secret for client authentication |
 | `--auth-token-file`                                                | `DFLOCKD_AUTH_TOKEN_FILE`            | *(unset)* | Path to file containing the auth token |
-| `--auto-release-on-disconnect` / `--no-auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true`    | Release locks on client disconnect     |
+| `--auto-release-on-disconnect`                                     | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true`    | Release locks on client disconnect     |
 | `--debug`                                                          | `DFLOCKD_DEBUG`                      | `false`   | Enable debug logging                   |
 
 Example:
@@ -425,8 +425,8 @@ func main() {
 ## Client Libraries
 
 - **Go** (in-repo) — `go get github.com/mtingers/dflockd/client` ([docs](https://mtingers.github.io/dflockd/client/))
-- [Python client](https://github.com/mtingers/dflockd-client-py)
-- [TypeScript client](https://github.com/mtingers/dflockd-client-ts)
+- **Python** — [dflockd-client-py](https://github.com/mtingers/dflockd-client-py) ([docs](https://mtingers.github.io/dflockd-client-py/))
+- **TypeScript** — [dflockd-client-ts](https://github.com/mtingers/dflockd-client-ts) ([docs](https://mtingers.github.io/dflockd-client-ts/))
 
 ### Go client quick start
 
