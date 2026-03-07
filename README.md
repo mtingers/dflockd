@@ -132,7 +132,8 @@ Example:
 
 ```bash
 # taken from macbook air m1 benchmark:
-$ bench: 100 workers x 500 rounds (key_prefix="bench", conns/worker=1)
+$ go run ./cmd/bench --workers 100 --rounds 500
+bench: 100 workers x 500 rounds (key_prefix="bench", conns/worker=1)
 
   total ops : 50000
   wall time : 0.575s
