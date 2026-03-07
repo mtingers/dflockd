@@ -9,15 +9,15 @@ theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: deep purple
-      accent: amber
+      primary: slate
+      accent: indigo
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: deep purple
-      accent: amber
+      primary: slate
+      accent: indigo
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -65,3 +65,6 @@ nav:
     - Overview: architecture/overview.md
     - Wire Protocol: architecture/protocol.md
   - Changelog: changelog.md
+
+extra_css:
+  - stylesheets/extra.css
