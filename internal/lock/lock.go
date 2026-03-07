@@ -231,6 +231,7 @@ func (lm *LockManager) connRemoveOwned(connID uint64, key, token string) {
 // grantNextWaiterLocked grants slots to FIFO waiters while capacity is
 // available. Must be called with the shard lock AND connMu held.
 func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
+	now := time.Now()
 	for st.WaiterHead < len(st.Waiters) && len(st.Holders) < st.Limit {
 		w := st.Waiters[st.WaiterHead]
 		st.Waiters[st.WaiterHead] = nil // avoid memory leak
@@ -246,9 +247,9 @@ func (lm *LockManager) grantNextWaiterLocked(key string, st *ResourceState) {
 			case w.ch <- token:
 				st.Holders[token] = &holder{
 					connID:       w.connID,
-					leaseExpires: time.Now().Add(w.leaseTTL),
+					leaseExpires: now.Add(w.leaseTTL),
 				}
-				st.LastActivity = time.Now()
+				st.LastActivity = now
 				lm.connAddOwned(w.connID, key, token)
 			default:
 			}
@@ -327,7 +328,8 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		return "", err
 	}
 
-	st.LastActivity = time.Now()
+	now := time.Now()
+	st.LastActivity = now
 
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
 	lm.evictExpiredLocked(key, st)
@@ -337,9 +339,8 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		token := lm.newToken()
 		st.Holders[token] = &holder{
 			connID:       connID,
-			leaseExpires: time.Now().Add(leaseTTL),
+			leaseExpires: now.Add(leaseTTL),
 		}
-		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key, token)
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
@@ -361,14 +362,8 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 	sh.mu.Unlock()
 	lm.connMu.Unlock()
 
-	var timer *time.Timer
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-	} else {
-		// Zero timeout: fire immediately
-		timer = time.NewTimer(0)
-	}
-	defer timer.Stop()
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	select {
 	case token, ok := <-w.ch:
@@ -387,9 +382,9 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		sh.mu.Unlock()
 		return "", ErrLeaseExpired
 
-	case <-ctx.Done():
+	case <-timeoutCtx.Done():
 		sh.mu.Lock()
-		// Race check: token may have arrived between ctx cancellation
+		// Race check: token may have arrived between cancellation
 		// and acquiring the mutex.
 		select {
 		case token, ok := <-w.ch:
@@ -410,31 +405,10 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 			removeWaiterFromState(s, w)
 		}
 		sh.mu.Unlock()
-		return "", ctx.Err()
-
-	case <-timer.C:
-		// Timeout — remove from queue
-		sh.mu.Lock()
-		// Race check: token may have arrived
-		select {
-		case token, ok := <-w.ch:
-			if ok && token != "" {
-				if s := sh.resources[key]; s != nil {
-					if _, ok := s.Holders[token]; ok {
-						s.LastActivity = time.Now()
-						sh.mu.Unlock()
-						return token, nil
-					}
-				}
-				// Token was granted but expired; fall through to cleanup.
-			}
-		default:
+		// Distinguish parent context cancellation from timeout
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
-		if s := sh.resources[key]; s != nil {
-			s.LastActivity = time.Now()
-			removeWaiterFromState(s, w)
-		}
-		sh.mu.Unlock()
 		return "", nil
 	}
 }
@@ -459,7 +433,8 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 		return "", "", 0, err
 	}
 
-	st.LastActivity = time.Now()
+	now := time.Now()
+	st.LastActivity = now
 	leaseSec := int(leaseTTL / time.Second)
 
 	// Opportunistic expired-lease eviction (avoids waiting for sweep tick)
@@ -470,9 +445,8 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 		token := lm.newToken()
 		st.Holders[token] = &holder{
 			connID:       connID,
-			leaseExpires: time.Now().Add(leaseTTL),
+			leaseExpires: now.Add(leaseTTL),
 		}
-		st.LastActivity = time.Now()
 		lm.connAddOwned(connID, key, token)
 		lm.connEnqueued[eqKey] = &enqueuedState{token: token, leaseTTL: leaseTTL}
 		return "acquired", token, leaseSec, nil
@@ -517,24 +491,25 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
+		now := time.Now()
 		st := sh.resources[key]
 		if st != nil {
 			h, hOK := st.Holders[esToken]
 			if hOK {
 				// Verify still held (lease may have expired)
-				if !h.leaseExpires.IsZero() && !time.Now().Before(h.leaseExpires) {
+				if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
 					// Expired: clean up holder and grant to next waiter
 					lm.connRemoveOwned(connID, key, esToken)
 					delete(st.Holders, esToken)
-					st.LastActivity = time.Now()
+					st.LastActivity = now
 					lm.grantNextWaiterLocked(key, st)
 					sh.mu.Unlock()
 					lm.connMu.Unlock()
 					return "", 0, ErrLeaseExpired
 				}
 				// Reset lease
-				h.leaseExpires = time.Now().Add(leaseTTL)
-				st.LastActivity = time.Now()
+				h.leaseExpires = now.Add(leaseTTL)
+				st.LastActivity = now
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
 				return esToken, leaseSec, nil
@@ -548,13 +523,8 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	}
 
 	// Slow path: waiter is pending
-	var timer *time.Timer
-	if timeout > 0 {
-		timer = time.NewTimer(timeout)
-	} else {
-		timer = time.NewTimer(0)
-	}
-	defer timer.Stop()
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	select {
 	case token, ok := <-w.ch:
@@ -567,10 +537,11 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
+		now := time.Now()
 		if st := sh.resources[key]; st != nil {
 			if h, hOK := st.Holders[token]; hOK {
-				h.leaseExpires = time.Now().Add(leaseTTL)
-				st.LastActivity = time.Now()
+				h.leaseExpires = now.Add(leaseTTL)
+				st.LastActivity = now
 				sh.mu.Unlock()
 				lm.connMu.Unlock()
 				return token, leaseSec, nil
@@ -581,17 +552,18 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		lm.connMu.Unlock()
 		return "", 0, ErrLeaseExpired
 
-	case <-ctx.Done():
+	case <-timeoutCtx.Done():
 		lm.connMu.Lock()
 		sh.mu.Lock()
 		delete(lm.connEnqueued, eqKey)
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
+				now := time.Now()
 				if st := sh.resources[key]; st != nil {
 					if h, hOK := st.Holders[token]; hOK {
-						h.leaseExpires = time.Now().Add(leaseTTL)
-						st.LastActivity = time.Now()
+						h.leaseExpires = now.Add(leaseTTL)
+						st.LastActivity = now
 						sh.mu.Unlock()
 						lm.connMu.Unlock()
 						return token, leaseSec, nil
@@ -607,36 +579,10 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		}
 		sh.mu.Unlock()
 		lm.connMu.Unlock()
-		return "", 0, ctx.Err()
-
-	case <-timer.C:
-		lm.connMu.Lock()
-		sh.mu.Lock()
-		delete(lm.connEnqueued, eqKey)
-		// Race check: token may have arrived
-		select {
-		case token, ok := <-w.ch:
-			if ok && token != "" {
-				if st := sh.resources[key]; st != nil {
-					if h, hOK := st.Holders[token]; hOK {
-						h.leaseExpires = time.Now().Add(leaseTTL)
-						st.LastActivity = time.Now()
-						sh.mu.Unlock()
-						lm.connMu.Unlock()
-						return token, leaseSec, nil
-					}
-				}
-				// Token was granted but expired; fall through to cleanup.
-			}
-		default:
+		// Distinguish parent context cancellation from timeout
+		if ctx.Err() != nil {
+			return "", 0, ctx.Err()
 		}
-		// Remove from queue
-		if st := sh.resources[key]; st != nil {
-			st.LastActivity = time.Now()
-			removeWaiterFromState(st, w)
-		}
-		sh.mu.Unlock()
-		lm.connMu.Unlock()
 		return "", 0, nil
 	}
 }
@@ -655,7 +601,8 @@ func (lm *LockManager) Release(key, token string) bool {
 		return false
 	}
 
-	st.LastActivity = time.Now()
+	now := time.Now()
+	st.LastActivity = now
 
 	h, ok := st.Holders[token]
 	if !ok {

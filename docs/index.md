@@ -35,8 +35,6 @@ Locks are auto-released on disconnect, so the connection must stay open.
 
 Each operation is one lock acquire + release over a persistent TCP connection. Measured on an Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost.
 
-![Benchmark charts](assets/bench.png)
-
 | Workers | Rounds | Ops | Throughput | Mean | p50 | p99 | Server RSS |
 |---|---|---|---|---|---|---|---|
 | 1 | 1,000 | 1,000 | 14,258 ops/s | 0.069 ms | 0.054 ms | 0.207 ms | 11.3 MB |
