@@ -91,6 +91,10 @@ func main() {
 	}
 
 	totalOps := len(all)
+	if totalOps == 0 {
+		fmt.Fprintln(os.Stderr, "no operations completed")
+		os.Exit(1)
+	}
 	sort.Float64s(all)
 
 	mean := mean(all)
