@@ -37,7 +37,7 @@ Each named key (lock or semaphore) maintains a `ResourceState`:
 - **waiters** — FIFO queue of pending acquire requests
 - **last_activity** — timestamp of the most recent operation (used for GC)
 
-A lock is simply a resource with `limit = 1`.
+A lock is simply a resource with `limit = 1`. Lock keys and semaphore keys are stored in **separate namespaces** (internally prefixed), so the same user-visible key string can be used for both a lock and a semaphore without conflict.
 
 ## FIFO acquire flow
 

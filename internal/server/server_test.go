@@ -1759,7 +1759,7 @@ func TestIntegration_WaitLeaseExpired(t *testing.T) {
 
 	// Force expire the lease (but don't wait for the sweep to run —
 	// FIFOWait's fast path checks LeaseExpires directly).
-	lm.ResetLeaseForTest("k1")
+	lm.ResetLeaseForTest("lock:k1")
 
 	// Wait — should get error_lease_expired from the fast-path check.
 	resp = connSendCmd(t, conn, reader, "w", "k1", "1")
@@ -2412,5 +2412,93 @@ func TestIntegration_StatsResponse(t *testing.T) {
 	}
 	if _, ok := result["locks"]; !ok {
 		t.Fatal("stats should include 'locks' field")
+	}
+}
+
+func TestIntegration_PingCommand(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn, resp := dialAndSendCmd(t, addr, "ping", "_", "")
+	defer conn.Close()
+	if resp != "ok" {
+		t.Fatalf("ping: got %q, want ok", resp)
+	}
+}
+
+// TestIntegration_LockAndSemaphoreSameKey verifies that a lock and a semaphore
+// can coexist on the same user-visible key without error_limit_mismatch.
+func TestIntegration_LockAndSemaphoreSameKey(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	// Connection 1: acquire a mutex lock on "shared-key"
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+
+	resp := connSendCmd(t, conn1, r1, "l", "shared-key", "5")
+	parts := strings.Fields(resp)
+	if len(parts) < 1 || parts[0] != "ok" {
+		t.Fatalf("lock acquire: got %q, want ok ...", resp)
+	}
+
+	// Connection 2: acquire a semaphore on the same key — must not get
+	// error_limit_mismatch
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	r2 := bufio.NewReader(conn2)
+
+	resp = connSendCmd(t, conn2, r2, "sl", "shared-key", "0 3")
+	parts = strings.Fields(resp)
+	if len(parts) < 1 || parts[0] != "ok" {
+		t.Fatalf("sem acquire on same key: got %q, want ok ...", resp)
+	}
+
+	// Verify stats shows the key without internal prefixes
+	statsResp := connSendCmd(t, conn1, r1, "stats", "_", "_")
+	if !strings.HasPrefix(statsResp, "ok ") {
+		t.Fatalf("stats: got %q", statsResp)
+	}
+	jsonPart := strings.TrimPrefix(statsResp, "ok ")
+
+	var st struct {
+		Locks      []struct{ Key string } `json:"locks"`
+		Semaphores []struct{ Key string } `json:"semaphores"`
+	}
+	if err := json.Unmarshal([]byte(jsonPart), &st); err != nil {
+		t.Fatalf("stats unmarshal: %v", err)
+	}
+	foundLock := false
+	for _, l := range st.Locks {
+		if l.Key == "shared-key" {
+			foundLock = true
+		}
+		if strings.HasPrefix(l.Key, "lock:") || strings.HasPrefix(l.Key, "sem:") {
+			t.Fatalf("stats lock key leaked internal prefix: %q", l.Key)
+		}
+	}
+	foundSem := false
+	for _, s := range st.Semaphores {
+		if s.Key == "shared-key" {
+			foundSem = true
+		}
+		if strings.HasPrefix(s.Key, "lock:") || strings.HasPrefix(s.Key, "sem:") {
+			t.Fatalf("stats sem key leaked internal prefix: %q", s.Key)
+		}
+	}
+	if !foundLock {
+		t.Fatal("stats should show 'shared-key' in locks")
+	}
+	if !foundSem {
+		t.Fatal("stats should show 'shared-key' in semaphores")
 	}
 }

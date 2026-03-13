@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -292,11 +293,33 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}
 }
 
+// lockPrefix and semPrefix separate lock and semaphore key namespaces so
+// that the same user-visible key can be used for both without conflict.
+const (
+	lockPrefix = "lock:"
+	semPrefix  = "sem:"
+)
+
+// stripKeyPrefix removes the internal namespace prefix from a key for
+// external display (e.g. stats output).
+func stripKeyPrefix(key string) string {
+	if after, ok := strings.CutPrefix(key, lockPrefix); ok {
+		return after
+	}
+	if after, ok := strings.CutPrefix(key, semPrefix); ok {
+		return after
+	}
+	return key
+}
+
 func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *connState) *protocol.Ack {
 	connID := cs.id
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
 
 	switch req.Cmd {
+	case "ping":
+		return &protocol.Ack{Status: "ok"}
+
 	case "stats":
 		st := s.lm.Stats(s.connCount.Load())
 		sigStats := s.sig.Stats()
@@ -307,6 +330,19 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 				Listeners: si.Listeners,
 			})
 		}
+		// Strip internal key prefixes from stats output.
+		for i := range st.Locks {
+			st.Locks[i].Key = stripKeyPrefix(st.Locks[i].Key)
+		}
+		for i := range st.Semaphores {
+			st.Semaphores[i].Key = stripKeyPrefix(st.Semaphores[i].Key)
+		}
+		for i := range st.IdleLocks {
+			st.IdleLocks[i].Key = stripKeyPrefix(st.IdleLocks[i].Key)
+		}
+		for i := range st.IdleSemaphores {
+			st.IdleSemaphores[i].Key = stripKeyPrefix(st.IdleSemaphores[i].Key)
+		}
 		data, err := json.Marshal(st)
 		if err != nil {
 			return &protocol.Ack{Status: "error"}
@@ -315,10 +351,12 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "l", "sl":
 		limit := 1
+		key := lockPrefix + req.Key
 		if req.Cmd == "sl" {
 			limit = req.Limit
+			key = semPrefix + req.Key
 		}
-		tok, err := s.lm.Acquire(ctx, req.Key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
+		tok, err := s.lm.Acquire(ctx, key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
@@ -341,13 +379,21 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
 
 	case "r", "sr":
-		if s.lm.Release(req.Key, req.Token) {
+		key := lockPrefix + req.Key
+		if req.Cmd == "sr" {
+			key = semPrefix + req.Key
+		}
+		if s.lm.Release(key, req.Token) {
 			return &protocol.Ack{Status: "ok"}
 		}
 		return &protocol.Ack{Status: "error"}
 
 	case "n", "sn":
-		remaining, ok := s.lm.Renew(req.Key, req.Token, req.LeaseTTL)
+		key := lockPrefix + req.Key
+		if req.Cmd == "sn" {
+			key = semPrefix + req.Key
+		}
+		remaining, ok := s.lm.Renew(key, req.Token, req.LeaseTTL)
 		if !ok {
 			return &protocol.Ack{Status: "error"}
 		}
@@ -355,10 +401,12 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "e", "se":
 		limit := 1
+		key := lockPrefix + req.Key
 		if req.Cmd == "se" {
 			limit = req.Limit
+			key = semPrefix + req.Key
 		}
-		status, tok, lease, err := s.lm.Enqueue(req.Key, req.LeaseTTL, connID, limit)
+		status, tok, lease, err := s.lm.Enqueue(key, req.LeaseTTL, connID, limit)
 		if err != nil {
 			if errors.Is(err, lock.ErrMaxLocks) {
 				return &protocol.Ack{Status: "error_max_locks"}
@@ -377,7 +425,11 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
 
 	case "w", "sw":
-		tok, lease, err := s.lm.Wait(ctx, req.Key, req.AcquireTimeout, connID)
+		key := lockPrefix + req.Key
+		if req.Cmd == "sw" {
+			key = semPrefix + req.Key
+		}
+		tok, lease, err := s.lm.Wait(ctx, key, req.AcquireTimeout, connID)
 		if err != nil {
 			if errors.Is(err, lock.ErrNotEnqueued) {
 				return &protocol.Ack{Status: "error_not_enqueued"}

@@ -348,7 +348,7 @@ if errors.Is(err, client.ErrTimeout) {
 | `ErrMaxWaiters` | The server returned `error_max_waiters` (waiter queue full for this key) |
 | `ErrServer` | The server returned an unexpected error response |
 | `ErrNotQueued` | A `Wait`/`SemWait` was attempted without a prior `Enqueue`/`SemEnqueue` |
-| `ErrLimitMismatch` | The server returned `error_limit_mismatch` (semaphore limit doesn't match existing key) |
+| `ErrLimitMismatch` | The server returned `error_limit_mismatch` (semaphore limit doesn't match the limit set by the first acquirer of that semaphore key) |
 | `ErrAlreadyQueued` | The server returned `error_already_enqueued` (connection already enqueued for this key) |
 | `ErrLeaseExpired` | The server returned `error_lease_expired` (lease expired before the grant was consumed) |
 | `ErrAuth` | The server returned `error_auth` (authentication failed or wrong token) |
@@ -367,6 +367,21 @@ if err != nil {
 sc := client.NewSignalConn(c)
 defer sc.Close()
 ```
+
+`NewSignalConn` accepts variadic `SignalConnOption` arguments. By default it starts a heartbeat goroutine that sends `ping` commands every 15 seconds to prevent the server from timing out idle signal connections:
+
+```go
+// Custom heartbeat interval
+sc := client.NewSignalConn(c, client.WithHeartbeatInterval(10*time.Second))
+
+// Disable heartbeat (not recommended — idle connections will be disconnected
+// after the server's read timeout, typically 23s)
+sc := client.NewSignalConn(c, client.WithHeartbeatInterval(0))
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `WithHeartbeatInterval(d)` | `15s` | Interval between heartbeat pings. Set to `0` to disable. |
 
 If the server requires authentication, call `Authenticate` on the `*Conn` before wrapping:
 

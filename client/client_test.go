@@ -2324,6 +2324,134 @@ func TestRenewEmptyKey(t *testing.T) {
 // Edge case: Semaphore context cancel during Enqueue
 // ---------------------------------------------------------------------------
 
+// TestSignalConn_HeartbeatKeepsAlive verifies that the heartbeat goroutine
+// prevents the server from disconnecting an idle signal connection.
+func TestSignalConn_HeartbeatKeepsAlive(t *testing.T) {
+	cfg := testConfig()
+	cfg.ReadTimeout = 1 * time.Second // aggressive timeout
+
+	_, addr := startServer(t, cfg)
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c, client.WithHeartbeatInterval(400*time.Millisecond))
+	defer sc.Close()
+
+	if err := sc.Listen("events.>"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait 2.5× the server read timeout. Without the heartbeat the
+	// connection would have been closed after 1s.
+	time.Sleep(2500 * time.Millisecond)
+
+	// Create publisher AFTER the sleep so it doesn't also time out.
+	pub, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	// If the connection is still alive, we should be able to emit and receive.
+	n, err := client.Emit(pub, "events.alive", "ping")
+	if err != nil {
+		t.Fatalf("emit after sleep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 delivery, got %d", n)
+	}
+
+	select {
+	case sig := <-sc.Signals():
+		if sig.Channel != "events.alive" {
+			t.Fatalf("expected channel 'events.alive', got %q", sig.Channel)
+		}
+		if sig.Payload != "ping" {
+			t.Fatalf("expected payload 'ping', got %q", sig.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for signal — connection likely dropped")
+	}
+}
+
+// TestSignalConn_NoHeartbeatTimesOut verifies that without a heartbeat,
+// the server disconnects an idle signal connection.
+func TestSignalConn_NoHeartbeatTimesOut(t *testing.T) {
+	cfg := testConfig()
+	cfg.ReadTimeout = 1 * time.Second // aggressive timeout
+
+	_, addr := startServer(t, cfg)
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c, client.WithHeartbeatInterval(0))
+	defer sc.Close()
+
+	if err := sc.Listen("events.>"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait longer than the read timeout — the server should close the
+	// connection and the Signals channel should be closed.
+	select {
+	case _, ok := <-sc.Signals():
+		if ok {
+			t.Fatal("expected channel to be closed, got a signal")
+		}
+		// Channel closed — connection was dropped as expected.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out — expected server to disconnect the idle connection")
+	}
+}
+
+// TestLockAndSemaphoreSameKey_Client verifies the Go client can acquire
+// a lock and a semaphore on the same key.
+func TestLockAndSemaphoreSameKey_Client(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	// Acquire a lock
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	lockTok, _, err := client.Acquire(c1, "same-key", 5*time.Second)
+	if err != nil {
+		t.Fatalf("lock acquire: %v", err)
+	}
+	if lockTok == "" {
+		t.Fatal("lock acquire returned empty token")
+	}
+
+	// Acquire a semaphore on the same key (limit=3) — should succeed
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	semTok, _, err := client.SemAcquire(c2, "same-key", 5*time.Second, 3)
+	if err != nil {
+		t.Fatalf("sem acquire on same key: %v", err)
+	}
+	if semTok == "" {
+		t.Fatal("sem acquire returned empty token")
+	}
+
+	// Release both
+	if err := client.Release(c1, "same-key", lockTok); err != nil {
+		t.Fatalf("lock release: %v", err)
+	}
+	if err := client.SemRelease(c2, "same-key", semTok); err != nil {
+		t.Fatalf("sem release: %v", err)
+	}
+}
+
 func TestSemaphoreEnqueue_ContextCancel(t *testing.T) {
 	_, addr := startServer(t, testConfig())
 

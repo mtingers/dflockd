@@ -137,6 +137,8 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 	case "auth":
 		argStr := strings.TrimSpace(arg)
 		return &Request{Cmd: "auth", Token: argStr}, nil
+	case "ping":
+		return &Request{Cmd: "ping"}, nil
 	case "stats":
 		return &Request{Cmd: "stats"}, nil
 	default:

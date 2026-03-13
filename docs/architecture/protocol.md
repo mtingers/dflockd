@@ -36,6 +36,25 @@ my-secret-token
 
 After a successful `auth`, the connection proceeds normally and all other commands are available.
 
+## Ping
+
+### Ping (`ping`)
+
+A no-op command that returns `ok`. Used by clients (e.g. `SignalConn`) to send periodic heartbeats that prevent the server from timing out idle connections.
+
+**Request:**
+```
+ping
+_
+
+```
+
+The key and arg lines are ignored (use `_` and empty by convention).
+
+**Response:**
+
+- `ok\n`
+
 ## Commands
 
 ### Lock (acquire)
@@ -172,7 +191,7 @@ n
 
 ## Semaphore Commands
 
-Semaphore commands mirror the lock commands but allow up to N concurrent holders per key (where N = `limit`). The first acquirer sets the limit for a key; subsequent requests must match or receive `error_limit_mismatch`.
+Semaphore commands mirror the lock commands but allow up to N concurrent holders per key (where N = `limit`). Lock keys and semaphore keys are in **separate namespaces** — the same key string can be used for both a lock and a semaphore without conflict. Within the semaphore namespace, the first acquirer sets the limit for a key; subsequent semaphore requests must match or receive `error_limit_mismatch`.
 
 ### Semaphore Acquire (`sl`)
 
@@ -454,7 +473,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 
 | Code | Meaning |
 |---|---|
-| 3 | Invalid command (not `auth`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, `listen`, `unlisten`, `signal`, or `stats`) |
+| 3 | Invalid command (not `auth`, `ping`, `l`, `r`, `n`, `e`, `w`, `sl`, `sr`, `sn`, `se`, `sw`, `listen`, `unlisten`, `signal`, or `stats`) |
 | 4 | Invalid integer in argument |
 | 5 | Invalid key (empty, contains whitespace, or wildcards in signal channel) |
 | 6 | Negative timeout |
@@ -475,7 +494,7 @@ In addition to the protocol error codes above (which close the connection), the 
 | `error_auth` | Authentication failed (connection is closed) |
 | `error_max_locks` | Server lock+semaphore key limit reached |
 | `error_max_waiters` | Waiter queue full for this key |
-| `error_limit_mismatch` | Semaphore limit doesn't match existing key |
+| `error_limit_mismatch` | Semaphore limit doesn't match the limit set by the first acquirer of that semaphore key |
 | `error_already_enqueued` | Connection already has a pending enqueue for this key |
 | `error_not_enqueued` | Wait called without a prior enqueue for this key |
 | `error_lease_expired` | Lock/slot lease expired before the waiter consumed the grant |
@@ -490,6 +509,6 @@ In addition to the protocol error codes above (which close the connection), the 
 - Signal channels (for publishing) must be literal — no wildcards.
 - Queue group members receive signals via round-robin. If all members' buffers are full, the primary member is disconnected (slow consumer eviction).
 - The server prunes idle lock and semaphore state (no owner/holders, no waiters) after a configurable idle period.
-- Lock keys and semaphore keys share the same `--max-locks` budget.
+- Lock keys and semaphore keys are in **separate namespaces** — using the same key string for both `l` and `sl` commands creates two independent resources. They share the same `--max-locks` budget (total resource count).
 
 See the [examples page](../getting-started/examples.md) for interactive protocol sessions.

@@ -28,7 +28,7 @@ CLI flags take precedence over environment variables when explicitly set; otherw
 | `--lease-sweep-interval` | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | Lease expiry check interval (seconds) |
 | `--gc-interval` | `DFLOCKD_GC_LOOP_SLEEP` | `5` | Idle state GC interval (seconds) |
 | `--gc-max-idle` | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle state is pruned |
-| `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max unique lock+semaphore keys |
+| `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max total lock and semaphore resource entries |
 | `--max-connections` | `DFLOCKD_MAX_CONNECTIONS` | `0` | Max concurrent connections (0 = unlimited) |
 | `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Max waiters per key (0 = unlimited) |
 | `--max-subscriptions` | `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Max signal subscriptions per connection (0 = unlimited) |
@@ -54,7 +54,7 @@ The `default-lease-ttl` controls how long a lock is held before it expires if no
 
 ### Max locks
 
-The `max-locks` setting caps the total number of unique lock keys **and** semaphore keys tracked by the server. Lock keys and semaphore keys share the same budget. When the limit is reached, new lock or semaphore requests for unknown keys return `error_max_locks`. Existing keys are unaffected.
+The `max-locks` setting caps the total number of resource entries (lock keys + semaphore keys) tracked by the server. Lock keys and semaphore keys are in separate namespaces — the same key string used for both a lock and a semaphore counts as two entries. When the limit is reached, new lock or semaphore requests for unknown keys return `error_max_locks`. Existing keys are unaffected.
 
 ### Garbage collection
 
@@ -63,6 +63,8 @@ Idle lock state (no owner, no waiters) is pruned after `gc-max-idle` seconds. Th
 ### Read timeout
 
 The `read-timeout` controls how long the server waits for a client to send a complete request line. Idle connections that send no data within this window are disconnected. This prevents resource exhaustion from abandoned connections.
+
+The Go client's `SignalConn` automatically sends `ping` heartbeats (default: every 15s) to keep signal listener connections alive. External clients that hold long-lived signal connections should send periodic `ping` commands to avoid read-timeout disconnections.
 
 ### Write timeout
 

@@ -1323,26 +1323,53 @@ type Signal struct {
 	Payload string
 }
 
+// DefaultHeartbeatInterval is the default interval between ping commands
+// sent by SignalConn to keep the server from timing out idle connections.
+const DefaultHeartbeatInterval = 15 * time.Second
+
+// SignalConnOption configures optional parameters for NewSignalConn.
+type SignalConnOption func(*SignalConn)
+
+// WithHeartbeatInterval sets the interval between heartbeat ping commands.
+// Set to 0 to disable heartbeats.
+func WithHeartbeatInterval(d time.Duration) SignalConnOption {
+	return func(sc *SignalConn) { sc.heartbeatInterval = d }
+}
+
 // SignalConn wraps a Conn for signal operations, providing a background
 // reader that separates push signals from command responses.
 type SignalConn struct {
-	conn   *Conn
-	sigCh  chan Signal
-	respCh chan string
-	done   chan struct{}
+	conn              *Conn
+	sigCh             chan Signal
+	respCh            chan string
+	done              chan struct{}
+	closeCh           chan struct{}
+	closeOnce         sync.Once
+	heartbeatInterval time.Duration
 }
 
 // NewSignalConn creates a SignalConn from an existing Conn.
 // It starts a background goroutine that reads lines from the connection
 // and routes "sig ..." push messages to sigCh and command responses to respCh.
-func NewSignalConn(c *Conn) *SignalConn {
+// A heartbeat goroutine sends periodic ping commands to prevent the server
+// from timing out the connection (default: every 15s). Use
+// WithHeartbeatInterval(0) to disable.
+func NewSignalConn(c *Conn, opts ...SignalConnOption) *SignalConn {
 	sc := &SignalConn{
-		conn:   c,
-		sigCh:  make(chan Signal, 64),
-		respCh: make(chan string, 1),
-		done:   make(chan struct{}),
+		conn:              c,
+		sigCh:             make(chan Signal, 64),
+		respCh:            make(chan string, 1),
+		done:              make(chan struct{}),
+		closeCh:           make(chan struct{}),
+		heartbeatInterval: DefaultHeartbeatInterval,
+	}
+	for _, o := range opts {
+		o(sc)
 	}
 	go sc.readLoop()
+	if sc.heartbeatInterval > 0 {
+		go sc.heartbeatLoop()
+	}
 	return sc
 }
 
@@ -1504,9 +1531,28 @@ func (sc *SignalConn) Signals() <-chan Signal {
 
 // Close closes the underlying connection and waits for the read loop to exit.
 func (sc *SignalConn) Close() error {
+	sc.closeOnce.Do(func() { close(sc.closeCh) })
 	err := sc.conn.Close()
 	<-sc.done
 	return err
+}
+
+// heartbeatLoop sends periodic ping commands to keep the connection alive.
+func (sc *SignalConn) heartbeatLoop() {
+	ticker := time.NewTicker(sc.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sc.closeCh:
+			return
+		case <-sc.done:
+			return
+		case <-ticker.C:
+			if _, err := sc.sendCmd("ping", "_", ""); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // Emit sends a signal on a channel using a regular (non-SignalConn) connection.
