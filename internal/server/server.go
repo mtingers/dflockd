@@ -22,6 +22,11 @@ import (
 	"github.com/mtingers/dflockd/internal/signal"
 )
 
+// writeChBuffer is the buffer size for a connection's push-writer writeCh.
+// Matches client.signalChanBuffer and httpapi.sigChBuffer so no stage of
+// the signal pipeline bottlenecks independently.
+const writeChBuffer = 64
+
 type connState struct {
 	id            uint64
 	writeCh       chan []byte
@@ -50,7 +55,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("both --tls-cert and --tls-key must be provided together")
 	}
 
-	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+	addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
@@ -100,6 +105,12 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 		listener.Close()
 	}()
 
+	// Exponential backoff on Accept errors. Without this, a persistent
+	// error (e.g. FD exhaustion) busy-spins logging at full tilt. Reset
+	// to zero on any successful accept.
+	var backoff time.Duration
+	const maxBackoff = 1 * time.Second
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -108,10 +119,25 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 				s.drain(&wg)
 				return nil
 			default:
-				s.log.Error("accept error", "err", err)
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				s.log.Error("accept error, backing off", "err", err, "backoff", backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					s.drain(&wg)
+					return nil
+				}
 				continue
 			}
 		}
+		backoff = 0
 		if max := s.cfg.MaxConnections; max > 0 && s.connCount.Load() >= int64(max) {
 			s.log.Warn("max connections reached, rejecting", "max", max)
 			conn.Close()
@@ -123,7 +149,9 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.handleConn(ctx, conn, connID)
+			defer s.connCount.Add(-1)
+			defer s.conns.Delete(conn)
+			s.ServeConn(ctx, conn, connID)
 		}()
 	}
 }
@@ -170,7 +198,147 @@ func (s *Server) writeResponse(conn net.Conn, data []byte) error {
 	return err
 }
 
-func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
+const (
+	peerCloseWatchDelay = 10 * time.Millisecond
+	peerCloseWatchPoll  = 50 * time.Millisecond
+)
+
+func requestMayBlock(req *protocol.Request) bool {
+	switch req.Cmd {
+	case "l", "sl", "w", "sw":
+		return req.AcquireTimeout > 0
+	default:
+		return false
+	}
+}
+
+func isTimeoutErr(err error) bool {
+	// errors.As (rather than a direct type assertion) so that errors
+	// wrapped by fmt.Errorf("...: %w", ...) or by transport layers
+	// (e.g. crypto/tls) still classify correctly.
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// watchPeerClose watches for a peer close while a blocking lock operation is
+// in flight. It peeks without consuming bytes, so a client that pipelines its
+// next request leaves that byte buffered for the normal protocol reader. The
+// delayed start keeps fast uncontended commands off this path.
+//
+// Concurrency invariant: the bufio.Reader is shared with the main handler
+// goroutine, which is NOT safe for concurrent reads. This is only safe
+// because the caller (ServeConn) guarantees:
+//
+//  1. The watcher goroutine is spawned only while the main goroutine is
+//     inside handleRequest (i.e. not reading from `reader`).
+//  2. stopPeerWatch() is called before the next ReadRequest and blocks
+//     on `<-done`, so the watcher has fully exited before the main
+//     goroutine resumes touching `reader`.
+//
+// Any future change that touches the reader from the main goroutine during
+// a blocking handleRequest call, or that allows the watcher to outlive
+// stopPeerWatch, will introduce a data race.
+func watchPeerClose(reader *bufio.Reader, conn net.Conn, cancelConn func()) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		timer := time.NewTimer(peerCloseWatchDelay)
+		defer timer.Stop()
+		select {
+		case <-stop:
+			return
+		case <-timer.C:
+		}
+
+		for {
+			select {
+			case <-stop:
+				_ = conn.SetReadDeadline(time.Time{})
+				return
+			default:
+			}
+
+			peekN := reader.Buffered() + 1
+			if peekN > reader.Size() {
+				// The peer has filled the reader with pipelined bytes
+				// behind a blocking command. We cannot observe EOF without
+				// consuming the next request, and preserving a full-buffer
+				// pipeline would leave disconnected waiters queued until
+				// grant or timeout. Treat this as an abusive pipeline and
+				// cancel the connection.
+				cancelConn()
+				return
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(peerCloseWatchPoll))
+			_, err := reader.Peek(peekN)
+			_ = conn.SetReadDeadline(time.Time{})
+
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			switch {
+			case err == nil:
+				// More pipelined data arrived. Keep peeking one byte
+				// past the buffered data so a later EOF is still observed
+				// without consuming the next request.
+				continue
+			case isTimeoutErr(err):
+				continue
+			default:
+				cancelConn()
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+		_ = conn.SetReadDeadline(time.Time{})
+	}
+}
+
+// NextConnID allocates a new connection ID from the shared counter.
+// Used by alternate transports (e.g. the HTTP bridge) that mint their
+// own virtual connections and need a unique connID.
+func (s *Server) NextConnID() uint64 {
+	return s.connSeq.Add(1)
+}
+
+// LockManager returns the shared lock manager. Used by alternate transports.
+func (s *Server) LockManager() *lock.LockManager {
+	return s.lm
+}
+
+// Signals returns the shared signal manager. Used by alternate transports.
+func (s *Server) Signals() *signal.Manager {
+	return s.sig
+}
+
+// ConnCount returns the current number of active TCP connections.
+func (s *Server) ConnCount() int64 {
+	return s.connCount.Load()
+}
+
+// Config returns the server config. Used by alternate transports.
+func (s *Server) Config() *config.Config {
+	return s.cfg
+}
+
+// ServeConn runs the protocol handler loop on a single conn with the given
+// connID until the conn is closed or the ctx is cancelled. The caller is
+// responsible for conn-level accounting (e.g. s.conns tracking in the TCP
+// accept loop) and for supplying a unique connID — typically from NextConnID().
+//
+// This is the entry point used by both the TCP accept loop (via handleConn
+// below) and the HTTP bridge (via net.Pipe virtual connections).
+func (s *Server) ServeConn(ctx context.Context, conn net.Conn, connID uint64) {
 	peer := conn.RemoteAddr().String()
 	s.log.Debug("client connected", "peer", peer, "conn_id", connID)
 
@@ -189,7 +357,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}
 
 	// writeCh is used by the signal push writer goroutine.
-	writeCh := make(chan []byte, 64)
+	writeCh := make(chan []byte, writeChBuffer)
 	var writeMu sync.Mutex
 
 	cs := &connState{
@@ -221,8 +389,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 	defer func() {
 		cancelConn()
 		s.sig.UnlistenAll(connID)
-		s.conns.Delete(conn)
-		s.connCount.Add(-1)
 		s.lm.CleanupConnection(connID)
 		close(writeCh)
 		pushWg.Wait()
@@ -241,8 +407,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 
 	if s.cfg.AuthToken != "" {
 		req, err := protocol.ReadRequest(reader, s.cfg.ReadTimeout, conn, defaultLeaseTTL)
-		if err != nil || req.Cmd != "auth" ||
-			subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.cfg.AuthToken)) != 1 {
+		token := ""
+		cmdOK := false
+		if err == nil && req != nil {
+			cmdOK = req.Cmd == "auth"
+			if cmdOK {
+				token = req.Token
+			}
+		}
+		tokenOK := subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AuthToken)) == 1
+		if !cmdOK || !tokenOK {
 			s.log.Warn("auth failed", "peer", peer, "conn_id", connID)
 			writeResp(&protocol.Ack{Status: "error_auth"})
 			// Small delay to slow down brute-force attempts.
@@ -282,9 +456,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, connID uint64) {
 			break
 		}
 
+		var stopPeerWatch func()
+		if requestMayBlock(req) {
+			stopPeerWatch = watchPeerClose(reader, conn, cancelConn)
+		}
 		ack := s.handleRequest(connCtx, req, cs)
-		if ack == nil {
-			break
+		if stopPeerWatch != nil {
+			stopPeerWatch()
 		}
 		if err := writeResp(ack); err != nil {
 			s.log.Debug("write error, disconnecting", "peer", peer, "err", err)
@@ -322,14 +500,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "stats":
 		st := s.lm.Stats(s.connCount.Load())
-		sigStats := s.sig.Stats()
-		for _, si := range sigStats {
-			st.SignalChannels = append(st.SignalChannels, lock.SignalChannelInfo{
-				Pattern:   si.Pattern,
-				Group:     si.Group,
-				Listeners: si.Listeners,
-			})
-		}
+		st.SignalChannels = append(st.SignalChannels, s.sig.Stats()...)
 		// Strip internal key prefixes from stats output.
 		for i := range st.Locks {
 			st.Locks[i].Key = stripKeyPrefix(st.Locks[i].Key)

@@ -1,9 +1,11 @@
 package client_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -57,6 +59,19 @@ func startServer(t *testing.T, cfg *config.Config) (cancel context.CancelFunc, a
 	})
 
 	return cancel, addr
+}
+
+func unusedTCPAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +331,9 @@ func TestLockEnqueueWait(t *testing.T) {
 }
 
 func TestAutoRenewal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("5s test; skip under -short")
+	}
 	cfg := testConfig()
 	cfg.DefaultLeaseTTL = 4 * time.Second
 	_, addr := startServer(t, cfg)
@@ -630,6 +648,9 @@ func TestSemaphoreTwoPhase(t *testing.T) {
 }
 
 func TestSemaphoreAutoRenewal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("5s test; skip under -short")
+	}
 	cfg := testConfig()
 	cfg.DefaultLeaseTTL = 4 * time.Second
 	_, addr := startServer(t, cfg)
@@ -955,6 +976,32 @@ func TestLockClose_NoRelease(t *testing.T) {
 	}
 }
 
+func TestLockAcquireFailureClearsStaleToken(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	l := &client.Lock{
+		Key:            "stale-token-lock",
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("initial acquire: ok=%v err=%v", ok, err)
+	}
+	if l.Token() == "" {
+		t.Fatal("expected initial token")
+	}
+
+	l.Servers = []string{unusedTCPAddr(t)}
+	ok, err = l.Acquire(context.Background())
+	if err == nil || ok {
+		t.Fatalf("second acquire: ok=%v err=%v, want dial failure", ok, err)
+	}
+	if got := l.Token(); got != "" {
+		t.Fatalf("Token() after failed reacquire = %q, want empty", got)
+	}
+}
+
 func TestSemaphoreClose_NoRelease(t *testing.T) {
 	_, addr := startServer(t, testConfig())
 
@@ -974,6 +1021,33 @@ func TestSemaphoreClose_NoRelease(t *testing.T) {
 	}
 	if s.Token() != "" {
 		t.Fatal("token should be cleared after Close")
+	}
+}
+
+func TestSemaphoreAcquireFailureClearsStaleToken(t *testing.T) {
+	_, addr := startServer(t, testConfig())
+
+	s := &client.Semaphore{
+		Key:            "stale-token-sem",
+		Limit:          2,
+		AcquireTimeout: 10 * time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("initial acquire: ok=%v err=%v", ok, err)
+	}
+	if s.Token() == "" {
+		t.Fatal("expected initial token")
+	}
+
+	s.Servers = []string{unusedTCPAddr(t)}
+	ok, err = s.Acquire(context.Background())
+	if err == nil || ok {
+		t.Fatalf("second acquire: ok=%v err=%v, want dial failure", ok, err)
+	}
+	if got := s.Token(); got != "" {
+		t.Fatalf("Token() after failed reacquire = %q, want empty", got)
 	}
 }
 
@@ -2327,6 +2401,9 @@ func TestRenewEmptyKey(t *testing.T) {
 // TestSignalConn_HeartbeatKeepsAlive verifies that the heartbeat goroutine
 // prevents the server from disconnecting an idle signal connection.
 func TestSignalConn_HeartbeatKeepsAlive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("2.5s test; skip under -short")
+	}
 	cfg := testConfig()
 	cfg.ReadTimeout = 1 * time.Second // aggressive timeout
 
@@ -2498,5 +2575,144 @@ func TestSemaphoreEnqueue_ContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("Wait did not return after context cancellation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for docs/bugs.md fixes
+// ---------------------------------------------------------------------------
+
+// TestLock_ReleaseTerminatesOnHungServer covers docs/bugs.md #2: the
+// renewal goroutine may be blocked mid-Renew on an unresponsive server,
+// and ctx cancellation alone can't interrupt its network I/O. Release()
+// must still terminate promptly — stopRenew force-closes the conn after
+// stopRenewGrace (2s).
+//
+// Uses a fake TCP server that accepts, answers the acquire, then goes
+// silent. The renewal goroutine fires, sends a Renew, and blocks waiting
+// for a response that will never come. Release() should complete within
+// stopRenewGrace + a small margin rather than hanging indefinitely.
+func TestLock_ReleaseTerminatesOnHungServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("3.5s test; skip under -short")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		// Consume the three lines of the acquire request.
+		for i := 0; i < 3; i++ {
+			if _, err := r.ReadString('\n'); err != nil {
+				return
+			}
+		}
+		// Answer the acquire with a real-looking token so the client
+		// starts its renewal loop.
+		conn.Write([]byte("ok aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2\n"))
+		// Now go silent. Any future Renew will hang waiting for a
+		// response until the conn is force-closed by the client.
+		io.Copy(io.Discard, r)
+	}()
+
+	l := &client.Lock{
+		Key:            "hang-test",
+		AcquireTimeout: 2 * time.Second,
+		LeaseTTL:       2, // short so RenewRatio * lease clamps up to 1s interval
+		Servers:        []string{ln.Addr().String()},
+		RenewRatio:     0.5,
+	}
+
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if !ok {
+		t.Fatal("acquire returned !ok")
+	}
+
+	// Wait past the first renewal tick (clamped to 1s min) so the
+	// renewal goroutine is parked inside Renew's network I/O.
+	time.Sleep(1500 * time.Millisecond)
+
+	start := time.Now()
+	_ = l.Release(context.Background())
+	elapsed := time.Since(start)
+
+	// stopRenewGrace is 2s. Release should complete within ~2.5s.
+	if elapsed > 5*time.Second {
+		t.Fatalf("Release hung for %v — stopRenew did not force-close the conn", elapsed)
+	}
+
+	<-serverDone
+}
+
+// TestSignalConn_DroppedSignalsIncrements covers docs/bugs.md #7: when
+// the client's sigCh (size 64) is full and more signals arrive, they
+// should be counted via DroppedSignals() rather than silently discarded.
+//
+// Uses a fake TCP server that emits raw "sig ..." lines without going
+// through the real protocol, avoiding interactions with the server-side
+// slow-consumer eviction path.
+func TestSignalConn_DroppedSignalsIncrements(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	const numSignals = 500 // well over sigCh buffer (64)
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Push many "sig" push frames without waiting for any client
+		// response. The client's readLoop processes them one by one;
+		// once sigCh fills, subsequent sends drop and increment the
+		// counter.
+		for i := 0; i < numSignals; i++ {
+			fmt.Fprintf(conn, "sig events.%d payload-%d\n", i, i)
+		}
+		// Wait briefly so the client has time to observe the drops
+		// before we disconnect.
+		time.Sleep(500 * time.Millisecond)
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := client.NewSignalConn(c, client.WithHeartbeatInterval(0))
+	defer sc.Close()
+
+	// Deliberately do NOT drain sc.Signals(). Wait for the fake server
+	// to send all frames and for readLoop to process them.
+	<-serverDone
+	time.Sleep(100 * time.Millisecond)
+
+	dropped := sc.DroppedSignals()
+	if dropped == 0 {
+		t.Fatalf("DroppedSignals returned 0 — counter should increment when sigCh is full")
+	}
+	// Lower bound check: we sent 500, buffer is 64, so drops should be
+	// at least numSignals - 64 minus a small grace for scheduling.
+	minDrops := uint64(numSignals - 64 - 16)
+	if dropped < minDrops {
+		t.Fatalf("DroppedSignals=%d, expected at least %d", dropped, minDrops)
 	}
 }

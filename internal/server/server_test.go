@@ -450,6 +450,126 @@ func TestIntegration_DisconnectReleasesLock(t *testing.T) {
 	}
 }
 
+func TestIntegration_DisconnectCancelsInFlightAcquire(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, lm := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	connSendCmd(t, conn1, r1, "l", "mykey", "10")
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn2.Write([]byte("l\nmykey\n30\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	internalKey := lockPrefix + "mykey"
+	waitForWaiters(t, lm, internalKey, 1)
+
+	if err := conn2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForWaiters(t, lm, internalKey, 0)
+}
+
+func TestIntegration_DisconnectCancelsPipelinedInFlightAcquire(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, lm := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	connSendCmd(t, conn1, r1, "l", "mykey", "10")
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pipeline one byte of the next request after the blocking acquire.
+	// The close watcher must not stop just because Peek sees this byte.
+	if _, err := conn2.Write([]byte("l\nmykey\n30\np")); err != nil {
+		t.Fatal(err)
+	}
+
+	internalKey := lockPrefix + "mykey"
+	waitForWaiters(t, lm, internalKey, 1)
+
+	if err := conn2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForWaiters(t, lm, internalKey, 0)
+}
+
+func TestIntegration_DisconnectCancelsFullBufferedPipelinedInFlightAcquire(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, lm := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	r1 := bufio.NewReader(conn1)
+	connSendCmd(t, conn1, r1, "l", "mykey", "10")
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn2.Write([]byte("l\nmykey\n30\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	internalKey := lockPrefix + "mykey"
+	waitForWaiters(t, lm, internalKey, 1)
+
+	// Fill the server-side bufio.Reader while the acquire is blocked.
+	// The close watcher cannot peek past a completely full buffer without
+	// consuming bytes, so it should cancel this abusive pipeline instead of
+	// leaving the disconnected waiter queued until timeout.
+	// The server may close the connection as soon as the buffer fills, so a
+	// short write or broken pipe here is an acceptable outcome.
+	_, _ = conn2.Write([]byte(strings.Repeat("p", 8192)))
+	if err := conn2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForWaiters(t, lm, internalKey, 0)
+}
+
+func waitForWaiters(t *testing.T, lm *lock.LockManager, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		lm.LockKeyForTest(key)
+		got := 0
+		if st := lm.ResourceForTest(key); st != nil {
+			got = len(st.Waiters) - st.WaiterHead
+		}
+		lm.UnlockKeyForTest(key)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiter count for %q: got %d want %d", key, got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestIntegration_FIFOOrdering(t *testing.T) {
 	cfg := testConfig()
 	cleanup, addr, _ := startServer(t, cfg)

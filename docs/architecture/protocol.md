@@ -460,7 +460,8 @@ _
 
 | Constraint | Value |
 |---|---|
-| Max line length | 256 bytes |
+| Max line length (cmd, key, most arg lines) | 256 bytes |
+| Max line length (`signal` payload, `auth` token) | 64 KiB |
 | Encoding | UTF-8 |
 | Key | Non-empty string without whitespace (within line limit) |
 | Token | UUID hex string (32 chars) |
@@ -482,7 +483,7 @@ Protocol violations cause the server to respond with `error\n` and close the con
 | 9 | Zero or negative lease TTL |
 | 10 | Read timeout (no data within server's read timeout) |
 | 11 | Client disconnected |
-| 12 | Line too long (exceeds 256 bytes) |
+| 12 | Line too long (exceeds the per-line cap — 256 bytes for command/key lines, 64 KiB for `signal` payload and `auth` token lines) |
 | 13 | Zero or negative semaphore limit |
 
 ### Semantic error responses
@@ -504,7 +505,7 @@ In addition to the protocol error codes above (which close the connection), the 
 - Locks are granted in **strict FIFO order** per key.
 - Semaphore slots are granted in **strict FIFO order** per key, up to the configured limit.
 - If a lease expires without renewal, the lock/slot automatically passes to the next waiter.
-- When a connection closes, all locks and semaphore slots held by that connection are released and transferred to waiters. All signal subscriptions are removed.
+- When a connection closes, signal subscriptions, pending waiters, and two-phase enqueue state for that connection are removed. Held locks and semaphore slots are released and transferred to waiters when `--auto-release-on-disconnect` is enabled, which is the default; otherwise they remain held until their leases expire.
 - Signal patterns support `*` (single token) and `>` (one or more trailing tokens) wildcards.
 - Signal channels (for publishing) must be literal — no wildcards.
 - Queue group members receive signals via round-robin. If all members' buffers are full, the primary member is disconnected (slow consumer eviction).

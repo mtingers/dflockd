@@ -11,15 +11,27 @@ import (
 type Listener struct {
 	ConnID     uint64
 	Pattern    string
-	Group      string     // empty = non-grouped (individual delivery)
+	Group      string // empty = non-grouped (individual delivery)
 	WriteCh    chan []byte
-	CancelConn func()     // called when WriteCh is full (slow consumer)
+	CancelConn func() // called when WriteCh is full (slow consumer)
+}
+
+// listenerKey identifies a unique subscription per connection: the
+// combination of pattern and group. It's the key type for the
+// connListeners reverse index.
+type listenerKey struct {
+	pattern string
+	group   string // empty = non-grouped
 }
 
 type listenerEntry struct {
 	pattern string
 	group   string // empty = non-grouped
 	isWild  bool
+}
+
+func (e listenerEntry) key() listenerKey {
+	return listenerKey{pattern: e.pattern, group: e.group}
 }
 
 // queueGroup tracks members of a named group for a specific pattern.
@@ -43,19 +55,22 @@ type ChannelInfo struct {
 
 // Manager manages signal subscriptions and delivery.
 type Manager struct {
-	mu            sync.RWMutex
-	exact         map[string]map[uint64]*Listener  // channel → connID → listener (non-grouped)
-	wildcards     []*Listener                       // non-grouped wildcards
-	connListeners map[uint64][]*listenerEntry       // connID → list of registrations
+	mu        sync.RWMutex
+	exact     map[string]map[uint64]*Listener // channel → connID → listener (non-grouped)
+	wildcards []*Listener                     // non-grouped wildcards
+	// connListeners indexes a connection's active subscriptions by
+	// (pattern, group) so duplicate detection and removal are O(1).
+	// The map value carries the isWild flag we need during UnlistenAll.
+	connListeners map[uint64]map[listenerKey]listenerEntry
 	exactGroups   map[string]map[string]*queueGroup // channel → groupName → queueGroup
-	wildGroups    []*wildGroupEntry                  // wildcard group entries
+	wildGroups    []*wildGroupEntry                 // wildcard group entries
 }
 
 // NewManager creates a new signal manager.
 func NewManager() *Manager {
 	return &Manager{
 		exact:         make(map[string]map[uint64]*Listener),
-		connListeners: make(map[uint64][]*listenerEntry),
+		connListeners: make(map[uint64]map[listenerKey]listenerEntry),
 		exactGroups:   make(map[string]map[string]*queueGroup),
 	}
 }
@@ -65,9 +80,9 @@ func isWildPattern(pattern string) bool {
 	return strings.Contains(pattern, "*") || strings.Contains(pattern, ">")
 }
 
-// validatePattern checks that ">" only appears as the final token and
+// ValidatePattern checks that ">" only appears as the final token and
 // that "*" only appears as a whole token (not as a substring like "c*").
-func validatePattern(pattern string) error {
+func ValidatePattern(pattern string) error {
 	tokens := strings.Split(pattern, ".")
 	for i, t := range tokens {
 		if t == ">" && i != len(tokens)-1 {
@@ -81,6 +96,10 @@ func validatePattern(pattern string) error {
 		}
 	}
 	return nil
+}
+
+func validatePattern(pattern string) error {
+	return ValidatePattern(pattern)
 }
 
 // MatchPattern checks if a literal channel name matches a pattern.
@@ -106,17 +125,16 @@ func MatchPattern(pattern, channel string) bool {
 // Returns an error if the pattern is invalid (e.g. ">" not as last token).
 func (m *Manager) Listen(listener *Listener) (bool, error) {
 	pattern := listener.Pattern
-	if err := validatePattern(pattern); err != nil {
+	if err := ValidatePattern(pattern); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check for duplicate subscription (same connID + pattern + group)
-	for _, e := range m.connListeners[listener.ConnID] {
-		if e.pattern == pattern && e.group == listener.Group {
-			return false, nil // already subscribed
-		}
+	// Duplicate check is O(1) via the reverse-index map.
+	key := listenerKey{pattern: pattern, group: listener.Group}
+	if _, exists := m.connListeners[listener.ConnID][key]; exists {
+		return false, nil // already subscribed
 	}
 
 	wild := isWildPattern(pattern)
@@ -169,11 +187,12 @@ func (m *Manager) Listen(listener *Listener) (bool, error) {
 		}
 	}
 
-	m.connListeners[listener.ConnID] = append(m.connListeners[listener.ConnID], &listenerEntry{
-		pattern: pattern,
-		group:   group,
-		isWild:  wild,
-	})
+	entries, ok := m.connListeners[listener.ConnID]
+	if !ok {
+		entries = make(map[listenerKey]listenerEntry)
+		m.connListeners[listener.ConnID] = entries
+	}
+	entries[key] = listenerEntry{pattern: pattern, group: group, isWild: wild}
 	return true, nil
 }
 
@@ -181,7 +200,7 @@ func (m *Manager) Listen(listener *Listener) (bool, error) {
 // Returns true if a listener was actually removed.
 // Returns an error if the pattern is invalid.
 func (m *Manager) Unlisten(pattern string, connID uint64, group string) (bool, error) {
-	if err := validatePattern(pattern); err != nil {
+	if err := ValidatePattern(pattern); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
@@ -251,33 +270,29 @@ func (m *Manager) Unlisten(pattern string, connID uint64, group string) (bool, e
 		}
 	}
 
-	// Update reverse index
+	// Update reverse index (O(1) via map).
 	entries := m.connListeners[connID]
-	removed := false
-	for i, e := range entries {
-		if e.pattern == pattern && e.group == group {
-			copy(entries[i:], entries[i+1:])
-			entries[len(entries)-1] = nil
-			entries = entries[:len(entries)-1]
-			removed = true
-			break
+	key := listenerKey{pattern: pattern, group: group}
+	_, removed := entries[key]
+	if removed {
+		delete(entries, key)
+		if len(entries) == 0 {
+			delete(m.connListeners, connID)
 		}
-	}
-	if len(entries) == 0 {
-		delete(m.connListeners, connID)
-	} else {
-		m.connListeners[connID] = entries
 	}
 	return removed, nil
 }
 
 // deliverToGroup delivers a message to one member of a queue group via round-robin.
-// Returns true if a delivery was made.
-// Falls back to the next member if the selected member's buffer is full.
-func deliverToGroup(qg *queueGroup, msg []byte) bool {
+// Returns (delivered, doomed): delivered is true if the message was sent,
+// and doomed is the member to disconnect if *all* members' buffers were full.
+// The caller is responsible for invoking doomed.CancelConn() *after* it
+// has released m.mu.RLock() — calling it inline under the lock would
+// block every concurrent Listen/Unlisten while the close syscall runs.
+func deliverToGroup(qg *queueGroup, msg []byte) (bool, *Listener) {
 	n := len(qg.members)
 	if n == 0 {
-		return false
+		return false, nil
 	}
 	start := qg.counter.Add(1) - 1
 	primary := int(start % uint64(n))
@@ -286,30 +301,36 @@ func deliverToGroup(qg *queueGroup, msg []byte) bool {
 		mem := qg.members[idx]
 		select {
 		case mem.WriteCh <- msg:
-			return true
+			return true, nil
 		default:
 			// Buffer full — try next member
 		}
 	}
 	// All members full — disconnect the primary to prevent permanent black hole.
-	if mem := qg.members[primary]; mem.CancelConn != nil {
-		mem.CancelConn()
-	}
-	return false
+	return false, qg.members[primary]
 }
 
 // Signal sends a payload to all listeners matching the literal channel.
 // Returns the number of successful deliveries (including independent group
 // deliveries, so a connection in both a non-grouped and grouped subscription
 // counts as 2).
+//
+// Concurrency note: when a listener's WriteCh is full we want to evict the
+// slow consumer by calling its CancelConn() — but that closes its TCP
+// socket (a syscall). We must not do that while holding m.mu.RLock,
+// because CancelConn triggers the peer's handler defers which in turn
+// call m.mu.Lock(UnlistenAll), stalling every other Listen/Unlisten on
+// every connection for the duration of the close. We collect doomed
+// listeners into a local slice, release the lock, then cancel.
 func (m *Manager) Signal(channel, payload string) int {
 	// msg is shared read-only across all recipients. Each recipient's push
 	// writer only passes it to conn.Write (read-only). Do not mutate msg
 	// after creation.
 	msg := []byte(fmt.Sprintf("sig %s %s\n", channel, payload))
 
+	var toCancel []*Listener
+
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 
 	count := 0
 
@@ -334,7 +355,7 @@ func (m *Manager) Signal(channel, payload string) int {
 				}
 			default:
 				if l.CancelConn != nil {
-					l.CancelConn()
+					toCancel = append(toCancel, l)
 				}
 			}
 		}
@@ -343,8 +364,12 @@ func (m *Manager) Signal(channel, payload string) int {
 	// 2. Exact grouped — each group independently delivers to one member
 	if groups, ok := m.exactGroups[channel]; ok {
 		for _, qg := range groups {
-			if deliverToGroup(qg, msg) {
+			ok, doomed := deliverToGroup(qg, msg)
+			if ok {
 				count++
+			}
+			if doomed != nil && doomed.CancelConn != nil {
+				toCancel = append(toCancel, doomed)
 			}
 		}
 	}
@@ -365,7 +390,7 @@ func (m *Manager) Signal(channel, payload string) int {
 					delivered[l.ConnID] = struct{}{}
 				default:
 					if l.CancelConn != nil {
-						l.CancelConn()
+						toCancel = append(toCancel, l)
 					}
 				}
 			}
@@ -375,10 +400,22 @@ func (m *Manager) Signal(channel, payload string) int {
 	// 4. Wildcard grouped — each group independently delivers to one member
 	for _, wge := range m.wildGroups {
 		if MatchPattern(wge.pattern, channel) {
-			if deliverToGroup(wge.qg, msg) {
+			ok, doomed := deliverToGroup(wge.qg, msg)
+			if ok {
 				count++
 			}
+			if doomed != nil && doomed.CancelConn != nil {
+				toCancel = append(toCancel, doomed)
+			}
 		}
+	}
+
+	m.mu.RUnlock()
+
+	// Perform evictions after releasing the read lock so concurrent
+	// Listen/Unlisten calls aren't blocked by our socket closes.
+	for _, l := range toCancel {
+		l.CancelConn()
 	}
 
 	return count

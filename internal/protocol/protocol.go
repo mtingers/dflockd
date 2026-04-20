@@ -2,24 +2,32 @@ package protocol
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 )
 
+// maxSecondsValue is the largest seconds value that can be multiplied by
+// time.Second without overflowing int64. time.Duration tops out at
+// ~9.22e9 seconds (~292 years); values beyond that would wrap to a
+// negative duration and silently corrupt timeouts.
+const maxSecondsValue = int64(math.MaxInt64) / int64(time.Second)
+
 // Pre-computed response prefixes to avoid allocations on the hot path.
 var (
-	respOK               = []byte("ok\n")
-	respTimeout          = []byte("timeout\n")
-	respError            = []byte("error\n")
-	respErrorAuth        = []byte("error_auth\n")
-	respErrorMaxLocks    = []byte("error_max_locks\n")
-	respErrorMaxWaiters  = []byte("error_max_waiters\n")
-	respErrorLimitMismatch    = []byte("error_limit_mismatch\n")
-	respErrorNotEnqueued      = []byte("error_not_enqueued\n")
-	respErrorAlreadyEnqueued  = []byte("error_already_enqueued\n")
+	respOK                   = []byte("ok\n")
+	respTimeout              = []byte("timeout\n")
+	respError                = []byte("error\n")
+	respErrorAuth            = []byte("error_auth\n")
+	respErrorMaxLocks        = []byte("error_max_locks\n")
+	respErrorMaxWaiters      = []byte("error_max_waiters\n")
+	respErrorLimitMismatch   = []byte("error_limit_mismatch\n")
+	respErrorNotEnqueued     = []byte("error_not_enqueued\n")
+	respErrorAlreadyEnqueued = []byte("error_already_enqueued\n")
 	respErrorLeaseExpired    = []byte("error_lease_expired\n")
 	respQueued               = []byte("queued\n")
 
@@ -27,7 +35,25 @@ var (
 	prefixAcquired = []byte("acquired ")
 )
 
+// MaxLineBytes caps command, key, and most arg lines. 256 is plenty for
+// the three-line request framing on every command except `signal` and
+// `auth` — a keyed hex token and integer args comfortably fit.
 const MaxLineBytes = 256
+
+// MaxPayloadBytes caps the `signal` payload line and the `auth` token
+// line — both of which can realistically carry larger values (JSON
+// events, long secrets). 64 KiB matches the client-side response cap
+// and is well under bufio.Reader's default 4 KiB buffer only for the
+// payload allocation, not the buffer itself: oversized payloads still
+// stream through the reader via repeated ReadByte calls.
+const MaxPayloadBytes = 64 * 1024
+
+// MaxSignalPayloadBytes returns the largest payload that can be delivered on
+// channel without exceeding the 64 KiB line cap used by TCP clients for pushed
+// "sig <channel> <payload>" frames.
+func MaxSignalPayloadBytes(channel string) int {
+	return MaxPayloadBytes - len("sig ") - len(channel) - len(" ")
+}
 
 type ProtocolError struct {
 	Code    int
@@ -56,20 +82,46 @@ type Ack struct {
 	Extra    string
 }
 
-// ReadLine reads a single newline-terminated line from the buffered reader,
-// enforcing MaxLineBytes during the read to prevent memory exhaustion from
-// oversized input.
+// ReadLine reads a newline-terminated line from the buffered reader using
+// the default MaxLineBytes cap. Thin shim over readLineN for command and
+// key lines.
 func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, error) {
+	return readLineN(r, timeout, conn, MaxLineBytes)
+}
+
+// readLineN is the underlying implementation, parameterised by max.
+// Signal payloads and auth tokens go through this with MaxPayloadBytes.
+//
+// Hot-path note: for the common case (max <= MaxLineBytes, which covers
+// every command/key line and most arg lines), we use a stack-allocated
+// backing array to avoid heap allocation on every read. Only when the
+// caller asks for the larger MaxPayloadBytes cap do we spill to the heap.
+// Previously a flat `make([]byte, 0, 256)` allocated on every call,
+// regressing throughput at high ops/s.
+func readLineN(r *bufio.Reader, timeout time.Duration, conn net.Conn, max int) (string, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return "", &ProtocolError{Code: 10, Message: "failed to set deadline"}
 	}
 
-	var buf [MaxLineBytes]byte
-	n := 0
+	var stackBuf [MaxLineBytes]byte
+	var buf []byte
+	if max <= MaxLineBytes {
+		buf = stackBuf[:0]
+	} else {
+		// Heap spill for the long-payload case. Seed with 256B so the
+		// common sub-256 payload doesn't grow.
+		buf = make([]byte, 0, 256)
+	}
+
 	for {
 		b, err := r.ReadByte()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			// errors.As rather than a direct type assertion: wrapped
+			// errors (fmt.Errorf "%w" chains, crypto/tls layering)
+			// should still classify as timeouts. Matches the pattern
+			// used by server.isTimeoutErr.
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
 				return "", &ProtocolError{Code: 10, Message: "read timeout"}
 			}
 			return "", &ProtocolError{Code: 11, Message: "client disconnected"}
@@ -77,7 +129,7 @@ func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, er
 		if b == '\n' {
 			break
 		}
-		if n >= len(buf) {
+		if len(buf) >= max {
 			// Drain the rest of the oversized line before reporting error
 			// to keep the reader in a consistent state.
 			for {
@@ -88,11 +140,9 @@ func ReadLine(r *bufio.Reader, timeout time.Duration, conn net.Conn) (string, er
 			}
 			return "", &ProtocolError{Code: 12, Message: "line too long"}
 		}
-		buf[n] = b
-		n++
+		buf = append(buf, b)
 	}
-	line := string(buf[:n])
-	return strings.TrimRight(line, "\r"), nil
+	return strings.TrimRight(string(buf), "\r"), nil
 }
 
 func parseInt(s string, what string) (int, error) {
@@ -101,6 +151,28 @@ func parseInt(s string, what string) (int, error) {
 		return 0, &ProtocolError{Code: 4, Message: fmt.Sprintf("invalid %s: %q", what, s)}
 	}
 	return n, nil
+}
+
+// parseSecondsArg parses an integer seconds value and converts it to a
+// time.Duration, rejecting values that would overflow on multiplication
+// with time.Second. minSec bounds the low end (0 for timeouts, 1 for
+// lease_ttl). code selects the error code so existing callers keep their
+// distinct protocol codes (6 for timeouts, 9 for lease_ttl).
+func parseSecondsArg(s, what string, minSec, code int) (time.Duration, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, &ProtocolError{Code: 4, Message: fmt.Sprintf("invalid %s: %q", what, s)}
+	}
+	if n < int64(minSec) {
+		if minSec == 0 {
+			return 0, &ProtocolError{Code: code, Message: fmt.Sprintf("%s must be >= 0", what)}
+		}
+		return 0, &ProtocolError{Code: code, Message: fmt.Sprintf("%s must be > 0", what)}
+	}
+	if n > maxSecondsValue {
+		return 0, &ProtocolError{Code: code, Message: fmt.Sprintf("%s too large (max %d)", what, maxSecondsValue)}
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 // validateKey rejects keys that are empty or contain whitespace (which would
@@ -126,7 +198,16 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 	if err != nil {
 		return nil, err
 	}
-	arg, err := ReadLine(r, timeout, conn)
+	// The third line is the arg. For commands that carry a payload or
+	// secret (signal payload, auth token), accept up to MaxPayloadBytes
+	// so realistic JSON events and long tokens aren't artificially
+	// rejected. All other commands keep the tight MaxLineBytes cap.
+	argMax := MaxLineBytes
+	switch cmd {
+	case "signal", "auth":
+		argMax = MaxPayloadBytes
+	}
+	arg, err := readLineN(r, timeout, conn, argMax)
 	if err != nil {
 		return nil, err
 	}
@@ -156,28 +237,21 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if len(parts) != 1 && len(parts) != 2 {
 			return nil, &ProtocolError{Code: 8, Message: "lock arg must be: <timeout> [<lease_ttl>]"}
 		}
-		timeout, err := parseInt(parts[0], "timeout")
+		timeoutDur, err := parseSecondsArg(parts[0], "timeout", 0, 6)
 		if err != nil {
 			return nil, err
 		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
-		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			leaseTTL, err = parseSecondsArg(parts[1], "lease_ttl", 1, 9)
 			if err != nil {
 				return nil, err
 			}
-			leaseTTL = time.Duration(lt) * time.Second
-		}
-		if leaseTTL <= 0 {
-			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
 		}
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
-			AcquireTimeout: time.Duration(timeout) * time.Second,
+			AcquireTimeout: timeoutDur,
 			LeaseTTL:       leaseTTL,
 		}, nil
 
@@ -198,14 +272,11 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			var err error
+			leaseTTL, err = parseSecondsArg(parts[1], "lease_ttl", 1, 9)
 			if err != nil {
 				return nil, err
 			}
-			leaseTTL = time.Duration(lt) * time.Second
-		}
-		if leaseTTL <= 0 {
-			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
 		}
 		return &Request{Cmd: cmd, Key: key, Token: token, LeaseTTL: leaseTTL}, nil
 
@@ -213,14 +284,11 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		stripped := strings.TrimSpace(arg)
 		leaseTTL := defaultLeaseTTL
 		if stripped != "" {
-			lt, err := parseInt(stripped, "lease_ttl")
+			var err error
+			leaseTTL, err = parseSecondsArg(stripped, "lease_ttl", 1, 9)
 			if err != nil {
 				return nil, err
 			}
-			if lt <= 0 {
-				return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
-			}
-			leaseTTL = time.Duration(lt) * time.Second
 		}
 		return &Request{Cmd: cmd, Key: key, LeaseTTL: leaseTTL}, nil
 
@@ -229,17 +297,14 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: "wait arg must be: <timeout>"}
 		}
-		timeout, err := parseInt(stripped, "timeout")
+		timeoutDur, err := parseSecondsArg(stripped, "timeout", 0, 6)
 		if err != nil {
 			return nil, err
-		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
 		}
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
-			AcquireTimeout: time.Duration(timeout) * time.Second,
+			AcquireTimeout: timeoutDur,
 		}, nil
 
 	case "sl":
@@ -247,12 +312,9 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if len(parts) != 2 && len(parts) != 3 {
 			return nil, &ProtocolError{Code: 8, Message: "sl arg must be: <timeout> <limit> [<lease_ttl>]"}
 		}
-		timeout, err := parseInt(parts[0], "timeout")
+		timeoutDur, err := parseSecondsArg(parts[0], "timeout", 0, 6)
 		if err != nil {
 			return nil, err
-		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
 		}
 		limit, err := parseInt(parts[1], "limit")
 		if err != nil {
@@ -263,19 +325,15 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 3 {
-			lt, err := parseInt(parts[2], "lease_ttl")
+			leaseTTL, err = parseSecondsArg(parts[2], "lease_ttl", 1, 9)
 			if err != nil {
 				return nil, err
 			}
-			leaseTTL = time.Duration(lt) * time.Second
-		}
-		if leaseTTL <= 0 {
-			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
 		}
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
-			AcquireTimeout: time.Duration(timeout) * time.Second,
+			AcquireTimeout: timeoutDur,
 			LeaseTTL:       leaseTTL,
 			Limit:          limit,
 		}, nil
@@ -299,14 +357,11 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			var err error
+			leaseTTL, err = parseSecondsArg(parts[1], "lease_ttl", 1, 9)
 			if err != nil {
 				return nil, err
 			}
-			leaseTTL = time.Duration(lt) * time.Second
-		}
-		if leaseTTL <= 0 {
-			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
 		}
 		return &Request{Cmd: cmd, Key: key, Token: token, LeaseTTL: leaseTTL}, nil
 
@@ -324,14 +379,10 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		leaseTTL := defaultLeaseTTL
 		if len(parts) == 2 {
-			lt, err := parseInt(parts[1], "lease_ttl")
+			leaseTTL, err = parseSecondsArg(parts[1], "lease_ttl", 1, 9)
 			if err != nil {
 				return nil, err
 			}
-			leaseTTL = time.Duration(lt) * time.Second
-		}
-		if leaseTTL <= 0 {
-			return nil, &ProtocolError{Code: 9, Message: "lease_ttl must be > 0"}
 		}
 		return &Request{
 			Cmd:      cmd,
@@ -346,17 +397,14 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		if stripped == "" {
 			return nil, &ProtocolError{Code: 8, Message: "sw arg must be: <timeout>"}
 		}
-		timeout, err := parseInt(stripped, "timeout")
+		timeoutDur, err := parseSecondsArg(stripped, "timeout", 0, 6)
 		if err != nil {
 			return nil, err
-		}
-		if timeout < 0 {
-			return nil, &ProtocolError{Code: 6, Message: "timeout must be >= 0"}
 		}
 		return &Request{
 			Cmd:            cmd,
 			Key:            key,
-			AcquireTimeout: time.Duration(timeout) * time.Second,
+			AcquireTimeout: timeoutDur,
 		}, nil
 
 	case "listen":
@@ -373,6 +421,12 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 		}
 		if strings.Contains(key, "*") || strings.Contains(key, ">") {
 			return nil, &ProtocolError{Code: 5, Message: "signal channel must not contain wildcards"}
+		}
+		if maxPayload := MaxSignalPayloadBytes(key); maxPayload < 0 || len(arg) > maxPayload {
+			if maxPayload < 0 {
+				maxPayload = 0
+			}
+			return nil, &ProtocolError{Code: 8, Message: fmt.Sprintf("signal payload too large (max %d bytes)", maxPayload)}
 		}
 		return &Request{Cmd: cmd, Key: key, Value: arg}, nil
 	}

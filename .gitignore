@@ -18,3 +18,9 @@ site/
 dflockd
 /bench
 /bench-redis
+
+.DS_Store
+
+.claude
+
+coverage.out

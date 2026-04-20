@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -89,6 +90,108 @@ func TestLoad_ValidEdgeCases(t *testing.T) {
 	}
 }
 
+// TestAuthTokenPrecedence documents the precedence order for auth token
+// resolution, matching the project-wide "CLI flag > env var > file" rule.
+//
+// The bug fixed here: previously DFLOCKD_AUTH_TOKEN silently overrode
+// --auth-token, contradicting the documented precedence.
+func TestAuthTokenPrecedence(t *testing.T) {
+	t.Run("flag wins over env var", func(t *testing.T) {
+		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
+		cfg, err := Load([]string{"--auth-token", "from-flag"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AuthToken != "from-flag" {
+			t.Fatalf("got %q, want from-flag (flag should win)", cfg.AuthToken)
+		}
+	})
+
+	t.Run("env var used when flag absent", func(t *testing.T) {
+		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AuthToken != "from-env" {
+			t.Fatalf("got %q, want from-env", cfg.AuthToken)
+		}
+	})
+
+	t.Run("empty flag does not override env", func(t *testing.T) {
+		// Edge case: `--auth-token=""` explicitly empty should NOT
+		// silently fall through to env. Our implementation treats empty
+		// flag as unset (so env wins), matching flag.Visit semantics.
+		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
+		cfg, err := Load([]string{"--auth-token", ""})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AuthToken != "from-env" {
+			t.Fatalf("got %q, want from-env (empty flag defers to env)", cfg.AuthToken)
+		}
+	})
+}
+
+// TestGCEnvVarAliases exercises the canonical + deprecated env var
+// fallback. Both DFLOCKD_GC_INTERVAL_S and the legacy
+// DFLOCKD_GC_LOOP_SLEEP should be accepted; the canonical takes
+// priority when both are set. Same for GC_MAX_IDLE_S vs
+// GC_MAX_UNUSED_TIME.
+func TestGCEnvVarAliases(t *testing.T) {
+	t.Run("canonical gc interval", func(t *testing.T) {
+		t.Setenv("DFLOCKD_GC_INTERVAL_S", "7")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.GCInterval.Seconds(); got != 7 {
+			t.Fatalf("GCInterval: got %v want 7s", got)
+		}
+	})
+	t.Run("deprecated gc loop sleep still works", func(t *testing.T) {
+		t.Setenv("DFLOCKD_GC_LOOP_SLEEP", "9")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.GCInterval.Seconds(); got != 9 {
+			t.Fatalf("GCInterval: got %v want 9s", got)
+		}
+	})
+	t.Run("canonical beats deprecated", func(t *testing.T) {
+		t.Setenv("DFLOCKD_GC_INTERVAL_S", "5")
+		t.Setenv("DFLOCKD_GC_LOOP_SLEEP", "99")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.GCInterval.Seconds(); got != 5 {
+			t.Fatalf("GCInterval: got %v want 5s (canonical should win)", got)
+		}
+	})
+	t.Run("canonical max idle", func(t *testing.T) {
+		t.Setenv("DFLOCKD_GC_MAX_IDLE_S", "30")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.GCMaxIdleTime.Seconds(); got != 30 {
+			t.Fatalf("GCMaxIdleTime: got %v want 30s", got)
+		}
+	})
+	t.Run("deprecated max unused time", func(t *testing.T) {
+		t.Setenv("DFLOCKD_GC_MAX_UNUSED_TIME", "45")
+		cfg, err := Load([]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.GCMaxIdleTime.Seconds(); got != 45 {
+			t.Fatalf("GCMaxIdleTime: got %v want 45s", got)
+		}
+	})
+}
+
 func TestSecondsCeil(t *testing.T) {
 	// Not directly exported, but we test via config validation of
 	// duration values. This exercises that the config correctly converts
@@ -100,4 +203,34 @@ func TestSecondsCeil(t *testing.T) {
 	if cfg.DefaultLeaseTTL.Seconds() != 7 {
 		t.Fatalf("expected 7s, got %v", cfg.DefaultLeaseTTL)
 	}
+}
+
+func TestLoadRejectsDurationOverflowBeforeMultiplication(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("duration overflow boundary does not fit in int on this platform")
+	}
+	tooLarge := strconv.FormatInt(maxDurationSeconds+1, 10)
+
+	t.Run("flag", func(t *testing.T) {
+		_, err := Load([]string{"--default-lease-ttl", tooLarge})
+		if err == nil || !strings.Contains(err.Error(), "too large") {
+			t.Fatalf("expected too-large error, got %v", err)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("DFLOCKD_READ_TIMEOUT_S", tooLarge)
+		_, err := Load([]string{})
+		if err == nil || !strings.Contains(err.Error(), "too large") {
+			t.Fatalf("expected too-large error, got %v", err)
+		}
+	})
+
+	t.Run("deprecated alias", func(t *testing.T) {
+		t.Setenv("DFLOCKD_GC_LOOP_SLEEP", tooLarge)
+		_, err := Load([]string{})
+		if err == nil || !strings.Contains(err.Error(), "too large") {
+			t.Fatalf("expected too-large error, got %v", err)
+		}
+	})
 }

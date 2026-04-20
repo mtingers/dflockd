@@ -10,7 +10,7 @@ The server listens on `127.0.0.1:6388` by default. See [Server Configuration](..
 
 ## 2. Acquire and release a lock
 
-Using an interactive netcat session (the connection must stay open — locks are auto-released on disconnect):
+Using an interactive netcat session (the connection must stay open — locks are auto-released on disconnect by default):
 
 ```bash
 $ nc localhost 6388
@@ -58,5 +58,5 @@ See [Examples](examples.md) for more signal patterns, queue groups, and Go clien
 2. It sends a lock request with the key and timeout.
 3. The server grants the lock immediately if it's free, or enqueues the client in FIFO order.
 4. Once acquired, the client is responsible for renewing the lease before it expires (using the `n` command).
-5. On release (or disconnect), the server frees the lock and grants it to the next FIFO waiter.
+5. On release (or disconnect, with the default auto-release setting), the server frees the lock and grants it to the next FIFO waiter.
 6. Background goroutines handle lease expiry sweeps and garbage collection of idle lock state.

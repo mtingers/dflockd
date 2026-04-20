@@ -8,24 +8,26 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Sentinel errors returned by protocol operations.
 var (
-	ErrTimeout        = errors.New("dflockd: timeout")
-	ErrMaxLocks       = errors.New("dflockd: max locks reached")
-	ErrMaxWaiters     = errors.New("dflockd: max waiters reached")
-	ErrServer         = errors.New("dflockd: server error")
-	ErrNotQueued      = errors.New("dflockd: not enqueued")
-	ErrAlreadyQueued  = errors.New("dflockd: already enqueued")
-	ErrLimitMismatch  = errors.New("dflockd: limit mismatch")
-	ErrLeaseExpired   = errors.New("dflockd: lease expired")
-	ErrAuth           = errors.New("dflockd: authentication failed")
+	ErrTimeout       = errors.New("dflockd: timeout")
+	ErrMaxLocks      = errors.New("dflockd: max locks reached")
+	ErrMaxWaiters    = errors.New("dflockd: max waiters reached")
+	ErrServer        = errors.New("dflockd: server error")
+	ErrNotQueued     = errors.New("dflockd: not enqueued")
+	ErrAlreadyQueued = errors.New("dflockd: already enqueued")
+	ErrLimitMismatch = errors.New("dflockd: limit mismatch")
+	ErrLeaseExpired  = errors.New("dflockd: lease expired")
+	ErrAuth          = errors.New("dflockd: authentication failed")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -35,9 +37,30 @@ type options struct {
 	leaseTTL int // seconds; 0 means use server default
 }
 
+const maxProtocolSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 // WithLeaseTTL sets a custom lease TTL (in seconds) for an Acquire or Enqueue call.
 func WithLeaseTTL(seconds int) Option {
 	return func(o *options) { o.leaseTTL = seconds }
+}
+
+// parseOptions applies and validates Option values. Previously each caller
+// inlined the apply loop and there was no validation: a negative leaseTTL
+// was silently treated as "server default" rather than surfacing the
+// programmer error. Callers expecting their custom lease often didn't
+// notice until the lock behaved unexpectedly.
+func parseOptions(opts []Option) (options, error) {
+	var o options
+	for _, fn := range opts {
+		fn(&o)
+	}
+	if o.leaseTTL < 0 {
+		return o, fmt.Errorf("dflockd: lease TTL must be >= 0 (got %d)", o.leaseTTL)
+	}
+	if int64(o.leaseTTL) > maxProtocolSeconds {
+		return o, fmt.Errorf("dflockd: lease TTL too large (max %d)", maxProtocolSeconds)
+	}
+	return o, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -105,8 +128,17 @@ const maxResponseBytes = 65536
 func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
-	if _, err := c.conn.Write([]byte(msg)); err != nil {
+	// Build the 3-line frame directly in one []byte rather than
+	// fmt.Sprintf + []byte cast (two allocations per request on the hot
+	// path). Pre-sized exactly, so append never reallocates.
+	buf := make([]byte, 0, len(cmd)+len(key)+len(arg)+3)
+	buf = append(buf, cmd...)
+	buf = append(buf, '\n')
+	buf = append(buf, key...)
+	buf = append(buf, '\n')
+	buf = append(buf, arg...)
+	buf = append(buf, '\n')
+	if _, err := c.conn.Write(buf); err != nil {
 		return "", err
 	}
 	return c.readLine()
@@ -178,15 +210,23 @@ func validateKey(key string) error {
 
 // secondsCeil converts a duration to whole seconds, rounding up so that
 // sub-second durations are not silently truncated to zero.
-func secondsCeil(d time.Duration) int {
+func secondsCeil(d time.Duration) int64 {
 	if d <= 0 {
 		return 0
 	}
-	s := int(d / time.Second)
+	s := int64(d / time.Second)
 	if d%time.Second != 0 {
 		s++
 	}
 	return s
+}
+
+func timeoutArg(d time.Duration) (string, error) {
+	seconds := secondsCeil(d)
+	if seconds > maxProtocolSeconds {
+		return "", fmt.Errorf("dflockd: timeout too large (max %d)", maxProtocolSeconds)
+	}
+	return strconv.FormatInt(seconds, 10), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -200,11 +240,14 @@ func Acquire(c *Conn, key string, acquireTimeout time.Duration, opts ...Option) 
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
-	var o options
-	for _, fn := range opts {
-		fn(&o)
+	o, err := parseOptions(opts)
+	if err != nil {
+		return "", 0, err
 	}
-	arg := strconv.Itoa(secondsCeil(acquireTimeout))
+	arg, err := timeoutArg(acquireTimeout)
+	if err != nil {
+		return "", 0, err
+	}
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
 	}
@@ -242,9 +285,9 @@ func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error
 	if err := validateValue(token); err != nil {
 		return 0, err
 	}
-	var o options
-	for _, fn := range opts {
-		fn(&o)
+	o, err := parseOptions(opts)
+	if err != nil {
+		return 0, err
 	}
 	arg := token
 	if o.leaseTTL > 0 {
@@ -273,9 +316,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	if err := validateKey(key); err != nil {
 		return "", "", 0, err
 	}
-	var o options
-	for _, fn := range opts {
-		fn(&o)
+	o, err := parseOptions(opts)
+	if err != nil {
+		return "", "", 0, err
 	}
 	arg := ""
 	if o.leaseTTL > 0 {
@@ -321,7 +364,10 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
-	arg := strconv.Itoa(secondsCeil(waitTimeout))
+	arg, err := timeoutArg(waitTimeout)
+	if err != nil {
+		return "", 0, err
+	}
 	resp, err := c.sendRecv("w", key, arg)
 	if err != nil {
 		return "", 0, err
@@ -352,11 +398,15 @@ func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, op
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
-	var o options
-	for _, fn := range opts {
-		fn(&o)
+	o, err := parseOptions(opts)
+	if err != nil {
+		return "", 0, err
 	}
-	arg := strconv.Itoa(secondsCeil(acquireTimeout)) + " " + strconv.Itoa(limit)
+	timeout, err := timeoutArg(acquireTimeout)
+	if err != nil {
+		return "", 0, err
+	}
+	arg := timeout + " " + strconv.Itoa(limit)
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
 	}
@@ -394,9 +444,9 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 	if err := validateValue(token); err != nil {
 		return 0, err
 	}
-	var o options
-	for _, fn := range opts {
-		fn(&o)
+	o, err := parseOptions(opts)
+	if err != nil {
+		return 0, err
 	}
 	arg := token
 	if o.leaseTTL > 0 {
@@ -425,9 +475,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	if err := validateKey(key); err != nil {
 		return "", "", 0, err
 	}
-	var o options
-	for _, fn := range opts {
-		fn(&o)
+	o, err := parseOptions(opts)
+	if err != nil {
+		return "", "", 0, err
 	}
 	arg := strconv.Itoa(limit)
 	if o.leaseTTL > 0 {
@@ -471,7 +521,10 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
-	arg := strconv.Itoa(secondsCeil(waitTimeout))
+	arg, err := timeoutArg(waitTimeout)
+	if err != nil {
+		return "", 0, err
+	}
 	resp, err := c.sendRecv("sw", key, arg)
 	if err != nil {
 		return "", 0, err
@@ -558,22 +611,15 @@ func CRC32Shard(key string, numServers int) int {
 }
 
 // ---------------------------------------------------------------------------
-// Lock — high-level distributed lock
+// Shared state + helpers used by both Lock and Semaphore
 // ---------------------------------------------------------------------------
 
-// Lock provides a high-level interface for acquiring, holding, and releasing
-// a distributed lock, including automatic lease renewal in the background.
-type Lock struct {
-	Key            string
-	AcquireTimeout time.Duration // default 10s
-	LeaseTTL       int           // custom lease TTL in seconds; 0 = server default
-	Servers        []string      // e.g. ["127.0.0.1:6388"]
-	ShardFunc      ShardFunc     // defaults to CRC32Shard
-	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
-	TLSConfig      *tls.Config   // if non-nil, connect using TLS
-	AuthToken      string        // if non-empty, authenticate after connecting
-	OnRenewError   func(err error) // optional; called when background lease renewal fails
-
+// renewableResource is the runtime state shared by Lock and Semaphore:
+// the live connection, the held token, and the renewal goroutine
+// lifecycle. Both public types embed this anonymously so that
+// Token(), Close(), stopRenew(), and connect() have one implementation.
+// Fields are unexported so they don't leak into the public API surface.
+type renewableResource struct {
 	mu          sync.Mutex
 	conn        *Conn
 	token       string
@@ -582,69 +628,255 @@ type Lock struct {
 	renewDone   chan struct{} // closed when the renew goroutine exits
 }
 
-func (l *Lock) shardFunc() ShardFunc {
-	if l.ShardFunc != nil {
-		return l.ShardFunc
-	}
-	return CRC32Shard
+// Token returns the current lock/semaphore token, or "" if not held.
+func (r *renewableResource) Token() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.token
 }
 
-func (l *Lock) acquireTimeout() time.Duration {
-	if l.AcquireTimeout > 0 {
-		return l.AcquireTimeout
+// Close ends the renewal goroutine and closes the connection without
+// sending a release. The server will auto-release if configured to do
+// so. Promoted onto Lock and Semaphore via embedding.
+func (r *renewableResource) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.stopRenew()
+
+	if r.conn == nil {
+		return nil
 	}
-	return 10 * time.Second
+	err := r.conn.Close()
+	r.conn = nil
+	r.token = ""
+	r.lease = 0
+	return err
 }
 
-func (l *Lock) renewRatio() float64 {
-	if l.RenewRatio > 0 {
-		return l.RenewRatio
+func (r *renewableResource) clearConnIfCurrent(conn *Conn) {
+	if r.conn == conn {
+		r.conn = nil
+		r.token = ""
+		r.lease = 0
 	}
-	return 0.5
 }
 
-func (l *Lock) serverAddr() string {
-	servers := l.Servers
-	if len(servers) == 0 {
-		servers = []string{"127.0.0.1:6388"}
+// stopRenew cancels the renewal goroutine and waits for it to exit.
+// Must be called with r.mu held. If the renewal goroutine is blocked
+// inside a network Renew call (server slow/hung), ctx cancellation
+// alone won't unblock it; after stopRenewGrace we force-close the conn
+// so its I/O errors out.
+func (r *renewableResource) stopRenew() {
+	if r.cancelRenew != nil {
+		r.cancelRenew()
+		r.cancelRenew = nil
 	}
-	idx := l.shardFunc()(l.Key, len(servers))
-	return servers[idx]
+	if r.renewDone == nil {
+		return
+	}
+	done := r.renewDone
+	r.renewDone = nil
+	conn := r.conn // snapshot for force-close; conn.Close is idempotent
+	r.mu.Unlock()
+	defer r.mu.Lock()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(stopRenewGrace):
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	<-done
 }
 
-func (l *Lock) opts() []Option {
-	if l.LeaseTTL > 0 {
-		return []Option{WithLeaseTTL(l.LeaseTTL)}
+// connect dials the given address, optionally over TLS, and
+// authenticates. Closes any pre-existing connection first. Must be
+// called with r.mu held.
+func (r *renewableResource) connect(addr string, tlsCfg *tls.Config, authToken string) error {
+	if r.conn != nil {
+		r.conn.Close()
 	}
-	return nil
-}
-
-// connect dials the appropriate shard server. If there is an existing
-// connection it is closed first to prevent resource leaks.
-func (l *Lock) connect() error {
-	if l.conn != nil {
-		l.conn.Close()
-		l.conn = nil
-	}
-	addr := l.serverAddr()
+	r.conn = nil
+	r.token = ""
+	r.lease = 0
 	var conn *Conn
 	var err error
-	if l.TLSConfig != nil {
-		conn, err = DialTLS(addr, l.TLSConfig)
+	if tlsCfg != nil {
+		conn, err = DialTLS(addr, tlsCfg)
 	} else {
 		conn, err = Dial(addr)
 	}
 	if err != nil {
 		return err
 	}
-	if l.AuthToken != "" {
-		if err := Authenticate(conn, l.AuthToken); err != nil {
+	if authToken != "" {
+		if err := Authenticate(conn, authToken); err != nil {
 			conn.Close()
 			return err
 		}
 	}
-	l.conn = conn
+	r.conn = conn
 	return nil
+}
+
+// defaultAcquireTimeout returns the given value, or 10s if unset.
+func defaultAcquireTimeout(t time.Duration) time.Duration {
+	if t > 0 {
+		return t
+	}
+	return 10 * time.Second
+}
+
+// validateRenewConfig rejects Lock/Semaphore field values that would
+// silently produce broken runtime behavior. Negative LeaseTTL is otherwise
+// dropped by buildOpts and the server default is used without warning;
+// RenewRatio >= 1.0 schedules the first renewal at-or-past the lease
+// expiry, so the lock is lost before the renewal fires.
+func validateRenewConfig(leaseTTL int, renewRatio float64) error {
+	if leaseTTL < 0 {
+		return fmt.Errorf("dflockd: LeaseTTL must be >= 0 (got %d)", leaseTTL)
+	}
+	if int64(leaseTTL) > maxProtocolSeconds {
+		return fmt.Errorf("dflockd: LeaseTTL too large (max %d)", maxProtocolSeconds)
+	}
+	if math.IsNaN(renewRatio) || renewRatio < 0 || renewRatio >= 1 {
+		return fmt.Errorf("dflockd: RenewRatio must be in [0, 1) (got %v)", renewRatio)
+	}
+	return nil
+}
+
+// defaultRenewRatio returns the given value, or 0.5 if unset.
+func defaultRenewRatio(r float64) float64 {
+	if r > 0 {
+		return r
+	}
+	return 0.5
+}
+
+// defaultShardFunc returns the given ShardFunc, or CRC32Shard if unset.
+func defaultShardFunc(f ShardFunc) ShardFunc {
+	if f != nil {
+		return f
+	}
+	return CRC32Shard
+}
+
+// resolveServerAddr picks the server for key based on the sharding
+// function. Defaults to 127.0.0.1:6388 if no servers are provided.
+func resolveServerAddr(key string, servers []string, f ShardFunc) string {
+	if len(servers) == 0 {
+		servers = []string{"127.0.0.1:6388"}
+	}
+	idx := defaultShardFunc(f)(key, len(servers))
+	return servers[idx]
+}
+
+// buildOpts constructs the Option slice from a lease TTL value. Returns
+// nil when leaseTTL is 0 so the server's default is used.
+func buildOpts(leaseTTL int) []Option {
+	if leaseTTL > 0 {
+		return []Option{WithLeaseTTL(leaseTTL)}
+	}
+	return nil
+}
+
+// startRenewLoop launches a background goroutine that renews a lease at
+// ratio * leaseSec intervals. renewFn is either Renew (locks) or
+// SemRenew (semaphores). Must be called with r.mu held.
+func (r *renewableResource) startRenewLoop(key string, leaseSec int, ratio float64, opts []Option, renewFn func(*Conn, string, string, ...Option) (int, error), onErr func(error)) {
+	r.stopRenew()
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancelRenew = cancel
+
+	done := make(chan struct{})
+	r.renewDone = done
+
+	leaseDur := time.Duration(leaseSec) * time.Second
+	interval := time.Duration(float64(leaseDur) * ratio)
+	if interval < 1*time.Second {
+		interval = 1 * time.Second
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.mu.Lock()
+				if r.conn == nil || r.token == "" {
+					r.mu.Unlock()
+					return
+				}
+				conn := r.conn
+				tok := r.token
+				r.mu.Unlock()
+
+				_, err := renewFn(conn, key, tok, opts...)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					if onErr != nil {
+						onErr(err)
+					}
+					return
+				}
+			}
+		}
+	}()
+}
+
+// ---------------------------------------------------------------------------
+// Lock — high-level distributed lock
+// ---------------------------------------------------------------------------
+
+// Lock provides a high-level interface for acquiring, holding, and releasing
+// a distributed lock, including automatic lease renewal in the background.
+type Lock struct {
+	Key            string
+	AcquireTimeout time.Duration   // default 10s
+	LeaseTTL       int             // custom lease TTL in seconds; 0 = server default
+	Servers        []string        // e.g. ["127.0.0.1:6388"]
+	ShardFunc      ShardFunc       // defaults to CRC32Shard
+	RenewRatio     float64         // fraction of lease at which to renew; default 0.5
+	TLSConfig      *tls.Config     // if non-nil, connect using TLS
+	AuthToken      string          // if non-empty, authenticate after connecting
+	OnRenewError   func(err error) // optional; called when background lease renewal fails
+
+	renewableResource
+}
+
+func (l *Lock) acquireTimeoutVal() time.Duration { return defaultAcquireTimeout(l.AcquireTimeout) }
+func (l *Lock) renewRatioVal() float64           { return defaultRenewRatio(l.RenewRatio) }
+func (l *Lock) serverAddr() string               { return resolveServerAddr(l.Key, l.Servers, l.ShardFunc) }
+func (l *Lock) opts() []Option                   { return buildOpts(l.LeaseTTL) }
+
+// closeConnOnContextDone closes conn if ctx is cancelled before the returned
+// stop function is called. stop waits for the watcher goroutine to exit so a
+// later context cancellation cannot close a connection after an operation has
+// already returned success.
+func closeConnOnContextDone(ctx context.Context, conn interface{ Close() error }) func() {
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
 }
 
 // Acquire connects to the server, acquires the lock, and starts a background
@@ -652,27 +884,21 @@ func (l *Lock) connect() error {
 // The provided context controls cancellation; if it is cancelled, the
 // connection is closed which unblocks the server-side wait.
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
+	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio); err != nil {
+		return false, err
+	}
 	l.mu.Lock()
 	l.stopRenew()
-	if err := l.connect(); err != nil {
+	if err := l.connect(l.serverAddr(), l.TLSConfig, l.AuthToken); err != nil {
 		l.mu.Unlock()
 		return false, err
 	}
 	conn := l.conn
 	l.mu.Unlock()
 
-	// If context is cancellable, close the connection on cancel to unblock.
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-
-	token, lease, err := Acquire(conn, l.Key, l.acquireTimeout(), l.opts()...)
-	close(done)
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
+	token, lease, err := Acquire(conn, l.Key, l.acquireTimeoutVal(), l.opts()...)
+	stopCancelWatch()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -680,9 +906,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
-			if l.conn == conn {
-				l.conn = nil
-			}
+			l.clearConnIfCurrent(conn)
 			return false, nil
 		}
 		// If context was cancelled, the conn.Close in the cancellation
@@ -692,15 +916,11 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 		// leaked FD; double-close on net.Conn is harmless.
 		if ctx.Err() != nil {
 			conn.Close()
-			if l.conn == conn {
-				l.conn = nil
-			}
+			l.clearConnIfCurrent(conn)
 			return false, ctx.Err()
 		}
 		conn.Close()
-		if l.conn == conn {
-			l.conn = nil
-		}
+		l.clearConnIfCurrent(conn)
 		return false, err
 	}
 
@@ -710,9 +930,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
 		conn.Close()
-		if l.conn == conn {
-			l.conn = nil
-		}
+		l.clearConnIfCurrent(conn)
 		return false, ctx.Err()
 	}
 
@@ -727,26 +945,21 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 // The provided context controls cancellation; if cancelled, the connection
 // is closed which unblocks any in-progress server I/O.
 func (l *Lock) Enqueue(ctx context.Context) (string, error) {
+	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio); err != nil {
+		return "", err
+	}
 	l.mu.Lock()
 	l.stopRenew()
-	if err := l.connect(); err != nil {
+	if err := l.connect(l.serverAddr(), l.TLSConfig, l.AuthToken); err != nil {
 		l.mu.Unlock()
 		return "", err
 	}
 	conn := l.conn
 	l.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	status, token, lease, err := Enqueue(conn, l.Key, l.opts()...)
-	close(done)
+	stopCancelWatch()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -754,15 +967,11 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	if err != nil {
 		if ctx.Err() != nil {
 			conn.Close()
-			if l.conn == conn {
-				l.conn = nil
-			}
+			l.clearConnIfCurrent(conn)
 			return "", ctx.Err()
 		}
 		conn.Close()
-		if l.conn == conn {
-			l.conn = nil
-		}
+		l.clearConnIfCurrent(conn)
 		return "", err
 	}
 
@@ -770,9 +979,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
 		conn.Close()
-		if l.conn == conn {
-			l.conn = nil
-		}
+		l.clearConnIfCurrent(conn)
 		return "", ctx.Err()
 	}
 
@@ -789,6 +996,9 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 // On timeout the connection is closed; the caller must call Enqueue again
 // to re-enter the queue.
 func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
+	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio); err != nil {
+		return false, err
+	}
 	l.mu.Lock()
 	if l.conn == nil {
 		l.mu.Unlock()
@@ -797,17 +1007,9 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	conn := l.conn
 	l.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	token, lease, err := Wait(conn, l.Key, timeout)
-	close(done)
+	stopCancelWatch()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -815,22 +1017,16 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
-			if l.conn == conn {
-				l.conn = nil
-			}
+			l.clearConnIfCurrent(conn)
 			return false, nil
 		}
 		if ctx.Err() != nil {
 			conn.Close()
-			if l.conn == conn {
-				l.conn = nil
-			}
+			l.clearConnIfCurrent(conn)
 			return false, ctx.Err()
 		}
 		conn.Close()
-		if l.conn == conn {
-			l.conn = nil
-		}
+		l.clearConnIfCurrent(conn)
 		return false, err
 	}
 
@@ -838,9 +1034,7 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
 		conn.Close()
-		if l.conn == conn {
-			l.conn = nil
-		}
+		l.clearConnIfCurrent(conn)
 		return false, ctx.Err()
 	}
 
@@ -850,23 +1044,20 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	return true, nil
 }
 
+// stopRenewGrace bounds how long stopRenew waits for the renewal goroutine
+// to notice ctx cancellation before it force-closes the connection. 2s is
+// long enough for a responsive server to complete an in-flight Renew, but
+// short enough that a hung server doesn't wedge Release() forever.
+const stopRenewGrace = 2 * time.Second
+
 // stopRenew cancels the renewal goroutine and waits for it to exit.
 // Must be called with l.mu held; temporarily releases the mutex so
 // the renewal goroutine can complete its tick (which grabs l.mu).
-func (l *Lock) stopRenew() {
-	if l.cancelRenew != nil {
-		l.cancelRenew()
-		l.cancelRenew = nil
-	}
-	if l.renewDone != nil {
-		done := l.renewDone
-		l.renewDone = nil
-		l.mu.Unlock()
-		<-done
-		l.mu.Lock()
-	}
-}
-
+//
+// If the goroutine is stuck inside a Renew network call (server hung or
+// network slow), ctx cancellation alone can't unblock it. After a grace
+// period we force-close the underlying conn, which interrupts the Renew
+// I/O with an error; the goroutine then exits normally.
 // Release stops the renewal goroutine, releases the lock on the server, and
 // closes the connection. The ctx parameter is reserved for future use.
 func (l *Lock) Release(ctx context.Context) error {
@@ -887,89 +1078,13 @@ func (l *Lock) Release(ctx context.Context) error {
 	return err
 }
 
-// Close stops renewal and closes the connection without explicitly releasing
-// the lock. The server will auto-release if configured to do so.
-func (l *Lock) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// Close (promoted from renewableResource) and Token (also promoted)
+// are defined on the embedded renewableResource type; they are
+// promoted into the public API of Lock and Semaphore via the
+// anonymous embed.
 
-	l.stopRenew()
-
-	if l.conn == nil {
-		return nil
-	}
-
-	err := l.conn.Close()
-	l.conn = nil
-	l.token = ""
-	l.lease = 0
-	return err
-}
-
-// Token returns the current lock token, or "" if not acquired.
-func (l *Lock) Token() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.token
-}
-
-// startRenew launches a background goroutine that renews the lease at
-// renewRatio * leaseTTL intervals. Must be called with l.mu held.
-// If renewal fails, the OnRenewError callback is invoked (if set)
-// and the goroutine exits.
 func (l *Lock) startRenew() {
-	l.stopRenew()
-	ctx, cancel := context.WithCancel(context.Background())
-	l.cancelRenew = cancel
-
-	done := make(chan struct{})
-	l.renewDone = done
-
-	leaseDur := time.Duration(l.lease) * time.Second
-	interval := time.Duration(float64(leaseDur) * l.renewRatio())
-	if interval < 1*time.Second {
-		interval = 1 * time.Second
-	}
-
-	conn := l.conn
-	key := l.Key
-	token := l.token
-	opts := l.opts()
-	onErr := l.OnRenewError
-
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				l.mu.Lock()
-				if l.conn == nil || l.token == "" {
-					l.mu.Unlock()
-					return
-				}
-				// Re-read in case of reconnection (future-proofing).
-				conn = l.conn
-				key = l.Key
-				token = l.token
-				l.mu.Unlock()
-
-				_, err := Renew(conn, key, token, opts...)
-				if err != nil {
-					if ctx.Err() != nil {
-						return // Deliberately stopped; not a real failure.
-					}
-					if onErr != nil {
-						onErr(err)
-					}
-					return
-				}
-			}
-		}
-	}()
+	l.startRenewLoop(l.Key, l.lease, l.renewRatioVal(), l.opts(), Renew, l.OnRenewError)
 }
 
 // ---------------------------------------------------------------------------
@@ -981,111 +1096,41 @@ func (l *Lock) startRenew() {
 type Semaphore struct {
 	Key            string
 	Limit          int
-	AcquireTimeout time.Duration // default 10s
-	LeaseTTL       int           // custom lease TTL in seconds; 0 = server default
-	Servers        []string      // e.g. ["127.0.0.1:6388"]
-	ShardFunc      ShardFunc     // defaults to CRC32Shard
-	RenewRatio     float64       // fraction of lease at which to renew; default 0.5
-	TLSConfig      *tls.Config   // if non-nil, connect using TLS
-	AuthToken      string        // if non-empty, authenticate after connecting
+	AcquireTimeout time.Duration   // default 10s
+	LeaseTTL       int             // custom lease TTL in seconds; 0 = server default
+	Servers        []string        // e.g. ["127.0.0.1:6388"]
+	ShardFunc      ShardFunc       // defaults to CRC32Shard
+	RenewRatio     float64         // fraction of lease at which to renew; default 0.5
+	TLSConfig      *tls.Config     // if non-nil, connect using TLS
+	AuthToken      string          // if non-empty, authenticate after connecting
 	OnRenewError   func(err error) // optional; called when background lease renewal fails
 
-	mu          sync.Mutex
-	conn        *Conn
-	token       string
-	lease       int
-	cancelRenew context.CancelFunc
-	renewDone   chan struct{}
+	renewableResource
 }
 
-func (s *Semaphore) shardFunc() ShardFunc {
-	if s.ShardFunc != nil {
-		return s.ShardFunc
-	}
-	return CRC32Shard
-}
-
-func (s *Semaphore) acquireTimeout() time.Duration {
-	if s.AcquireTimeout > 0 {
-		return s.AcquireTimeout
-	}
-	return 10 * time.Second
-}
-
-func (s *Semaphore) renewRatio() float64 {
-	if s.RenewRatio > 0 {
-		return s.RenewRatio
-	}
-	return 0.5
-}
-
-func (s *Semaphore) serverAddr() string {
-	servers := s.Servers
-	if len(servers) == 0 {
-		servers = []string{"127.0.0.1:6388"}
-	}
-	idx := s.shardFunc()(s.Key, len(servers))
-	return servers[idx]
-}
-
-func (s *Semaphore) opts() []Option {
-	if s.LeaseTTL > 0 {
-		return []Option{WithLeaseTTL(s.LeaseTTL)}
-	}
-	return nil
-}
-
-// connect dials the appropriate shard server. If there is an existing
-// connection it is closed first to prevent resource leaks.
-func (s *Semaphore) connect() error {
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-	addr := s.serverAddr()
-	var conn *Conn
-	var err error
-	if s.TLSConfig != nil {
-		conn, err = DialTLS(addr, s.TLSConfig)
-	} else {
-		conn, err = Dial(addr)
-	}
-	if err != nil {
-		return err
-	}
-	if s.AuthToken != "" {
-		if err := Authenticate(conn, s.AuthToken); err != nil {
-			conn.Close()
-			return err
-		}
-	}
-	s.conn = conn
-	return nil
-}
+func (s *Semaphore) acquireTimeoutVal() time.Duration { return defaultAcquireTimeout(s.AcquireTimeout) }
+func (s *Semaphore) renewRatioVal() float64           { return defaultRenewRatio(s.RenewRatio) }
+func (s *Semaphore) serverAddr() string               { return resolveServerAddr(s.Key, s.Servers, s.ShardFunc) }
+func (s *Semaphore) opts() []Option                   { return buildOpts(s.LeaseTTL) }
 
 // Acquire connects to the server, acquires a semaphore slot, and starts
 // background lease renewal. Returns false (with nil error) on timeout.
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
+	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	s.stopRenew()
-	if err := s.connect(); err != nil {
+	if err := s.connect(s.serverAddr(), s.TLSConfig, s.AuthToken); err != nil {
 		s.mu.Unlock()
 		return false, err
 	}
 	conn := s.conn
 	s.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-
-	token, lease, err := SemAcquire(conn, s.Key, s.acquireTimeout(), s.Limit, s.opts()...)
-	close(done)
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
+	token, lease, err := SemAcquire(conn, s.Key, s.acquireTimeoutVal(), s.Limit, s.opts()...)
+	stopCancelWatch()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1093,22 +1138,16 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
-			if s.conn == conn {
-				s.conn = nil
-			}
+			s.clearConnIfCurrent(conn)
 			return false, nil
 		}
 		if ctx.Err() != nil {
 			conn.Close()
-			if s.conn == conn {
-				s.conn = nil
-			}
+			s.clearConnIfCurrent(conn)
 			return false, ctx.Err()
 		}
 		conn.Close()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		s.clearConnIfCurrent(conn)
 		return false, err
 	}
 
@@ -1116,9 +1155,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
 		conn.Close()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		s.clearConnIfCurrent(conn)
 		return false, ctx.Err()
 	}
 
@@ -1132,26 +1169,21 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 // The provided context controls cancellation; if cancelled, the connection
 // is closed which unblocks any in-progress server I/O.
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
+	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio); err != nil {
+		return "", err
+	}
 	s.mu.Lock()
 	s.stopRenew()
-	if err := s.connect(); err != nil {
+	if err := s.connect(s.serverAddr(), s.TLSConfig, s.AuthToken); err != nil {
 		s.mu.Unlock()
 		return "", err
 	}
 	conn := s.conn
 	s.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	status, token, lease, err := SemEnqueue(conn, s.Key, s.Limit, s.opts()...)
-	close(done)
+	stopCancelWatch()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1159,15 +1191,11 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	if err != nil {
 		if ctx.Err() != nil {
 			conn.Close()
-			if s.conn == conn {
-				s.conn = nil
-			}
+			s.clearConnIfCurrent(conn)
 			return "", ctx.Err()
 		}
 		conn.Close()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		s.clearConnIfCurrent(conn)
 		return "", err
 	}
 
@@ -1175,9 +1203,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
 		conn.Close()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		s.clearConnIfCurrent(conn)
 		return "", ctx.Err()
 	}
 
@@ -1193,6 +1219,9 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 // Returns false (with nil error) on timeout. On timeout the connection is
 // closed; the caller must call Enqueue again to re-enter the queue.
 func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
+	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	if s.conn == nil {
 		s.mu.Unlock()
@@ -1201,17 +1230,9 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	conn := s.conn
 	s.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	token, lease, err := SemWait(conn, s.Key, timeout)
-	close(done)
+	stopCancelWatch()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1219,22 +1240,16 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
-			if s.conn == conn {
-				s.conn = nil
-			}
+			s.clearConnIfCurrent(conn)
 			return false, nil
 		}
 		if ctx.Err() != nil {
 			conn.Close()
-			if s.conn == conn {
-				s.conn = nil
-			}
+			s.clearConnIfCurrent(conn)
 			return false, ctx.Err()
 		}
 		conn.Close()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		s.clearConnIfCurrent(conn)
 		return false, err
 	}
 
@@ -1242,9 +1257,7 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	// closed the conn, and closing it below triggers server-side auto-release.
 	if ctx.Err() != nil {
 		conn.Close()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		s.clearConnIfCurrent(conn)
 		return false, ctx.Err()
 	}
 
@@ -1252,20 +1265,6 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	s.lease = lease
 	s.startRenew()
 	return true, nil
-}
-
-func (s *Semaphore) stopRenew() {
-	if s.cancelRenew != nil {
-		s.cancelRenew()
-		s.cancelRenew = nil
-	}
-	if s.renewDone != nil {
-		done := s.renewDone
-		s.renewDone = nil
-		s.mu.Unlock()
-		<-done
-		s.mu.Lock()
-	}
 }
 
 // Release stops renewal, releases the semaphore slot, and closes the connection.
@@ -1288,30 +1287,7 @@ func (s *Semaphore) Release(ctx context.Context) error {
 	return err
 }
 
-// Close stops renewal and closes the connection without explicitly releasing.
-func (s *Semaphore) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.stopRenew()
-
-	if s.conn == nil {
-		return nil
-	}
-
-	err := s.conn.Close()
-	s.conn = nil
-	s.token = ""
-	s.lease = 0
-	return err
-}
-
-// Token returns the current semaphore slot token, or "" if not acquired.
-func (s *Semaphore) Token() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.token
-}
+// Close and Token are promoted from the embedded renewableResource.
 
 // ---------------------------------------------------------------------------
 // Signaling
@@ -1327,6 +1303,12 @@ type Signal struct {
 // sent by SignalConn to keep the server from timing out idle connections.
 const DefaultHeartbeatInterval = 15 * time.Second
 
+// signalChanBuffer is the buffer size for the client's sigCh. Matches
+// the server-side push-writer buffer (internal/server.writeChBuffer)
+// and the bridge-side buffer (internal/httpapi.sigChBuffer) so none of
+// the three pipeline stages bottlenecks independently.
+const signalChanBuffer = 64
+
 // SignalConnOption configures optional parameters for NewSignalConn.
 type SignalConnOption func(*SignalConn)
 
@@ -1338,6 +1320,13 @@ func WithHeartbeatInterval(d time.Duration) SignalConnOption {
 
 // SignalConn wraps a Conn for signal operations, providing a background
 // reader that separates push signals from command responses.
+//
+// The sigCh buffer (64) is a soft cap: if the consumer can't keep up and
+// the channel fills, incoming signals are dropped silently and the drop
+// count is exposed via DroppedSignals(). Consumers that must not miss
+// signals should monitor that counter and either scale up consumers or
+// drop the connection (the server will also evict slow consumers via
+// CancelConn when its own WriteCh buffer overflows).
 type SignalConn struct {
 	conn              *Conn
 	sigCh             chan Signal
@@ -1346,6 +1335,7 @@ type SignalConn struct {
 	closeCh           chan struct{}
 	closeOnce         sync.Once
 	heartbeatInterval time.Duration
+	dropped           atomic.Uint64
 }
 
 // NewSignalConn creates a SignalConn from an existing Conn.
@@ -1357,7 +1347,7 @@ type SignalConn struct {
 func NewSignalConn(c *Conn, opts ...SignalConnOption) *SignalConn {
 	sc := &SignalConn{
 		conn:              c,
-		sigCh:             make(chan Signal, 64),
+		sigCh:             make(chan Signal, signalChanBuffer),
 		respCh:            make(chan string, 1),
 		done:              make(chan struct{}),
 		closeCh:           make(chan struct{}),
@@ -1394,6 +1384,10 @@ func (sc *SignalConn) readLoop() {
 			select {
 			case sc.sigCh <- sig:
 			default:
+				// Slow consumer — drop rather than block, matching the
+				// server's own slow-consumer policy. Count is exposed via
+				// DroppedSignals() so callers can observe lossy delivery.
+				sc.dropped.Add(1)
 			}
 		} else {
 			// Command responses must not be dropped — sendCmd serializes
@@ -1412,8 +1406,15 @@ func (sc *SignalConn) sendCmd(cmd, key, arg string) (string, error) {
 	case <-sc.respCh:
 	default:
 	}
-	msg := fmt.Sprintf("%s\n%s\n%s\n", cmd, key, arg)
-	if _, err := sc.conn.conn.Write([]byte(msg)); err != nil {
+	// Direct build — see Conn.sendRecv for rationale.
+	buf := make([]byte, 0, len(cmd)+len(key)+len(arg)+3)
+	buf = append(buf, cmd...)
+	buf = append(buf, '\n')
+	buf = append(buf, key...)
+	buf = append(buf, '\n')
+	buf = append(buf, arg...)
+	buf = append(buf, '\n')
+	if _, err := sc.conn.conn.Write(buf); err != nil {
 		return "", err
 	}
 	select {
@@ -1529,6 +1530,14 @@ func (sc *SignalConn) Signals() <-chan Signal {
 	return sc.sigCh
 }
 
+// DroppedSignals returns the total number of signals that were dropped
+// because the Signals() channel was full when they arrived. Monotonically
+// increasing; use it to detect slow-consumer conditions. Zero in the
+// common case.
+func (sc *SignalConn) DroppedSignals() uint64 {
+	return sc.dropped.Load()
+}
+
 // Close closes the underlying connection and waits for the read loop to exit.
 func (sc *SignalConn) Close() error {
 	sc.closeOnce.Do(func() { close(sc.closeCh) })
@@ -1583,59 +1592,6 @@ func parseOKInt(resp, cmd string) (int, error) {
 	return 0, fmt.Errorf("%w: %s: %s", ErrServer, cmd, resp)
 }
 
-// startRenew launches a background goroutine that renews the semaphore lease.
-// If renewal fails, the OnRenewError callback is invoked (if set)
-// and the goroutine exits.
 func (s *Semaphore) startRenew() {
-	s.stopRenew()
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancelRenew = cancel
-
-	done := make(chan struct{})
-	s.renewDone = done
-
-	leaseDur := time.Duration(s.lease) * time.Second
-	interval := time.Duration(float64(leaseDur) * s.renewRatio())
-	if interval < 1*time.Second {
-		interval = 1 * time.Second
-	}
-
-	conn := s.conn
-	key := s.Key
-	token := s.token
-	opts := s.opts()
-	onErr := s.OnRenewError
-
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.mu.Lock()
-				if s.conn == nil || s.token == "" {
-					s.mu.Unlock()
-					return
-				}
-				conn = s.conn
-				key = s.Key
-				token = s.token
-				s.mu.Unlock()
-
-				_, err := SemRenew(conn, key, token, opts...)
-				if err != nil {
-					if ctx.Err() != nil {
-						return // Deliberately stopped; not a real failure.
-					}
-					if onErr != nil {
-						onErr(err)
-					}
-					return
-				}
-			}
-		}
-	}()
+	s.startRenewLoop(s.Key, s.lease, s.renewRatioVal(), s.opts(), SemRenew, s.OnRenewError)
 }

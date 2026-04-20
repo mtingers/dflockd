@@ -15,7 +15,6 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"os"
 	"sort"
 	"strings"
@@ -28,7 +27,7 @@ import (
 func main() {
 	workers := flag.Int("workers", 10, "number of concurrent workers")
 	rounds := flag.Int("rounds", 50, "acquire/release rounds per worker")
-	key := flag.String("key", "bench", "lock key prefix")
+	key := flag.String("key", "bench", "lock key")
 	timeout := flag.Int("timeout", 30, "acquire timeout in seconds")
 	servers := flag.String("servers", "127.0.0.1:6388", "comma-separated host:port pairs")
 	leaseTTL := flag.Int("lease", 10, "lease TTL in seconds")
@@ -36,18 +35,13 @@ func main() {
 	warmup := flag.Int("warmup", 10, "warmup rounds per worker (not measured)")
 	flag.Parse()
 
-	addrs := strings.Split(*servers, ",")
-	for i := range addrs {
-		addrs[i] = strings.TrimSpace(addrs[i])
+	addrs, connsPerWorker, err := validateBenchFlags(*workers, *rounds, *timeout, *leaseTTL, *connections, *warmup, *servers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bench: %v\n", err)
+		os.Exit(2)
 	}
 
-	// connections=0 means 1 persistent conn per worker (default, pooled mode)
-	connsPerWorker := *connections
-	if connsPerWorker <= 0 {
-		connsPerWorker = 1
-	}
-
-	fmt.Printf("bench: %d workers x %d rounds (key_prefix=%q, conns/worker=%d)\n\n",
+	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d)\n\n",
 		*workers, *rounds, *key, connsPerWorker)
 
 	type result struct {
@@ -57,8 +51,8 @@ func main() {
 
 	results := make([]result, *workers)
 	var wg sync.WaitGroup
-	var warmupWg sync.WaitGroup // tracks warmup completion
-	startCh := make(chan struct{})   // closed to signal "go measure"
+	var warmupWg sync.WaitGroup    // tracks warmup completion
+	startCh := make(chan struct{}) // closed to signal "go measure"
 
 	warmupWg.Add(*workers)
 
@@ -66,9 +60,8 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			workerKey := fmt.Sprintf("%s_%d", *key, rand.IntN(9900000)+100000)
 			addr := addrs[id%len(addrs)]
-			lats, err := worker(workerKey, addr, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
+			lats, err := worker(*key, addr, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
 			results[id] = result{latencies: lats, err: err}
 		}(i)
 	}
@@ -114,6 +107,41 @@ func main() {
 	fmt.Printf("  p50       : %.3f ms\n", p50*1000)
 	fmt.Printf("  p99       : %.3f ms\n", p99*1000)
 	fmt.Printf("  stdev     : %.3f ms\n", sd*1000)
+}
+
+func validateBenchFlags(workers, rounds, timeoutSec, leaseTTL, connections, warmup int, servers string) ([]string, int, error) {
+	if workers <= 0 {
+		return nil, 0, fmt.Errorf("--workers must be > 0")
+	}
+	if rounds <= 0 {
+		return nil, 0, fmt.Errorf("--rounds must be > 0")
+	}
+	if timeoutSec < 0 {
+		return nil, 0, fmt.Errorf("--timeout must be >= 0")
+	}
+	if leaseTTL < 0 {
+		return nil, 0, fmt.Errorf("--lease must be >= 0")
+	}
+	if connections < 0 {
+		return nil, 0, fmt.Errorf("--connections must be >= 0")
+	}
+	if warmup < 0 {
+		return nil, 0, fmt.Errorf("--warmup must be >= 0")
+	}
+
+	addrs := strings.Split(servers, ",")
+	for i := range addrs {
+		addrs[i] = strings.TrimSpace(addrs[i])
+		if addrs[i] == "" {
+			return nil, 0, fmt.Errorf("--servers must not contain empty addresses")
+		}
+	}
+
+	connsPerWorker := connections
+	if connsPerWorker == 0 {
+		connsPerWorker = 1
+	}
+	return addrs, connsPerWorker, nil
 }
 
 func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {

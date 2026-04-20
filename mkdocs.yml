@@ -59,6 +59,7 @@ nav:
     - Examples: getting-started/examples.md
   - Server:
     - Configuration: server.md
+    - HTTP API: http-api.md
   - Client:
     - Go Client: client.md
   - Architecture:

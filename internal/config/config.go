@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -29,6 +30,26 @@ type Config struct {
 	TLSCert                 string
 	TLSKey                  string
 	AuthToken               string
+
+	// HTTP API (opt-in; HTTPPort=0 disables).
+	HTTPPort               int
+	HTTPHost               string
+	HTTPSessionIdleTimeout time.Duration
+	HTTPMaxSessions        int
+	HTTPSSEPingInterval    time.Duration
+}
+
+// envLookup returns the first non-empty env value from the given keys,
+// or "" if none are set. Used for canonical-plus-deprecated name lookup.
+// First key should be the canonical (new) name; subsequent keys are
+// deprecated aliases kept for backward compatibility.
+func envLookup(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // envOrInt returns the environment variable value parsed as int, or the flag
@@ -73,30 +94,66 @@ func envOrString(envKey string, flagVal string) string {
 	return v
 }
 
-// envOrDuration returns a time.Duration in seconds from the environment
-// variable, or converts the flag default (in seconds) if the env var is unset.
-func envOrDuration(envKey string, flagVal int) time.Duration {
-	return time.Duration(envOrInt(envKey, flagVal)) * time.Second
+const maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
+
+func durationFromSeconds(label string, seconds int) (time.Duration, error) {
+	n := int64(seconds)
+	if n > maxDurationSeconds || n < -maxDurationSeconds {
+		return 0, fmt.Errorf("%s too large (max %d seconds)", label, maxDurationSeconds)
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
-// loadAuthToken resolves the auth token from (in priority order):
-//  1. DFLOCKD_AUTH_TOKEN env var
-//  2. --auth-token flag
-//  3. contents of --auth-token-file (trailing whitespace stripped)
-//  4. contents of DFLOCKD_AUTH_TOKEN_FILE env var
-func loadAuthToken(flagToken, flagTokenFile string) (string, error) {
-	// Env var takes highest priority
+// envOrDuration returns a time.Duration in seconds from the environment
+// variable, or converts the flag default (in seconds) if the env var is unset.
+func envOrDuration(envKey string, flagVal int) (time.Duration, error) {
+	return durationFromSeconds(envKey, envOrInt(envKey, flagVal))
+}
+
+// envOrDurationWithAliases is envOrDuration that also looks up deprecated
+// env var names. Used to migrate from legacy names (DFLOCKD_GC_LOOP_SLEEP,
+// DFLOCKD_GC_MAX_UNUSED_TIME) to the canonical-matching-flag names
+// (DFLOCKD_GC_INTERVAL, DFLOCKD_GC_MAX_IDLE). Reports which name was used
+// via the returned string so the caller can log a deprecation warning.
+func envOrDurationWithAliases(flagVal int, keys ...string) (time.Duration, string, error) {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				continue
+			}
+			d, err := durationFromSeconds(k, n)
+			return d, k, err
+		}
+	}
+	d, err := durationFromSeconds(keys[0], flagVal)
+	return d, "", err
+}
+
+// loadAuthToken resolves the auth token following the same precedence the
+// rest of the config uses (README: "CLI flags take precedence over
+// environment variables"):
+//
+//  1. --auth-token flag (if explicitly set)
+//  2. DFLOCKD_AUTH_TOKEN env var
+//  3. --auth-token-file flag (if explicitly set)
+//  4. DFLOCKD_AUTH_TOKEN_FILE env var
+//
+// flagTokenSet and flagTokenFileSet tell us whether the caller actually
+// passed the flag (vs receiving the empty default), so an empty flag
+// value doesn't accidentally override a set env var.
+func loadAuthToken(flagToken string, flagTokenSet bool, flagTokenFile string, flagTokenFileSet bool) (string, error) {
+	if flagTokenSet && flagToken != "" {
+		return flagToken, nil
+	}
 	if v := os.Getenv("DFLOCKD_AUTH_TOKEN"); v != "" {
 		return v, nil
 	}
-	// Explicit flag value
-	if flagToken != "" {
-		return flagToken, nil
-	}
-	// File-based token (flag or env)
-	path := flagTokenFile
-	if path == "" {
-		path = os.Getenv("DFLOCKD_AUTH_TOKEN_FILE")
+	path := ""
+	if flagTokenFileSet && flagTokenFile != "" {
+		path = flagTokenFile
+	} else if v := os.Getenv("DFLOCKD_AUTH_TOKEN_FILE"); v != "" {
+		path = v
 	}
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -132,6 +189,11 @@ func Load(args []string) (*Config, error) {
 	tlsKey := fs.String("tls-key", "", "Path to TLS private key PEM file")
 	authToken := fs.String("auth-token", "", "Shared secret token for client authentication (visible in process list; prefer --auth-token-file)")
 	authTokenFile := fs.String("auth-token-file", "", "Path to file containing the auth token (one line, trailing whitespace stripped)")
+	httpPort := fs.Int("http-port", 0, "HTTP API listen port (0 = disabled)")
+	httpHost := fs.String("http-host", "", "HTTP API bind address (defaults to --host)")
+	httpIdle := fs.Int("http-session-idle-timeout", 20, "HTTP session idle timeout (seconds)")
+	httpMaxSessions := fs.Int("http-max-sessions", 0, "Max concurrent HTTP sessions (0 = unlimited)")
+	httpSSEPing := fs.Int("http-sse-ping-interval", 15, "Internal ping interval for SSE streams (seconds)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	version := fs.Bool("version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -163,14 +225,72 @@ func Load(args []string) (*Config, error) {
 		}
 		return envOrBool(envKey, flagVal)
 	}
-	resolveDuration := func(flagName, envKey string, flagVal int) time.Duration {
+	resolveDuration := func(flagName, envKey string, flagVal int) (time.Duration, error) {
 		if setFlags[flagName] {
-			return time.Duration(flagVal) * time.Second
+			return durationFromSeconds("--"+flagName, flagVal)
 		}
 		return envOrDuration(envKey, flagVal)
 	}
+	// resolveDurationWithAliases prefers the canonical env var name, falls
+	// back to one or more deprecated aliases, and prints a one-shot
+	// deprecation warning to stderr when an alias matches. CLI flag still
+	// wins when explicitly set.
+	resolveDurationWithAliases := func(flagName string, flagVal int, keys ...string) (time.Duration, error) {
+		if setFlags[flagName] {
+			return durationFromSeconds("--"+flagName, flagVal)
+		}
+		d, matched, err := envOrDurationWithAliases(flagVal, keys...)
+		if err != nil {
+			return 0, err
+		}
+		if matched != "" && matched != keys[0] {
+			fmt.Fprintf(os.Stderr,
+				"dflockd: env var %s is deprecated; please use %s instead\n",
+				matched, keys[0])
+		}
+		return d, nil
+	}
 
-	authTok, err := loadAuthToken(*authToken, *authTokenFile)
+	authTok, err := loadAuthToken(*authToken, setFlags["auth-token"], *authTokenFile, setFlags["auth-token-file"])
+	if err != nil {
+		return nil, err
+	}
+
+	defaultLeaseTTLDuration, err := resolveDuration("default-lease-ttl", "DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL)
+	if err != nil {
+		return nil, err
+	}
+	leaseSweepIntervalDuration, err := resolveDuration("lease-sweep-interval", "DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval)
+	if err != nil {
+		return nil, err
+	}
+	gcIntervalDuration, err := resolveDurationWithAliases("gc-interval", *gcInterval,
+		"DFLOCKD_GC_INTERVAL_S", "DFLOCKD_GC_LOOP_SLEEP")
+	if err != nil {
+		return nil, err
+	}
+	gcMaxIdleDuration, err := resolveDurationWithAliases("gc-max-idle", *gcMaxIdle,
+		"DFLOCKD_GC_MAX_IDLE_S", "DFLOCKD_GC_MAX_UNUSED_TIME")
+	if err != nil {
+		return nil, err
+	}
+	readTimeoutDuration, err := resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout)
+	if err != nil {
+		return nil, err
+	}
+	writeTimeoutDuration, err := resolveDuration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout)
+	if err != nil {
+		return nil, err
+	}
+	shutdownTimeoutDuration, err := resolveDuration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout)
+	if err != nil {
+		return nil, err
+	}
+	httpIdleDuration, err := resolveDuration("http-session-idle-timeout", "DFLOCKD_HTTP_SESSION_IDLE_S", *httpIdle)
+	if err != nil {
+		return nil, err
+	}
+	httpSSEPingDuration, err := resolveDuration("http-sse-ping-interval", "DFLOCKD_HTTP_SSE_PING_S", *httpSSEPing)
 	if err != nil {
 		return nil, err
 	}
@@ -178,21 +298,26 @@ func Load(args []string) (*Config, error) {
 	cfg := &Config{
 		Host:                    resolveString("host", "DFLOCKD_HOST", *host),
 		Port:                    resolveInt("port", "DFLOCKD_PORT", *port),
-		DefaultLeaseTTL:         resolveDuration("default-lease-ttl", "DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL),
-		LeaseSweepInterval:      resolveDuration("lease-sweep-interval", "DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval),
-		GCInterval:              resolveDuration("gc-interval", "DFLOCKD_GC_LOOP_SLEEP", *gcInterval),
-		GCMaxIdleTime:           resolveDuration("gc-max-idle", "DFLOCKD_GC_MAX_UNUSED_TIME", *gcMaxIdle),
+		DefaultLeaseTTL:         defaultLeaseTTLDuration,
+		LeaseSweepInterval:      leaseSweepIntervalDuration,
+		GCInterval:              gcIntervalDuration,
+		GCMaxIdleTime:           gcMaxIdleDuration,
 		MaxLocks:                resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks),
 		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
 		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
 		MaxSubscriptions:        resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions),
-		ReadTimeout:             resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout),
-		WriteTimeout:            resolveDuration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout),
-		ShutdownTimeout:         resolveDuration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout),
+		ReadTimeout:             readTimeoutDuration,
+		WriteTimeout:            writeTimeoutDuration,
+		ShutdownTimeout:         shutdownTimeoutDuration,
 		AutoReleaseOnDisconnect: resolveBool("auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease),
 		TLSCert:                 resolveString("tls-cert", "DFLOCKD_TLS_CERT", *tlsCert),
 		TLSKey:                  resolveString("tls-key", "DFLOCKD_TLS_KEY", *tlsKey),
 		AuthToken:               authTok,
+		HTTPPort:                resolveInt("http-port", "DFLOCKD_HTTP_PORT", *httpPort),
+		HTTPHost:                resolveString("http-host", "DFLOCKD_HTTP_HOST", *httpHost),
+		HTTPSessionIdleTimeout:  httpIdleDuration,
+		HTTPMaxSessions:         resolveInt("http-max-sessions", "DFLOCKD_HTTP_MAX_SESSIONS", *httpMaxSessions),
+		HTTPSSEPingInterval:     httpSSEPingDuration,
 		Debug:                   resolveBool("debug", "DFLOCKD_DEBUG", *debug),
 		Version:                 *version,
 	}
@@ -245,6 +370,21 @@ func (c *Config) validate() error {
 	}
 	if strings.ContainsAny(c.AuthToken, "\n\r") {
 		return fmt.Errorf("auth token must not contain newline characters")
+	}
+	if c.HTTPPort < 0 || c.HTTPPort > 65535 {
+		return fmt.Errorf("--http-port must be 0-65535 (got %d)", c.HTTPPort)
+	}
+	if c.HTTPPort != 0 && c.HTTPPort == c.Port {
+		return fmt.Errorf("--http-port (%d) must differ from --port", c.HTTPPort)
+	}
+	if c.HTTPSessionIdleTimeout < 0 {
+		return fmt.Errorf("--http-session-idle-timeout must be >= 0")
+	}
+	if c.HTTPMaxSessions < 0 {
+		return fmt.Errorf("--http-max-sessions must be >= 0")
+	}
+	if c.HTTPSSEPingInterval < 0 {
+		return fmt.Errorf("--http-sse-ping-interval must be >= 0")
 	}
 	return nil
 }

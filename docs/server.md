@@ -26,8 +26,8 @@ CLI flags take precedence over environment variables when explicitly set; otherw
 | `--port` | `DFLOCKD_PORT` | `6388` | Bind port |
 | `--default-lease-ttl` | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lease duration (seconds) |
 | `--lease-sweep-interval` | `DFLOCKD_LEASE_SWEEP_INTERVAL_S` | `1` | Lease expiry check interval (seconds) |
-| `--gc-interval` | `DFLOCKD_GC_LOOP_SLEEP` | `5` | Idle state GC interval (seconds) |
-| `--gc-max-idle` | `DFLOCKD_GC_MAX_UNUSED_TIME` | `60` | Seconds before idle state is pruned |
+| `--gc-interval` | `DFLOCKD_GC_INTERVAL_S`<sup>†</sup> | `5` | Idle state GC interval (seconds) |
+| `--gc-max-idle` | `DFLOCKD_GC_MAX_IDLE_S`<sup>†</sup> | `60` | Seconds before idle state is pruned |
 | `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max total lock and semaphore resource entries |
 | `--max-connections` | `DFLOCKD_MAX_CONNECTIONS` | `0` | Max concurrent connections (0 = unlimited) |
 | `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Max waiters per key (0 = unlimited) |
@@ -39,9 +39,11 @@ CLI flags take precedence over environment variables when explicitly set; otherw
 | `--tls-key` | `DFLOCKD_TLS_KEY` | *(unset)* | TLS private key PEM file |
 | `--auth-token` | `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for authentication |
 | `--auth-token-file` | `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | File containing the auth token |
-| `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release locks on disconnect |
+| `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release held locks/semaphore slots on disconnect |
 | `--version` | — | | Print version and exit |
 | `--debug` | `DFLOCKD_DEBUG` | `false` | Enable debug logging |
+
+<sup>†</sup> The legacy env var names `DFLOCKD_GC_LOOP_SLEEP` and `DFLOCKD_GC_MAX_UNUSED_TIME` are still accepted as deprecated aliases; a warning is printed to stderr on startup if they are used. Prefer the canonical names listed above.
 
 ## Tuning guide
 
@@ -107,10 +109,10 @@ GOMEMLIMIT=128MiB ./dflockd
 
 ### Auto release on disconnect
 
-When enabled (the default), the server automatically releases any locks held by a client when its TCP connection closes — whether gracefully or due to a crash. Pending waiters from that connection are also cancelled. The released lock is transferred to the next FIFO waiter, if any.
+When enabled (the default), the server automatically releases any locks or semaphore slots held by a client when its TCP connection closes — whether gracefully or due to a crash. Pending waiters and two-phase enqueue state from that connection are always cancelled. Released resources are transferred to the next FIFO waiter, if any.
 
 !!! warning
-    Disabling this means locks from disconnected clients will only be freed when their lease expires.
+    Disabling this affects only held locks and semaphore slots. Pending waiters and two-phase enqueue state are still cleaned up on disconnect, but held resources from disconnected clients are only freed when their leases expire.
 
 ## TLS
 
@@ -156,7 +158,7 @@ export DFLOCKD_AUTH_TOKEN_FILE=/run/secrets/dflockd-token
 ./dflockd
 ```
 
-Token resolution priority: `DFLOCKD_AUTH_TOKEN` env var > `--auth-token` flag > `--auth-token-file` flag > `DFLOCKD_AUTH_TOKEN_FILE` env var.
+Token resolution priority: explicit `--auth-token` flag > `DFLOCKD_AUTH_TOKEN` env var > explicit `--auth-token-file` flag > `DFLOCKD_AUTH_TOKEN_FILE` env var.
 
 When `--auth-token` is set, every new connection must send an `auth` command as its **first** message. If the token matches, the server responds with `ok` and the connection proceeds normally. If the token is wrong or a non-auth command is sent first, the server responds with `error_auth` and closes the connection.
 

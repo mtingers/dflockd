@@ -5,13 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"hash/fnv"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/config"
+	"github.com/mtingers/dflockd/internal/signal"
 )
 
 var (
@@ -136,9 +136,12 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 }
 
 func shardIndex(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() % numShards)
+	h := uint32(2166136261) // FNV-32a offset basis
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619 // FNV-32a prime
+	}
+	return int(h % numShards)
 }
 
 func (lm *LockManager) shardFor(key string) *shard {
@@ -190,8 +193,21 @@ func removeWaitersByConn(st *ResourceState, connID uint64, closed map[chan strin
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// connID == 0 is a sentinel meaning "skip per-connection bookkeeping" —
+// the caller is responsible for their own cleanup (explicit Release or
+// lease expiry). connAddOwned and connRemoveOwned must agree on this so
+// CleanupConnection(0) remains a correct no-op rather than leaking
+// entries that only ever got added.
+//
+// Today connSeq starts at 1 so no real connection uses 0; the sentinel is
+// reserved for potential transport-agnostic callers (e.g. test helpers)
+// that want to bypass the disconnect-cleanup path entirely.
+
 // connAddOwned adds a token to the shard's connOwned map. Must be called with sh.mu held.
 func (sh *shard) connAddOwned(connID uint64, key, token string) {
+	if connID == 0 {
+		return
+	}
 	m, ok := sh.connOwned[connID]
 	if !ok {
 		m = make(map[string]map[string]struct{})
@@ -236,32 +252,62 @@ func (lm *LockManager) grantNextWaiterLocked(sh *shard, key string, st *Resource
 		st.Waiters[st.WaiterHead] = nil // avoid memory leak
 		st.WaiterHead++
 		token := lm.newToken()
-		// Non-blocking send: if the channel is full the waiter is
-		// skipped.  Closed channels are not expected here (callers
-		// always remove the waiter from the queue before closing its
-		// channel), but we defend against it to avoid a panic.
-		func() {
-			defer func() { recover() }()
-			select {
-			case w.ch <- token:
-				st.Holders[token] = &holder{
-					connID:       w.connID,
-					leaseExpires: now.Add(w.leaseTTL),
-				}
-				st.LastActivity = now
-				sh.connAddOwned(w.connID, key, token)
-			default:
-			}
-		}()
+		// Non-blocking send: if the channel is full, the waiter isn't
+		// reading yet (it's still in flight to its select) — we skip
+		// this grant for them.
+		//
+		// A send on a closed channel would panic. Our protocol is that
+		// callers always remove the waiter from the queue before
+		// closing its channel (see removeWaitersByConn and the
+		// connEnqueued cleanup in CleanupConnection), so this path
+		// should be unreachable. We recover specifically from the send
+		// and log loudly if it ever fires — a silent recover here
+		// previously swallowed the invariant violation, leaving
+		// phantom holders if any map mutation below panicked too.
+		sent := lm.trySendGrant(w.ch, token, key, w.connID)
+		if !sent {
+			continue
+		}
+		eqKey := connKey{ConnID: w.connID, Key: key}
+		if es, ok := sh.connEnqueued[eqKey]; ok && es.waiter == w {
+			es.waiter = nil
+			es.token = token
+		}
+		st.Holders[token] = &holder{
+			connID:       w.connID,
+			leaseExpires: now.Add(w.leaseTTL),
+		}
+		st.LastActivity = now
+		sh.connAddOwned(w.connID, key, token)
 	}
 	st.compactWaiters()
+}
+
+// trySendGrant performs the potentially-closed-channel send in isolation.
+// Returns true if the token was delivered; false if the channel was full
+// or closed. A recovered panic is logged with key+connID so the
+// invariant-violation case doesn't go silent.
+func (lm *LockManager) trySendGrant(ch chan<- string, token, key string, connID uint64) (sent bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			lm.log.Error("grant send panicked (closed channel?)",
+				"key", key, "conn_id", connID, "recovered", r)
+			sent = false
+		}
+	}()
+	select {
+	case ch <- token:
+		return true
+	default:
+		return false
+	}
 }
 
 // evictExpiredLocked evicts any holders whose leases have expired and grants
 // freed slots to waiting callers. Must be called with sh.mu held.
 func (lm *LockManager) evictExpiredLocked(sh *shard, key string, st *ResourceState) {
 	now := time.Now()
-	var expired []string
+	anyExpired := false
 	for token, h := range st.Holders {
 		if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {
 			lm.log.Warn("evicting expired lease on acquire",
@@ -271,13 +317,11 @@ func (lm *LockManager) evictExpiredLocked(sh *shard, key string, st *ResourceSta
 			if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
 				delete(sh.connEnqueued, eqKey)
 			}
-			expired = append(expired, token)
+			delete(st.Holders, token)
+			anyExpired = true
 		}
 	}
-	for _, token := range expired {
-		delete(st.Holders, token)
-	}
-	if len(expired) > 0 {
+	if anyExpired {
 		st.LastActivity = now
 		lm.grantNextWaiterLocked(sh, key, st)
 	}
@@ -297,8 +341,19 @@ func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*Res
 		}
 		return st, nil
 	}
-	if lm.resourceCount() >= lm.cfg.MaxLocks {
-		return nil, ErrMaxLocks
+	// CAS loop to enforce MaxLocks as a hard cap. The prior version used
+	// a check-then-add pattern that two shards could race past, allowing
+	// resourceTotal to temporarily exceed MaxLocks. CAS here ensures
+	// that at most MaxLocks transitions 0→1 succeed across all shards.
+	maxLocks := int64(lm.cfg.MaxLocks)
+	for {
+		current := lm.resourceTotal.Load()
+		if current >= maxLocks {
+			return nil, ErrMaxLocks
+		}
+		if lm.resourceTotal.CompareAndSwap(current, current+1) {
+			break
+		}
 	}
 	st = &ResourceState{
 		Limit:        limit,
@@ -306,7 +361,6 @@ func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*Res
 		LastActivity: time.Now(),
 	}
 	sh.resources[key] = st
-	lm.resourceTotal.Add(1)
 	return st, nil
 }
 
@@ -384,7 +438,21 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		case token, ok := <-w.ch:
 			if ok && token != "" {
 				if s := sh.resources[key]; s != nil {
-					if _, ok := s.Holders[token]; ok {
+					if h, hOK := s.Holders[token]; hOK {
+						// If the PARENT ctx was cancelled (not just our
+						// timeoutCtx), the caller asked to abandon —
+						// they don't expect to end up holding a lock.
+						// Release the just-granted token and pass it to
+						// the next waiter instead of leaking it until
+						// lease expiry.
+						if ctx.Err() != nil {
+							sh.connRemoveOwned(h.connID, key, token)
+							delete(s.Holders, token)
+							s.LastActivity = time.Now()
+							lm.grantNextWaiterLocked(sh, key, s)
+							sh.mu.Unlock()
+							return "", ctx.Err()
+						}
 						s.LastActivity = time.Now()
 						sh.mu.Unlock()
 						return token, nil
@@ -546,6 +614,18 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 				now := time.Now()
 				if st := sh.resources[key]; st != nil {
 					if h, hOK := st.Holders[token]; hOK {
+						// Parent ctx cancelled: the caller is
+						// abandoning, don't hand them a lock they
+						// didn't know they'd hold. Release and pass
+						// the grant to the next waiter.
+						if ctx.Err() != nil {
+							sh.connRemoveOwned(h.connID, key, token)
+							delete(st.Holders, token)
+							st.LastActivity = now
+							lm.grantNextWaiterLocked(sh, key, st)
+							sh.mu.Unlock()
+							return "", 0, ctx.Err()
+						}
 						h.leaseExpires = now.Add(leaseTTL)
 						st.LastActivity = now
 						sh.mu.Unlock()
@@ -654,10 +734,6 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 // Safe to call after the connection handler exits — no new operations from
 // this connID are possible, so iterating shards one-at-a-time is correct.
 func (lm *LockManager) CleanupConnection(connID uint64) {
-	if !lm.cfg.AutoReleaseOnDisconnect {
-		return
-	}
-
 	closed := make(map[chan string]struct{})
 
 	for i := range lm.shards {
@@ -686,26 +762,30 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 			removeWaitersByConn(st, connID, closed)
 		}
 
-		// Release owned slots.
-		if owned, ok := sh.connOwned[connID]; ok {
-			for key, tokens := range owned {
-				st := sh.resources[key]
-				if st == nil {
-					continue
-				}
-				for token := range tokens {
-					h, ok := st.Holders[token]
-					if !ok || h.connID != connID {
+		// Release owned slots only when configured to do so. Pending
+		// waiters/enqueued state above are always cleaned; a disconnected
+		// waiter can never observe a later grant.
+		if lm.cfg.AutoReleaseOnDisconnect {
+			if owned, ok := sh.connOwned[connID]; ok {
+				for key, tokens := range owned {
+					st := sh.resources[key]
+					if st == nil {
 						continue
 					}
-					lm.log.Warn("disconnect cleanup: releasing",
-						"key", key, "conn_id", connID)
-					delete(st.Holders, token)
+					for token := range tokens {
+						h, ok := st.Holders[token]
+						if !ok || h.connID != connID {
+							continue
+						}
+						lm.log.Warn("disconnect cleanup: releasing",
+							"key", key, "conn_id", connID)
+						delete(st.Holders, token)
+					}
+					st.LastActivity = time.Now()
+					lm.grantNextWaiterLocked(sh, key, st)
 				}
-				st.LastActivity = time.Now()
-				lm.grantNextWaiterLocked(sh, key, st)
+				delete(sh.connOwned, connID)
 			}
-			delete(sh.connOwned, connID)
 		}
 
 		sh.mu.Unlock()
@@ -732,7 +812,7 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 				sh := &lm.shards[i]
 				sh.mu.Lock()
 				for key, st := range sh.resources {
-					var expired []string
+					anyExpired := false
 					for token, h := range st.Holders {
 						if h.leaseExpires.IsZero() {
 							continue
@@ -745,13 +825,11 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 							if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
 								delete(sh.connEnqueued, eqKey)
 							}
-							expired = append(expired, token)
+							delete(st.Holders, token)
+							anyExpired = true
 						}
 					}
-					for _, token := range expired {
-						delete(st.Holders, token)
-					}
-					if len(expired) > 0 {
+					if anyExpired {
 						st.LastActivity = now
 						lm.grantNextWaiterLocked(sh, key, st)
 					}
@@ -784,12 +862,12 @@ func (lm *LockManager) GCLoop(ctx context.Context) {
 						expired = append(expired, key)
 					}
 				}
+				if len(expired) > 0 {
+					lm.resourceTotal.Add(-int64(len(expired)))
+				}
 				for _, key := range expired {
 					lm.log.Debug("GC: pruning unused state", "key", key)
 					delete(sh.resources, key)
-				}
-				if len(expired) > 0 {
-					lm.resourceTotal.Add(-int64(len(expired)))
 				}
 				sh.mu.Unlock()
 			}
@@ -820,19 +898,19 @@ type IdleInfo struct {
 	IdleS float64 `json:"idle_s"`
 }
 
-type SignalChannelInfo struct {
-	Pattern   string `json:"pattern"`
-	Group     string `json:"group,omitempty"`
-	Listeners int    `json:"listeners"`
-}
+// SignalChannelInfo is an alias of the canonical type defined by the
+// signal package. Kept as a name-preserving alias so existing external
+// consumers of the lock package's Stats continue to compile; new code
+// should reference signal.ChannelInfo directly.
+type SignalChannelInfo = signal.ChannelInfo
 
 type Stats struct {
-	Connections    int64              `json:"connections"`
-	Locks          []LockInfo         `json:"locks"`
-	Semaphores     []SemInfo          `json:"semaphores"`
-	IdleLocks      []IdleInfo         `json:"idle_locks"`
-	IdleSemaphores []IdleInfo         `json:"idle_semaphores"`
-	SignalChannels []SignalChannelInfo `json:"signal_channels"`
+	Connections    int64                `json:"connections"`
+	Locks          []LockInfo           `json:"locks"`
+	Semaphores     []SemInfo            `json:"semaphores"`
+	IdleLocks      []IdleInfo           `json:"idle_locks"`
+	IdleSemaphores []IdleInfo           `json:"idle_semaphores"`
+	SignalChannels []signal.ChannelInfo `json:"signal_channels"`
 }
 
 // Stats returns a snapshot of the current lock manager state.
@@ -844,7 +922,7 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 		Semaphores:     []SemInfo{},
 		IdleLocks:      []IdleInfo{},
 		IdleSemaphores: []IdleInfo{},
-		SignalChannels: []SignalChannelInfo{},
+		SignalChannels: []signal.ChannelInfo{},
 	}
 
 	for i := range lm.shards {

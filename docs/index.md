@@ -7,7 +7,7 @@ A lightweight distributed lock server using a simple line-based TCP protocol wit
 - **Strict FIFO ordering** — waiters are granted locks in the order they enqueue, per key
 - **Two-phase lock acquisition** — split enqueue and wait to notify external systems between joining the queue and blocking
 - **Automatic lease expiry** — held locks expire if not renewed, preventing deadlocks
-- **Disconnect cleanup** — locks are released automatically when a client disconnects
+- **Disconnect cleanup** — held locks and semaphore slots are released automatically when a client disconnects, unless that safety net is disabled
 - **Pub/sub signals** — publish messages to channels with wildcard pattern matching (`*`, `>`) and optional queue groups for load-balanced delivery
 - **Zero dependencies** — single Go binary
 - **Go client library** — high-level `Lock` type with automatic renewal and sharding, plus low-level protocol API
@@ -29,7 +29,7 @@ abc123...
 ok
 ```
 
-Locks are auto-released on disconnect, so the connection must stay open.
+By default, locks are auto-released on disconnect, so the connection must stay open.
 
 ## Performance
 

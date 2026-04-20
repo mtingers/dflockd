@@ -2,31 +2,41 @@
 
 ## Overview
 
-dflockd is a single-process Go server that manages named locks with FIFO ordering, automatic lease expiry, garbage collection of idle state, and pub/sub signal delivery.
+dflockd is a single-process Go server that manages named locks with FIFO ordering, automatic lease expiry, garbage collection of idle state, and pub/sub signal delivery. The core lock manager is shared across two transports — the native line-based TCP protocol and an optional HTTP REST + SSE layer — so contenders on the same key are ordered together regardless of how they connected.
 
 ```
-┌───────────┐    TCP     ┌─────────────────────────────────────┐
-│ Go client │◄──────────►│            dflockd server           │
-│ (client/) │  line-     │                                     │
-│           │  based     │  ┌──────────┐  ┌────────────────┐   │
-└───────────┘  UTF-8     │  │  Lock    │  │  Background    │   │
-                         │  │  State   │  │  Goroutines    │   │
-┌───────────┐            │  │          │  │                │   │
-│ TCP client│◄──────────►│  │  key →   │  │  • lease       │   │
-│ (any lang)│            │  │   owner  │  │    expiry      │   │
-└───────────┘            │  │   waiter │  │  • lock GC     │   │
-                         │  │   queue  │  │                │   │
-                         │  ├──────────┤  └────────────────┘   │
-                         │  │  Signal  │                       │
-                         │  │  Manager │                       │
-                         │  │          │                       │
-                         │  │  pattern→│                       │
-                         │  │  listener│                       │
-                         │  └──────────┘                       │
-                         └─────────────────────────────────────┘
+┌───────────┐    TCP     ┌────────────────────────────────────────┐
+│ Go client │◄──────────►│             dflockd server             │
+│ (client/) │  line-     │                                        │
+│           │  based     │  ┌──────────┐  ┌────────────────────┐  │
+└───────────┘  UTF-8     │  │  Lock    │  │  Background        │  │
+                         │  │  Manager │  │  Goroutines        │  │
+┌───────────┐            │  │          │  │                    │  │
+│ TCP client│◄──────────►│  │  key →   │  │  • lease expiry    │  │
+│ (any lang)│            │  │   owner  │  │  • state GC        │  │
+└───────────┘            │  │   waiter │  │  • HTTP session    │  │
+                         │  │   queue  │  │    sweeper         │  │
+┌───────────┐   HTTP/    │  ├──────────┤  └────────────────────┘  │
+│ HTTP      │   SSE      │  │  Signal  │                          │
+│ client    │◄──────────►│  │  Manager │  ┌────────────────────┐  │
+│ (curl,    │            │  │          │  │  HTTP bridge       │  │
+│  webhook, │            │  │  pattern→│◄─┤  (internal/httpapi)│  │
+│  codegen) │            │  │  listener│  │                    │  │
+└───────────┘            │  └──────────┘  │  session map →     │  │
+                         │                │   net.Pipe →       │  │
+                         │                │   ServeConn        │  │
+                         │                └────────────────────┘  │
+                         └────────────────────────────────────────┘
 ```
 
-An in-repo Go client (`github.com/mtingers/dflockd/client`) provides a high-level `Lock` type with automatic lease renewal and CRC32-based sharding, as well as low-level protocol functions. External clients exist for [Python](https://github.com/mtingers/dflockd-client-py) and [TypeScript](https://github.com/mtingers/dflockd-client-ts). Any TCP client that speaks the line-based protocol can also interact with the server directly.
+### Transports
+
+- **Native TCP protocol.** Line-based UTF-8 (`command\nkey\narg\n`). Each request is three lines; responses are one line plus asynchronous `sig ...` push frames on signal subscriptions. Lock ownership is tied to the TCP connection — locks auto-release on disconnect when enabled.
+- **HTTP REST + SSE (optional).** Enabled with `--http-port`. Every HTTP session owns an in-process virtual connection (`net.Pipe`) that feeds into the same `ServeConn` handler used by TCP. The bridge is a pure translation layer: HTTP requests become protocol lines, responses become JSON, and SSE streams fan out `sig ...` push frames as `text/event-stream` events. Because both transports share one `LockManager`, a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.
+
+### Clients
+
+An in-repo Go client (`github.com/mtingers/dflockd/client`) provides a high-level `Lock` type with automatic lease renewal and CRC32-based sharding, as well as low-level protocol functions. External clients exist for [Python](https://github.com/mtingers/dflockd-client-py) and [TypeScript](https://github.com/mtingers/dflockd-client-ts). Any TCP client that speaks the line-based protocol can also interact with the server directly; any HTTP client can use the REST + SSE layer (see the [HTTP API reference](../http-api.md) and [OpenAPI spec](../openapi.json)).
 
 ## Resource state
 
@@ -61,7 +71,7 @@ The two-phase flow splits acquisition into enqueue (`e`) and wait (`w`), allowin
 7. Otherwise, the client blocks until the lock is granted or timeout elapses.
 8. On success, the lease is reset to `now + lease_ttl_s`, giving the client the full TTL from the moment `w` returns.
 
-The two-phase flow uses an `EnqueuedState` tracked per `(conn_id, key)`. This state is cleaned up on disconnect, timeout, or successful wait.
+The two-phase flow uses an `enqueuedState` tracked per `(conn_id, key)`. This state is cleaned up on disconnect, timeout, or successful wait.
 
 ## Background goroutines
 
@@ -116,21 +126,32 @@ If a listener's write buffer is full, its connection is cancelled (slow consumer
 
 All signal subscriptions for a connection are automatically removed on disconnect via `UnlistenAll`.
 
+## HTTP bridge
+
+When `--http-port` is set, `internal/httpapi` runs alongside the TCP listener. Each HTTP session maps to:
+
+- A 32-char hex session ID (minted by the server from `crypto/rand`, sent back to the client on `POST /v1/sessions`).
+- A `net.Pipe()` pair — the server end is handed to `ServeConn`, which treats it identically to a TCP connection.
+- A multiplexer goroutine that splits response lines from async `sig ...` push frames for SSE.
+- A unique `connID` from the same `connSeq` counter the TCP accept loop uses, so cross-transport FIFO holds.
+
+Sessions have three teardown paths: explicit `DELETE /v1/sessions/{id}`, the virtual connection's read timeout (same as TCP), and the bridge's idle-session sweeper (which skips sessions with in-flight HTTP commands). See the [HTTP API reference](../http-api.md) for flow details and the [OpenAPI spec](../openapi.json) for the full contract.
+
 ## Connection cleanup
 
-When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), the server performs cleanup when a TCP connection closes (graceful or abrupt):
+When a TCP connection or an HTTP-bridge virtual connection closes (graceful or abrupt), the server performs cleanup for that connection:
 
-1. Cleans up any two-phase enqueued state for the connection, cancelling pending waiters and removing them from lock queues.
+1. Cleans up any two-phase enqueued state for the connection, cancelling pending waiters and removing them from queues.
 2. Cancels any pending waiter futures belonging to that connection.
-3. Releases any locks held by that connection.
-4. Transfers released locks to the next FIFO waiter, if any.
+3. When `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` is enabled (the default), releases any locks or semaphore slots held by that connection.
+4. Transfers released resources to the next FIFO waiter, if any.
 
-If disabled, locks from disconnected clients are only freed when their lease expires.
+If disabled, held locks and semaphore slots from disconnected clients are only freed when their leases expire. Pending waiters and two-phase enqueue state are still removed immediately because a disconnected waiter cannot observe a later grant.
 
 ## Concurrency model
 
-Lock state is distributed across 64 shards, keyed by `fnv32a(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map, so operations on different keys rarely contend. A separate `connMu` mutex protects connection-level tracking (`connOwned`, `connEnqueued`).
+Lock state is distributed across 64 shards, keyed by `fnv32a(key) % 64`. Each shard has its own `sync.Mutex` protecting its `resources` map plus the per-connection indexes for keys in that shard (`connOwned`, `connEnqueued`). Operations on different shards rarely contend.
 
-**Lock ordering protocol:** `connMu` is always acquired before any shard lock. Two shard locks are never held simultaneously. This prevents deadlocks while allowing high concurrency across keys.
+Operations hold at most one shard lock at a time. Connection cleanup and background loops iterate shards sequentially, so there is no cross-shard lock ordering requirement.
 
-Each client connection is handled in its own goroutine. On the fast path (uncontended acquire), only the relevant shard lock and `connMu` are held briefly. Background loops (lease expiry, GC) iterate shards sequentially, locking one at a time.
+Each client connection is handled in its own goroutine. On the fast path (uncontended acquire), only the relevant shard lock is held briefly. Background loops (lease expiry, GC) iterate shards sequentially, locking one at a time.

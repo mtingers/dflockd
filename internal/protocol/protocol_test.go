@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,6 +119,49 @@ func TestReadRequest_ZeroLease(t *testing.T) {
 	pe, ok := err.(*ProtocolError)
 	if !ok || pe.Code != 9 {
 		t.Fatalf("expected code 9, got %v", err)
+	}
+}
+
+func TestReadRequest_RejectsSecondsOverflow(t *testing.T) {
+	tooLarge := strconv.FormatInt(maxSecondsValue+1, 10)
+
+	cases := []struct {
+		name string
+		cmd  string
+		arg  string
+		code int
+	}{
+		{name: "lock timeout", cmd: "l", arg: tooLarge, code: 6},
+		{name: "lock lease", cmd: "l", arg: "10 " + tooLarge, code: 9},
+		{name: "enqueue lease", cmd: "e", arg: tooLarge, code: 9},
+		{name: "wait timeout", cmd: "w", arg: tooLarge, code: 6},
+		{name: "sem timeout", cmd: "sl", arg: tooLarge + " 2", code: 6},
+		{name: "sem lease", cmd: "sl", arg: "10 2 " + tooLarge, code: 9},
+		{name: "sem enqueue lease", cmd: "se", arg: "2 " + tooLarge, code: 9},
+		{name: "sem wait timeout", cmd: "sw", arg: tooLarge, code: 6},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := makeReader(tc.cmd, "k", tc.arg)
+			_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+			pe, ok := err.(*ProtocolError)
+			if !ok || pe.Code != tc.code {
+				t.Fatalf("expected code %d, got %v", tc.code, err)
+			}
+		})
+	}
+}
+
+func TestReadRequest_AllowsMaxSecondsValue(t *testing.T) {
+	maxSeconds := strconv.FormatInt(maxSecondsValue, 10)
+	r := makeReader("w", "k", maxSeconds)
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.AcquireTimeout != time.Duration(maxSecondsValue)*time.Second {
+		t.Fatalf("timeout: got %v", req.AcquireTimeout)
 	}
 }
 
@@ -583,6 +627,30 @@ func TestReadRequest_SignalEmptyPayload(t *testing.T) {
 	pe, ok := err.(*ProtocolError)
 	if !ok || pe.Code != 8 {
 		t.Fatalf("expected code 8, got %v", err)
+	}
+}
+
+func TestReadRequest_SignalRejectsPayloadThatWouldOverflowPushFrame(t *testing.T) {
+	channel := "events.test"
+	payload := strings.Repeat("x", MaxSignalPayloadBytes(channel)+1)
+	r := makeReader("signal", channel, payload)
+	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	pe, ok := err.(*ProtocolError)
+	if !ok || pe.Code != 8 {
+		t.Fatalf("expected code 8, got %v", err)
+	}
+}
+
+func TestReadRequest_SignalAllowsMaxPushFramePayload(t *testing.T) {
+	channel := "events.test"
+	payload := strings.Repeat("x", MaxSignalPayloadBytes(channel))
+	r := makeReader("signal", channel, payload)
+	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Value != payload {
+		t.Fatalf("payload length: got %d want %d", len(req.Value), len(payload))
 	}
 }
 
