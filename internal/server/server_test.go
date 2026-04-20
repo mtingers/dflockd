@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2620,5 +2621,103 @@ func TestIntegration_LockAndSemaphoreSameKey(t *testing.T) {
 	}
 	if !foundSem {
 		t.Fatal("stats should show 'shared-key' in semaphores")
+	}
+}
+
+// TestContendedAcquireDoesNotDeadlockOnPeerWatcher exercises the regression
+// fixed in stopPeerWatch: when many workers contend on one key, each grant
+// response went through stopPeerWatch → <-done → waiting for the watcher's
+// Peek to complete its 50ms deadline. That added up to 50ms per blocking
+// response, and once per-round wait exceeded the watcher's 10ms initial
+// delay the slowdown was self-reinforcing (longer wait → more handlers
+// entering the peek loop → longer wait). At 150+ workers on a single key
+// the bench used to stall indefinitely.
+//
+// The fix forces the in-flight Peek to return immediately via
+// conn.SetReadDeadline(aLongTimeAgo). This test verifies the full round-trip
+// completes in well under the pre-fix worst case.
+func TestContendedAcquireDoesNotDeadlockOnPeerWatcher(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	const (
+		workers = 150
+		rounds  = 30
+	)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	startCh := make(chan struct{})
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				errCh <- fmt.Errorf("dial: %w", err)
+				return
+			}
+			defer conn.Close()
+			reader := bufio.NewReader(conn)
+			<-startCh
+			for r := 0; r < rounds; r++ {
+				msg := "l\ncontended\n30\n"
+				if _, err := conn.Write([]byte(msg)); err != nil {
+					errCh <- fmt.Errorf("write l: %w", err)
+					return
+				}
+				if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+					errCh <- fmt.Errorf("deadline: %w", err)
+					return
+				}
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					errCh <- fmt.Errorf("read l: %w", err)
+					return
+				}
+				fields := strings.Fields(strings.TrimRight(line, "\r\n"))
+				if len(fields) < 2 || fields[0] != "ok" {
+					errCh <- fmt.Errorf("unexpected l response: %q", line)
+					return
+				}
+				token := fields[1]
+				rel := "r\ncontended\n" + token + "\n"
+				if _, err := conn.Write([]byte(rel)); err != nil {
+					errCh <- fmt.Errorf("write r: %w", err)
+					return
+				}
+				line, err = reader.ReadString('\n')
+				if err != nil {
+					errCh <- fmt.Errorf("read r: %w", err)
+					return
+				}
+				if got := strings.TrimRight(line, "\r\n"); got != "ok" {
+					errCh <- fmt.Errorf("unexpected r response: %q", got)
+					return
+				}
+			}
+		}()
+	}
+
+	start := time.Now()
+	close(startCh)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	// Pre-fix behavior at this scale was observed at ~50ms/op serialized,
+	// i.e. 150*30*50ms ≈ 225s. The post-fix expectation is well under 10s;
+	// 15s is a generous ceiling that still catches the deadlock.
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("contended run stalled beyond 15s (elapsed %s) — peer watcher deadlock regression", time.Since(start))
+	}
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
 	}
 }

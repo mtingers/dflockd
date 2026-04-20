@@ -299,10 +299,22 @@ func watchPeerClose(reader *bufio.Reader, conn net.Conn, cancelConn func()) func
 
 	return func() {
 		close(stop)
+		// Force any in-flight reader.Peek to return immediately. Without
+		// this, the watcher sits in Peek until its 50ms poll deadline
+		// fires before it can observe `close(stop)` — up to 50ms of
+		// added latency on every blocking command response. Under heavy
+		// contention that overhead feeds back (longer responses →
+		// longer queue waits → more watchers cross the 10ms initial
+		// delay → more peek loops), collapsing throughput.
+		_ = conn.SetReadDeadline(aLongTimeAgo)
 		<-done
 		_ = conn.SetReadDeadline(time.Time{})
 	}
 }
+
+// aLongTimeAgo is a sentinel past time used to force an in-flight read to
+// return with a timeout immediately. Same pattern used in net/http.
+var aLongTimeAgo = time.Unix(1, 0)
 
 // NextConnID allocates a new connection ID from the shared counter.
 // Used by alternate transports (e.g. the HTTP bridge) that mint their
