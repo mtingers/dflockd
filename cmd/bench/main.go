@@ -27,12 +27,14 @@ import (
 func main() {
 	workers := flag.Int("workers", 10, "number of concurrent workers")
 	rounds := flag.Int("rounds", 50, "acquire/release rounds per worker")
-	key := flag.String("key", "bench", "lock key")
+	key := flag.String("key", "bench", "lock key (used as a prefix unless --shared-key is set)")
 	timeout := flag.Int("timeout", 30, "acquire timeout in seconds")
 	servers := flag.String("servers", "127.0.0.1:6388", "comma-separated host:port pairs")
 	leaseTTL := flag.Int("lease", 10, "lease TTL in seconds")
 	connections := flag.Int("connections", 0, "connections per worker (0 = 1 persistent conn per worker)")
 	warmup := flag.Int("warmup", 10, "warmup rounds per worker (not measured)")
+	sharedKey := flag.Bool("shared-key", false, "all workers contend on the literal --key value (measures single-key throughput). "+
+		"Default is to append the worker ID, so workers use unique keys and throughput scales with sharding.")
 	flag.Parse()
 
 	addrs, connsPerWorker, err := validateBenchFlags(*workers, *rounds, *timeout, *leaseTTL, *connections, *warmup, *servers)
@@ -41,8 +43,14 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d)\n\n",
-		*workers, *rounds, *key, connsPerWorker)
+	mode := "unique per-worker keys"
+	displayKey := *key + "_<id>"
+	if *sharedKey {
+		mode = "shared key (contended)"
+		displayKey = *key
+	}
+	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d, %s)\n\n",
+		*workers, *rounds, displayKey, connsPerWorker, mode)
 
 	type result struct {
 		latencies []float64
@@ -60,8 +68,9 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			workerKey := workerKeyFor(*key, id, *sharedKey)
 			addr := addrs[id%len(addrs)]
-			lats, err := worker(*key, addr, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
+			lats, err := worker(workerKey, addr, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
 			results[id] = result{latencies: lats, err: err}
 		}(i)
 	}
@@ -107,6 +116,17 @@ func main() {
 	fmt.Printf("  p50       : %.3f ms\n", p50*1000)
 	fmt.Printf("  p99       : %.3f ms\n", p99*1000)
 	fmt.Printf("  stdev     : %.3f ms\n", sd*1000)
+}
+
+// workerKeyFor picks the lock key for a given worker id. When shared is
+// true every worker contends on the same literal key (measures single-key
+// throughput). Otherwise the worker id is appended so each worker has its
+// own key and throughput scales with the server's shard count.
+func workerKeyFor(baseKey string, id int, shared bool) string {
+	if shared {
+		return baseKey
+	}
+	return fmt.Sprintf("%s_%d", baseKey, id)
 }
 
 func validateBenchFlags(workers, rounds, timeoutSec, leaseTTL, connections, warmup int, servers string) ([]string, int, error) {

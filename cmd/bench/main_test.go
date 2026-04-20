@@ -50,3 +50,18 @@ func TestValidateBenchFlagsDefaultsConnections(t *testing.T) {
 		t.Fatalf("addrs: %#v", addrs)
 	}
 }
+
+func TestWorkerKeyFor(t *testing.T) {
+	if got := workerKeyFor("bench", 0, false); got != "bench_0" {
+		t.Fatalf("unique id=0: got %q want bench_0", got)
+	}
+	if got := workerKeyFor("bench", 42, false); got != "bench_42" {
+		t.Fatalf("unique id=42: got %q want bench_42", got)
+	}
+	if got := workerKeyFor("bench", 0, true); got != "bench" {
+		t.Fatalf("shared id=0: got %q want bench", got)
+	}
+	if got := workerKeyFor("bench", 42, true); got != "bench" {
+		t.Fatalf("shared id=42: got %q want bench", got)
+	}
+}
