@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Build: prefer Go 1.26.2 toolchain.** This clears reachable standard-library TLS/x509 findings reported by `govulncheck` against Go 1.26.1.
+
 ### Fixed
 
 - **Config: auth token source precedence now matches documented CLI-first behavior.** Explicit values resolve as `--auth-token` > `--auth-token-file` > `DFLOCKD_AUTH_TOKEN` > `DFLOCKD_AUTH_TOKEN_FILE`; direct token values and token files are trimmed of surrounding whitespace, and empty tokens are rejected.
