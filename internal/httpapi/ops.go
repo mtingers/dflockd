@@ -68,12 +68,29 @@ func (h *httpServer) withCORS(next http.Handler) http.Handler {
 // Rate and connection limiting
 // ---------------------------------------------------------------------------
 
+// rateBucketIdleEviction is how long a per-IP bucket may sit untouched
+// before the sweeper drops it. After this much idle time the bucket has
+// already refilled to full burst, so deleting it is equivalent to keeping
+// it (the next allow() recreates it with burst-1 tokens, the same value a
+// "still-here" bucket would observe after consuming one token).
+const rateBucketIdleEviction = 10 * time.Minute
+
+// rateBucketSweepInterval is how often the sweeper scans the map. Picked
+// to amortise the linear pass over many buckets without letting memory
+// grow unboundedly between sweeps. Worst-case retention for an idle
+// bucket is rateBucketIdleEviction + rateBucketSweepInterval.
+const rateBucketSweepInterval = 5 * time.Minute
+
 type httpRateLimiter struct {
 	rate  float64
 	burst float64
 
 	mu      sync.Mutex
 	buckets map[string]*rateBucket
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	done     chan struct{}
 }
 
 type rateBucket struct {
@@ -88,11 +105,15 @@ func newHTTPRateLimiter(rate, burst int) *httpRateLimiter {
 	if burst <= 0 {
 		burst = rate
 	}
-	return &httpRateLimiter{
+	l := &httpRateLimiter{
 		rate:    float64(rate),
 		burst:   float64(burst),
 		buckets: make(map[string]*rateBucket),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
+	go l.sweepLoop()
+	return l
 }
 
 func (l *httpRateLimiter) allow(ip string, now time.Time) bool {
@@ -116,6 +137,43 @@ func (l *httpRateLimiter) allow(ip string, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// sweep removes buckets whose `last` is older than rateBucketIdleEviction
+// before `now`. Bounded by len(buckets) per call.
+func (l *httpRateLimiter) sweep(now time.Time) {
+	cutoff := now.Add(-rateBucketIdleEviction)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for ip, b := range l.buckets {
+		if b.last.Before(cutoff) {
+			delete(l.buckets, ip)
+		}
+	}
+}
+
+func (l *httpRateLimiter) sweepLoop() {
+	defer close(l.done)
+	t := time.NewTicker(rateBucketSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-l.stop:
+			return
+		case now := <-t.C:
+			l.sweep(now)
+		}
+	}
+}
+
+// Stop terminates the sweeper goroutine and waits for it to exit. Safe
+// to call on a nil receiver and idempotent across repeat calls.
+func (l *httpRateLimiter) Stop() {
+	if l == nil {
+		return
+	}
+	l.stopOnce.Do(func() { close(l.stop) })
+	<-l.done
 }
 
 func (h *httpServer) withRateLimit(next http.Handler) http.Handler {

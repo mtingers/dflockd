@@ -289,6 +289,55 @@ func TestMetricsEndpointEmitsPrometheus(t *testing.T) {
 	}
 }
 
+func TestHTTPRateLimiterEvictsIdleBuckets(t *testing.T) {
+	l := newHTTPRateLimiter(10, 10)
+	defer l.Stop()
+
+	base := time.Now()
+	if !l.allow("192.0.2.10", base) {
+		t.Fatal("first allow should succeed")
+	}
+	if !l.allow("192.0.2.11", base) {
+		t.Fatal("first allow should succeed")
+	}
+
+	bucketCount := func() int {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return len(l.buckets)
+	}
+
+	if got := bucketCount(); got != 2 {
+		t.Fatalf("buckets after allows: got %d want 2", got)
+	}
+
+	// Sweep with cutoff before any activity — nothing should be evicted.
+	l.sweep(base)
+	if got := bucketCount(); got != 2 {
+		t.Fatalf("after no-op sweep: got %d want 2", got)
+	}
+
+	// Sweep with `now` past the eviction threshold — both buckets removed.
+	l.sweep(base.Add(rateBucketIdleEviction + time.Second))
+	if got := bucketCount(); got != 0 {
+		t.Fatalf("after eviction sweep: got %d want 0", got)
+	}
+
+	// Recreating a bucket after eviction must behave identically to the
+	// first allow (full burst minus one), so a freshly-resurrected IP isn't
+	// punished for the sweeper having run.
+	if !l.allow("192.0.2.10", base.Add(rateBucketIdleEviction+2*time.Second)) {
+		t.Fatal("post-eviction allow should succeed with full burst")
+	}
+}
+
+func TestHTTPRateLimiterStopIsIdempotentAndNilSafe(t *testing.T) {
+	(*httpRateLimiter)(nil).Stop() // must not panic on nil receiver
+	l := newHTTPRateLimiter(1, 1)
+	l.Stop()
+	l.Stop() // second Stop must be a no-op, not a panic
+}
+
 func TestHTTPRateLimitPerIP(t *testing.T) {
 	cfg := testConfig()
 	cfg.HTTPRateLimitPerIP = 1

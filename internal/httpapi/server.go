@@ -94,6 +94,7 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 		metrics: newMetricsRegistry(),
 		limiter: newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
 	}
+	defer hs.limiter.Stop() // safe on nil receiver if rate limiting is disabled
 
 	mux := http.NewServeMux()
 	hs.registerRoutes(mux)
