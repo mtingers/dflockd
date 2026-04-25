@@ -45,11 +45,12 @@ type Config struct {
 	HTTPCORSAllowedOrigins  []string
 
 	// Replication (opt-in; ReplicationRole=="" disables).
-	ReplicationRole       string        // "primary" | "secondary" | "" (standalone)
-	ReplicationPeerAddr   string        // primary: where the secondary listens; secondary: ignored
-	ReplicationListenAddr string        // secondary: where the primary connects; primary: ignored
-	ReplicationMaxPause   time.Duration // 0 → 5s
-	ReplicationNodeID     string        // optional; auto-derived from --host:--port if empty
+	ReplicationRole        string        // "primary" | "secondary" | "witness" | "" (standalone)
+	ReplicationPeerAddr    string        // primary: where the secondary listens; secondary: ignored
+	ReplicationListenAddr  string        // secondary or witness: where to listen; primary: ignored
+	ReplicationMaxPause    time.Duration // 0 → 5s
+	ReplicationNodeID      string        // optional; auto-derived from --host:--port if empty
+	ReplicationWitnessAddr string        // optional; primary/secondary connect here for auto-failover voting
 }
 
 // envLookup returns the first non-empty env value from the given keys,
@@ -244,6 +245,7 @@ func Load(args []string) (*Config, error) {
 	replicationListenAddr := fs.String("replication-listen", "", "Secondary only: address (host:port) to listen on for the primary's replication connection")
 	replicationMaxPauseMS := fs.Int("max-pause-ms", 5000, "Replication: ms with no peer contact before primary self-promotes to solo")
 	replicationNodeID := fs.String("replication-node-id", "", "Replication: free-form node identifier (auto-derived if empty)")
+	replicationWitnessAddr := fs.String("replication-witness", "", "Replication: witness daemon address (host:port). When set on primary/secondary, enables witness-mediated auto-failover.")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	version := fs.Bool("version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -385,6 +387,7 @@ func Load(args []string) (*Config, error) {
 		ReplicationListenAddr:   resolveString("replication-listen", "DFLOCKD_REPLICATION_LISTEN", *replicationListenAddr),
 		ReplicationMaxPause:     time.Duration(resolveInt("max-pause-ms", "DFLOCKD_MAX_PAUSE_MS", *replicationMaxPauseMS)) * time.Millisecond,
 		ReplicationNodeID:       resolveString("replication-node-id", "DFLOCKD_REPLICATION_NODE_ID", *replicationNodeID),
+		ReplicationWitnessAddr:  resolveString("replication-witness", "DFLOCKD_REPLICATION_WITNESS", *replicationWitnessAddr),
 		Debug:                   resolveBool("debug", "DFLOCKD_DEBUG", *debug),
 		Version:                 *version,
 	}
@@ -482,17 +485,18 @@ func (c *Config) Validate() error {
 			c.HTTPSSEPingInterval, c.HTTPSessionIdleTimeout)
 	}
 	switch c.ReplicationRole {
-	case "", "primary", "secondary":
-	case "witness":
-		return fmt.Errorf("--replication-role=witness is reserved for a future release; not implemented")
+	case "", "primary", "secondary", "witness":
 	default:
-		return fmt.Errorf("--replication-role must be one of: primary, secondary, '' (got %q)", c.ReplicationRole)
+		return fmt.Errorf("--replication-role must be one of: primary, secondary, witness, '' (got %q)", c.ReplicationRole)
 	}
 	if c.ReplicationRole == "primary" && c.ReplicationPeerAddr == "" {
 		return fmt.Errorf("--replication-role=primary requires --replication-peer")
 	}
 	if c.ReplicationRole == "secondary" && c.ReplicationListenAddr == "" {
 		return fmt.Errorf("--replication-role=secondary requires --replication-listen")
+	}
+	if c.ReplicationRole == "witness" && c.ReplicationListenAddr == "" {
+		return fmt.Errorf("--replication-role=witness requires --replication-listen")
 	}
 	if c.ReplicationMaxPause < 0 {
 		return fmt.Errorf("--max-pause-ms must be >= 0")

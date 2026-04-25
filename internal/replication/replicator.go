@@ -109,6 +109,13 @@ type Config struct {
 	// Optional on the secondary. nil on a pure secondary.
 	Snapshotter Snapshotter
 
+	// WitnessAddr, when non-empty, enables witness-mediated
+	// auto-failover. Both primary and secondary connect to the
+	// witness and heartbeat. On peer loss, the secondary asks the
+	// witness for liveness; if the witness agrees the primary is
+	// gone, the secondary auto-promotes (without operator action).
+	WitnessAddr string
+
 	Log *slog.Logger
 }
 
@@ -124,6 +131,13 @@ const outboundBufSize = 4096
 // NewReplicator, call Start to spawn its goroutines, and Stop on
 // shutdown. It implements the Hook interface so the lock manager can
 // publish mutations directly to it.
+//
+// Lifecycle: Start() spawns a "loop" appropriate to the configured
+// role (primary dial loop, or secondary listener accept loop).
+// Promote(newPeer) tears down the current loop and starts a fresh
+// primary loop with the supplied peer address (or no loop if
+// newPeer=="" — Solo mode). All loops run under a context derived
+// from the rootCtx supplied to Start; Stop() cancels it and waits.
 type Replicator struct {
 	cfg Config
 	log *slog.Logger
@@ -139,9 +153,20 @@ type Replicator struct {
 	// Sync replication: callers waiting for a specific seq to be acked.
 	ackedSeq atomic.Uint64
 
+	// Loop lifecycle. loopMu serialises Start / Promote / Stop so
+	// concurrent calls don't double-spawn. loopCancel terminates the
+	// currently-running loop's context; loopWg waits for it to exit.
+	loopMu     sync.Mutex
+	rootCtx    context.Context
+	loopCancel context.CancelFunc
+	loopWg     sync.WaitGroup
+
+	// witness is the optional client to a witness daemon. When set,
+	// the secondary's failover path consults it before auto-promoting.
+	witness *witnessClient
+
 	stopOnce sync.Once
 	stop     chan struct{}
-	done     chan struct{}
 }
 
 // NewReplicator creates a configured replicator without starting it.
@@ -161,24 +186,78 @@ func NewReplicator(cfg Config) *Replicator {
 		state:    StateInit,
 		outbound: make(chan *Op, outboundBufSize),
 		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
 	}
 	return r
 }
 
-// Start spawns the replicator's worker goroutines. Returns nil if the
-// replicator started cleanly. On the secondary side it begins
-// listening on cfg.ListenAddr immediately; on the primary side it
-// begins dialling cfg.PeerAddr in a loop.
+// Start spawns the replicator's worker goroutines for the configured
+// role. The supplied ctx is the root context — it bounds the
+// replicator's overall lifetime. Loop lifecycles within that root
+// (e.g. across Promote calls) use child contexts and are tracked by
+// the internal WaitGroup.
 func (r *Replicator) Start(ctx context.Context) error {
-	switch r.cfg.Role {
+	r.loopMu.Lock()
+	defer r.loopMu.Unlock()
+	r.rootCtx = ctx
+	r.mu.Lock()
+	witnessAddr := r.cfg.WitnessAddr
+	tlsCfg := r.cfg.TLSConfig
+	role := r.cfg.Role
+	nodeID := r.cfg.NodeID
+	epoch := r.epoch
+	r.mu.Unlock()
+	if witnessAddr != "" {
+		wc := newWitnessClient(witnessAddr, tlsCfg, role, nodeID, epoch, r.log)
+		wc.Start(ctx)
+		r.mu.Lock()
+		r.witness = wc
+		r.mu.Unlock()
+	}
+	return r.startLoopLocked()
+}
+
+// startLoopLocked spawns a fresh loop matching the current cfg.Role.
+// Caller MUST hold loopMu. Returns an error if role is unsupported
+// or the secondary's listen address is taken.
+func (r *Replicator) startLoopLocked() error {
+	if r.loopCancel != nil {
+		// A loop is already running; don't double-spawn.
+		return nil
+	}
+	parent := r.rootCtx
+	if parent == nil {
+		// Promote called before Start (e.g. in unit tests that drive
+		// the state machine directly). Use Background — Stop will
+		// still cancel this loop's child context cleanly.
+		parent = context.Background()
+	}
+	loopCtx, cancel := context.WithCancel(parent)
+	// Snapshot mutable cfg fields under r.mu so the race detector
+	// sees synchronised reads (Promote writes them under r.mu).
+	r.mu.Lock()
+	role := r.cfg.Role
+	peerAddr := r.cfg.PeerAddr
+	listenAddr := r.cfg.ListenAddr
+	r.mu.Unlock()
+	switch role {
 	case RolePrimary:
-		go r.runPrimary(ctx)
+		if peerAddr == "" {
+			// Solo primary: no peer to dial, no loop. The state was
+			// already set by Promote (or by the caller before Start).
+			cancel()
+			return nil
+		}
+		r.loopCancel = cancel
+		r.loopWg.Add(1)
+		go func() {
+			defer r.loopWg.Done()
+			r.runPrimary(loopCtx)
+		}()
 	case RoleSecondary:
-		// Secondary owns its own listener; failure to bind is fatal.
-		lis, err := net.Listen("tcp", r.cfg.ListenAddr)
+		lis, err := net.Listen("tcp", listenAddr)
 		if err != nil {
-			return fmt.Errorf("listen %s: %w", r.cfg.ListenAddr, err)
+			cancel()
+			return fmt.Errorf("listen %s: %w", listenAddr, err)
 		}
 		if r.cfg.TLSConfig != nil {
 			lis = tls.NewListener(lis, r.cfg.TLSConfig)
@@ -186,25 +265,59 @@ func (r *Replicator) Start(ctx context.Context) error {
 		r.mu.Lock()
 		r.listener = lis
 		r.mu.Unlock()
-		go r.runSecondary(ctx, lis)
+		r.loopCancel = cancel
+		r.loopWg.Add(1)
+		go func() {
+			defer r.loopWg.Done()
+			r.runSecondary(loopCtx, lis)
+		}()
 	default:
+		cancel()
 		return fmt.Errorf("unsupported role %q", r.cfg.Role)
 	}
 	return nil
 }
 
-// Stop terminates the replicator cleanly.
-func (r *Replicator) Stop() {
-	r.stopOnce.Do(func() { close(r.stop) })
+// stopLoopLocked tears down the currently-running loop. Caller MUST
+// hold loopMu. Releases loopMu briefly to let the loop drain, then
+// re-acquires before returning so callers see consistent state.
+// Internally synchronous: returns only after the loop's goroutines
+// have exited.
+func (r *Replicator) stopLoopLocked() {
+	if r.loopCancel != nil {
+		r.loopCancel()
+		r.loopCancel = nil
+	}
 	r.mu.Lock()
 	if r.listener != nil {
 		_ = r.listener.Close()
+		r.listener = nil
 	}
 	if r.peer != nil {
 		r.peer.Close(nil)
+		r.peer = nil
 	}
 	r.mu.Unlock()
-	<-r.done
+	// Releasing loopMu while waiting prevents a deadlock if the loop
+	// itself acquires loopMu indirectly (it shouldn't, but defensive).
+	r.loopMu.Unlock()
+	r.loopWg.Wait()
+	r.loopMu.Lock()
+}
+
+// Stop terminates the replicator cleanly. Idempotent.
+func (r *Replicator) Stop() {
+	r.stopOnce.Do(func() { close(r.stop) })
+	r.loopMu.Lock()
+	r.stopLoopLocked()
+	r.mu.Lock()
+	w := r.witness
+	r.witness = nil
+	r.mu.Unlock()
+	if w != nil {
+		w.Stop()
+	}
+	r.loopMu.Unlock()
 }
 
 // State returns the current high-level state. Primarily used by
@@ -299,38 +412,68 @@ func (r *Replicator) AwaitAcked(ctx context.Context, seq uint64) error {
 
 // Promote transitions a secondary into a primary at a bumped epoch.
 // Invoked by the operator (via SIGUSR1 or an admin endpoint) after
-// the original primary has been confirmed dead. The result is a
-// standalone-primary configuration: there is no peer, no further
-// replication, and the lock manager continues serving from current
-// state. To rejoin a fresh secondary, restart the binary with new
-// flags — there is no in-flight reconfiguration.
+// the original primary has been confirmed dead.
+//
+// Idempotent: returns "already primary" error if called on a node
+// already in primary role. Operators can call PromoteAndRejoin
+// instead if they want to point at a fresh secondary.
 //
 // Safety:
 //   - Bumping the epoch fences any returning original-primary; if it
-//     comes back, it's at the old epoch and will fail to handshake
-//     against any new secondary that joined the new primary.
-//   - The peer link (if any) is closed — the old peer is now stale.
-//   - Returns an error if already a primary; idempotent in that case.
+//     comes back, it's at the old epoch and will fail to peer with
+//     any secondary that joined the new primary.
+//   - The peer link (if any) is closed.
+//   - State transitions to Solo. Mutation gate opens.
 func (r *Replicator) Promote() error {
+	return r.promoteAndConfigurePeer("")
+}
+
+// PromoteAndRejoin is Promote followed by reconfiguring this node as
+// a primary that dials newPeer as the fresh secondary. Lets an
+// operator promote a former secondary AND immediately re-establish
+// replication against a brand-new secondary process.
+//
+// newPeer must be a "host:port" address reachable from this node.
+// If empty, behaves identically to Promote (Solo).
+func (r *Replicator) PromoteAndRejoin(newPeer string) error {
+	return r.promoteAndConfigurePeer(newPeer)
+}
+
+func (r *Replicator) promoteAndConfigurePeer(newPeer string) error {
+	r.loopMu.Lock()
+	defer r.loopMu.Unlock()
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.cfg.Role == RolePrimary {
+		r.mu.Unlock()
 		return errors.New("replication: already primary")
 	}
+	r.mu.Unlock()
+
+	// Tear down the secondary loop. This blocks until its goroutines
+	// have exited.
+	r.stopLoopLocked()
+
+	// Flip role and bump epoch under the state lock.
+	r.mu.Lock()
 	r.epoch++
 	r.cfg.Role = RolePrimary
+	r.cfg.PeerAddr = newPeer
+	r.cfg.ListenAddr = ""
 	r.state = StateSolo
-	if r.peer != nil {
-		r.peer.Close(nil)
-		r.peer = nil
+	newEpoch := r.epoch
+	r.mu.Unlock()
+
+	if newPeer != "" {
+		r.log.Warn("replication: PROMOTED to primary, dialling new secondary",
+			"new_epoch", newEpoch, "new_peer", newPeer)
+	} else {
+		r.log.Warn("replication: PROMOTED to primary (Solo, no peer)",
+			"new_epoch", newEpoch)
 	}
-	if r.listener != nil {
-		_ = r.listener.Close()
-		r.listener = nil
-	}
-	r.log.Warn("replication: PROMOTED to primary (operator action)",
-		"new_epoch", r.epoch)
-	return nil
+
+	// Start a fresh primary loop (or no loop, if newPeer is empty).
+	return r.startLoopLocked()
 }
 
 // HighWaterMark returns the largest seq Capture has assigned so far.
@@ -365,7 +508,6 @@ var ErrStopped = errors.New("replication: stopped")
 // hello, drain outbound ops, watch heartbeats, transition to paused
 // → solo on peer loss.
 func (r *Replicator) runPrimary(ctx context.Context) {
-	defer close(r.done)
 	for {
 		select {
 		case <-r.stop:
@@ -575,7 +717,6 @@ func (r *Replicator) primarySender(ctx context.Context, pc *peerConn) {
 // ---------------------------------------------------------------------------
 
 func (r *Replicator) runSecondary(ctx context.Context, lis net.Listener) {
-	defer close(r.done)
 	err := runPeerListener(ctx, lis, func(pc *peerConn) {
 		r.handleSecondarySession(ctx, pc)
 	})
@@ -595,10 +736,20 @@ func (r *Replicator) handleSecondarySession(ctx context.Context, pc *peerConn) {
 	defer func() {
 		r.detachPeer(pc)
 		// Peer disconnect on the secondary side → secondary can no
-		// longer mirror, so it enters FAILED. It refuses client traffic.
-		// Manual operator action (or witness, in phase 3) can promote
-		// it to primary.
+		// longer mirror, so it enters FAILED. It refuses client
+		// traffic. If a witness is configured, kick off auto-failover
+		// in a SEPARATE goroutine — Promote() needs this loop to
+		// exit (it stops the current loop before starting the new
+		// primary loop), and the auto-promote work must outlive this
+		// session's defer chain. Otherwise an operator must call
+		// Promote / SIGUSR1 / the admin HTTP endpoint to advance.
 		r.setState(StateFailed)
+		r.mu.Lock()
+		hasWitness := r.witness != nil
+		r.mu.Unlock()
+		if hasWitness {
+			go r.tryWitnessAutoPromote(ctx)
+		}
 	}()
 
 	// Wipe local state and request a fresh snapshot. Stale state
@@ -678,6 +829,62 @@ func (r *Replicator) secondaryReader(ctx context.Context, pc *peerConn) {
 			return nil
 		}
 	})
+}
+
+// tryWitnessAutoPromote queries the witness; if the witness reports
+// the primary is no longer alive, the secondary auto-promotes itself
+// (no operator action). Best-effort: if the witness is unreachable
+// or disagrees, the secondary stays in StateFailed and the existing
+// SIGUSR1 / HTTP-admin paths remain the failover route.
+//
+// Safety: this function calls Promote() which closes the peer link
+// (already closed) and bumps epoch. The witness's record is updated
+// via Endorse so any returning original-primary will see a higher
+// endorsed epoch on its next witness query.
+func (r *Replicator) tryWitnessAutoPromote(ctx context.Context) {
+	r.mu.Lock()
+	wc := r.witness
+	r.mu.Unlock()
+	if wc == nil {
+		return
+	}
+	// Give the witness a moment to update its own view (it's bounded
+	// by WitnessLivenessThreshold).
+	deadline := time.Now().Add(WitnessLivenessThreshold + time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.stop:
+			return
+		default:
+		}
+		st, err := wc.Query()
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if !st.PrimaryAlive {
+			r.log.Warn("witness: primary confirmed dead, auto-promoting",
+				"endorsed_epoch", st.EndorsedEpoch)
+			if err := r.Promote(); err != nil {
+				r.log.Warn("witness auto-promote: Promote failed", "err", err)
+				return
+			}
+			// Inform the witness of the new authority.
+			r.mu.Lock()
+			wc2 := r.witness
+			r.mu.Unlock()
+			if wc2 != nil {
+				_, _ = wc2.Endorse(r.Epoch())
+				wc2.SetEpoch(r.Epoch())
+			}
+			return
+		}
+		// Witness still sees primary alive; wait and re-check.
+		time.Sleep(200 * time.Millisecond)
+	}
+	r.log.Warn("witness: gave up waiting for primary-dead confirmation; staying in FAILED")
 }
 
 // applySnapshotPart installs one resource's worth of state on the
@@ -784,6 +991,8 @@ func (r *Replicator) IsPrimary() bool {
 	if r == nil {
 		return true // standalone server with no replicator: behave as primary
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.cfg.Role == RolePrimary
 }
 

@@ -58,6 +58,15 @@ const (
 	FrameSnapshotReq  FrameType = "snap_req"      // secondary asks for full state
 	FrameSnapshotPart FrameType = "snap_part"     // one chunk of the snapshot
 	FrameSnapshotEnd  FrameType = "snap_end"      // snapshot done; resume live ops
+
+	// Witness frames. Used between primary/secondary and the witness
+	// daemon. Witness frames travel over a separate connection from
+	// the primary↔secondary peer link so the witness's view of
+	// liveness is independent.
+	FrameWitnessHello   FrameType = "wit_hello"   // peer (re-)registers with witness
+	FrameWitnessQuery   FrameType = "wit_query"   // peer asks witness for status
+	FrameWitnessStatus  FrameType = "wit_status"  // witness's response
+	FrameWitnessEndorse FrameType = "wit_endorse" // peer tells witness "I'm authoritative at epoch N"
 )
 
 // Role identifies the role advertised in the Hello frame. Witness is
@@ -94,13 +103,56 @@ const (
 type Frame struct {
 	Type FrameType `json:"type"`
 
-	Hello        *Hello         `json:"hello,omitempty"`
-	Heartbeat    *Heartbeat     `json:"heartbeat,omitempty"`
-	Op           *Op            `json:"op,omitempty"`
-	OpAck        *OpAck         `json:"op_ack,omitempty"`
-	SnapshotReq  *SnapshotReq   `json:"snap_req,omitempty"`
-	SnapshotPart *SnapshotPart  `json:"snap_part,omitempty"`
-	SnapshotEnd  *SnapshotEnd   `json:"snap_end,omitempty"`
+	Hello        *Hello        `json:"hello,omitempty"`
+	Heartbeat    *Heartbeat    `json:"heartbeat,omitempty"`
+	Op           *Op           `json:"op,omitempty"`
+	OpAck        *OpAck        `json:"op_ack,omitempty"`
+	SnapshotReq  *SnapshotReq  `json:"snap_req,omitempty"`
+	SnapshotPart *SnapshotPart `json:"snap_part,omitempty"`
+	SnapshotEnd  *SnapshotEnd  `json:"snap_end,omitempty"`
+
+	WitnessHello   *WitnessHello   `json:"wit_hello,omitempty"`
+	WitnessQuery   *WitnessQuery   `json:"wit_query,omitempty"`
+	WitnessStatus  *WitnessStatus  `json:"wit_status,omitempty"`
+	WitnessEndorse *WitnessEndorse `json:"wit_endorse,omitempty"`
+}
+
+// WitnessHello identifies a peer to the witness. Sent on connection
+// open. Witness keys its tracking by NodeID + Role.
+type WitnessHello struct {
+	Role     Role   `json:"role"`
+	NodeID   string `json:"node_id"`
+	Epoch    uint64 `json:"epoch"`
+	ProtoVer uint32 `json:"proto_ver"`
+}
+
+// WitnessQuery is sent by a secondary that has lost contact with its
+// primary and wants to know whether the witness has also lost
+// contact. The witness answers with WitnessStatus.
+type WitnessQuery struct{}
+
+// WitnessStatus is the witness's view of cluster liveness. Returned
+// in response to a WitnessQuery. A secondary uses it to decide
+// whether to auto-promote.
+//
+// PrimaryAlive is true if the witness has had a heartbeat from the
+// currently-endorsed primary within WitnessLivenessThreshold.
+// EndorsedEpoch is the highest epoch the witness has endorsed (used
+// by a returning original-primary to detect that it's stale).
+type WitnessStatus struct {
+	PrimaryAlive    bool   `json:"primary_alive"`
+	EndorsedNodeID  string `json:"endorsed_node_id"`
+	EndorsedEpoch   uint64 `json:"endorsed_epoch"`
+	PrimaryLastSeen int64  `json:"primary_last_seen_unix_ns"`
+}
+
+// WitnessEndorse is sent by a secondary that has decided to promote
+// itself. It tells the witness "I am now the primary at epoch N."
+// The witness updates its endorsement so future queries reflect the
+// new authority.
+type WitnessEndorse struct {
+	NodeID string `json:"node_id"`
+	Epoch  uint64 `json:"epoch"`
 }
 
 // Hello is the first frame sent on a new peer connection. The

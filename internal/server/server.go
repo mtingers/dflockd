@@ -43,6 +43,7 @@ type Replicator interface {
 	AwaitAcked(ctx context.Context, seq uint64) error
 	HighWaterMark() uint64
 	Promote() error
+	PromoteAndRejoin(newPeer string) error
 }
 
 type Server struct {
@@ -81,6 +82,18 @@ func (s *Server) Promote() error {
 		return fmt.Errorf("no replicator configured")
 	}
 	return (*rp).Promote()
+}
+
+// PromoteAndRejoin promotes a secondary and reconfigures it to dial a
+// fresh secondary at newPeer. Used by the admin HTTP endpoint when
+// the operator wants to re-establish replication against a brand-new
+// follower in one step.
+func (s *Server) PromoteAndRejoin(newPeer string) error {
+	rp := s.rep.Load()
+	if rp == nil {
+		return fmt.Errorf("no replicator configured")
+	}
+	return (*rp).PromoteAndRejoin(newPeer)
 }
 
 // shouldRefuseMutations returns true if the configured replicator is

@@ -581,6 +581,47 @@
           }
         }
       }
+    },
+    "/v1/admin/promote": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Promote replication secondary to primary",
+        "operationId": "promote",
+        "description": "Operator-driven failover. When this node is a replication secondary that has lost its primary, calling this endpoint promotes it to primary at a bumped epoch. Equivalent to sending SIGUSR1 to the process. The optional `rejoin_peer` field reconfigures the promoted node to dial that address as a fresh secondary in one step.\n\nReturns `409` if the node is already a primary, `412` if no replication is configured, `500` on internal failure.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "rejoin_peer": {
+                    "type": "string",
+                    "description": "Optional. host:port of a fresh secondary to dial after promotion. Empty for Solo mode.",
+                    "example": "10.0.0.42:6389"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Node promoted to primary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {"status": {"type": "string", "example": "promoted"}}
+                }
+              }
+            }
+          },
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "412": {"$ref": "#/components/responses/BadRequest"},
+          "500": {"$ref": "#/components/responses/Internal"}
+        }
+      }
     }
   },
   "components": {
@@ -634,6 +675,14 @@
       "CapacityExceeded": {
         "description": "Server resource limit hit or server draining (max_locks, max_waiters, max_sessions, max_sessions_per_ip, draining)",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "examples": {"max_locks": {"value": {"error": "max_locks"}}, "max_waiters": {"value": {"error": "max_waiters"}}, "max_sessions": {"value": {"error": "max_sessions"}}, "max_sessions_per_ip": {"value": {"error": "max_sessions_per_ip"}}, "draining": {"value": {"error": "draining"}}}}}
+      },
+      "Conflict": {
+        "description": "State conflict (e.g. promote called on a node that is already a primary)",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "example": {"error": "already_primary"}}}
+      },
+      "Internal": {
+        "description": "Internal server error",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "example": {"error": "promote_failed"}}}
       }
     },
     "schemas": {

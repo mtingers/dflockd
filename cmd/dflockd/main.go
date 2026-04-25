@@ -97,6 +97,22 @@ func main() {
 		}
 	}()
 
+	// Witness role: a tiny daemon that participates in auto-failover.
+	// Holds no lock state, accepts no client traffic. Just listens
+	// for primary/secondary connections, tracks heartbeats, and
+	// answers liveness queries.
+	if cfg.ReplicationRole == "witness" {
+		ws := replication.NewWitnessServer(log.With("component", "witness"))
+		if err := ws.Start(ctx, cfg.ReplicationListenAddr, nil); err != nil {
+			log.Error("witness: failed to start", "err", err)
+			os.Exit(1)
+		}
+		defer ws.Stop()
+		log.Info("witness: ready", "addr", ws.Addr())
+		<-ctx.Done()
+		return
+	}
+
 	// Replication is opt-in. When enabled, the replicator owns the
 	// peer link and is installed as the lock manager's mutation hook.
 	// On the secondary, the server is also told to refuse client
@@ -115,6 +131,7 @@ func main() {
 			MaxPause:    cfg.ReplicationMaxPause,
 			Apply:       lm, // used by secondary; harmless on primary
 			Snapshotter: snapshotAdapter{lm},
+			WitnessAddr: cfg.ReplicationWitnessAddr,
 			Log:         log.With("component", "replication"),
 		})
 		if err := rep.Start(ctx); err != nil {

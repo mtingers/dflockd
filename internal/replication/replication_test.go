@@ -332,6 +332,160 @@ func TestReplicator_PromoteSecondary(t *testing.T) {
 	}
 }
 
+// TestReplicator_PromoteAndRejoin verifies the one-step
+// failover-and-reattach path: a secondary is promoted to primary AND
+// reconfigured to dial a fresh secondary, all in one call. The new
+// primary should be able to replicate to the new secondary.
+func TestReplicator_PromoteAndRejoin(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Original secondary (about to be promoted).
+	origSecAddr := pickFreeAddr(t)
+	origApply := newFakeApply()
+	orig := NewReplicator(Config{
+		Role:        RoleSecondary,
+		NodeID:      "orig",
+		ListenAddr:  origSecAddr,
+		Apply:       origApply,
+		Snapshotter: fakeSnapshotter{},
+		Log:         quietLog(t),
+	})
+	if err := orig.Start(ctx); err != nil {
+		t.Fatalf("orig start: %v", err)
+	}
+	defer orig.Stop()
+
+	// Bring up the brand-new secondary that will receive the
+	// promoted node's replication stream.
+	freshSecAddr := pickFreeAddr(t)
+	freshApply := newFakeApply()
+	fresh := NewReplicator(Config{
+		Role:        RoleSecondary,
+		NodeID:      "fresh",
+		ListenAddr:  freshSecAddr,
+		Apply:       freshApply,
+		Snapshotter: fakeSnapshotter{},
+		Log:         quietLog(t),
+	})
+	if err := fresh.Start(ctx); err != nil {
+		t.Fatalf("fresh start: %v", err)
+	}
+	defer fresh.Stop()
+
+	// Promote the original secondary AND tell it to peer with the fresh one.
+	if err := orig.PromoteAndRejoin(freshSecAddr); err != nil {
+		t.Fatalf("PromoteAndRejoin: %v", err)
+	}
+
+	// The promoted node should now be a primary; the fresh secondary
+	// should reach Active after the snapshot exchange.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (orig.State() != StateActive || fresh.State() != StateActive) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !orig.IsPrimary() {
+		t.Fatal("orig should be primary after PromoteAndRejoin")
+	}
+	if orig.State() != StateActive {
+		t.Fatalf("orig state: got %s want active", orig.State())
+	}
+	if fresh.State() != StateActive {
+		t.Fatalf("fresh state: got %s want active", fresh.State())
+	}
+
+	// A mutation captured on the new primary should propagate to the fresh secondary.
+	expires := time.Now().Add(30 * time.Second).UnixNano()
+	seq := orig.Capture(Mutation{
+		Kind: OpHolderAdd, Key: "lock:rejoin", Token: "tok-rejoin",
+		ConnID: 7, Limit: 1, LeaseExpiresUnixNS: expires,
+	})
+	awaitCtx, cancelAwait := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelAwait()
+	if err := orig.AwaitAcked(awaitCtx, seq); err != nil {
+		t.Fatalf("await ack: %v", err)
+	}
+	if got := freshApply.holderCount(); got != 1 {
+		t.Fatalf("fresh secondary holder count: got %d want 1", got)
+	}
+}
+
+// TestWitness_AutoPromoteOnPeerLoss is the headline witness test:
+//   1. Witness daemon starts.
+//   2. Primary + secondary connect to the witness, peer with each other.
+//   3. Primary "dies" (we Stop it).
+//   4. Secondary's peer link drops; secondary consults witness.
+//   5. Witness, after WitnessLivenessThreshold without primary heartbeats,
+//      reports primary not alive.
+//   6. Secondary auto-promotes (without operator action).
+func TestWitness_AutoPromoteOnPeerLoss(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	witnessAddr := pickFreeAddr(t)
+	ws := NewWitnessServer(quietLog(t))
+	if err := ws.Start(ctx, witnessAddr, nil); err != nil {
+		t.Fatalf("witness start: %v", err)
+	}
+	defer ws.Stop()
+
+	secAddr := pickFreeAddr(t)
+	apply := newFakeApply()
+	sec := NewReplicator(Config{
+		Role:        RoleSecondary,
+		NodeID:      "sec-node",
+		ListenAddr:  secAddr,
+		Apply:       apply,
+		Snapshotter: fakeSnapshotter{},
+		WitnessAddr: witnessAddr,
+		Log:         quietLog(t),
+	})
+	if err := sec.Start(ctx); err != nil {
+		t.Fatalf("sec start: %v", err)
+	}
+	defer sec.Stop()
+
+	pri := NewReplicator(Config{
+		Role:        RolePrimary,
+		NodeID:      "pri-node",
+		PeerAddr:    secAddr,
+		Snapshotter: fakeSnapshotter{},
+		WitnessAddr: witnessAddr,
+		Log:         quietLog(t),
+	})
+	if err := pri.Start(ctx); err != nil {
+		t.Fatalf("pri start: %v", err)
+	}
+
+	// Wait for primary↔secondary peering to come up.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (pri.State() != StateActive || sec.State() != StateActive) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pri.State() != StateActive || sec.State() != StateActive {
+		t.Fatalf("peer link not active: pri=%s sec=%s", pri.State(), sec.State())
+	}
+
+	// Kill the primary. The secondary's peer link will drop; the
+	// witness will (after WitnessLivenessThreshold) stop seeing
+	// primary heartbeats; the secondary will auto-promote.
+	pri.Stop()
+
+	// Allow up to ~2× WitnessLivenessThreshold for the auto-promote
+	// to fire. (The secondary polls the witness every 200ms during
+	// its tryWitnessAutoPromote window.)
+	deadline = time.Now().Add(WitnessLivenessThreshold + 4*time.Second)
+	for time.Now().Before(deadline) && !sec.IsPrimary() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !sec.IsPrimary() {
+		t.Fatalf("secondary did not auto-promote; state=%s", sec.State())
+	}
+	if sec.Epoch() == 0 {
+		t.Fatalf("epoch did not advance after auto-promote: %d", sec.Epoch())
+	}
+}
+
 // TestReplicator_RefuseMutationsOnSecondary verifies that the
 // ShouldRefuseMutations gate is consistent with role.
 func TestReplicator_RefuseMutationsOnSecondary(t *testing.T) {

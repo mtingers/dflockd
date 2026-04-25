@@ -263,6 +263,7 @@ var registeredRoutes = []RegisteredPath{
 	{Pattern: "/v1/signals/{channel}", Methods: []string{"POST"}},
 	{Pattern: "/v1/signals", Methods: []string{"GET"}}, // SSE stream
 	{Pattern: "/v1/openapi.json", Methods: []string{"GET"}},
+	{Pattern: "/v1/admin/promote", Methods: []string{"POST"}}, // replication failover
 }
 
 // Routes exposes the registered route list for tests.
@@ -313,6 +314,9 @@ func (h *httpServer) registerRoutes(mux *http.ServeMux) {
 	// Signals
 	mux.HandleFunc("POST /v1/signals/{channel}", withChannel(h.handlePublishSignal))
 	mux.HandleFunc("GET /v1/signals", h.handleSSE)
+
+	// Admin (replication failover, etc.). Always behind auth when --auth-token is set.
+	mux.HandleFunc("POST /v1/admin/promote", h.handlePromote)
 }
 
 // withKey extracts and validates the `{key}` path param, then invokes fn.

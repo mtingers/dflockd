@@ -112,6 +112,58 @@ func (h *httpServer) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
+// promoteRequest is the optional body for /v1/admin/promote. If
+// rejoin_peer is non-empty the promoted node also reconfigures
+// itself to dial that address as the fresh secondary (one-step
+// failover-and-reattach).
+type promoteRequest struct {
+	RejoinPeer string `json:"rejoin_peer,omitempty"`
+}
+
+// POST /v1/admin/promote — replication failover. When this node is a
+// secondary that has lost its primary, an operator can call this
+// endpoint (with the configured bearer auth) to promote it. Returns
+// 200 with status:promoted on success, 409 conflict if already a
+// primary, 412 precondition_failed if no replicator is configured,
+// 500 with error detail on unexpected failure.
+//
+// Operators with shell access can equivalently use SIGUSR1; this
+// endpoint exists for containerised deployments where SIGUSR1 isn't
+// reachable from outside the pod. Auth is enforced via the standard
+// withAuth middleware — this endpoint is NOT exempt.
+//
+// Optional JSON body: {"rejoin_peer": "host:port"} — if supplied,
+// the promoted node immediately starts dialling that address as a
+// fresh secondary, re-establishing replication in one step.
+func (h *httpServer) handlePromote(w http.ResponseWriter, r *http.Request) {
+	if h.bridge == nil || h.bridge.srv == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "no server")
+		return
+	}
+	var req promoteRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+	var err error
+	if req.RejoinPeer != "" {
+		err = h.bridge.srv.PromoteAndRejoin(req.RejoinPeer)
+	} else {
+		err = h.bridge.srv.Promote()
+	}
+	if err != nil {
+		switch err.Error() {
+		case "no replicator configured":
+			writeError(w, http.StatusPreconditionFailed, "no_replicator", err.Error())
+		case "replication: already primary":
+			writeError(w, http.StatusConflict, "already_primary", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "promote_failed", err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, statusResponse{Status: "promoted"})
+}
+
 // GET /v1/stats — sessionless. We don't need a virtual conn for this; we
 // ask LockManager directly for stats (same as the "stats" protocol cmd does
 // internally via server.handleRequest).
