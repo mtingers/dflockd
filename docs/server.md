@@ -158,7 +158,7 @@ export DFLOCKD_AUTH_TOKEN_FILE=/run/secrets/dflockd-token
 ./dflockd
 ```
 
-Token resolution priority: explicit `--auth-token` flag > `DFLOCKD_AUTH_TOKEN` env var > explicit `--auth-token-file` flag > `DFLOCKD_AUTH_TOKEN_FILE` env var.
+Token resolution priority: explicit `--auth-token` flag > explicit `--auth-token-file` flag > `DFLOCKD_AUTH_TOKEN` env var > `DFLOCKD_AUTH_TOKEN_FILE` env var. Direct token values and token files are trimmed of surrounding whitespace before use; empty tokens are rejected.
 
 When `--auth-token` is set, every new connection must send an `auth` command as its **first** message. If the token matches, the server responds with `ok` and the connection proceeds normally. If the token is wrong or a non-auth command is sent first, the server responds with `error_auth` and closes the connection.
 

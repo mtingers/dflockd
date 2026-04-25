@@ -21,6 +21,8 @@ _
 
 The key line is ignored (use `_` by convention).
 
+The token value is trimmed of surrounding whitespace before comparison.
+
 **Response:**
 
 - Success: `ok\n`
@@ -464,7 +466,7 @@ _
 | Max line length (`signal` payload, `auth` token) | 64 KiB |
 | Encoding | UTF-8 |
 | Key | Non-empty string without whitespace (within line limit) |
-| Token | UUID hex string (32 chars) |
+| Token | Random hex string (32 chars) |
 | Timeout | Integer >= 0 |
 | Lease TTL | Integer > 0 |
 

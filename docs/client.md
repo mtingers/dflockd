@@ -133,6 +133,8 @@ if err != nil {
 }
 ```
 
+If cancellation races with a grant that has already arrived, the high-level `Lock` and `Semaphore` APIs release that token before returning the context error so callers do not unknowingly hold a resource.
+
 ### Cleanup without release
 
 `Close` stops the renewal goroutine and closes the connection without sending a release command. The server will auto-release the lock (if configured):
@@ -150,6 +152,8 @@ fmt.Println("token:", l.Token())
 ## Low-level API
 
 The low-level functions operate on a `*Conn` and map directly to wire protocol commands. Use these when you need fine-grained control.
+
+The Go client validates protocol field limits before sending: keys, tokens, queue groups, and other short argument lines are capped at 256 bytes; signal payloads must be non-empty, contain no newlines, and fit the 64 KiB pushed-frame limit after `sig <channel> ` framing.
 
 ### Connecting
 
@@ -427,6 +431,8 @@ for sig := range sc.Signals() {
 ```
 
 `Signals()` returns a read-only channel of `Signal` structs. The channel is closed when the connection is closed or an error occurs.
+
+If the local receive channel fills, `SignalConn` drops incoming signals rather than blocking the read loop. Monitor `DroppedSignals()` if your consumer must detect local loss.
 
 ### Publishing signals
 

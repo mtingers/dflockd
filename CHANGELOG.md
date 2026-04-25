@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Config: auth token source precedence now matches documented CLI-first behavior.** Explicit values resolve as `--auth-token` > `--auth-token-file` > `DFLOCKD_AUTH_TOKEN` > `DFLOCKD_AUTH_TOKEN_FILE`; direct token values and token files are trimmed of surrounding whitespace, and empty tokens are rejected.
+- **Client: high-level cancellation no longer leaves abandoned grants behind.** If context cancellation races with a successful lock or semaphore grant, the `Lock` and `Semaphore` APIs release the token before returning the context error.
+- **HTTP/OpenAPI: validation limits now match the native protocol.** Keys, tokens, SSE groups, signal channels, renew args, and signal payloads are documented and validated against the same line/payload caps used by TCP clients.
+- **Server: duplicate signal listens no longer count against `--max-subscriptions`.** Re-listening the same pattern/group at the cap is idempotent instead of being rejected.
+
 ## [v1.15.0] - 2026-04-25
 
 ### Added
@@ -69,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Bench: every worker hammered the same literal `--key`, which measured single-key contention instead of the scaling workload the docs describe.** Restored the documented behavior (each worker gets a `<key>_<id>` suffix) as the default and added a `--shared-key` flag for the opt-in contended workload. Defaults now reproduce the scaling numbers in `docs/index.md` (~90k ops/s at 100-500 workers on an M1 MacBook Air).
 - **Server: `watchPeerClose` stall on blocking-command response added up to 50 ms latency per op and deadlocked under contention.** `stopPeerWatch` waited on the watcher goroutine to exit, but the watcher was sitting in `reader.Peek(…)` with a 50 ms read deadline and couldn't observe `close(stop)` until that timer fired. Each blocking-command response therefore paid up to 50 ms of extra latency, and once per-round wait on a contended key crossed the watcher's 10 ms initial delay the overhead was self-reinforcing (longer responses → longer queue waits → more handlers entering the peek loop). In practice a 200-worker `cmd/bench` run on a single key collapsed to ~20 ops/s and took hours instead of seconds. `stopPeerWatch` now forces the in-flight Peek to return immediately via `conn.SetReadDeadline(aLongTimeAgo)` before waiting on `<-done`; the deadline is reset to zero once the watcher has exited. Regression test in `TestContendedAcquireDoesNotDeadlockOnPeerWatcher`.
 
+[Unreleased]: https://github.com/mtingers/dflockd/compare/v1.15.0...HEAD
 [v1.15.0]: https://github.com/mtingers/dflockd/releases/tag/v1.15.0
 
 ## [v1.14.0] - 2026-03-13

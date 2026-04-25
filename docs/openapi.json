@@ -457,8 +457,8 @@
             "name": "channel",
             "in": "path",
             "required": true,
-            "description": "Literal channel name (dot-separated tokens). Must not contain `*` or `>`.",
-            "schema": {"type": "string", "example": "events.user.login"}
+            "description": "Literal channel name (dot-separated tokens). Must be non-empty, fit in 256 bytes, and must not contain whitespace, `*`, or `>`.",
+            "schema": {"type": "string", "minLength": 1, "maxLength": 256, "example": "events.user.login"}
           }
         ],
         "requestBody": {
@@ -497,16 +497,16 @@
             "name": "pattern",
             "in": "query",
             "required": true,
-            "description": "Subscription pattern. Exact channel (`events.user.login`) or wildcard (`events.*`, `events.>`).",
-            "schema": {"type": "string"},
+            "description": "Subscription pattern. Exact channel (`events.user.login`) or wildcard (`events.*`, `events.>`). Must be non-empty, contain no whitespace, and fit in 256 bytes.",
+            "schema": {"type": "string", "minLength": 1, "maxLength": 256},
             "example": "events.>"
           },
           {
             "name": "group",
             "in": "query",
             "required": false,
-            "description": "Queue group name. Within a group, each matching signal is delivered to exactly one member (round-robin).",
-            "schema": {"type": "string"},
+            "description": "Queue group name. Within a group, each matching signal is delivered to exactly one member (round-robin). Must fit in 256 bytes.",
+            "schema": {"type": "string", "maxLength": 256},
             "example": "workers"
           }
         ],
@@ -550,7 +550,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Shared secret configured via `--auth-token` / `DFLOCKD_AUTH_TOKEN`. When set, every request (except `GET /v1/openapi.json`) must carry `Authorization: Bearer <token>`. When unset, authentication is disabled and the header is ignored."
+        "description": "Shared secret configured via `--auth-token`, `--auth-token-file`, `DFLOCKD_AUTH_TOKEN`, or `DFLOCKD_AUTH_TOKEN_FILE`. When set, every request (except `GET /v1/openapi.json`) must carry `Authorization: Bearer <token>`. When unset, authentication is disabled and the header is ignored."
       }
     },
     "parameters": {
@@ -572,8 +572,8 @@
         "name": "key",
         "in": "path",
         "required": true,
-        "description": "Lock or semaphore key. Must be non-empty and contain no whitespace. URL-encode any special characters.",
-        "schema": {"type": "string", "minLength": 1}
+        "description": "Lock or semaphore key. Must be non-empty, fit in 256 bytes, and contain no whitespace. URL-encode any special characters.",
+        "schema": {"type": "string", "minLength": 1, "maxLength": 256}
       }
     },
     "responses": {
@@ -633,14 +633,14 @@
         "type": "object",
         "required": ["token"],
         "properties": {
-          "token": {"type": "string", "description": "Token returned by the acquire/wait/enqueue call."}
+          "token": {"type": "string", "maxLength": 256, "description": "Token returned by the acquire/wait/enqueue call. Must contain no whitespace and fit in 256 bytes."}
         }
       },
       "RenewRequest": {
         "type": "object",
         "required": ["token"],
         "properties": {
-          "token": {"type": "string"},
+          "token": {"type": "string", "maxLength": 256, "description": "Token returned by the acquire/wait/enqueue call. Must contain no whitespace and fit in 256 bytes; if `lease_ttl_s` is set, the token plus space plus TTL must also fit in the 256-byte protocol arg line."},
           "lease_ttl_s": {"type": "integer", "minimum": 0, "description": "New lease duration. If omitted or 0, uses server default."}
         }
       },
@@ -694,7 +694,7 @@
         "type": "object",
         "required": ["payload"],
         "properties": {
-          "payload": {"type": "string", "minLength": 1, "description": "Any non-empty UTF-8 string (no newlines). Typically a JSON-encoded object."}
+          "payload": {"type": "string", "minLength": 1, "description": "Any UTF-8 string that is non-empty after trimming and contains no newlines. Typically a JSON-encoded object. Must fit the native protocol's 64 KiB pushed-frame limit after `sig <channel> ` framing."}
         }
       },
       "SignalResponse": {

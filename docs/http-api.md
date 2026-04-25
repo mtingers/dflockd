@@ -86,6 +86,10 @@ For quick recovery, keep lease TTLs short and renew aggressively.
 
 When `--auth-token` is set, every request must carry `Authorization: Bearer <token>`. The one exception is `GET /v1/openapi.json`, which is always reachable so tools can fetch the schema without credentials.
 
+## Validation limits
+
+Keys, signal channels, tokens, and SSE queue groups are capped at 256 bytes to match the native TCP protocol's command/key/arg line limit. Signal payloads must be non-empty after trimming, cannot contain newlines, and must fit the 64 KiB pushed-frame limit after `sig <channel> ` framing. Violations return `400 bad_request`.
+
 ## Error mapping
 
 Lock and semaphore wait timeouts are domain outcomes: they return HTTP `200` with `{"status":"timeout"}` so clients can distinguish "the request was valid, but acquisition timed out" from "the server rejected the request." Protocol-level conflicts such as already enqueued, not enqueued, lease expired, and semaphore limit mismatch return `409`.

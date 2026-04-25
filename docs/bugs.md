@@ -1,6 +1,6 @@
 # Historical Bug Audit
 
-Findings from an earlier read-only audit, kept for traceability. This is not the current list of known bugs. Entries under "Fixed in this branch" describe the pre-fix behavior that was audited and then corrected.
+Findings from an earlier read-only audit, kept for traceability. This is not the current list of known bugs. Entries under "Fixed in current code" describe the pre-fix behavior that was audited and then corrected. Line references are historical and may no longer match the current files exactly.
 
 Each entry has a confidence level — **high** means "reading the code makes the bug obvious", **medium** means "the bug exists but requires an unusual trigger", **speculative** means "plausible but I didn't reproduce it."
 
@@ -8,9 +8,9 @@ Not included: design tradeoffs, style nits, cosmetic comment errors. Those are d
 
 ---
 
-## Fixed in this branch
+## Fixed in current code
 
-The confirmed bugs below have been fixed on `feature/http-api` with dedicated commits and (where practical) regression tests. Kept here for history and to make the audit-to-fix trail visible.
+The confirmed bugs below have been fixed in the current codebase with dedicated commits and (where practical) regression tests. Kept here for history and to make the audit-to-fix trail visible.
 
 ## High severity
 
@@ -21,7 +21,7 @@ The confirmed bugs below have been fixed on `feature/http-api` with dedicated co
 
 Every other setting resolves via "explicit flag > env var > default" (`resolveInt`/`resolveString`). `loadAuthToken` short-circuits with `os.Getenv("DFLOCKD_AUTH_TOKEN")` first and only falls back to the flag if the env var is empty. Either the code or the docs is wrong — pick one and align.
 
-Fix: either reverse the priority in `loadAuthToken`, or document the auth-specific precedence in README and keep it.
+Resolution: `loadAuthToken` now uses CLI-first precedence and the docs state the exact source order.
 
 ### 2. `stopRenew` can hang indefinitely on an unresponsive server
 
@@ -30,7 +30,7 @@ Fix: either reverse the priority in `loadAuthToken`, or document the auth-specif
 
 `stopRenew` cancels the renewal goroutine's ctx, then `<-done` waits for it. But the goroutine can be blocked inside `Renew` → `sendRecv` → network I/O, and ctx cancellation doesn't unblock that. `Release` and `Close` both call `stopRenew` before closing the conn, so they inherit the hang.
 
-Fix options:
+Original fix options:
 - Close the conn first, then `stopRenew` (Renew I/O errors out, goroutine exits). Requires reordering Release.
 - Add a timeout to `stopRenew`'s `<-done` wait and force-close on timeout.
 
@@ -66,7 +66,7 @@ if ne, ok := err.(net.Error); ok && ne.Temporary() {
 
 In the timeout branch, the race-check re-selects on `w.ch` and returns the granted token if one arrived. It does this even when `ctx.Err() != nil`. The caller treated `ctx.Done()` as "abandon" but now owns a lock they don't know they hold. The lock leaks until lease expiry. The `if ctx.Err() != nil { return "", ctx.Err() }` below the race-check is dead in the race-win branch.
 
-Fix: if `ctx.Err() != nil` after the race-check win, release the just-granted token before returning the context error.
+Resolution: if `ctx.Err() != nil` after the race-check win, the just-granted token is released before returning the context error.
 
 ### 6. `Signal` holds `m.mu.RLock` across `CancelConn` (blocking syscall)
 
@@ -75,7 +75,7 @@ Fix: if `ctx.Err() != nil` after the race-check win, release the just-granted to
 
 When a listener's `WriteCh` is full, `Signal` calls `CancelConn()` → `conn.Close()` (syscall) under the read lock. Concurrent `Listen`/`Unlisten` (which need the write lock) stall until the close returns. Not a deadlock but a real throughput stall under slow-consumer conditions.
 
-Fix: collect doomed listeners into a local slice, release the lock, then call `CancelConn` on each.
+Resolution: doomed listeners are collected into a local slice and cancelled after releasing the manager lock.
 
 ### 7. Client-side silent signal drop
 
@@ -84,7 +84,7 @@ Fix: collect doomed listeners into a local slice, release the lock, then call `C
 
 When `sigCh` (buffer 64) is full, `readLoop` drops signals via `select { ... default }`. User's `Signals()` channel never reflects the loss. Server-side slow-consumer eviction is documented; client-side silent drop is not.
 
-Fix: either document the drop policy clearly, or expose a counter (`DroppedSignals() uint64`), or both.
+Resolution: the drop policy is documented and `DroppedSignals() uint64` exposes a monotonic counter.
 
 ### 8. `resourceTotal` check-then-increment is not atomic; `MaxLocks` can be exceeded
 
