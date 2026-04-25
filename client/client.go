@@ -4,7 +4,9 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -30,6 +32,7 @@ var (
 	ErrLimitMismatch = errors.New("dflockd: limit mismatch")
 	ErrLeaseExpired  = errors.New("dflockd: lease expired")
 	ErrAuth          = errors.New("dflockd: authentication failed")
+	ErrDraining      = errors.New("dflockd: server draining")
 )
 
 // Option configures optional parameters for protocol commands.
@@ -190,6 +193,9 @@ func Authenticate(c *Conn, token string) error {
 		return err
 	}
 	if resp != "ok" {
+		if resp == "error_draining" {
+			return ErrDraining
+		}
 		return ErrAuth
 	}
 	return nil
@@ -290,6 +296,9 @@ func Release(c *Conn, key, token string) error {
 		return err
 	}
 	if resp != "ok" {
+		if resp == "error_draining" {
+			return ErrDraining
+		}
 		return fmt.Errorf("%w: release: %s", ErrServer, resp)
 	}
 	return nil
@@ -327,6 +336,9 @@ func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error
 			return 0, fmt.Errorf("%w: renew: bad remaining %q", ErrServer, parts[1])
 		}
 		return r, nil
+	}
+	if resp == "error_draining" {
+		return 0, ErrDraining
 	}
 	return 0, fmt.Errorf("%w: renew: %s", ErrServer, resp)
 }
@@ -369,6 +381,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	if resp == "error_limit_mismatch" {
 		return "", "", 0, ErrLimitMismatch
 	}
+	if resp == "error_draining" {
+		return "", "", 0, ErrDraining
+	}
 
 	parts := strings.Fields(resp)
 	if len(parts) == 3 && parts[0] == "acquired" {
@@ -410,6 +425,9 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	}
 	if resp == "error" {
 		return "", 0, ErrServer
+	}
+	if resp == "error_draining" {
+		return "", 0, ErrDraining
 	}
 	return parseOKTokenLease(resp, "wait")
 }
@@ -464,6 +482,9 @@ func SemRelease(c *Conn, key, token string) error {
 		return err
 	}
 	if resp != "ok" {
+		if resp == "error_draining" {
+			return ErrDraining
+		}
 		return fmt.Errorf("%w: sem_release: %s", ErrServer, resp)
 	}
 	return nil
@@ -501,6 +522,9 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 			return 0, fmt.Errorf("%w: sem_renew: bad remaining %q", ErrServer, parts[1])
 		}
 		return r, nil
+	}
+	if resp == "error_draining" {
+		return 0, ErrDraining
 	}
 	return 0, fmt.Errorf("%w: sem_renew: %s", ErrServer, resp)
 }
@@ -543,6 +567,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	if resp == "error_already_enqueued" {
 		return "", "", 0, ErrAlreadyQueued
 	}
+	if resp == "error_draining" {
+		return "", "", 0, ErrDraining
+	}
 
 	parts := strings.Fields(resp)
 	if len(parts) == 3 && parts[0] == "acquired" {
@@ -583,6 +610,9 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	if resp == "error" {
 		return "", 0, ErrServer
 	}
+	if resp == "error_draining" {
+		return "", 0, ErrDraining
+	}
 	return parseOKTokenLease(resp, "sem_wait")
 }
 
@@ -606,6 +636,9 @@ func parseSemAcquireResponse(resp string) (string, int, error) {
 	if resp == "error_lease_expired" {
 		return "", 0, ErrLeaseExpired
 	}
+	if resp == "error_draining" {
+		return "", 0, ErrDraining
+	}
 	return parseOKTokenLease(resp, "sem_acquire")
 }
 
@@ -625,10 +658,16 @@ func parseAcquireResponse(resp string) (string, int, error) {
 	if resp == "error_lease_expired" {
 		return "", 0, ErrLeaseExpired
 	}
+	if resp == "error_draining" {
+		return "", 0, ErrDraining
+	}
 	return parseOKTokenLease(resp, "acquire")
 }
 
 func parseOKTokenLease(resp, cmd string) (string, int, error) {
+	if resp == "error_draining" {
+		return "", 0, ErrDraining
+	}
 	parts := strings.Fields(resp)
 	if len(parts) == 3 && parts[0] == "ok" {
 		ttl, err := strconv.Atoi(parts[2])
@@ -830,12 +869,14 @@ func defaultAcquireTimeout(t time.Duration) time.Duration {
 	return 10 * time.Second
 }
 
+const defaultRenewJitter = 0.10
+
 // validateRenewConfig rejects Lock/Semaphore field values that would
 // silently produce broken runtime behavior. Negative LeaseTTL is otherwise
 // dropped by buildOpts and the server default is used without warning;
 // RenewRatio >= 1.0 schedules the first renewal at-or-past the lease
 // expiry, so the lock is lost before the renewal fires.
-func validateRenewConfig(leaseTTL int, renewRatio float64) error {
+func validateRenewConfig(leaseTTL int, renewRatio, renewJitter float64) error {
 	if leaseTTL < 0 {
 		return fmt.Errorf("dflockd: LeaseTTL must be >= 0 (got %d)", leaseTTL)
 	}
@@ -844,6 +885,9 @@ func validateRenewConfig(leaseTTL int, renewRatio float64) error {
 	}
 	if math.IsNaN(renewRatio) || renewRatio < 0 || renewRatio >= 1 {
 		return fmt.Errorf("dflockd: RenewRatio must be in [0, 1) (got %v)", renewRatio)
+	}
+	if math.IsNaN(renewJitter) || renewJitter < 0 || renewJitter >= 1 {
+		return fmt.Errorf("dflockd: RenewJitter must be in [0, 1) (got %v)", renewJitter)
 	}
 	return nil
 }
@@ -854,6 +898,13 @@ func defaultRenewRatio(r float64) float64 {
 		return r
 	}
 	return 0.5
+}
+
+func defaultRenewJitterValue(j float64) float64 {
+	if j > 0 {
+		return j
+	}
+	return defaultRenewJitter
 }
 
 // defaultShardFunc returns the given ShardFunc, or CRC32Shard if unset.
@@ -886,7 +937,7 @@ func buildOpts(leaseTTL int) []Option {
 // startRenewLoop launches a background goroutine that renews a lease at
 // ratio * leaseSec intervals. renewFn is either Renew (locks) or
 // SemRenew (semaphores). Must be called with r.mu held.
-func (r *renewableResource) startRenewLoop(key string, leaseSec int, ratio float64, opts []Option, renewFn func(*Conn, string, string, ...Option) (int, error), onErr func(error)) {
+func (r *renewableResource) startRenewLoop(key string, leaseSec int, ratio, jitter float64, opts []Option, renewFn func(*Conn, string, string, ...Option) (int, error), onErr func(error)) {
 	r.stopRenew()
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancelRenew = cancel
@@ -902,13 +953,13 @@ func (r *renewableResource) startRenewLoop(key string, leaseSec int, ratio float
 
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		timer := time.NewTimer(jitteredRenewInterval(interval, jitter))
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				r.mu.Lock()
 				if r.conn == nil || r.token == "" {
 					r.mu.Unlock()
@@ -928,9 +979,31 @@ func (r *renewableResource) startRenewLoop(key string, leaseSec int, ratio float
 					}
 					return
 				}
+				timer.Reset(jitteredRenewInterval(interval, jitter))
 			}
 		}
 	}()
+}
+
+func jitteredRenewInterval(interval time.Duration, jitter float64) time.Duration {
+	if interval <= 0 || jitter <= 0 {
+		return interval
+	}
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return interval
+	}
+	// Use the top 53 bits so the integer-to-float conversion has full
+	// float64 precision. The factor is [1-jitter, 1], so jitter only moves
+	// renewals earlier and never risks renewing after the configured ratio.
+	const denom = float64(uint64(1) << 53)
+	x := float64(binary.BigEndian.Uint64(buf[:])>>11) / denom
+	factor := 1 - x*jitter
+	d := time.Duration(float64(interval) * factor)
+	if d <= 0 {
+		return interval
+	}
+	return d
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +1019,7 @@ type Lock struct {
 	Servers        []string        // e.g. ["127.0.0.1:6388"]
 	ShardFunc      ShardFunc       // defaults to CRC32Shard
 	RenewRatio     float64         // fraction of lease at which to renew; default 0.5
+	RenewJitter    float64         // early-only jitter fraction for renewals; default 0.10
 	TLSConfig      *tls.Config     // if non-nil, connect using TLS
 	AuthToken      string          // if non-empty, authenticate after connecting
 	OnRenewError   func(err error) // optional; called when background lease renewal fails
@@ -955,6 +1029,7 @@ type Lock struct {
 
 func (l *Lock) acquireTimeoutVal() time.Duration { return defaultAcquireTimeout(l.AcquireTimeout) }
 func (l *Lock) renewRatioVal() float64           { return defaultRenewRatio(l.RenewRatio) }
+func (l *Lock) renewJitterVal() float64          { return defaultRenewJitterValue(l.RenewJitter) }
 func (l *Lock) serverAddr() string               { return resolveServerAddr(l.Key, l.Servers, l.ShardFunc) }
 func (l *Lock) opts() []Option                   { return buildOpts(l.LeaseTTL) }
 
@@ -984,7 +1059,7 @@ func closeConnOnContextDone(ctx context.Context, conn interface{ Close() error }
 // The provided context controls cancellation; if it is cancelled, the
 // connection is closed which unblocks the server-side wait.
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
-	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio); err != nil {
+	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio, l.RenewJitter); err != nil {
 		return false, err
 	}
 	l.mu.Lock()
@@ -1050,7 +1125,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 // The provided context controls cancellation; if cancelled, the connection
 // is closed which unblocks any in-progress server I/O.
 func (l *Lock) Enqueue(ctx context.Context) (string, error) {
-	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio); err != nil {
+	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio, l.RenewJitter); err != nil {
 		return "", err
 	}
 	l.mu.Lock()
@@ -1105,7 +1180,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 // On timeout the connection is closed; the caller must call Enqueue again
 // to re-enter the queue.
 func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
-	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio); err != nil {
+	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio, l.RenewJitter); err != nil {
 		return false, err
 	}
 	l.mu.Lock()
@@ -1197,7 +1272,7 @@ func (l *Lock) Release(ctx context.Context) error {
 // anonymous embed.
 
 func (l *Lock) startRenew() {
-	l.startRenewLoop(l.Key, l.lease, l.renewRatioVal(), l.opts(), Renew, l.OnRenewError)
+	l.startRenewLoop(l.Key, l.lease, l.renewRatioVal(), l.renewJitterVal(), l.opts(), Renew, l.OnRenewError)
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,6 +1289,7 @@ type Semaphore struct {
 	Servers        []string        // e.g. ["127.0.0.1:6388"]
 	ShardFunc      ShardFunc       // defaults to CRC32Shard
 	RenewRatio     float64         // fraction of lease at which to renew; default 0.5
+	RenewJitter    float64         // early-only jitter fraction for renewals; default 0.10
 	TLSConfig      *tls.Config     // if non-nil, connect using TLS
 	AuthToken      string          // if non-empty, authenticate after connecting
 	OnRenewError   func(err error) // optional; called when background lease renewal fails
@@ -1223,13 +1299,14 @@ type Semaphore struct {
 
 func (s *Semaphore) acquireTimeoutVal() time.Duration { return defaultAcquireTimeout(s.AcquireTimeout) }
 func (s *Semaphore) renewRatioVal() float64           { return defaultRenewRatio(s.RenewRatio) }
+func (s *Semaphore) renewJitterVal() float64          { return defaultRenewJitterValue(s.RenewJitter) }
 func (s *Semaphore) serverAddr() string               { return resolveServerAddr(s.Key, s.Servers, s.ShardFunc) }
 func (s *Semaphore) opts() []Option                   { return buildOpts(s.LeaseTTL) }
 
 // Acquire connects to the server, acquires a semaphore slot, and starts
 // background lease renewal. Returns false (with nil error) on timeout.
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
-	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio); err != nil {
+	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio, s.RenewJitter); err != nil {
 		return false, err
 	}
 	s.mu.Lock()
@@ -1286,7 +1363,7 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 // The provided context controls cancellation; if cancelled, the connection
 // is closed which unblocks any in-progress server I/O.
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
-	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio); err != nil {
+	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio, s.RenewJitter); err != nil {
 		return "", err
 	}
 	s.mu.Lock()
@@ -1340,7 +1417,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 // Returns false (with nil error) on timeout. On timeout the connection is
 // closed; the caller must call Enqueue again to re-enter the queue.
 func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
-	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio); err != nil {
+	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio, s.RenewJitter); err != nil {
 		return false, err
 	}
 	s.mu.Lock()
@@ -1733,5 +1810,5 @@ func parseOKInt(resp, cmd string) (int, error) {
 }
 
 func (s *Semaphore) startRenew() {
-	s.startRenewLoop(s.Key, s.lease, s.renewRatioVal(), s.opts(), SemRenew, s.OnRenewError)
+	s.startRenewLoop(s.Key, s.lease, s.renewRatioVal(), s.renewJitterVal(), s.opts(), SemRenew, s.OnRenewError)
 }

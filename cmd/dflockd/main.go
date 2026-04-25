@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 
 	"github.com/mtingers/dflockd/internal/config"
@@ -44,38 +43,37 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	var tcpErr, httpErr error
-
-	wg.Add(1)
+	errCh := make(chan error, 2)
+	runners := 1
 	go func() {
-		defer wg.Done()
 		if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			tcpErr = err
+			errCh <- fmt.Errorf("tcp server: %w", err)
 			cancel() // cascade shutdown to the HTTP server
+			return
 		}
+		errCh <- nil
 	}()
 
 	if cfg.HTTPPort > 0 {
-		wg.Add(1)
+		runners++
 		go func() {
-			defer wg.Done()
 			if err := httpapi.Run(ctx, srv, cfg, log); err != nil && !errors.Is(err, context.Canceled) {
-				httpErr = err
+				errCh <- fmt.Errorf("http server: %w", err)
 				cancel() // cascade shutdown to the TCP server
+				return
 			}
+			errCh <- nil
 		}()
 	}
 
-	wg.Wait()
-
-	if tcpErr != nil {
-		log.Error("tcp server error", "err", tcpErr)
+	var failed bool
+	for i := 0; i < runners; i++ {
+		if err := <-errCh; err != nil {
+			log.Error("server error", "err", err)
+			failed = true
+		}
 	}
-	if httpErr != nil {
-		log.Error("http server error", "err", httpErr)
-	}
-	if tcpErr != nil || httpErr != nil {
+	if failed {
 		os.Exit(1)
 	}
 }

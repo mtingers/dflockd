@@ -52,10 +52,14 @@ func (h *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Open dedicated session.
-	id, err := h.bridge.CreateSession()
+	id, err := h.bridge.CreateSession(remoteIPFromAddr(r.RemoteAddr))
 	if err != nil {
 		if errors.Is(err, ErrMaxSessions) {
 			writeError(w, http.StatusServiceUnavailable, "max_sessions", "")
+			return
+		}
+		if errors.Is(err, ErrMaxSessionsPerIP) {
+			writeError(w, http.StatusServiceUnavailable, "max_sessions_per_ip", "")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())

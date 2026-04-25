@@ -62,6 +62,8 @@ func mapProtocolError(resp, opContext string) (int, errorBody) {
 		return http.StatusConflict, errorBody{Error: "not_enqueued"}
 	case "error_lease_expired":
 		return http.StatusConflict, errorBody{Error: "lease_expired"}
+	case "error_draining":
+		return http.StatusServiceUnavailable, errorBody{Error: "draining"}
 	case "error":
 		// Generic protocol error on a state-mutating op usually means
 		// "token/key combination not held." 404 is friendlier than 400

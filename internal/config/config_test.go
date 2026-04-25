@@ -18,6 +18,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.MaxLocks != 1024 {
 		t.Fatalf("expected max-locks 1024, got %d", cfg.MaxLocks)
 	}
+	if cfg.HTTPRateLimitBurst != 0 {
+		t.Fatalf("expected default http-rate-limit-burst 0, got %d", cfg.HTTPRateLimitBurst)
+	}
 }
 
 func TestLoad_BadFlags_ReturnsError(t *testing.T) {
@@ -43,7 +46,12 @@ func TestLoad_ValidationErrors(t *testing.T) {
 		{"port negative", []string{"--port", "-1"}, "port"},
 		{"port too high", []string{"--port", "99999"}, "port"},
 		{"max-connections negative", []string{"--max-connections", "-1"}, "max-connections"},
+		{"max-connections-per-ip negative", []string{"--max-connections-per-ip", "-1"}, "max-connections-per-ip"},
 		{"max-waiters negative", []string{"--max-waiters", "-1"}, "max-waiters"},
+		{"http-max-sessions-per-ip negative", []string{"--http-max-sessions-per-ip", "-1"}, "http-max-sessions-per-ip"},
+		{"http-max-connections-per-ip negative", []string{"--http-max-connections-per-ip", "-1"}, "http-max-connections-per-ip"},
+		{"http-rate-limit negative", []string{"--http-rate-limit-per-ip", "-1"}, "http-rate-limit-per-ip"},
+		{"http-rate-limit-burst negative", []string{"--http-rate-limit-burst", "-1"}, "http-rate-limit-burst"},
 	}
 
 	for _, tc := range tests {
@@ -56,6 +64,27 @@ func TestLoad_ValidationErrors(t *testing.T) {
 				t.Fatalf("error %q should contain %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+func TestLoad_HTTPRateLimitBurstDefaultsToRate(t *testing.T) {
+	cfg, err := Load([]string{"--http-rate-limit-per-ip", "10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPRateLimitBurst != 10 {
+		t.Fatalf("burst got %d, want 10", cfg.HTTPRateLimitBurst)
+	}
+}
+
+func TestLoad_HTTPCORSOrigins(t *testing.T) {
+	cfg, err := Load([]string{"--http-cors-allowed-origins", "https://a.example, https://b.example ,, "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(cfg.HTTPCORSAllowedOrigins, ",")
+	if got != "https://a.example,https://b.example" {
+		t.Fatalf("origins got %q", got)
 	}
 }
 

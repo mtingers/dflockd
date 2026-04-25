@@ -15,11 +15,11 @@ import (
 // test. We deliberately don't depend on an OpenAPI validator library
 // (would violate the zero-deps policy) — we only verify shape invariants.
 type openAPIDoc struct {
-	OpenAPI    string                             `json:"openapi"`
-	Info       map[string]any                     `json:"info"`
-	Servers    []any                              `json:"servers"`
-	Paths      map[string]map[string]openAPIOp    `json:"paths"`
-	Components map[string]any                     `json:"components"`
+	OpenAPI    string                          `json:"openapi"`
+	Info       map[string]any                  `json:"info"`
+	Servers    []any                           `json:"servers"`
+	Paths      map[string]map[string]openAPIOp `json:"paths"`
+	Components map[string]any                  `json:"components"`
 }
 
 type openAPIOp struct {
@@ -282,6 +282,7 @@ func TestOpenAPI_SchemaListStable(t *testing.T) {
 		"SignalRequest",
 		"SignalResponse",
 		"StatsResponse",
+		"StatusResponse",
 		"WaitRequest",
 		"WaitResponse",
 	}

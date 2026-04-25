@@ -86,6 +86,34 @@ func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error
 
 func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 	var wg sync.WaitGroup
+	var ipMu sync.Mutex
+	ipCounts := make(map[string]int)
+
+	acquireIPSlot := func(conn net.Conn) (string, bool) {
+		max := s.cfg.MaxConnectionsPerIP
+		if max <= 0 {
+			return "", true
+		}
+		ip := remoteIP(conn.RemoteAddr().String())
+		ipMu.Lock()
+		defer ipMu.Unlock()
+		if ipCounts[ip] >= max {
+			return ip, false
+		}
+		ipCounts[ip]++
+		return ip, true
+	}
+	releaseIPSlot := func(ip string) {
+		if ip == "" {
+			return
+		}
+		ipMu.Lock()
+		defer ipMu.Unlock()
+		ipCounts[ip]--
+		if ipCounts[ip] <= 0 {
+			delete(ipCounts, ip)
+		}
+	}
 
 	// Background loops
 	wg.Add(2)
@@ -142,6 +170,12 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 			conn.Close()
 			continue
 		}
+		ip, ok := acquireIPSlot(conn)
+		if !ok {
+			s.log.Warn("max connections per IP reached, rejecting", "ip", ip, "max", s.cfg.MaxConnectionsPerIP)
+			conn.Close()
+			continue
+		}
 		s.connCount.Add(1)
 		s.conns.Store(conn, struct{}{})
 		connID := s.connSeq.Add(1)
@@ -150,9 +184,18 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 			defer wg.Done()
 			defer s.connCount.Add(-1)
 			defer s.conns.Delete(conn)
+			defer releaseIPSlot(ip)
 			s.ServeConn(ctx, conn, connID)
 		}()
 	}
+}
+
+func remoteIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return host
+	}
+	return addr
 }
 
 // drain waits for all goroutines to finish, force-closing connections if the
@@ -464,6 +507,10 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, connID uint64) {
 				continue
 			}
 			s.log.Error("read error", "peer", peer, "err", err)
+			break
+		}
+		if ctx.Err() != nil {
+			_ = writeResp(&protocol.Ack{Status: "error_draining"})
 			break
 		}
 

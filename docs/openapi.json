@@ -4,7 +4,7 @@
     "title": "dflockd HTTP API",
     "version": "0.1.0",
     "summary": "REST + SSE interface to dflockd's distributed lock, semaphore, and signal primitives.",
-    "description": "dflockd is a lightweight distributed lock server with FIFO ordering, automatic lease expiry, semaphores, and NATS-style pub/sub signals. This HTTP API is a translation layer over the native line-based TCP protocol: every HTTP session owns an in-process virtual connection that feeds the unchanged protocol handler, so FIFO ordering, lease handling, two-phase acquire, and configured disconnect cleanup are identical across transports.\n\n## Session model\n\nThe native protocol ties lock ownership to a TCP connection. HTTP has no such connection, so the bridge introduces a **session** abstraction:\n\n1. `POST /v1/sessions` mints a server-generated opaque ID and allocates a virtual connection server-side.\n2. Every subsequent request carries `X-Dflockd-Session: <id>` so the bridge routes it to the correct virtual connection. Two-phase `enqueue`/`wait` flows therefore work the same way they do over TCP.\n3. `DELETE /v1/sessions/{id}` closes the virtual connection synchronously, triggering the same cleanup path as a TCP disconnect. With default `--auto-release-on-disconnect`, this releases held locks and semaphore slots immediately; if that setting is disabled, held resources remain until explicit release or lease expiry.\n\n## Keeping sessions alive\n\nThe virtual connection has a read timeout (server-configured via `--read-timeout`, default 23s). Any HTTP operation on a session resets that deadline, so an actively-used session stays alive. If a lock or semaphore session is otherwise idle, the client should call `POST /v1/sessions/{id}/ping` to keep the virtual connection from being torn down. SSE streams use a dedicated internal session with server-side protocol pings, so SSE clients do not ping sessions themselves.\n\n## Lease renewal\n\nAcquire returns a `token` and a `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the lock and transfers it to the next waiter. Typical clients renew at ~1/3 of the TTL.\n\n## Crash safety\n\nIf an HTTP client dies without calling `DELETE /v1/sessions/{id}`, the bridge cleans up when the virtual connection read timeout fires or when the idle session sweeper closes the session after roughly 2× `--http-session-idle-timeout`; active in-flight commands are not swept. With auto-release on disconnect enabled, held locks and semaphore slots are released when the virtual connection closes. With auto-release disabled, rely on explicit release or lease expiry.\n\n## Cross-transport interop\n\nThe HTTP bridge and the TCP protocol share a single `LockManager`, so an HTTP session and a TCP client contending on the same key are ordered together in the same FIFO queue.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
+    "description": "dflockd is a lightweight distributed lock server with FIFO ordering, automatic lease expiry, semaphores, and NATS-style pub/sub signals. This HTTP API is a translation layer over the native line-based TCP protocol: every HTTP session owns an in-process virtual connection that feeds the unchanged protocol handler, so FIFO ordering, lease handling, two-phase acquire, and configured disconnect cleanup are identical across transports.\n\n## Session model\n\nThe native protocol ties lock ownership to a TCP connection. HTTP has no such connection, so the bridge introduces a **session** abstraction:\n\n1. `POST /v1/sessions` mints a server-generated opaque ID and allocates a virtual connection server-side.\n2. Every subsequent request carries `X-Dflockd-Session: <id>` so the bridge routes it to the correct virtual connection. Two-phase `enqueue`/`wait` flows therefore work the same way they do over TCP.\n3. `DELETE /v1/sessions/{id}` closes the virtual connection synchronously, triggering the same cleanup path as a TCP disconnect. With default `--auto-release-on-disconnect`, this releases held locks and semaphore slots immediately; if that setting is disabled, held resources remain until explicit release or lease expiry.\n\n## Keeping sessions alive\n\nThe virtual connection has a read timeout (server-configured via `--read-timeout`, default 23s). Any HTTP operation on a session resets that deadline, so an actively-used session stays alive. If a lock or semaphore session is otherwise idle, the client should call `POST /v1/sessions/{id}/ping` to keep the virtual connection from being torn down. SSE streams use a dedicated internal session with server-side protocol pings, so SSE clients do not ping sessions themselves.\n\n## Lease renewal\n\nAcquire returns a `token` and a `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the lock and transfers it to the next waiter. Renew well before expiry; the Go client defaults to renewing at 50% of the TTL with early-only jitter.\n\n## Crash safety\n\nIf an HTTP client dies without calling `DELETE /v1/sessions/{id}`, the bridge cleans up when the virtual connection read timeout fires or when the idle session sweeper closes the session after roughly 2× `--http-session-idle-timeout`; active in-flight commands are not swept. With auto-release on disconnect enabled, held locks and semaphore slots are released when the virtual connection closes. With auto-release disabled, rely on explicit release or lease expiry.\n\n## Operational behavior\n\n`GET /health` and `GET /ready` are exempt from bearer auth and per-IP rate limiting. Other endpoints require auth when configured and may return `429 rate_limited` when `--http-rate-limit-per-ip` is enabled. `GET /metrics` returns Prometheus text metrics and follows the same auth/rate-limit rules as the API.\n\n## Cross-transport interop\n\nThe HTTP bridge and the TCP protocol share a single `LockManager`, so an HTTP session and a TCP client contending on the same key are ordered together in the same FIFO queue.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
   },
   "servers": [
     {
@@ -27,6 +27,44 @@
     {"name": "introspection", "description": "Server state and schema."}
   ],
   "paths": {
+    "/health": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "Liveness probe",
+        "operationId": "getHealth",
+        "description": "Returns `200` when the HTTP API process is alive. This endpoint is exempt from bearer authentication so orchestrators can use it as a liveness probe.",
+        "security": [],
+        "responses": {
+          "200": {"description": "Alive", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "ok"}}}}
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "Readiness probe",
+        "operationId": "getReady",
+        "description": "Returns `200` while the HTTP API should receive traffic and `503` while the process is draining during graceful shutdown. This endpoint is exempt from bearer authentication so orchestrators can use it as a readiness probe.",
+        "security": [],
+        "responses": {
+          "200": {"description": "Ready", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "ok"}}}},
+          "503": {"description": "Draining", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "draining"}}}}
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "Prometheus metrics",
+        "operationId": "getMetrics",
+        "description": "Returns Prometheus text-format metrics for HTTP request counts/durations and current dflockd runtime gauges derived from stats. When bearer auth is configured, metrics require the same `Authorization` header as the rest of the HTTP API.",
+        "responses": {
+          "200": {"description": "Prometheus text-format metrics", "content": {"text/plain": {"schema": {"type": "string"}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "429": {"$ref": "#/components/responses/TooManyRequests"}
+        }
+      }
+    },
     "/v1/sessions": {
       "post": {
         "tags": ["sessions"],
@@ -45,8 +83,8 @@
           },
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "503": {
-            "description": "Session cap reached (`--http-max-sessions`)",
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "example": {"error": "max_sessions"}}}
+            "description": "Session cap reached (`--http-max-sessions` or `--http-max-sessions-per-ip`)",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "examples": {"max_sessions": {"value": {"error": "max_sessions"}}, "max_sessions_per_ip": {"value": {"error": "max_sessions_per_ip"}}}}}
           }
         }
       }
@@ -178,7 +216,7 @@
         "tags": ["locks"],
         "summary": "Renew a lock's lease",
         "operationId": "renewLock",
-        "description": "Extend the lease on a currently-held lock. The new expiry is `now + lease_ttl_s`, or `now + --default-lease-ttl` if `lease_ttl_s` is omitted or zero. If the token no longer matches the current holder, returns 404 `not_held`.\n\nClients should renew at ~1/3 of the lease TTL to survive network hiccups without dropping the lock.",
+        "description": "Extend the lease on a currently-held lock. The new expiry is `now + lease_ttl_s`, or `now + --default-lease-ttl` if `lease_ttl_s` is omitted or zero. If the token no longer matches the current holder, returns 404 `not_held`.\n\nClients should renew well before the lease expires. The Go client defaults to renewing at 50% of the lease TTL with early-only jitter.",
         "parameters": [
           {"$ref": "#/components/parameters/KeyPath"},
           {"$ref": "#/components/parameters/SessionHeader"}
@@ -585,13 +623,17 @@
         "description": "Malformed request (bad JSON, missing field, invalid parameter, etc.)",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "example": {"error": "bad_request", "detail": "acquire_timeout_s must be >= 0"}}}
       },
+      "TooManyRequests": {
+        "description": "Per-IP HTTP rate limit exceeded",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "example": {"error": "rate_limited"}}}
+      },
       "SessionGone": {
         "description": "Session ID doesn't resolve — either never existed or was swept/closed",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "example": {"error": "session_gone"}}}
       },
       "CapacityExceeded": {
-        "description": "Server resource limit hit (max_locks, max_waiters, max_sessions)",
-        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "examples": {"max_locks": {"value": {"error": "max_locks"}}, "max_waiters": {"value": {"error": "max_waiters"}}, "max_sessions": {"value": {"error": "max_sessions"}}}}}
+        "description": "Server resource limit hit or server draining (max_locks, max_waiters, max_sessions, max_sessions_per_ip, draining)",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}, "examples": {"max_locks": {"value": {"error": "max_locks"}}, "max_waiters": {"value": {"error": "max_waiters"}}, "max_sessions": {"value": {"error": "max_sessions"}}, "max_sessions_per_ip": {"value": {"error": "max_sessions_per_ip"}}, "draining": {"value": {"error": "draining"}}}}}
       }
     },
     "schemas": {
@@ -713,6 +755,13 @@
           "idle_locks": {"type": "array", "items": {"$ref": "#/components/schemas/IdleInfo"}},
           "idle_semaphores": {"type": "array", "items": {"$ref": "#/components/schemas/IdleInfo"}},
           "signal_channels": {"type": "array", "items": {"$ref": "#/components/schemas/SignalChannelInfo"}}
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"type": "string", "description": "Machine-readable status such as `ok` or `draining`."}
         }
       },
       "LockInfo": {

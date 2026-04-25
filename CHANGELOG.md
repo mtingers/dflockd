@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Operations: health, readiness, and Prometheus metrics.** The HTTP API now exposes unauthenticated `GET /health` and `GET /ready`, plus authenticated `GET /metrics` when bearer auth is enabled. Metrics include HTTP request counters/duration counters and runtime gauges for readiness, uptime, connections, HTTP sessions, locks, semaphores, waiters, and signal listeners.
+- **Operations: per-IP HTTP protections and CORS.** Added `--http-rate-limit-per-ip`, `--http-rate-limit-burst`, `--http-max-connections-per-ip`, `--http-max-sessions-per-ip`, and `--http-cors-allowed-origins` with matching `DFLOCKD_HTTP_*` env vars.
+- **Server: per-IP TCP connection cap.** Added `--max-connections-per-ip` / `DFLOCKD_MAX_CONNECTIONS_PER_IP` to prevent a single source from consuming every TCP connection slot.
+- **CI: production gate workflow.** GitHub Actions now runs Go 1.26.2 tests, race tests, `go vet`, `govulncheck`, and strict docs builds.
+
+### Changed
+
+- **Client: background renewals use early-only jitter.** High-level `Lock` and `Semaphore` renewal loops now default to 10% jitter before the configured renewal ratio, reducing synchronized renewal bursts without risking late renewals.
+- **Server: graceful shutdown reports draining.** New commands on existing TCP connections receive `error_draining` during shutdown, and HTTP readiness returns `503 {"status":"draining"}` while draining.
+- **Lock: disconnect cleanup is indexed by connection.** Two-phase enqueue cleanup now uses a per-connection index so disconnect cost scales with that connection's enqueues instead of every enqueued waiter in a shard.
+- **Cmd: server error fan-in now uses an error channel.** The daemon no longer relies on shared `tcpErr`/`httpErr` variables synchronized indirectly by `WaitGroup`.
+- **Tests: package test configs now call `Config.Validate()`.** Test helpers validate constructed configs so future default/constraint drift fails in tests instead of bypassing validation.
+
 ### Security
 
 - **Build: prefer Go 1.26.2 toolchain.** This clears reachable standard-library TLS/x509 findings reported by `govulncheck` against Go 1.26.1.

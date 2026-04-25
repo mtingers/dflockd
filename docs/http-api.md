@@ -20,9 +20,16 @@ TCP and HTTP can run concurrently on different ports, and they share the same `L
 | `--http-host` | `DFLOCKD_HTTP_HOST` | same as `--host` | Bind address for the HTTP API |
 | `--http-session-idle-timeout` | `DFLOCKD_HTTP_SESSION_IDLE_S` | `20` | Advisory idle timeout reported to clients (seconds) |
 | `--http-max-sessions` | `DFLOCKD_HTTP_MAX_SESSIONS` | `0` (unlimited) | Cap on concurrent HTTP sessions |
+| `--http-max-sessions-per-ip` | `DFLOCKD_HTTP_MAX_SESSIONS_PER_IP` | `0` (unlimited) | Cap on concurrent HTTP sessions from one remote IP |
+| `--http-max-connections-per-ip` | `DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP` | `0` (unlimited) | Cap on HTTP transport connections from one remote IP |
+| `--http-rate-limit-per-ip` | `DFLOCKD_HTTP_RATE_LIMIT_PER_IP` | `0` (unlimited) | Token-bucket HTTP requests per second per remote IP |
+| `--http-rate-limit-burst` | `DFLOCKD_HTTP_RATE_LIMIT_BURST` | `0` (same as rate) | Token-bucket burst size when rate limiting is enabled |
+| `--http-cors-allowed-origins` | `DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS` | *(disabled)* | Comma-separated allowed CORS origins; `*` allows any origin |
 | `--http-sse-ping-interval` | `DFLOCKD_HTTP_SSE_PING_S` | `15` | Internal pinger interval for SSE streams (seconds) |
 
 TLS and authentication reuse `--tls-cert` / `--tls-key` / `--auth-token` from the TCP server — same credentials, served on both listeners.
+
+Rate and connection limits use `RemoteAddr` as observed by dflockd. If you run behind a reverse proxy, enforce client-IP policy at the proxy or make sure the proxy itself is the intended limit key.
 
 ## The session model
 
@@ -82,9 +89,25 @@ When `--auto-release-on-disconnect` is enabled (the default), deleting, timing o
 
 For quick recovery, keep lease TTLs short and renew aggressively.
 
+## Operational endpoints
+
+The HTTP listener exposes standard operational endpoints:
+
+| Endpoint | Auth | Response |
+|---|---|---|
+| `GET /health` | Exempt | `200 {"status":"ok"}` when the HTTP process is alive |
+| `GET /ready` | Exempt | `200 {"status":"ok"}` while accepting traffic; `503 {"status":"draining"}` during graceful shutdown |
+| `GET /metrics` | Required when auth is configured | Prometheus text-format request counters, duration counters, readiness, uptime, connection/session, lock, semaphore, and signal gauges |
+
+`GET /v1/stats` remains available for JSON introspection. Prefer `/ready` for orchestrator readiness probes and `/metrics` for monitoring.
+
 ## Authentication
 
-When `--auth-token` is set, every request must carry `Authorization: Bearer <token>`. The one exception is `GET /v1/openapi.json`, which is always reachable so tools can fetch the schema without credentials.
+When `--auth-token` is set, every request must carry `Authorization: Bearer <token>`. The exceptions are `GET /v1/openapi.json`, `GET /health`, and `GET /ready`.
+
+## CORS
+
+CORS is disabled by default. Set `--http-cors-allowed-origins` to a comma-separated list of exact origins, or `*` to allow any browser origin. When an incoming `Origin` is allowed, dflockd emits the CORS response headers and answers browser preflight requests with `204`.
 
 ## Validation limits
 
@@ -103,7 +126,8 @@ Lock and semaphore wait timeouts are domain outcomes: they return HTTP `200` wit
 | `404` | Token doesn't match any holder |
 | `409` | Already enqueued, not enqueued, lease expired, limit mismatch |
 | `410` | Session ID unknown — you need to create a new session |
-| `503` | Server capacity hit (max_locks, max_waiters, max_sessions) |
+| `429` | Per-IP HTTP rate limit exceeded |
+| `503` | Server capacity hit (`max_locks`, `max_waiters`, `max_sessions`, `max_sessions_per_ip`) or server draining |
 
 Error bodies have the shape `{"error": "<stable_code>", "detail": "<optional prose>"}`.
 

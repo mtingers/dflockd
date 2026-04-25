@@ -30,6 +30,7 @@ CLI flags take precedence over environment variables when explicitly set; otherw
 | `--gc-max-idle` | `DFLOCKD_GC_MAX_IDLE_S`<sup>†</sup> | `60` | Seconds before idle state is pruned |
 | `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max total lock and semaphore resource entries |
 | `--max-connections` | `DFLOCKD_MAX_CONNECTIONS` | `0` | Max concurrent connections (0 = unlimited) |
+| `--max-connections-per-ip` | `DFLOCKD_MAX_CONNECTIONS_PER_IP` | `0` | Max concurrent TCP connections per remote IP (0 = unlimited) |
 | `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Max waiters per key (0 = unlimited) |
 | `--max-subscriptions` | `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Max signal subscriptions per connection (0 = unlimited) |
 | `--read-timeout` | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
@@ -85,6 +86,8 @@ The `shutdown-timeout` controls the maximum time the server waits for active con
 
 The `max-connections` setting caps the total number of concurrent TCP connections. When the limit is reached, new connections are accepted and immediately closed. Set to `0` (the default) for unlimited connections.
 
+The `max-connections-per-ip` setting applies the same kind of cap per remote IP address. This prevents a single source from consuming every TCP connection slot. Set to `0` (the default) for unlimited per-IP connections.
+
 ### Max waiters
 
 The `max-waiters` setting caps the number of pending waiters **per key** for both locks and semaphores. When the limit is reached, new acquire or enqueue requests for that key return `error_max_waiters`. This prevents unbounded memory growth from waiter queues on a single contended key. Set to `0` (the default) for unlimited waiters.
@@ -113,6 +116,10 @@ When enabled (the default), the server automatically releases any locks or semap
 
 !!! warning
     Disabling this affects only held locks and semaphore slots. Pending waiters and two-phase enqueue state are still cleaned up on disconnect, but held resources from disconnected clients are only freed when their leases expire.
+
+### Draining
+
+During graceful shutdown, the TCP listener stops accepting new connections. Existing connections that send a new command after shutdown has started receive `error_draining` and are closed, giving clients a protocol-level retry signal instead of an unexplained EOF.
 
 ## TLS
 
@@ -171,7 +178,7 @@ The token comparison uses constant-time comparison (`crypto/subtle.ConstantTimeC
 
 ## Runtime stats
 
-The `stats` protocol command returns a JSON snapshot of the server's current state. This is useful for monitoring, debugging, and building health checks.
+The `stats` protocol command returns a JSON snapshot of the server's current state. This is useful for debugging and ad hoc introspection.
 
 ```bash
 printf 'stats\n_\n\n' | nc localhost 6388

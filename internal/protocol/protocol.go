@@ -29,6 +29,7 @@ var (
 	respErrorNotEnqueued     = []byte("error_not_enqueued\n")
 	respErrorAlreadyEnqueued = []byte("error_already_enqueued\n")
 	respErrorLeaseExpired    = []byte("error_lease_expired\n")
+	respErrorDraining        = []byte("error_draining\n")
 	respQueued               = []byte("queued\n")
 
 	prefixOK       = []byte("ok ")
@@ -76,7 +77,7 @@ type Request struct {
 }
 
 type Ack struct {
-	Status   string // "ok", "acquired", "queued", "timeout", "error", "error_auth", "error_max_locks", "error_max_waiters", "error_limit_mismatch", "error_not_enqueued", "error_already_enqueued"
+	Status   string // "ok", "acquired", "queued", "timeout", "error", "error_auth", "error_max_locks", "error_max_waiters", "error_limit_mismatch", "error_not_enqueued", "error_already_enqueued", "error_draining"
 	Token    string
 	LeaseTTL int // seconds; 0 means not set
 	Extra    string
@@ -492,6 +493,8 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 			return respErrorAlreadyEnqueued
 		case "error_lease_expired":
 			return respErrorLeaseExpired
+		case "error_draining":
+			return respErrorDraining
 		case "queued":
 			return respQueued
 		default:

@@ -501,6 +501,7 @@ In addition to the protocol error codes above (which close the connection), the 
 | `error_already_enqueued` | Connection already has a pending enqueue for this key |
 | `error_not_enqueued` | Wait called without a prior enqueue for this key |
 | `error_lease_expired` | Lock/slot lease expired before the waiter consumed the grant |
+| `error_draining` | Server is gracefully shutting down; retry on another server or after restart |
 
 ## Behavior
 
@@ -508,6 +509,7 @@ In addition to the protocol error codes above (which close the connection), the 
 - Semaphore slots are granted in **strict FIFO order** per key, up to the configured limit.
 - If a lease expires without renewal, the lock/slot automatically passes to the next waiter.
 - When a connection closes, signal subscriptions, pending waiters, and two-phase enqueue state for that connection are removed. Held locks and semaphore slots are released and transferred to waiters when `--auto-release-on-disconnect` is enabled, which is the default; otherwise they remain held until their leases expire.
+- During graceful shutdown, new commands on existing TCP connections receive `error_draining` and the server closes the connection.
 - Signal patterns support `*` (single token) and `>` (one or more trailing tokens) wildcards.
 - Signal channels (for publishing) must be literal — no wildcards.
 - Queue group members receive signals via round-robin. If all members' buffers are full, the primary member is disconnected (slow consumer eviction).

@@ -27,7 +27,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func testConfig() *config.Config {
-	return &config.Config{
+	cfg := &config.Config{
 		Host:                    "127.0.0.1",
 		Port:                    0,
 		DefaultLeaseTTL:         33 * time.Second,
@@ -41,6 +41,10 @@ func testConfig() *config.Config {
 		HTTPSessionIdleTimeout:  1 * time.Second,
 		HTTPSSEPingInterval:     200 * time.Millisecond,
 	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
 }
 
 // testHarness wires up the moving parts for HTTP-bridge integration
@@ -83,13 +87,15 @@ func newHarness(t *testing.T, cfg *config.Config) *testHarness {
 	bridge := NewBridge(ctx, srv, cfg, log, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions)
 
 	hs := &httpServer{
-		bridge: bridge,
-		cfg:    cfg,
-		log:    log,
+		bridge:  bridge,
+		cfg:     cfg,
+		log:     log,
+		metrics: newMetricsRegistry(),
+		limiter: newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
 	}
 	mux := http.NewServeMux()
 	hs.registerRoutes(mux)
-	handler := hs.withAuth(jsonRouteErrors(mux))
+	handler := hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux)))))
 	ts := httptest.NewServer(handler)
 
 	h := &testHarness{
@@ -221,6 +227,165 @@ func TestPingSession_UnknownReturns410(t *testing.T) {
 	resp := h.do(t, "POST", "/v1/sessions/00000000000000000000000000000000/ping", "", nil)
 	if resp.StatusCode != 410 {
 		t.Fatalf("status: %d want 410", resp.StatusCode)
+	}
+}
+
+func TestHealthAndReadyBypassAuth(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthToken = "secret"
+	h := newHarness(t, cfg)
+
+	for _, path := range []string{"/health", "/ready"} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		h.handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status %d, want 200", path, rec.Code)
+		}
+	}
+}
+
+func TestReadyReportsDraining(t *testing.T) {
+	cfg := testConfig()
+	h := newHarness(t, cfg)
+	hs := &httpServer{
+		bridge:  h.bridge,
+		cfg:     cfg,
+		log:     h.bridge.log,
+		metrics: newMetricsRegistry(),
+	}
+	hs.draining.Store(true)
+	mux := http.NewServeMux()
+	hs.registerRoutes(mux)
+	handler := hs.withAuth(jsonRouteErrors(mux))
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ready draining status %d, want 503", rec.Code)
+	}
+}
+
+func TestMetricsEndpointEmitsPrometheus(t *testing.T) {
+	h := newHarness(t, testConfig())
+	_ = h.do(t, "GET", "/health", "", nil)
+	resp := h.do(t, "GET", "/metrics", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics: status %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	for _, want := range []string{
+		"dflockd_http_requests_total",
+		`path="/health"`,
+		"dflockd_connections",
+		"dflockd_http_sessions",
+		"dflockd_ready",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("metrics missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+func TestHTTPRateLimitPerIP(t *testing.T) {
+	cfg := testConfig()
+	cfg.HTTPRateLimitPerIP = 1
+	cfg.HTTPRateLimitBurst = 1
+	h := newHarness(t, cfg)
+
+	resp := h.do(t, "GET", "/metrics", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first metrics status %d", resp.StatusCode)
+	}
+	resp = h.do(t, "GET", "/metrics", "", nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second metrics status %d, want 429", resp.StatusCode)
+	}
+	resp = h.do(t, "GET", "/health", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health should bypass rate limit, got %d", resp.StatusCode)
+	}
+}
+
+type testNetAddr string
+
+func (a testNetAddr) Network() string { return "tcp" }
+func (a testNetAddr) String() string  { return string(a) }
+
+type testConn struct {
+	remote net.Addr
+	closed bool
+}
+
+func (c *testConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *testConn) Write([]byte) (int, error)        { return 0, net.ErrClosed }
+func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) LocalAddr() net.Addr              { return testNetAddr("127.0.0.1:0") }
+func (c *testConn) RemoteAddr() net.Addr             { return c.remote }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestHTTPMaxConnectionsPerIP(t *testing.T) {
+	limiter := newHTTPConnLimiter(1)
+	c1 := &testConn{remote: testNetAddr("192.0.2.10:1000")}
+	c2 := &testConn{remote: testNetAddr("192.0.2.10:1001")}
+	c3 := &testConn{remote: testNetAddr("192.0.2.10:1002")}
+
+	limiter.ConnState(c1, http.StateNew)
+	if c1.closed {
+		t.Fatal("first connection unexpectedly closed")
+	}
+
+	limiter.ConnState(c2, http.StateNew)
+	if !c2.closed {
+		t.Fatal("second same-IP connection was not closed")
+	}
+
+	limiter.ConnState(c1, http.StateClosed)
+	limiter.ConnState(c3, http.StateNew)
+	if c3.closed {
+		t.Fatal("connection after close unexpectedly rejected")
+	}
+}
+
+func TestCORSPreflight(t *testing.T) {
+	cfg := testConfig()
+	cfg.HTTPCORSAllowedOrigins = []string{"https://app.example"}
+	h := newHarness(t, cfg)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/sessions", nil)
+	req.Header.Set("Origin", "https://app.example")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("preflight status %d, want 204", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+		t.Fatalf("allow-origin %q", got)
+	}
+}
+
+func TestMaxSessionsPerIP(t *testing.T) {
+	cfg := testConfig()
+	cfg.HTTPMaxSessionsPerIP = 1
+	h := newHarness(t, cfg)
+
+	resp := h.do(t, "POST", "/v1/sessions", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first session status %d", resp.StatusCode)
+	}
+	resp = h.do(t, "POST", "/v1/sessions", "", nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second session status %d, want 503", resp.StatusCode)
+	}
+	var body errorBody
+	decodeBody(t, resp, &body)
+	if body.Error != "max_sessions_per_ip" {
+		t.Fatalf("error %q, want max_sessions_per_ip", body.Error)
 	}
 }
 

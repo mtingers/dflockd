@@ -17,6 +17,10 @@ import (
 
 const maxProtocolSeconds = int64(math.MaxInt64) / int64(time.Second)
 
+type statusResponse struct {
+	Status string `json:"status"`
+}
+
 // ---------------------------------------------------------------------------
 // Session endpoints
 // ---------------------------------------------------------------------------
@@ -28,10 +32,14 @@ type createSessionResponse struct {
 
 // POST /v1/sessions
 func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	id, err := h.bridge.CreateSession()
+	id, err := h.bridge.CreateSession(remoteIPFromAddr(r.RemoteAddr))
 	if err != nil {
 		if errors.Is(err, ErrMaxSessions) {
 			writeError(w, http.StatusServiceUnavailable, "max_sessions", "")
+			return
+		}
+		if errors.Is(err, ErrMaxSessionsPerIP) {
+			writeError(w, http.StatusServiceUnavailable, "max_sessions_per_ip", "")
 			return
 		}
 		// A bridge-auth failure here means our own configured --auth-token
@@ -85,13 +93,33 @@ func (h *httpServer) handlePingSession(w http.ResponseWriter, r *http.Request, i
 }
 
 // ---------------------------------------------------------------------------
-// Stats
+// Health, readiness, stats
 // ---------------------------------------------------------------------------
+
+// GET /health — unauthenticated liveness probe.
+func (h *httpServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+// GET /ready — unauthenticated readiness probe. During graceful shutdown the
+// server reports not-ready before the listener drains, giving load balancers
+// a standard "going away" signal.
+func (h *httpServer) handleReady(w http.ResponseWriter, r *http.Request) {
+	if h.draining.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, statusResponse{Status: "draining"})
+		return
+	}
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
 
 // GET /v1/stats — sessionless. We don't need a virtual conn for this; we
 // ask LockManager directly for stats (same as the "stats" protocol cmd does
 // internally via server.handleRequest).
 func (h *httpServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.currentStats())
+}
+
+func (h *httpServer) currentStats() *lock.Stats {
 	stats := h.bridge.LockManager().Stats(h.bridge.ConnCount() + int64(h.bridge.SessionCount()))
 	// Mirror signal channels into the stats struct. Both fields are now
 	// the same type (signal.ChannelInfo aliased through lock), so no
@@ -110,7 +138,7 @@ func (h *httpServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	for i := range stats.IdleSemaphores {
 		stats.IdleSemaphores[i].Key = lock.StripKeyPrefix(stats.IdleSemaphores[i].Key)
 	}
-	writeJSON(w, http.StatusOK, stats)
+	return stats
 }
 
 // ---------------------------------------------------------------------------

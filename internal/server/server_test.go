@@ -20,7 +20,7 @@ import (
 )
 
 func testConfig() *config.Config {
-	return &config.Config{
+	cfg := &config.Config{
 		Host:                    "127.0.0.1",
 		Port:                    0,
 		DefaultLeaseTTL:         33 * time.Second,
@@ -32,6 +32,10 @@ func testConfig() *config.Config {
 		WriteTimeout:            5 * time.Second,
 		AutoReleaseOnDisconnect: true,
 	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
 }
 
 // startServer creates a server on a random port and returns a cancel func and the address.
@@ -147,6 +151,61 @@ func TestIntegration_LockAndRelease(t *testing.T) {
 	if resp != "ok" {
 		t.Fatalf("expected 'ok', got %q", resp)
 	}
+}
+
+func TestMaxConnectionsPerIPRejectsSecondConnection(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxConnectionsPerIP = 1
+	cleanup, addr, _ := startServer(t, cfg)
+	defer cleanup()
+
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	_, _ = conn2.Write([]byte("ping\n_\n\n"))
+	conn2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if line, err := bufio.NewReader(conn2).ReadString('\n'); err == nil {
+		t.Fatalf("second connection unexpectedly got response %q", line)
+	}
+}
+
+func TestServerDrainingRespondsToNewCommandOnExistingConn(t *testing.T) {
+	cfg := testConfig()
+	cfg.ShutdownTimeout = 5 * time.Second
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.RunOnListener(ctx, ln)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	cancel()
+	resp := connSendCmd(t, conn, reader, "ping", "_", "")
+	if resp != "error_draining" {
+		t.Fatalf("draining response %q, want error_draining", resp)
+	}
+	conn.Close()
+	<-done
 }
 
 func TestIntegration_LockTimeout(t *testing.T) {

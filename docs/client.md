@@ -60,6 +60,7 @@ l := &client.Lock{
     },
     ShardFunc:      client.CRC32Shard,      // default: CRC32Shard
     RenewRatio:     0.5,                    // default: 0.5
+    RenewJitter:    0.10,                   // default: 0.10
 }
 ```
 
@@ -71,6 +72,7 @@ l := &client.Lock{
 | `Servers` | `["127.0.0.1:6388"]` | List of dflockd server addresses |
 | `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew (e.g. 0.5 = renew at half the lease) |
+| `RenewJitter` | `0.10` | Early-only random jitter applied to renewal intervals to reduce synchronized renewal bursts |
 | `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
 | `AuthToken` | `""` | If non-empty, authenticate with this token after connecting |
 | `OnRenewError` | `nil` | Optional callback invoked when background lease renewal fails |
@@ -134,6 +136,10 @@ if err != nil {
 ```
 
 If cancellation races with a grant that has already arrived, the high-level `Lock` and `Semaphore` APIs release that token before returning the context error so callers do not unknowingly hold a resource.
+
+### Renewal timing
+
+High-level locks and semaphores renew at `RenewRatio × lease_ttl`, with an early-only jitter applied by default. The default `RenewJitter` is `0.10`, so a lock with `RenewRatio: 0.5` renews randomly between 45% and 50% of the lease TTL. Jitter never delays a renewal past the configured ratio.
 
 ### Cleanup without release
 
@@ -259,6 +265,7 @@ s := &client.Semaphore{
     Servers:        []string{"127.0.0.1:6388"}, // default: ["127.0.0.1:6388"]
     ShardFunc:      client.CRC32Shard,          // default: CRC32Shard
     RenewRatio:     0.5,                        // default: 0.5
+    RenewJitter:    0.10,                       // default: 0.10
 }
 ```
 
@@ -271,6 +278,7 @@ s := &client.Semaphore{
 | `Servers` | `["127.0.0.1:6388"]` | List of dflockd server addresses |
 | `ShardFunc` | `CRC32Shard` | Function that maps a key to a server index |
 | `RenewRatio` | `0.5` | Fraction of lease TTL at which to renew |
+| `RenewJitter` | `0.10` | Early-only random jitter applied to renewal intervals to reduce synchronized renewal bursts |
 | `TLSConfig` | `nil` | If non-nil, connect to the server using TLS with this `*tls.Config` |
 | `AuthToken` | `""` | If non-empty, authenticate with this token after connecting |
 | `OnRenewError` | `nil` | Optional callback invoked when background lease renewal fails |
@@ -356,6 +364,7 @@ if errors.Is(err, client.ErrTimeout) {
 | `ErrAlreadyQueued` | The server returned `error_already_enqueued` (connection already enqueued for this key) |
 | `ErrLeaseExpired` | The server returned `error_lease_expired` (lease expired before the grant was consumed) |
 | `ErrAuth` | The server returned `error_auth` (authentication failed or wrong token) |
+| `ErrDraining` | The server returned `error_draining` during graceful shutdown |
 
 ## Signal API: `SignalConn`
 

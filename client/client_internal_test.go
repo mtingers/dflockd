@@ -109,10 +109,40 @@ func TestValidateRenewConfigRejectsInvalidValues(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateRenewConfig(tc.leaseTTL, tc.renewRatio); err == nil {
+			if err := validateRenewConfig(tc.leaseTTL, tc.renewRatio, 0); err == nil {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestValidateRenewConfigRejectsBadJitter(t *testing.T) {
+	for _, jitter := range []float64{-0.1, 1, math.NaN()} {
+		if err := validateRenewConfig(0, 0.5, jitter); err == nil {
+			t.Fatalf("expected validation error for jitter %v", jitter)
+		}
+	}
+}
+
+func TestJitteredRenewIntervalMovesEarlierOnly(t *testing.T) {
+	base := 10 * time.Second
+	for i := 0; i < 100; i++ {
+		got := jitteredRenewInterval(base, 0.25)
+		if got <= 0 || got > base {
+			t.Fatalf("jittered interval %s outside (0, %s]", got, base)
+		}
+		if got < 7500*time.Millisecond {
+			t.Fatalf("jittered interval %s earlier than 25%% bound", got)
+		}
+	}
+}
+
+func TestParseDrainingResponse(t *testing.T) {
+	if _, _, err := parseAcquireResponse("error_draining"); !errors.Is(err, ErrDraining) {
+		t.Fatalf("parseAcquireResponse error = %v, want ErrDraining", err)
+	}
+	if _, _, err := parseSemAcquireResponse("error_draining"); !errors.Is(err, ErrDraining) {
+		t.Fatalf("parseSemAcquireResponse error = %v, want ErrDraining", err)
 	}
 }
 

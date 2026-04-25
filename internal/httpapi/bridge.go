@@ -59,11 +59,14 @@ type Bridge struct {
 	log       *slog.Logger
 	authToken string
 
-	idleTimeout time.Duration
-	maxSessions int
+	idleTimeout      time.Duration
+	maxSessions      int
+	maxSessionsPerIP int
 
-	mu       sync.Mutex
-	sessions map[string]*session
+	mu            sync.Mutex
+	sessions      map[string]*session
+	sessionIPs    map[string]string
+	sessionCounts map[string]int
 
 	// Lifecycle: ctx is derived from the parent context passed to the
 	// HTTP server. Cancelling it tears down every session's virtual conn.
@@ -79,16 +82,19 @@ type Bridge struct {
 func NewBridge(parent context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger, idleTimeout time.Duration, maxSessions int) *Bridge {
 	ctx, cancel := context.WithCancel(parent)
 	b := &Bridge{
-		srv:         srv,
-		cfg:         cfg,
-		log:         log,
-		authToken:   cfg.AuthToken,
-		idleTimeout: idleTimeout,
-		maxSessions: maxSessions,
-		sessions:    make(map[string]*session),
-		ctx:         ctx,
-		cancel:      cancel,
-		sweeperDone: make(chan struct{}),
+		srv:              srv,
+		cfg:              cfg,
+		log:              log,
+		authToken:        cfg.AuthToken,
+		idleTimeout:      idleTimeout,
+		maxSessions:      maxSessions,
+		maxSessionsPerIP: cfg.HTTPMaxSessionsPerIP,
+		sessions:         make(map[string]*session),
+		sessionIPs:       make(map[string]string),
+		sessionCounts:    make(map[string]int),
+		ctx:              ctx,
+		cancel:           cancel,
+		sweeperDone:      make(chan struct{}),
 	}
 	go b.sweeperLoop()
 	return b
@@ -105,6 +111,8 @@ func (b *Bridge) Shutdown() {
 		sessions = append(sessions, s)
 	}
 	b.sessions = make(map[string]*session)
+	b.sessionIPs = make(map[string]string)
+	b.sessionCounts = make(map[string]int)
 	b.mu.Unlock()
 
 	for _, s := range sessions {
@@ -123,6 +131,9 @@ var ErrSessionGone = errors.New("session gone")
 
 // ErrMaxSessions is returned when the bridge has reached its session cap.
 var ErrMaxSessions = errors.New("max sessions reached")
+
+// ErrMaxSessionsPerIP is returned when one remote IP has reached its session cap.
+var ErrMaxSessionsPerIP = errors.New("max sessions per ip reached")
 
 // session represents a single HTTP-originated virtual connection into the
 // protocol handler. It owns:
@@ -163,13 +174,22 @@ type session struct {
 // returns the session ID. If the server has an auth token configured, the
 // bridge performs protocol-level authentication transparently so the HTTP
 // client never has to send the `auth` command.
-func (b *Bridge) CreateSession() (string, error) {
+func (b *Bridge) CreateSession(remoteIP ...string) (string, error) {
+	ownerIP := ""
+	if len(remoteIP) > 0 {
+		ownerIP = remoteIP[0]
+	}
 	b.mu.Lock()
 	doomed := b.pruneDeadSessionsLocked()
 	if b.maxSessions > 0 && len(b.sessions) >= b.maxSessions {
 		b.mu.Unlock()
 		closeSessions(doomed)
 		return "", ErrMaxSessions
+	}
+	if b.maxSessionsPerIP > 0 && ownerIP != "" && b.sessionCounts[ownerIP] >= b.maxSessionsPerIP {
+		b.mu.Unlock()
+		closeSessions(doomed)
+		return "", ErrMaxSessionsPerIP
 	}
 	b.mu.Unlock()
 	closeSessions(doomed)
@@ -208,7 +228,17 @@ func (b *Bridge) CreateSession() (string, error) {
 		s.close()
 		return "", ErrMaxSessions
 	}
+	if b.maxSessionsPerIP > 0 && ownerIP != "" && b.sessionCounts[ownerIP] >= b.maxSessionsPerIP {
+		b.mu.Unlock()
+		closeSessions(doomed)
+		s.close()
+		return "", ErrMaxSessionsPerIP
+	}
 	b.sessions[id] = s
+	if ownerIP != "" {
+		b.sessionIPs[id] = ownerIP
+		b.sessionCounts[ownerIP]++
+	}
 	b.mu.Unlock()
 	closeSessions(doomed)
 	return id, nil
@@ -230,7 +260,7 @@ func (b *Bridge) LookupSession(id string) (*session, error) {
 		return nil, ErrSessionGone
 	}
 	if s.dead.Load() {
-		delete(b.sessions, id)
+		b.deleteSessionLocked(id)
 		b.mu.Unlock()
 		s.close()
 		return nil, ErrSessionGone
@@ -245,7 +275,7 @@ func (b *Bridge) pruneDeadSessionsLocked() []*session {
 	for id, s := range b.sessions {
 		if s.dead.Load() {
 			doomed = append(doomed, s)
-			delete(b.sessions, id)
+			b.deleteSessionLocked(id)
 		}
 	}
 	return doomed
@@ -264,7 +294,7 @@ func (b *Bridge) DeleteSession(id string) error {
 	b.mu.Lock()
 	s, ok := b.sessions[id]
 	if ok {
-		delete(b.sessions, id)
+		b.deleteSessionLocked(id)
 	}
 	b.mu.Unlock()
 	if !ok {
@@ -272,6 +302,17 @@ func (b *Bridge) DeleteSession(id string) error {
 	}
 	s.close()
 	return nil
+}
+
+func (b *Bridge) deleteSessionLocked(id string) {
+	delete(b.sessions, id)
+	if ip := b.sessionIPs[id]; ip != "" {
+		delete(b.sessionIPs, id)
+		b.sessionCounts[ip]--
+		if b.sessionCounts[ip] <= 0 {
+			delete(b.sessionCounts, ip)
+		}
+	}
 }
 
 // SessionCount returns the current number of active sessions. Used by
@@ -510,7 +551,7 @@ func (b *Bridge) sweeperLoop() {
 			for id, s := range b.sessions {
 				if s.dead.Load() {
 					doomed = append(doomed, s)
-					delete(b.sessions, id)
+					b.deleteSessionLocked(id)
 					continue
 				}
 				if s.inFlight.Load() > 0 {
@@ -520,7 +561,7 @@ func (b *Bridge) sweeperLoop() {
 					last := time.Unix(0, s.lastSeen.Load())
 					if last.Before(cutoff) {
 						doomed = append(doomed, s)
-						delete(b.sessions, id)
+						b.deleteSessionLocked(id)
 					}
 				}
 			}

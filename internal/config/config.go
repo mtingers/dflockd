@@ -19,6 +19,7 @@ type Config struct {
 	GCMaxIdleTime           time.Duration
 	MaxLocks                int
 	MaxConnections          int
+	MaxConnectionsPerIP     int
 	MaxWaiters              int
 	MaxSubscriptions        int
 	ReadTimeout             time.Duration
@@ -32,11 +33,16 @@ type Config struct {
 	AuthToken               string
 
 	// HTTP API (opt-in; HTTPPort=0 disables).
-	HTTPPort               int
-	HTTPHost               string
-	HTTPSessionIdleTimeout time.Duration
-	HTTPMaxSessions        int
-	HTTPSSEPingInterval    time.Duration
+	HTTPPort                int
+	HTTPHost                string
+	HTTPSessionIdleTimeout  time.Duration
+	HTTPMaxSessions         int
+	HTTPMaxSessionsPerIP    int
+	HTTPMaxConnectionsPerIP int
+	HTTPRateLimitPerIP      int
+	HTTPRateLimitBurst      int
+	HTTPSSEPingInterval     time.Duration
+	HTTPCORSAllowedOrigins  []string
 }
 
 // envLookup returns the first non-empty env value from the given keys,
@@ -92,6 +98,20 @@ func envOrString(envKey string, flagVal string) string {
 		return flagVal
 	}
 	return v
+}
+
+func splitCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 const maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
@@ -191,6 +211,7 @@ func Load(args []string) (*Config, error) {
 	gcMaxIdle := fs.Int("gc-max-idle", 60, "Idle seconds before pruning lock state")
 	maxLocks := fs.Int("max-locks", 1024, "Maximum number of unique lock keys")
 	maxConnections := fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
+	maxConnectionsPerIP := fs.Int("max-connections-per-ip", 0, "Maximum concurrent TCP connections per remote IP (0 = unlimited)")
 	maxWaiters := fs.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
 	maxSubscriptions := fs.Int("max-subscriptions", 0, "Maximum watch+listen registrations per connection (0 = unlimited)")
 	readTimeout := fs.Int("read-timeout", 23, "Client read timeout (seconds)")
@@ -205,7 +226,12 @@ func Load(args []string) (*Config, error) {
 	httpHost := fs.String("http-host", "", "HTTP API bind address (defaults to --host)")
 	httpIdle := fs.Int("http-session-idle-timeout", 20, "HTTP session idle timeout (seconds)")
 	httpMaxSessions := fs.Int("http-max-sessions", 0, "Max concurrent HTTP sessions (0 = unlimited)")
+	httpMaxSessionsPerIP := fs.Int("http-max-sessions-per-ip", 0, "Max concurrent HTTP sessions per remote IP (0 = unlimited)")
+	httpMaxConnsPerIP := fs.Int("http-max-connections-per-ip", 0, "Max concurrent HTTP transport connections per remote IP (0 = unlimited)")
+	httpRateLimitPerIP := fs.Int("http-rate-limit-per-ip", 0, "HTTP requests per second per remote IP (0 = unlimited)")
+	httpRateLimitBurst := fs.Int("http-rate-limit-burst", 0, "HTTP per-IP rate-limit burst size (0 = same as rate)")
 	httpSSEPing := fs.Int("http-sse-ping-interval", 15, "Internal ping interval for SSE streams (seconds)")
+	httpCORSOrigins := fs.String("http-cors-allowed-origins", "", "Comma-separated allowed CORS origins for the HTTP API (empty = disabled)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	version := fs.Bool("version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -307,6 +333,12 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 
+	resolvedHTTPRate := resolveInt("http-rate-limit-per-ip", "DFLOCKD_HTTP_RATE_LIMIT_PER_IP", *httpRateLimitPerIP)
+	resolvedHTTPBurst := resolveInt("http-rate-limit-burst", "DFLOCKD_HTTP_RATE_LIMIT_BURST", *httpRateLimitBurst)
+	if resolvedHTTPRate > 0 && resolvedHTTPBurst == 0 {
+		resolvedHTTPBurst = resolvedHTTPRate
+	}
+
 	cfg := &Config{
 		Host:                    resolveString("host", "DFLOCKD_HOST", *host),
 		Port:                    resolveInt("port", "DFLOCKD_PORT", *port),
@@ -316,6 +348,7 @@ func Load(args []string) (*Config, error) {
 		GCMaxIdleTime:           gcMaxIdleDuration,
 		MaxLocks:                resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks),
 		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
+		MaxConnectionsPerIP:     resolveInt("max-connections-per-ip", "DFLOCKD_MAX_CONNECTIONS_PER_IP", *maxConnectionsPerIP),
 		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
 		MaxSubscriptions:        resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions),
 		ReadTimeout:             readTimeoutDuration,
@@ -329,18 +362,23 @@ func Load(args []string) (*Config, error) {
 		HTTPHost:                resolveString("http-host", "DFLOCKD_HTTP_HOST", *httpHost),
 		HTTPSessionIdleTimeout:  httpIdleDuration,
 		HTTPMaxSessions:         resolveInt("http-max-sessions", "DFLOCKD_HTTP_MAX_SESSIONS", *httpMaxSessions),
+		HTTPMaxSessionsPerIP:    resolveInt("http-max-sessions-per-ip", "DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", *httpMaxSessionsPerIP),
+		HTTPMaxConnectionsPerIP: resolveInt("http-max-connections-per-ip", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP", *httpMaxConnsPerIP),
+		HTTPRateLimitPerIP:      resolvedHTTPRate,
+		HTTPRateLimitBurst:      resolvedHTTPBurst,
 		HTTPSSEPingInterval:     httpSSEPingDuration,
+		HTTPCORSAllowedOrigins:  splitCSV(resolveString("http-cors-allowed-origins", "DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", *httpCORSOrigins)),
 		Debug:                   resolveBool("debug", "DFLOCKD_DEBUG", *debug),
 		Version:                 *version,
 	}
 
-	if err := cfg.validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
-func (c *Config) validate() error {
+func (c *Config) Validate() error {
 	if c.MaxLocks <= 0 {
 		return fmt.Errorf("--max-locks must be > 0 (got %d)", c.MaxLocks)
 	}
@@ -368,6 +406,9 @@ func (c *Config) validate() error {
 	if c.MaxConnections < 0 {
 		return fmt.Errorf("--max-connections must be >= 0 (got %d)", c.MaxConnections)
 	}
+	if c.MaxConnectionsPerIP < 0 {
+		return fmt.Errorf("--max-connections-per-ip must be >= 0 (got %d)", c.MaxConnectionsPerIP)
+	}
 	if c.MaxWaiters < 0 {
 		return fmt.Errorf("--max-waiters must be >= 0 (got %d)", c.MaxWaiters)
 	}
@@ -394,6 +435,21 @@ func (c *Config) validate() error {
 	}
 	if c.HTTPMaxSessions < 0 {
 		return fmt.Errorf("--http-max-sessions must be >= 0")
+	}
+	if c.HTTPMaxSessionsPerIP < 0 {
+		return fmt.Errorf("--http-max-sessions-per-ip must be >= 0")
+	}
+	if c.HTTPMaxConnectionsPerIP < 0 {
+		return fmt.Errorf("--http-max-connections-per-ip must be >= 0")
+	}
+	if c.HTTPRateLimitPerIP < 0 {
+		return fmt.Errorf("--http-rate-limit-per-ip must be >= 0")
+	}
+	if c.HTTPRateLimitBurst < 0 {
+		return fmt.Errorf("--http-rate-limit-burst must be >= 0")
+	}
+	if c.HTTPRateLimitPerIP > 0 && c.HTTPRateLimitBurst == 0 {
+		return fmt.Errorf("--http-rate-limit-burst must be > 0 when --http-rate-limit-per-ip is set")
 	}
 	if c.HTTPSSEPingInterval < 0 {
 		return fmt.Errorf("--http-sse-ping-interval must be >= 0")

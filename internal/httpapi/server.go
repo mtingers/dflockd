@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/config"
@@ -29,10 +30,13 @@ var openAPISpec []byte
 
 // httpServer wraps a *http.Server plus the bridge it delegates to.
 type httpServer struct {
-	bridge *Bridge
-	cfg    *config.Config
-	log    *slog.Logger
-	srv    *http.Server
+	bridge   *Bridge
+	cfg      *config.Config
+	log      *slog.Logger
+	srv      *http.Server
+	metrics  *metricsRegistry
+	limiter  *httpRateLimiter
+	draining atomic.Bool
 }
 
 // Run starts the HTTP API listener on the configured host+port and blocks
@@ -84,22 +88,26 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 	}
 
 	hs := &httpServer{
-		bridge: bridge,
-		cfg:    cfg,
-		log:    log,
+		bridge:  bridge,
+		cfg:     cfg,
+		log:     log,
+		metrics: newMetricsRegistry(),
+		limiter: newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
 	}
 
 	mux := http.NewServeMux()
 	hs.registerRoutes(mux)
+	connLimiter := newHTTPConnLimiter(cfg.HTTPMaxConnectionsPerIP)
 
 	hs.srv = &http.Server{
-		Handler: hs.withAuth(jsonRouteErrors(mux)),
+		Handler: hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux))))),
 		// Leave ReadTimeout/WriteTimeout at 0 (unlimited) so long-poll
 		// acquires with large --default-lease-ttl values aren't cut off.
 		// ReadHeaderTimeout still protects against slowloris.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          nil, // slog is our path; don't double-log
+		ConnState:         connLimiter.ConnState,
 	}
 	hs.srv.RegisterOnShutdown(startBridgeShutdown)
 
@@ -118,6 +126,7 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 
 	select {
 	case <-ctx.Done():
+		hs.draining.Store(true)
 		startBridgeShutdown()
 		shutdownTimeout := cfg.ShutdownTimeout
 		if shutdownTimeout <= 0 {
@@ -147,7 +156,7 @@ func (h *httpServer) withAuth(next http.Handler) http.Handler {
 		}
 		// Exempt: the OpenAPI spec describes auth; it shouldn't itself
 		// require auth.
-		if r.URL.Path == "/v1/openapi.json" {
+		if r.URL.Path == "/v1/openapi.json" || r.URL.Path == "/health" || r.URL.Path == "/ready" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -233,6 +242,9 @@ type RegisteredPath struct {
 // registerRoutes — the OpenAPI drift test enforces this. Kept as a
 // package-level var so we don't reallocate on every call.
 var registeredRoutes = []RegisteredPath{
+	{Pattern: "/health", Methods: []string{"GET"}},
+	{Pattern: "/ready", Methods: []string{"GET"}},
+	{Pattern: "/metrics", Methods: []string{"GET"}},
 	{Pattern: "/v1/sessions", Methods: []string{"POST"}},
 	{Pattern: "/v1/sessions/{id}", Methods: []string{"DELETE"}},
 	{Pattern: "/v1/sessions/{id}/ping", Methods: []string{"POST"}},
@@ -269,6 +281,11 @@ func Routes() []RegisteredPath { return registeredRoutes }
 // (unencoded) falls through to 404 instead of misrouting — a
 // deliberate trade-off for predictable behavior.
 func (h *httpServer) registerRoutes(mux *http.ServeMux) {
+	// Operational endpoints
+	mux.HandleFunc("GET /health", h.handleHealth)
+	mux.HandleFunc("GET /ready", h.handleReady)
+	mux.HandleFunc("GET /metrics", h.handleMetrics)
+
 	// Sessions
 	mux.HandleFunc("POST /v1/sessions", h.handleCreateSession)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", withSessionID(h.handleDeleteSession))

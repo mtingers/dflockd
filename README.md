@@ -95,6 +95,7 @@ CLI flags take precedence over environment variables.
 | `--default-lease-ttl` | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lease duration (seconds) |
 | `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max unique lock+semaphore keys |
 | `--max-connections` | `DFLOCKD_MAX_CONNECTIONS` | `0` | Max concurrent connections (0 = unlimited) |
+| `--max-connections-per-ip` | `DFLOCKD_MAX_CONNECTIONS_PER_IP` | `0` | Max concurrent TCP connections per remote IP (0 = unlimited) |
 | `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Max waiters per key (0 = unlimited) |
 | `--max-subscriptions` | `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Max signal subscriptions per connection (0 = unlimited) |
 | `--read-timeout` | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
@@ -109,6 +110,11 @@ CLI flags take precedence over environment variables.
 | `--http-host` | `DFLOCKD_HTTP_HOST` | same as `--host` | HTTP API bind address |
 | `--http-session-idle-timeout` | `DFLOCKD_HTTP_SESSION_IDLE_S` | `20` | HTTP session idle timeout (seconds) |
 | `--http-max-sessions` | `DFLOCKD_HTTP_MAX_SESSIONS` | `0` | Max concurrent HTTP sessions (0 = unlimited) |
+| `--http-max-sessions-per-ip` | `DFLOCKD_HTTP_MAX_SESSIONS_PER_IP` | `0` | Max concurrent HTTP sessions per remote IP (0 = unlimited) |
+| `--http-max-connections-per-ip` | `DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP` | `0` | Max concurrent HTTP transport connections per remote IP (0 = unlimited) |
+| `--http-rate-limit-per-ip` | `DFLOCKD_HTTP_RATE_LIMIT_PER_IP` | `0` | HTTP requests per second per remote IP (0 = unlimited) |
+| `--http-rate-limit-burst` | `DFLOCKD_HTTP_RATE_LIMIT_BURST` | `0` | HTTP per-IP burst size (0 = same as rate when rate is set) |
+| `--http-cors-allowed-origins` | `DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS` | *(unset)* | Comma-separated CORS origins; `*` allows any origin |
 | `--http-sse-ping-interval` | `DFLOCKD_HTTP_SSE_PING_S` | `15` | Internal pinger interval for SSE streams (seconds) |
 | `--debug` | `DFLOCKD_DEBUG` | `false` | Enable debug logging |
 
