@@ -71,16 +71,16 @@ The connection must stay open — by default, locks are auto-released on disconn
 
 ## Performance
 
-Each operation is one lock acquire + release over a persistent TCP connection. Measured on an Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost.
+Each operation is one lock acquire + release over a persistent TCP connection. Median of three runs on v1.16.0; Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost.
 
 | Workers | Rounds | Ops | Throughput | Mean | p50 | p99 |
 |---|---|---|---|---|---|---|
-| 1 | 1,000 | 1,000 | 14,030 ops/s | 0.071 ms | 0.055 ms | 0.223 ms |
-| 10 | 1,000 | 10,000 | 49,974 ops/s | 0.199 ms | 0.191 ms | 0.430 ms |
-| 50 | 1,000 | 50,000 | 95,741 ops/s | 0.504 ms | 0.386 ms | 2.977 ms |
-| 100 | 1,000 | 100,000 | 92,948 ops/s | 1.042 ms | 0.766 ms | 6.606 ms |
-| 200 | 1,000 | 200,000 | 92,895 ops/s | 2.079 ms | 1.503 ms | 13.354 ms |
-| 500 | 1,000 | 500,000 | 93,460 ops/s | 5.172 ms | 4.295 ms | 29.387 ms |
+| 1 | 1,000 | 1,000 | 13,440 ops/s | 0.074 ms | 0.062 ms | 0.178 ms |
+| 10 | 1,000 | 10,000 | 45,861 ops/s | 0.217 ms | 0.215 ms | 0.382 ms |
+| 50 | 1,000 | 50,000 | 83,516 ops/s | 0.590 ms | 0.513 ms | 2.096 ms |
+| 100 | 1,000 | 100,000 | 87,448 ops/s | 1.124 ms | 0.935 ms | 4.192 ms |
+| 200 | 1,000 | 200,000 | 89,706 ops/s | 2.200 ms | 1.864 ms | 7.892 ms |
+| 500 | 1,000 | 500,000 | 85,124 ops/s | 5.814 ms | 5.117 ms | 18.554 ms |
 
 All workers use unique keys (no contention). Run your own benchmarks with `go run ./cmd/bench --help`.
 
