@@ -1,5 +1,6 @@
-// Concurrent benchmark: N goroutine workers each acquire/release a shared lock
-// repeatedly and report latency statistics.
+// Concurrent benchmark: N goroutine workers each acquire/release locks
+// repeatedly and report latency statistics. By default each worker uses a
+// unique key; --shared-key makes all workers contend on one lock.
 //
 // Each worker dials a persistent TCP connection and uses the low-level
 // Acquire/Release protocol, so the benchmark measures lock latency rather
