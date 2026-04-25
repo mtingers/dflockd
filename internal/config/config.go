@@ -43,6 +43,13 @@ type Config struct {
 	HTTPRateLimitBurst      int
 	HTTPSSEPingInterval     time.Duration
 	HTTPCORSAllowedOrigins  []string
+
+	// Replication (opt-in; ReplicationRole=="" disables).
+	ReplicationRole       string        // "primary" | "secondary" | "" (standalone)
+	ReplicationPeerAddr   string        // primary: where the secondary listens; secondary: ignored
+	ReplicationListenAddr string        // secondary: where the primary connects; primary: ignored
+	ReplicationMaxPause   time.Duration // 0 → 5s
+	ReplicationNodeID     string        // optional; auto-derived from --host:--port if empty
 }
 
 // envLookup returns the first non-empty env value from the given keys,
@@ -232,6 +239,11 @@ func Load(args []string) (*Config, error) {
 	httpRateLimitBurst := fs.Int("http-rate-limit-burst", 0, "HTTP per-IP rate-limit burst size (0 = same as rate)")
 	httpSSEPing := fs.Int("http-sse-ping-interval", 15, "Internal ping interval for SSE streams (seconds)")
 	httpCORSOrigins := fs.String("http-cors-allowed-origins", "", "Comma-separated allowed CORS origins for the HTTP API (empty = disabled)")
+	replicationRole := fs.String("replication-role", "", "Replication role: 'primary', 'secondary', or '' (standalone)")
+	replicationPeerAddr := fs.String("replication-peer", "", "Primary only: address (host:port) of the secondary's replication listener")
+	replicationListenAddr := fs.String("replication-listen", "", "Secondary only: address (host:port) to listen on for the primary's replication connection")
+	replicationMaxPauseMS := fs.Int("max-pause-ms", 5000, "Replication: ms with no peer contact before primary self-promotes to solo")
+	replicationNodeID := fs.String("replication-node-id", "", "Replication: free-form node identifier (auto-derived if empty)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	version := fs.Bool("version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -368,6 +380,11 @@ func Load(args []string) (*Config, error) {
 		HTTPRateLimitBurst:      resolvedHTTPBurst,
 		HTTPSSEPingInterval:     httpSSEPingDuration,
 		HTTPCORSAllowedOrigins:  splitCSV(resolveString("http-cors-allowed-origins", "DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", *httpCORSOrigins)),
+		ReplicationRole:         resolveString("replication-role", "DFLOCKD_REPLICATION_ROLE", *replicationRole),
+		ReplicationPeerAddr:     resolveString("replication-peer", "DFLOCKD_REPLICATION_PEER", *replicationPeerAddr),
+		ReplicationListenAddr:   resolveString("replication-listen", "DFLOCKD_REPLICATION_LISTEN", *replicationListenAddr),
+		ReplicationMaxPause:     time.Duration(resolveInt("max-pause-ms", "DFLOCKD_MAX_PAUSE_MS", *replicationMaxPauseMS)) * time.Millisecond,
+		ReplicationNodeID:       resolveString("replication-node-id", "DFLOCKD_REPLICATION_NODE_ID", *replicationNodeID),
 		Debug:                   resolveBool("debug", "DFLOCKD_DEBUG", *debug),
 		Version:                 *version,
 	}
@@ -463,6 +480,20 @@ func (c *Config) Validate() error {
 		c.HTTPSSEPingInterval >= c.HTTPSessionIdleTimeout {
 		return fmt.Errorf("--http-sse-ping-interval (%s) must be less than --http-session-idle-timeout (%s)",
 			c.HTTPSSEPingInterval, c.HTTPSessionIdleTimeout)
+	}
+	switch c.ReplicationRole {
+	case "", "primary", "secondary":
+	default:
+		return fmt.Errorf("--replication-role must be one of: primary, secondary, '' (got %q)", c.ReplicationRole)
+	}
+	if c.ReplicationRole == "primary" && c.ReplicationPeerAddr == "" {
+		return fmt.Errorf("--replication-role=primary requires --replication-peer")
+	}
+	if c.ReplicationRole == "secondary" && c.ReplicationListenAddr == "" {
+		return fmt.Errorf("--replication-role=secondary requires --replication-listen")
+	}
+	if c.ReplicationMaxPause < 0 {
+		return fmt.Errorf("--max-pause-ms must be >= 0")
 	}
 	return nil
 }

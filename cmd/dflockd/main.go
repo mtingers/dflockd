@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/httpapi"
 	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/replication"
 	"github.com/mtingers/dflockd/internal/server"
 )
 
@@ -42,6 +45,39 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Replication is opt-in. When enabled, the replicator owns the
+	// peer link and is installed as the lock manager's mutation hook.
+	// On the secondary, the server is also told to refuse client
+	// mutations.
+	var rep *replication.Replicator
+	if cfg.ReplicationRole != "" {
+		nodeID := cfg.ReplicationNodeID
+		if nodeID == "" {
+			nodeID = net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+		}
+		rep = replication.NewReplicator(replication.Config{
+			Role:        replication.Role(cfg.ReplicationRole),
+			NodeID:      nodeID,
+			PeerAddr:    cfg.ReplicationPeerAddr,
+			ListenAddr:  cfg.ReplicationListenAddr,
+			MaxPause:    cfg.ReplicationMaxPause,
+			Apply:       lm,
+			Log:         log.With("component", "replication"),
+		})
+		if err := rep.Start(ctx); err != nil {
+			log.Error("replication: failed to start", "err", err)
+			os.Exit(1)
+		}
+		defer rep.Stop()
+		// The primary publishes all state mutations to the replicator
+		// so they reach the secondary; the secondary doesn't (its
+		// mutations come from the wire).
+		if cfg.ReplicationRole == "primary" {
+			lm.SetReplicationHook(rep)
+		}
+		srv.SetReplicator(rep)
+	}
 
 	errCh := make(chan error, 2)
 	runners := 1

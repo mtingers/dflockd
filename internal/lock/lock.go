@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mtingers/dflockd/internal/config"
+	"github.com/mtingers/dflockd/internal/replication"
 	"github.com/mtingers/dflockd/internal/signal"
 )
 
@@ -142,6 +143,46 @@ type LockManager struct {
 	cfg           *config.Config
 	log           *slog.Logger
 	tokBuf        tokenBuf
+
+	// hook is the replication outlet. NoopHook by default; replaced
+	// via SetReplicationHook on the primary. Read-mostly: callers may
+	// load it without holding sh.mu, but the swap should happen at
+	// startup before any client traffic. Atomic so a future hot-swap
+	// (e.g. role change) doesn't tear.
+	hook atomic.Pointer[replication.Hook]
+}
+
+// LeaseExpiresOrZeroNS returns the holder's leaseExpires as Unix nanos,
+// or 0 if zero-time. Used by the replication layer for serialisation.
+func leaseExpiresOrZeroNS(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// captureMutation publishes m to the configured Hook (if any). Must be
+// called while the shard lock for m.Key is held — this guarantees a
+// strict happens-before ordering between the local state change and
+// the mutation reaching the replicator's queue.
+func (lm *LockManager) captureMutation(m replication.Mutation) {
+	hp := lm.hook.Load()
+	if hp == nil {
+		return
+	}
+	(*hp).Capture(m)
+}
+
+// SetReplicationHook installs the Hook used to capture state changes
+// for replication. Pass replication.NoopHook{} (or nil) to disable.
+// Should be called once at startup before serving traffic.
+func (lm *LockManager) SetReplicationHook(h replication.Hook) {
+	if h == nil {
+		var noop replication.Hook = replication.NoopHook{}
+		lm.hook.Store(&noop)
+		return
+	}
+	lm.hook.Store(&h)
 }
 
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
@@ -150,6 +191,8 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 		log:    log,
 		tokBuf: newTokenBuf(),
 	}
+	var noop replication.Hook = replication.NoopHook{}
+	lm.hook.Store(&noop)
 	for i := range lm.shards {
 		lm.shards[i].resources = make(map[string]*ResourceState)
 		lm.shards[i].connOwned = make(map[uint64]map[string]map[string]struct{})
@@ -339,9 +382,11 @@ func (lm *LockManager) grantNextWaiterLocked(sh *shard, key string, st *Resource
 			continue
 		}
 		eqKey := connKey{ConnID: w.connID, Key: key}
+		hadEnqueued := false
 		if es, ok := sh.connEnqueued[eqKey]; ok && es.waiter == w {
 			es.waiter = nil
 			es.token = token
+			hadEnqueued = true
 		}
 		st.Holders[token] = &holder{
 			connID:       w.connID,
@@ -349,6 +394,27 @@ func (lm *LockManager) grantNextWaiterLocked(sh *shard, key string, st *Resource
 		}
 		st.LastActivity = now
 		sh.connAddOwned(w.connID, key, token)
+		// Replicate: a granted waiter becomes a holder. If there was a
+		// two-phase enqueued state, it transitions from waiter-form to
+		// post-grant form — emit both mutations so the secondary
+		// records both pieces (it never saw the pre-grant waiter).
+		lm.captureMutation(replication.Mutation{
+			Kind:               replication.OpHolderAdd,
+			Key:                key,
+			Token:              token,
+			ConnID:             w.connID,
+			Limit:              st.Limit,
+			LeaseExpiresUnixNS: leaseExpiresOrZeroNS(now.Add(w.leaseTTL)),
+		})
+		if hadEnqueued {
+			lm.captureMutation(replication.Mutation{
+				Kind:       replication.OpEnqueuedAdd,
+				Key:        key,
+				Token:      token,
+				ConnID:     w.connID,
+				LeaseTTLNS: int64(w.leaseTTL),
+			})
+		}
 	}
 	st.compactWaiters()
 }
@@ -386,8 +452,14 @@ func (lm *LockManager) evictExpiredLocked(sh *shard, key string, st *ResourceSta
 			eqKey := connKey{ConnID: h.connID, Key: key}
 			if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
 				sh.connRemoveEnqueued(eqKey)
+				lm.captureMutation(replication.Mutation{
+					Kind: replication.OpEnqueuedRemove, Key: key, ConnID: h.connID,
+				})
 			}
 			delete(st.Holders, token)
+			lm.captureMutation(replication.Mutation{
+				Kind: replication.OpHolderRemove, Key: key, Token: token,
+			})
 			anyExpired = true
 		}
 	}
@@ -457,11 +529,20 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 			leaseExpires: now.Add(leaseTTL),
 		}
 		sh.connAddOwned(connID, key, token)
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpHolderAdd, Key: key, Token: token,
+			ConnID: connID, Limit: st.Limit,
+			LeaseExpiresUnixNS: leaseExpiresOrZeroNS(now.Add(leaseTTL)),
+		})
 		sh.mu.Unlock()
 		return token, nil
 	}
 
-	// Slow path: allocate waiter and enqueue
+	// Slow path: allocate waiter and enqueue. The waiter itself is
+	// primary-only — its queue position cannot be transferred safely
+	// across a failover, so the secondary doesn't track it. The
+	// holder add that follows when the waiter is granted is what gets
+	// replicated (via grantNextWaiterLocked above).
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
 		sh.mu.Unlock()
 		return "", ErrMaxWaiters
@@ -573,10 +654,21 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 		}
 		sh.connAddOwned(connID, key, token)
 		sh.connSetEnqueued(eqKey, &enqueuedState{token: token, leaseTTL: leaseTTL})
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpHolderAdd, Key: key, Token: token,
+			ConnID: connID, Limit: st.Limit,
+			LeaseExpiresUnixNS: leaseExpiresOrZeroNS(now.Add(leaseTTL)),
+		})
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpEnqueuedAdd, Key: key, Token: token,
+			ConnID: connID, LeaseTTLNS: int64(leaseTTL),
+		})
 		return "acquired", token, leaseSec, nil
 	}
 
-	// Slow path: create waiter and enqueue
+	// Slow path: create waiter and enqueue. As above, the waiter is
+	// primary-only; the secondary will be told about it only when it
+	// is granted (via grantNextWaiterLocked).
 	if max := lm.cfg.MaxWaiters; max > 0 && st.waiterCount() >= max {
 		return "", "", 0, ErrMaxWaiters
 	}
@@ -614,6 +706,9 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	if esToken != "" {
 		sh.mu.Lock()
 		sh.connRemoveEnqueued(eqKey)
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpEnqueuedRemove, Key: key, ConnID: connID,
+		})
 		now := time.Now()
 		st := sh.resources[key]
 		if st != nil {
@@ -624,6 +719,9 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 					// Expired: clean up holder and grant to next waiter
 					sh.connRemoveOwned(connID, key, esToken)
 					delete(st.Holders, esToken)
+					lm.captureMutation(replication.Mutation{
+						Kind: replication.OpHolderRemove, Key: key, Token: esToken,
+					})
 					st.LastActivity = now
 					lm.grantNextWaiterLocked(sh, key, st)
 					sh.mu.Unlock()
@@ -632,6 +730,10 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 				// Reset lease
 				h.leaseExpires = now.Add(leaseTTL)
 				st.LastActivity = now
+				lm.captureMutation(replication.Mutation{
+					Kind: replication.OpHolderRenew, Key: key, Token: esToken,
+					LeaseExpiresUnixNS: leaseExpiresOrZeroNS(h.leaseExpires),
+				})
 				sh.mu.Unlock()
 				return esToken, leaseSec, nil
 			}
@@ -651,16 +753,26 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		if !ok || token == "" {
 			sh.mu.Lock()
 			sh.connRemoveEnqueued(eqKey)
+			lm.captureMutation(replication.Mutation{
+				Kind: replication.OpEnqueuedRemove, Key: key, ConnID: connID,
+			})
 			sh.mu.Unlock()
 			return "", 0, ErrWaiterClosed
 		}
 		sh.mu.Lock()
 		sh.connRemoveEnqueued(eqKey)
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpEnqueuedRemove, Key: key, ConnID: connID,
+		})
 		now := time.Now()
 		if st := sh.resources[key]; st != nil {
 			if h, hOK := st.Holders[token]; hOK {
 				h.leaseExpires = now.Add(leaseTTL)
 				st.LastActivity = now
+				lm.captureMutation(replication.Mutation{
+					Kind: replication.OpHolderRenew, Key: key, Token: token,
+					LeaseExpiresUnixNS: leaseExpiresOrZeroNS(h.leaseExpires),
+				})
 				sh.mu.Unlock()
 				return token, leaseSec, nil
 			}
@@ -672,6 +784,9 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	case <-timeoutCtx.Done():
 		sh.mu.Lock()
 		sh.connRemoveEnqueued(eqKey)
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpEnqueuedRemove, Key: key, ConnID: connID,
+		})
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
@@ -685,6 +800,9 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 						if ctx.Err() != nil {
 							sh.connRemoveOwned(h.connID, key, token)
 							delete(st.Holders, token)
+							lm.captureMutation(replication.Mutation{
+								Kind: replication.OpHolderRemove, Key: key, Token: token,
+							})
 							st.LastActivity = now
 							lm.grantNextWaiterLocked(sh, key, st)
 							sh.mu.Unlock()
@@ -692,6 +810,10 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 						}
 						h.leaseExpires = now.Add(leaseTTL)
 						st.LastActivity = now
+						lm.captureMutation(replication.Mutation{
+							Kind: replication.OpHolderRenew, Key: key, Token: token,
+							LeaseExpiresUnixNS: leaseExpiresOrZeroNS(h.leaseExpires),
+						})
 						sh.mu.Unlock()
 						return token, leaseSec, nil
 					}
@@ -737,8 +859,14 @@ func (lm *LockManager) Release(key, token string) bool {
 	eqKey := connKey{ConnID: h.connID, Key: key}
 	if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
 		sh.connRemoveEnqueued(eqKey)
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpEnqueuedRemove, Key: key, ConnID: h.connID,
+		})
 	}
 	delete(st.Holders, token)
+	lm.captureMutation(replication.Mutation{
+		Kind: replication.OpHolderRemove, Key: key, Token: token,
+	})
 	lm.grantNextWaiterLocked(sh, key, st)
 	return true
 }
@@ -772,8 +900,14 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 		eqKey := connKey{ConnID: h.connID, Key: key}
 		if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
 			sh.connRemoveEnqueued(eqKey)
+			lm.captureMutation(replication.Mutation{
+				Kind: replication.OpEnqueuedRemove, Key: key, ConnID: h.connID,
+			})
 		}
 		delete(st.Holders, token)
+		lm.captureMutation(replication.Mutation{
+			Kind: replication.OpHolderRemove, Key: key, Token: token,
+		})
 		st.LastActivity = now
 		lm.grantNextWaiterLocked(sh, key, st)
 		return 0, false
@@ -782,6 +916,10 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 	// Reset lease
 	h.leaseExpires = now.Add(leaseTTL)
 	st.LastActivity = now
+	lm.captureMutation(replication.Mutation{
+		Kind: replication.OpHolderRenew, Key: key, Token: token,
+		LeaseExpiresUnixNS: leaseExpiresOrZeroNS(h.leaseExpires),
+	})
 
 	remaining := int(leaseTTL.Seconds())
 	if remaining < 0 {
@@ -809,7 +947,15 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 		// than every enqueued waiter in the shard.
 		for _, ck := range sh.connEnqueuedKeys(connID) {
 			es := sh.connEnqueued[ck]
+			hadToken := es != nil && es.token != ""
 			sh.connRemoveEnqueued(ck)
+			if hadToken {
+				// Only the post-grant form was ever replicated; only that
+				// form needs an enqueued_remove on the secondary.
+				lm.captureMutation(replication.Mutation{
+					Kind: replication.OpEnqueuedRemove, Key: ck.Key, ConnID: connID,
+				})
+			}
 			if es != nil && es.waiter != nil {
 				if _, already := closed[es.waiter.ch]; !already {
 					close(es.waiter.ch)
@@ -850,6 +996,9 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 						lm.log.Warn("disconnect cleanup: releasing",
 							"key", key, "conn_id", connID)
 						delete(st.Holders, token)
+						lm.captureMutation(replication.Mutation{
+							Kind: replication.OpHolderRemove, Key: key, Token: token,
+						})
 					}
 					st.LastActivity = time.Now()
 					lm.grantNextWaiterLocked(sh, key, st)
@@ -860,6 +1009,112 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 
 		sh.mu.Unlock()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Replication apply path (secondary-side state installation)
+// ---------------------------------------------------------------------------
+//
+// These methods install state from a replication frame WITHOUT publishing
+// further mutations (the secondary doesn't echo). They are intentionally
+// blunt: the primary has already done the validation and conflict
+// resolution; the secondary just mirrors. Concurrency is sh.mu.
+//
+// Resources are auto-created when the first holder/enqueued lands on a
+// previously-unknown key. Limit is taken from the incoming op for a
+// fresh resource and ignored for an existing one (the primary cannot
+// change Limit on an extant resource — see ErrLimitMismatch).
+
+// applyReplicatedEnsureResource returns (or creates) the ResourceState
+// for key with the given Limit. Must be called with sh.mu held. Does
+// not bump resourceTotal beyond MaxLocks (the secondary mirrors
+// whatever the primary admitted, even if MaxLocks would normally
+// reject it; the primary is the gatekeeper).
+func (lm *LockManager) applyReplicatedEnsureResource(sh *shard, key string, limit int) *ResourceState {
+	if st, ok := sh.resources[key]; ok {
+		return st
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+	st := &ResourceState{
+		Limit:        limit,
+		Holders:      make(map[string]*holder),
+		LastActivity: time.Now(),
+	}
+	sh.resources[key] = st
+	lm.resourceTotal.Add(1)
+	return st
+}
+
+// ApplyReplicatedHolderAdd installs a holder for the given key with
+// the supplied (token, connID, leaseExpires). Idempotent: re-applying
+// an existing token replaces the holder with the new lease.
+func (lm *LockManager) ApplyReplicatedHolderAdd(key string, limit int, token string, connID uint64, leaseExpires time.Time) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := lm.applyReplicatedEnsureResource(sh, key, limit)
+	st.Holders[token] = &holder{connID: connID, leaseExpires: leaseExpires}
+	st.LastActivity = time.Now()
+	sh.connAddOwned(connID, key, token)
+}
+
+// ApplyReplicatedHolderRemove deletes the holder for token if present.
+func (lm *LockManager) ApplyReplicatedHolderRemove(key string, token string) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil {
+		return
+	}
+	if h, ok := st.Holders[token]; ok {
+		sh.connRemoveOwned(h.connID, key, token)
+		delete(st.Holders, token)
+	}
+	st.LastActivity = time.Now()
+}
+
+// ApplyReplicatedHolderRenew updates an existing holder's lease.
+// No-op if the holder is unknown (catch-up may not have arrived yet).
+func (lm *LockManager) ApplyReplicatedHolderRenew(key string, token string, leaseExpires time.Time) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil {
+		return
+	}
+	if h, ok := st.Holders[token]; ok {
+		h.leaseExpires = leaseExpires
+		st.LastActivity = time.Now()
+	}
+}
+
+// ApplyReplicatedEnqueuedAdd records the post-grant two-phase state.
+// Only the form with a token is replicated; pre-grant waiters are
+// primary-local.
+func (lm *LockManager) ApplyReplicatedEnqueuedAdd(key string, connID uint64, token string, leaseTTL time.Duration) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, ok := sh.resources[key]; !ok {
+		// Holder must exist before enqueued state is meaningful;
+		// if not, drop on the floor — the upcoming holder_add or
+		// snapshot will reconcile.
+		return
+	}
+	eqKey := connKey{ConnID: connID, Key: key}
+	sh.connSetEnqueued(eqKey, &enqueuedState{token: token, leaseTTL: leaseTTL})
+}
+
+// ApplyReplicatedEnqueuedRemove clears the two-phase enqueued state for connID/key.
+func (lm *LockManager) ApplyReplicatedEnqueuedRemove(key string, connID uint64) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.connRemoveEnqueued(connKey{ConnID: connID, Key: key})
 }
 
 // ---------------------------------------------------------------------------
@@ -894,8 +1149,14 @@ func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 							eqKey := connKey{ConnID: h.connID, Key: key}
 							if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
 								sh.connRemoveEnqueued(eqKey)
+								lm.captureMutation(replication.Mutation{
+									Kind: replication.OpEnqueuedRemove, Key: key, ConnID: h.connID,
+								})
 							}
 							delete(st.Holders, token)
+							lm.captureMutation(replication.Mutation{
+								Kind: replication.OpHolderRemove, Key: key, Token: token,
+							})
 							anyExpired = true
 						}
 					}

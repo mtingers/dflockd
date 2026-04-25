@@ -33,6 +33,16 @@ type connState struct {
 	subscriptions int
 }
 
+// Replicator is the optional replication coordinator. Implemented by
+// *replication.Replicator. Declared here as an interface so the server
+// package does not import replication (avoids an import cycle since
+// replication imports lock, and we want lock to remain server-free).
+type Replicator interface {
+	IsPrimary() bool
+	ShouldRefuseMutations() bool
+	AwaitAcked(ctx context.Context, seq uint64) error
+}
+
 type Server struct {
 	lm        *lock.LockManager
 	cfg       *config.Config
@@ -41,10 +51,34 @@ type Server struct {
 	connSeq   atomic.Uint64
 	connCount atomic.Int64
 	conns     sync.Map // net.Conn → struct{}
+
+	rep atomic.Pointer[Replicator] // nil unless replication enabled
 }
 
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
 	return &Server{lm: lm, cfg: cfg, log: log, sig: signal.NewManager()}
+}
+
+// SetReplicator installs the replication coordinator. Called once at
+// startup before serving traffic. When set, mutation requests on a
+// secondary or paused-primary are rejected with status "error_paused".
+func (s *Server) SetReplicator(r Replicator) {
+	if r == nil {
+		s.rep.Store(nil)
+		return
+	}
+	s.rep.Store(&r)
+}
+
+// shouldRefuseMutations returns true if the configured replicator is
+// telling the server to refuse client mutation traffic. A nil
+// replicator pointer means standalone mode → never refuse.
+func (s *Server) shouldRefuseMutations() bool {
+	rp := s.rep.Load()
+	if rp == nil {
+		return false
+	}
+	return (*rp).ShouldRefuseMutations()
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -529,9 +563,30 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}
 }
 
+// isMutation reports whether the command changes server-visible state
+// and therefore must be refused on a non-authoritative replica.
+// "auth" is intentionally excluded — the auth handshake on a secondary
+// is OK; we just don't accept any commands afterwards. Read-only
+// commands (ping, stats, listen, unlisten) pass through.
+func isMutation(cmd string) bool {
+	switch cmd {
+	case "l", "sl", "r", "sr", "n", "sn", "e", "se", "w", "sw", "signal":
+		return true
+	}
+	return false
+}
+
 func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *connState) *protocol.Ack {
 	connID := cs.id
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
+
+	// Replication gate: refuse mutations when this node is not
+	// authoritative (secondary always; primary during pause). Read-only
+	// commands continue to work so monitoring / SSE / listen-style
+	// traffic remains useful on the secondary.
+	if isMutation(req.Cmd) && s.shouldRefuseMutations() {
+		return &protocol.Ack{Status: "error_paused"}
+	}
 
 	switch req.Cmd {
 	case "ping":
