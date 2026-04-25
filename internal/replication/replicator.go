@@ -47,15 +47,46 @@ func (s State) String() string {
 
 // Apply is the lock-manager-side callback. The secondary uses these
 // methods to install state arriving from the primary. Implemented by
-// *lock.LockManager (via the ApplyReplicated* methods); declared as
-// an interface here so the replication package does not import lock
-// (avoiding an import cycle).
+// *lock.LockManager; declared as an interface here so the replication
+// package does not import lock (avoiding an import cycle).
 type Apply interface {
 	ApplyReplicatedHolderAdd(key string, limit int, token string, connID uint64, leaseExpires time.Time)
 	ApplyReplicatedHolderRemove(key string, token string)
 	ApplyReplicatedHolderRenew(key string, token string, leaseExpires time.Time)
 	ApplyReplicatedEnqueuedAdd(key string, connID uint64, token string, leaseTTL time.Duration)
 	ApplyReplicatedEnqueuedRemove(key string, connID uint64)
+	ClearAll()
+}
+
+// Snapshotter is the primary-side state walker. Implemented by
+// *lock.LockManager (via Snapshot()). The replicator calls it on
+// receipt of a SnapshotReq frame.
+type Snapshotter interface {
+	Snapshot() []SnapshotEntry
+}
+
+// SnapshotEntry mirrors lock.SnapshotEntry. Repeated here as a thin
+// type so replication doesn't import lock.
+type SnapshotEntry struct {
+	Key      string
+	Limit    int
+	Holders  []SnapshotHolder
+	Enqueued []SnapshotEnqueued
+}
+
+// SnapshotHolder mirrors lock.SnapshotHolder.
+type SnapshotHolder struct {
+	Token              string
+	ConnID             uint64
+	LeaseExpiresUnixNS int64
+}
+
+// SnapshotEnqueued mirrors lock.SnapshotEnqueued (note: distinct
+// from the wire-frame Enqueued in protocol.go).
+type SnapshotEnqueued struct {
+	ConnID     uint64
+	Token      string
+	LeaseTTLNS int64
 }
 
 // Config is the wiring the replicator needs at construction time.
@@ -68,8 +99,17 @@ type Config struct {
 	TLSConfig   *tls.Config   // optional; same on both sides
 	MaxPause    time.Duration // 0 → DefaultMaxPause
 	DialTimeout time.Duration
-	Apply       Apply
-	Log         *slog.Logger
+
+	// Apply is required on the secondary (incoming state). Optional
+	// on the primary (only needed if a single LockManager backs both
+	// roles, e.g. tests). nil on a pure primary.
+	Apply Apply
+
+	// Snapshotter is required on the primary (it serves SnapshotReq).
+	// Optional on the secondary. nil on a pure secondary.
+	Snapshotter Snapshotter
+
+	Log *slog.Logger
 }
 
 // outboundBufSize bounds the in-flight pre-ack queue. Sized to absorb
@@ -215,15 +255,16 @@ func (r *Replicator) Capture(m Mutation) uint64 {
 	return seq
 }
 
-// AwaitAcked blocks until the peer has acked at least seq, or until
-// ctx is cancelled / the replicator stops / the role transitions to
-// Solo (in which case the primary now has authority on its own and
-// post-pause writes don't require peer ack).
+// AwaitAcked blocks until the peer has acked at least seq, OR the
+// primary self-promotes to Solo (in which case the caller is free to
+// proceed because the primary is now authoritative alone).
 //
-// Returns nil on success. Returns ctx.Err() on context cancellation.
-// Returns ErrSolo if the primary self-promoted past the pause window
-// (the caller can interpret this as "your write is durable on me, but
-// not on the peer — I'm authoritative now anyway").
+// The two "OK to proceed" cases collapse to a nil return so callers
+// can stay schema-light: nil = response to client, non-nil = surface
+// an error. Returns ctx.Err() on cancellation, ErrStopped on shutdown,
+// ErrLostPeer if the peer link broke during ACTIVE mode (the caller
+// should reject the mutation with error_paused — the operation has
+// already been applied locally but is not durable across failover).
 func (r *Replicator) AwaitAcked(ctx context.Context, seq uint64) error {
 	if seq == 0 {
 		return nil
@@ -233,28 +274,85 @@ func (r *Replicator) AwaitAcked(ctx context.Context, seq uint64) error {
 			return nil
 		}
 		st := r.State()
-		if st == StateSolo {
-			return ErrSolo
+		switch st {
+		case StateSolo:
+			// Primary is now authoritative alone. Local apply is the
+			// system of record. Treat as "acked".
+			return nil
+		case StateFailed:
+			// We're a secondary that lost the primary. Should never
+			// reach here for client-side mutations (gate refuses).
+			return ErrLostPeer
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-r.stop:
 			return ErrStopped
-		case <-time.After(20 * time.Millisecond):
-			// Re-check on wakeup. (A condvar would be tighter but
-			// requires careful integration with ctx cancellation;
-			// short polling is simpler and the latency cost is
-			// bounded.)
+		case <-time.After(5 * time.Millisecond):
+			// Short polling. A condvar would be tighter but couples
+			// awkwardly with ctx cancellation. 5ms keeps median sync
+			// latency well under 10ms in healthy conditions.
 		}
 	}
 }
 
-// ErrSolo is returned by AwaitAcked when the primary self-promoted
-// past the pause window. The mutation is in the primary's local
-// state; further peer ack is not coming until the peer reconnects
-// and catches up.
-var ErrSolo = errors.New("replication: primary in solo mode")
+// Promote transitions a secondary into a primary at a bumped epoch.
+// Invoked by the operator (via SIGUSR1 or an admin endpoint) after
+// the original primary has been confirmed dead. The result is a
+// standalone-primary configuration: there is no peer, no further
+// replication, and the lock manager continues serving from current
+// state. To rejoin a fresh secondary, restart the binary with new
+// flags — there is no in-flight reconfiguration.
+//
+// Safety:
+//   - Bumping the epoch fences any returning original-primary; if it
+//     comes back, it's at the old epoch and will fail to handshake
+//     against any new secondary that joined the new primary.
+//   - The peer link (if any) is closed — the old peer is now stale.
+//   - Returns an error if already a primary; idempotent in that case.
+func (r *Replicator) Promote() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cfg.Role == RolePrimary {
+		return errors.New("replication: already primary")
+	}
+	r.epoch++
+	r.cfg.Role = RolePrimary
+	r.state = StateSolo
+	if r.peer != nil {
+		r.peer.Close(nil)
+		r.peer = nil
+	}
+	if r.listener != nil {
+		_ = r.listener.Close()
+		r.listener = nil
+	}
+	r.log.Warn("replication: PROMOTED to primary (operator action)",
+		"new_epoch", r.epoch)
+	return nil
+}
+
+// HighWaterMark returns the largest seq Capture has assigned so far.
+// The server handler reads this AFTER calling into the lock manager
+// to learn the high-water of mutations its operation produced, then
+// waits for that seq to be acked before responding to the client.
+//
+// Reading is racy with concurrent Captures from other goroutines, but
+// safely conservative: a higher hwm just means we wait for unrelated
+// mutations to ack too — they will, since they're being replicated
+// anyway, and the wait time is bounded by the slowest concurrent op.
+func (r *Replicator) HighWaterMark() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seq
+}
+
+// ErrLostPeer is returned by AwaitAcked when the peer link broke
+// before the supplied seq was acked and the primary did not (yet)
+// self-promote. The caller's mutation has been applied locally but is
+// not durable across failover.
+var ErrLostPeer = errors.New("replication: peer lost before ack")
 
 // ErrStopped is returned by AwaitAcked when the replicator is shutting down.
 var ErrStopped = errors.New("replication: stopped")
@@ -388,16 +486,72 @@ func (r *Replicator) primaryReader(ctx context.Context, pc *peerConn) {
 			}
 			return nil
 		case FrameSnapshotReq:
-			// TODO(replication): emit a full snapshot. For v1 we just
-			// log; the secondary will operate from incremental ops only.
-			r.log.Warn("replication: snapshot req received (v1 stub)")
-			end := &Frame{Type: FrameSnapshotEnd, SnapshotEnd: &SnapshotEnd{Epoch: r.Epoch(), LastSeq: r.ackedSeq.Load()}}
-			return pc.WriteFrame(end)
+			return r.sendSnapshot(pc)
 		default:
 			r.log.Debug("replication: unexpected frame on primary reader", "type", f.Type)
 			return nil
 		}
 	})
+}
+
+// sendSnapshot serialises the lock manager's current state and pushes
+// SnapshotPart frames + SnapshotEnd. Live ops captured during
+// snapshot generation will follow naturally on the outbound channel
+// because Snapshot() reads under shard locks (so no new ops can be
+// captured for a shard while we're reading it). Across shards the
+// snapshot is "soft" — but per-key consistency is what matters for
+// lock semantics.
+func (r *Replicator) sendSnapshot(pc *peerConn) error {
+	if r.cfg.Snapshotter == nil {
+		r.log.Error("replication: snapshot requested but no Snapshotter configured")
+		return pc.WriteFrame(&Frame{
+			Type:        FrameSnapshotEnd,
+			SnapshotEnd: &SnapshotEnd{Epoch: r.Epoch(), LastSeq: r.ackedSeq.Load()},
+		})
+	}
+	entries := r.cfg.Snapshotter.Snapshot()
+	r.mu.Lock()
+	snapSeq := r.seq // high-water at snapshot completion
+	epoch := r.epoch
+	r.mu.Unlock()
+	r.log.Info("replication: sending snapshot",
+		"entries", len(entries), "snap_seq", snapSeq, "epoch", epoch)
+	for _, e := range entries {
+		part := &Frame{Type: FrameSnapshotPart, SnapshotPart: &SnapshotPart{
+			Epoch:    epoch,
+			Key:      e.Key,
+			Limit:    e.Limit,
+			Holders:  toWireHolders(e.Holders),
+			Enqueued: toWireEnqueued(e.Enqueued),
+		}}
+		if err := pc.WriteFrame(part); err != nil {
+			return err
+		}
+	}
+	end := &Frame{Type: FrameSnapshotEnd, SnapshotEnd: &SnapshotEnd{Epoch: epoch, LastSeq: snapSeq}}
+	return pc.WriteFrame(end)
+}
+
+func toWireHolders(in []SnapshotHolder) []Holder {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Holder, len(in))
+	for i, h := range in {
+		out[i] = Holder{Token: h.Token, ConnID: h.ConnID, LeaseExpiresUnixNS: h.LeaseExpiresUnixNS}
+	}
+	return out
+}
+
+func toWireEnqueued(in []SnapshotEnqueued) []Enqueued {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Enqueued, len(in))
+	for i, e := range in {
+		out[i] = Enqueued{ConnID: e.ConnID, Token: e.Token, LeaseTTLNS: e.LeaseTTLNS}
+	}
+	return out
 }
 
 func (r *Replicator) primarySender(ctx context.Context, pc *peerConn) {
@@ -436,7 +590,7 @@ func (r *Replicator) handleSecondarySession(ctx context.Context, pc *peerConn) {
 		r.log.Warn("replication: secondary handshake failed", "err", err)
 		return
 	}
-	r.setState(StateActive)
+	r.setState(StateSyncing)
 	r.attachPeer(pc)
 	defer func() {
 		r.detachPeer(pc)
@@ -446,6 +600,20 @@ func (r *Replicator) handleSecondarySession(ctx context.Context, pc *peerConn) {
 		// it to primary.
 		r.setState(StateFailed)
 	}()
+
+	// Wipe local state and request a fresh snapshot. Stale state
+	// from a previous connection epoch is unsafe to keep — the peer
+	// may have pruned things we never heard about.
+	if r.cfg.Apply != nil {
+		r.cfg.Apply.ClearAll()
+	}
+	if err := pc.WriteFrame(&Frame{
+		Type:        FrameSnapshotReq,
+		SnapshotReq: &SnapshotReq{Epoch: r.Epoch()},
+	}); err != nil {
+		r.log.Warn("replication: snapshot request failed", "err", err)
+		return
+	}
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
@@ -498,16 +666,37 @@ func (r *Replicator) secondaryReader(ctx context.Context, pc *peerConn) {
 			ack := &Frame{Type: FrameOpAck, OpAck: &OpAck{Seq: f.Op.Seq, Epoch: f.Op.Epoch}}
 			return pc.WriteFrame(ack)
 		case FrameSnapshotPart:
-			// TODO(replication): apply snapshot part.
-			r.log.Warn("replication: snapshot part received (v1 stub)")
+			r.applySnapshotPart(f.SnapshotPart)
 			return nil
 		case FrameSnapshotEnd:
+			r.log.Info("replication: snapshot complete",
+				"epoch", f.SnapshotEnd.Epoch, "last_seq", f.SnapshotEnd.LastSeq)
+			r.setState(StateActive)
 			return nil
 		default:
 			r.log.Debug("replication: unexpected frame on secondary reader", "type", f.Type)
 			return nil
 		}
 	})
+}
+
+// applySnapshotPart installs one resource's worth of state on the
+// secondary. Holders and Enqueued are added via the same Apply
+// methods used for live ops — idempotent and order-tolerant.
+func (r *Replicator) applySnapshotPart(p *SnapshotPart) {
+	if p == nil || r.cfg.Apply == nil {
+		return
+	}
+	for _, h := range p.Holders {
+		expires := time.Time{}
+		if h.LeaseExpiresUnixNS != 0 {
+			expires = time.Unix(0, h.LeaseExpiresUnixNS)
+		}
+		r.cfg.Apply.ApplyReplicatedHolderAdd(p.Key, p.Limit, h.Token, h.ConnID, expires)
+	}
+	for _, e := range p.Enqueued {
+		r.cfg.Apply.ApplyReplicatedEnqueuedAdd(p.Key, e.ConnID, e.Token, time.Duration(e.LeaseTTLNS))
+	}
 }
 
 // applyOp installs the mutation on the local lock manager via the

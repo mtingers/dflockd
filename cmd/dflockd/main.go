@@ -20,6 +20,42 @@ import (
 
 var version = "dev"
 
+// snapshotAdapter bridges *lock.LockManager.Snapshot() (returns
+// []lock.SnapshotEntry) to replication.Snapshotter (expects
+// []replication.SnapshotEntry). The two types carry the same
+// information; the adapter just translates field-by-field so the
+// replication package doesn't need to import lock.
+type snapshotAdapter struct{ lm *lock.LockManager }
+
+func (s snapshotAdapter) Snapshot() []replication.SnapshotEntry {
+	in := s.lm.Snapshot()
+	out := make([]replication.SnapshotEntry, len(in))
+	for i, e := range in {
+		out[i] = replication.SnapshotEntry{Key: e.Key, Limit: e.Limit}
+		if len(e.Holders) > 0 {
+			out[i].Holders = make([]replication.SnapshotHolder, len(e.Holders))
+			for j, h := range e.Holders {
+				out[i].Holders[j] = replication.SnapshotHolder{
+					Token:              h.Token,
+					ConnID:             h.ConnID,
+					LeaseExpiresUnixNS: h.LeaseExpiresUnixNS,
+				}
+			}
+		}
+		if len(e.Enqueued) > 0 {
+			out[i].Enqueued = make([]replication.SnapshotEnqueued, len(e.Enqueued))
+			for j, q := range e.Enqueued {
+				out[i].Enqueued[j] = replication.SnapshotEnqueued{
+					ConnID:     q.ConnID,
+					Token:      q.Token,
+					LeaseTTLNS: q.LeaseTTLNS,
+				}
+			}
+		}
+	}
+	return out
+}
+
 func main() {
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
@@ -46,6 +82,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// SIGUSR1 promotes a replication secondary to primary in-place.
+	// One-way (no demote). For containerised deployments use the
+	// admin HTTP endpoint instead — same semantics.
+	promoteCh := make(chan os.Signal, 1)
+	signal.Notify(promoteCh, syscall.SIGUSR1)
+	go func() {
+		for range promoteCh {
+			if err := srv.Promote(); err != nil {
+				log.Error("promote signal: failed", "err", err)
+				continue
+			}
+			log.Warn("promote signal: secondary promoted to primary")
+		}
+	}()
+
 	// Replication is opt-in. When enabled, the replicator owns the
 	// peer link and is installed as the lock manager's mutation hook.
 	// On the secondary, the server is also told to refuse client
@@ -62,7 +113,8 @@ func main() {
 			PeerAddr:    cfg.ReplicationPeerAddr,
 			ListenAddr:  cfg.ReplicationListenAddr,
 			MaxPause:    cfg.ReplicationMaxPause,
-			Apply:       lm,
+			Apply:       lm, // used by secondary; harmless on primary
+			Snapshotter: snapshotAdapter{lm},
 			Log:         log.With("component", "replication"),
 		})
 		if err := rep.Start(ctx); err != nil {

@@ -41,6 +41,8 @@ type Replicator interface {
 	IsPrimary() bool
 	ShouldRefuseMutations() bool
 	AwaitAcked(ctx context.Context, seq uint64) error
+	HighWaterMark() uint64
+	Promote() error
 }
 
 type Server struct {
@@ -70,6 +72,17 @@ func (s *Server) SetReplicator(r Replicator) {
 	s.rep.Store(&r)
 }
 
+// Promote calls Replicator.Promote on the configured replicator. Used
+// by main.go's SIGUSR1 handler. Returns an error if no replicator is
+// configured or if promotion fails.
+func (s *Server) Promote() error {
+	rp := s.rep.Load()
+	if rp == nil {
+		return fmt.Errorf("no replicator configured")
+	}
+	return (*rp).Promote()
+}
+
 // shouldRefuseMutations returns true if the configured replicator is
 // telling the server to refuse client mutation traffic. A nil
 // replicator pointer means standalone mode → never refuse.
@@ -79,6 +92,41 @@ func (s *Server) shouldRefuseMutations() bool {
 		return false
 	}
 	return (*rp).ShouldRefuseMutations()
+}
+
+// awaitReplication blocks until every mutation captured up to the
+// current high-water-mark has been acked by the peer (or the primary
+// went solo). Called after a lock-manager mutation, before the
+// server writes the response to the client. Returns nil for
+// standalone mode (no replicator).
+func (s *Server) awaitReplication(ctx context.Context) error {
+	rp := s.rep.Load()
+	if rp == nil {
+		return nil
+	}
+	rep := *rp
+	return rep.AwaitAcked(ctx, rep.HighWaterMark())
+}
+
+// replicateThenAck is the sync-replication wrapper around a mutation's
+// terminal Ack. If replication is configured, it blocks until peer
+// ack catches up to the current high-water-mark; on lost-peer the ack
+// is replaced with error_paused so the client knows their write was
+// not durably replicated. Standalone mode is a no-op pass-through.
+//
+// The mutation has already been applied locally by the time this is
+// called — that's deliberate. Local ordering and FIFO are preserved
+// regardless; replication is a *durability* guarantee on top.
+func (s *Server) replicateThenAck(ctx context.Context, ack *protocol.Ack) *protocol.Ack {
+	if err := s.awaitReplication(ctx); err != nil {
+		// ctx cancellation, replicator stopped, or peer lost. The
+		// safest thing for the client is to return error_paused so
+		// they retry against whoever is authoritative now (which may
+		// be us if we self-promote, or the secondary after a
+		// failover, or they get a real error).
+		return &protocol.Ack{Status: "error_paused"}
+	}
+	return ack
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -149,16 +197,25 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 		}
 	}
 
-	// Background loops
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		s.lm.LeaseExpiryLoop(ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		s.lm.GCLoop(ctx)
-	}()
+	// Background loops. On a replication secondary the local lock
+	// manager is driven entirely by replicated ops, so the time-based
+	// loops MUST NOT run there: they would evict / GC state behind the
+	// primary's back and cause divergence. On the primary, evictions
+	// are captured and replicated to the secondary like any other
+	// mutation.
+	rp := s.rep.Load()
+	runLoops := rp == nil || (*rp).IsPrimary()
+	if runLoops {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			s.lm.LeaseExpiryLoop(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			s.lm.GCLoop(ctx)
+		}()
+	}
 
 	// Close listener on context cancellation
 	go func() {
@@ -648,9 +705,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			return &protocol.Ack{Status: "error"}
 		}
 		if tok == "" {
-			return &protocol.Ack{Status: "timeout"}
+			return s.replicateThenAck(ctx, &protocol.Ack{Status: "timeout"})
 		}
-		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
+		return s.replicateThenAck(ctx, &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())})
 
 	case "r", "sr":
 		key := lock.LockPrefix + req.Key
@@ -658,7 +715,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			key = lock.SemPrefix + req.Key
 		}
 		if s.lm.Release(key, req.Token) {
-			return &protocol.Ack{Status: "ok"}
+			return s.replicateThenAck(ctx, &protocol.Ack{Status: "ok"})
 		}
 		return &protocol.Ack{Status: "error"}
 
@@ -671,7 +728,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		if !ok {
 			return &protocol.Ack{Status: "error"}
 		}
-		return &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d", remaining)}
+		return s.replicateThenAck(ctx, &protocol.Ack{Status: "ok", Extra: fmt.Sprintf("%d", remaining)})
 
 	case "e", "se":
 		limit := 1
@@ -696,7 +753,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			return &protocol.Ack{Status: "error"}
 		}
-		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
+		return s.replicateThenAck(ctx, &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease})
 
 	case "w", "sw":
 		key := lock.LockPrefix + req.Key
@@ -718,9 +775,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			return &protocol.Ack{Status: "error"}
 		}
 		if tok == "" {
-			return &protocol.Ack{Status: "timeout"}
+			return s.replicateThenAck(ctx, &protocol.Ack{Status: "timeout"})
 		}
-		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
+		return s.replicateThenAck(ctx, &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease})
 
 	case "listen":
 		if max := s.cfg.MaxSubscriptions; max > 0 &&

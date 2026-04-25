@@ -1118,6 +1118,115 @@ func (lm *LockManager) ApplyReplicatedEnqueuedRemove(key string, connID uint64) 
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot for replication catch-up
+// ---------------------------------------------------------------------------
+
+// SnapshotEntry is one resource's serialised state. Used by the
+// replication layer to ship a full state copy to a reconnecting
+// secondary.
+type SnapshotEntry struct {
+	Key      string
+	Limit    int
+	Holders  []SnapshotHolder
+	Enqueued []SnapshotEnqueued
+}
+
+// SnapshotHolder is a serialisable holder record.
+type SnapshotHolder struct {
+	Token              string
+	ConnID             uint64
+	LeaseExpiresUnixNS int64
+}
+
+// SnapshotEnqueued is a serialisable post-grant two-phase enqueued
+// state. Pre-grant waiters are NOT in the snapshot — their queue
+// position is primary-local and cannot transfer across a failover.
+type SnapshotEnqueued struct {
+	ConnID     uint64
+	Token      string
+	LeaseTTLNS int64
+}
+
+// Snapshot returns one entry per current resource. Each shard is
+// walked under its own lock so the result is per-shard consistent;
+// across shards the snapshot is "soft" (read at slightly different
+// moments). For replication catch-up this is sufficient: lock
+// semantics are per-key, so per-shard consistency is what matters.
+//
+// Snapshot is intended for low-frequency use (reconnect catch-up).
+// It allocates O(total_holders + total_enqueued) and locks each
+// shard briefly while iterating its maps.
+func (lm *LockManager) Snapshot() []SnapshotEntry {
+	var out []SnapshotEntry
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		for key, st := range sh.resources {
+			entry := SnapshotEntry{Key: key, Limit: st.Limit}
+			for tok, h := range st.Holders {
+				entry.Holders = append(entry.Holders, SnapshotHolder{
+					Token:              tok,
+					ConnID:             h.connID,
+					LeaseExpiresUnixNS: leaseExpiresOrZeroNS(h.leaseExpires),
+				})
+			}
+			// Walk connEnqueued to find any post-grant entries for this key.
+			// We index by (conn, key) — iterate connEnqueuedByID per conn
+			// instead so we don't re-iterate the full map per resource.
+			out = append(out, entry)
+		}
+		// Second pass: connEnqueued post-grant states. Each entry maps to
+		// its key; we group them onto the right SnapshotEntry by key.
+		// For shards with many keys this is O(K * E); fine for snapshot.
+		for ck, es := range sh.connEnqueued {
+			if es == nil || es.token == "" {
+				// Pre-grant waiters are not replicated.
+				continue
+			}
+			// Find or append the entry for ck.Key.
+			var entry *SnapshotEntry
+			for i := range out {
+				if out[i].Key == ck.Key {
+					entry = &out[i]
+					break
+				}
+			}
+			if entry == nil {
+				continue // resource gone between passes; skip
+			}
+			entry.Enqueued = append(entry.Enqueued, SnapshotEnqueued{
+				ConnID:     ck.ConnID,
+				Token:      es.token,
+				LeaseTTLNS: int64(es.leaseTTL),
+			})
+		}
+		sh.mu.Unlock()
+	}
+	return out
+}
+
+// ClearAll wipes all in-memory lock state. Used by the secondary
+// before applying a fresh snapshot so stale state from a prior
+// connection epoch doesn't linger.
+//
+// Mutations are NOT captured for replication — the caller is expected
+// to be the secondary, which has a NoopHook installed. (If a primary
+// ever called this, the resulting deletes would not propagate, which
+// is a divergence; primaries must not use this method.)
+func (lm *LockManager) ClearAll() {
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		sh.resources = make(map[string]*ResourceState)
+		sh.connOwned = make(map[uint64]map[string]map[string]struct{})
+		sh.connEnqueued = make(map[connKey]*enqueuedState)
+		sh.connEnqueuedByID = make(map[uint64]map[string]struct{})
+		sh.mu.Unlock()
+	}
+	lm.resourceTotal.Store(0)
+}
+
+// ---------------------------------------------------------------------------
 // Background loops
 // ---------------------------------------------------------------------------
 

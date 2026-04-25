@@ -67,7 +67,14 @@ type Role string
 const (
 	RolePrimary   Role = "primary"
 	RoleSecondary Role = "secondary"
-	RoleWitness   Role = "witness"
+
+	// RoleWitness is reserved for phase 3 (auto-failover with a tiny
+	// arbiter daemon participating in 2-of-3 quorum). The handshake
+	// rejects this role today — operators wanting auto-failover
+	// should use either an external orchestration layer (Kubernetes
+	// liveness probes that promote on primary loss) or wait for
+	// phase 3.
+	RoleWitness Role = "witness"
 )
 
 // OpKind is the discriminator on Op.Kind. Each kind names a state

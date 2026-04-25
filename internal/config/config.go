@@ -483,6 +483,8 @@ func (c *Config) Validate() error {
 	}
 	switch c.ReplicationRole {
 	case "", "primary", "secondary":
+	case "witness":
+		return fmt.Errorf("--replication-role=witness is reserved for a future release; not implemented")
 	default:
 		return fmt.Errorf("--replication-role must be one of: primary, secondary, '' (got %q)", c.ReplicationRole)
 	}

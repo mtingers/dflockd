@@ -55,6 +55,20 @@ func (f *fakeApply) ApplyReplicatedEnqueuedRemove(key string, connID uint64) {
 	delete(f.enqueued, key+"|"+fmt.Sprint(connID))
 }
 
+func (f *fakeApply) ClearAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.holders = make(map[string]Holder)
+	f.enqueued = make(map[string]Enqueued)
+}
+
+// fakeSnapshotter returns a fixed snapshot for tests of the catch-up path.
+type fakeSnapshotter struct {
+	entries []SnapshotEntry
+}
+
+func (f fakeSnapshotter) Snapshot() []SnapshotEntry { return f.entries }
+
 func (f *fakeApply) holderCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -126,12 +140,14 @@ func TestReplicator_PrimarySecondaryEndToEnd(t *testing.T) {
 	}
 	defer sec.Stop()
 
-	// Primary: dials secondary.
+	// Primary: dials secondary. Empty snapshot since we'll capture
+	// mutations directly during the test.
 	pri := NewReplicator(Config{
-		Role:     RolePrimary,
-		NodeID:   "pri",
-		PeerAddr: secAddr,
-		Log:      quietLog(t),
+		Role:        RolePrimary,
+		NodeID:      "pri",
+		PeerAddr:    secAddr,
+		Snapshotter: fakeSnapshotter{},
+		Log:         quietLog(t),
 	})
 	if err := pri.Start(ctx); err != nil {
 		t.Fatalf("pri start: %v", err)
@@ -161,6 +177,158 @@ func TestReplicator_PrimarySecondaryEndToEnd(t *testing.T) {
 
 	if got := apply.holderCount(); got != 1 {
 		t.Fatalf("secondary holder count: got %d want 1", got)
+	}
+}
+
+// TestReplicator_SnapshotOnReconnect verifies the catch-up flow: a
+// secondary that connects to a primary with non-trivial state ends up
+// with that state mirrored locally after the snapshot exchange.
+func TestReplicator_SnapshotOnReconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	secAddr := pickFreeAddr(t)
+	apply := newFakeApply()
+
+	sec := NewReplicator(Config{
+		Role:       RoleSecondary,
+		NodeID:     "sec",
+		ListenAddr: secAddr,
+		Apply:      apply,
+		Log:        quietLog(t),
+	})
+	if err := sec.Start(ctx); err != nil {
+		t.Fatalf("sec start: %v", err)
+	}
+	defer sec.Stop()
+
+	// Primary has pre-existing state from before secondary connected.
+	preExisting := []SnapshotEntry{
+		{
+			Key:   "lock:k1",
+			Limit: 1,
+			Holders: []SnapshotHolder{
+				{Token: "tok-pre", ConnID: 1, LeaseExpiresUnixNS: time.Now().Add(time.Minute).UnixNano()},
+			},
+		},
+		{
+			Key:   "sem:s1",
+			Limit: 3,
+			Holders: []SnapshotHolder{
+				{Token: "sem-tok-1", ConnID: 2, LeaseExpiresUnixNS: time.Now().Add(time.Minute).UnixNano()},
+				{Token: "sem-tok-2", ConnID: 3, LeaseExpiresUnixNS: time.Now().Add(time.Minute).UnixNano()},
+			},
+		},
+	}
+
+	pri := NewReplicator(Config{
+		Role:        RolePrimary,
+		NodeID:      "pri",
+		PeerAddr:    secAddr,
+		Snapshotter: fakeSnapshotter{entries: preExisting},
+		Log:         quietLog(t),
+	})
+	if err := pri.Start(ctx); err != nil {
+		t.Fatalf("pri start: %v", err)
+	}
+	defer pri.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && apply.holderCount() < 3 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := apply.holderCount(); got != 3 {
+		t.Fatalf("post-snapshot holder count: got %d want 3", got)
+	}
+
+	// Active state should be reached after snapshot complete.
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && sec.State() != StateActive {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if sec.State() != StateActive {
+		t.Fatalf("secondary state after snapshot: got %s want active", sec.State())
+	}
+}
+
+// TestReplicator_PrimarySelfPromoteOnPeerLoss verifies that the
+// primary transitions to Solo (with bumped epoch) after max-pause-ms
+// elapses with no peer contact, and that AwaitAcked returns nil
+// (treating Solo as "OK to proceed") in that state.
+func TestReplicator_PrimarySelfPromoteOnPeerLoss(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pri := NewReplicator(Config{
+		Role:        RolePrimary,
+		NodeID:      "pri",
+		PeerAddr:    "127.0.0.1:1", // refused immediately
+		MaxPause:    150 * time.Millisecond,
+		Snapshotter: fakeSnapshotter{},
+		Log:         quietLog(t),
+	})
+	startEpoch := pri.Epoch()
+	if err := pri.Start(ctx); err != nil {
+		t.Fatalf("pri start: %v", err)
+	}
+	defer pri.Stop()
+
+	// Capture a mutation while peer unreachable.
+	seq := pri.Capture(Mutation{Kind: OpHolderAdd, Key: "lock:k", Token: "t"})
+
+	// Should transition to Solo within ~MaxPause + a session-establish
+	// delay. Generous deadline to avoid flake.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && pri.State() != StateSolo {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pri.State() != StateSolo {
+		t.Fatalf("primary state: got %s want solo", pri.State())
+	}
+	if pri.Epoch() <= startEpoch {
+		t.Fatalf("epoch did not advance: start=%d now=%d", startEpoch, pri.Epoch())
+	}
+
+	// AwaitAcked should return nil (Solo treated as proceed-OK).
+	awaitCtx, cancelAwait := context.WithTimeout(ctx, time.Second)
+	defer cancelAwait()
+	if err := pri.AwaitAcked(awaitCtx, seq); err != nil {
+		t.Fatalf("AwaitAcked in Solo: got %v want nil", err)
+	}
+}
+
+// TestReplicator_PromoteSecondary verifies the operator-driven
+// failover: a secondary that has lost its primary can be promoted to
+// primary, after which it accepts client mutations and runs at a
+// bumped epoch.
+func TestReplicator_PromoteSecondary(t *testing.T) {
+	apply := newFakeApply()
+	sec := NewReplicator(Config{
+		Role:       RoleSecondary,
+		NodeID:     "sec",
+		ListenAddr: pickFreeAddr(t),
+		Apply:      apply,
+		Log:        quietLog(t),
+	})
+	if !sec.ShouldRefuseMutations() {
+		t.Fatal("secondary should refuse before promote")
+	}
+	startEpoch := sec.Epoch()
+	if err := sec.Promote(); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if sec.ShouldRefuseMutations() {
+		t.Fatal("promoted node should not refuse mutations")
+	}
+	if !sec.IsPrimary() {
+		t.Fatal("promoted node should report IsPrimary")
+	}
+	if sec.Epoch() <= startEpoch {
+		t.Fatalf("epoch did not advance: start=%d now=%d", startEpoch, sec.Epoch())
+	}
+	// Idempotency: a second Promote on a primary returns an error.
+	if err := sec.Promote(); err == nil {
+		t.Fatal("second Promote should error")
 	}
 }
 
