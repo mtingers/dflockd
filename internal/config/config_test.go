@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -170,6 +171,54 @@ func TestAuthTokenPrecedence(t *testing.T) {
 			t.Fatalf("got %q, want from-env (empty flag defers to env)", cfg.AuthToken)
 		}
 	})
+
+	t.Run("flag token file wins over env var", func(t *testing.T) {
+		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
+		path := writeTempTokenFile(t, "from-file\n")
+		cfg, err := Load([]string{"--auth-token-file", path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AuthToken != "from-file" {
+			t.Fatalf("got %q, want from-file (explicit token file should win)", cfg.AuthToken)
+		}
+	})
+
+	t.Run("direct token is trimmed like token files", func(t *testing.T) {
+		cfg, err := Load([]string{"--auth-token", "  from-flag  "})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AuthToken != "from-flag" {
+			t.Fatalf("got %q, want from-flag", cfg.AuthToken)
+		}
+	})
+
+	t.Run("whitespace only direct token is rejected", func(t *testing.T) {
+		_, err := Load([]string{"--auth-token", "   "})
+		if err == nil {
+			t.Fatal("expected whitespace-only auth token to fail")
+		}
+		if !strings.Contains(err.Error(), "auth-token") {
+			t.Fatalf("error should mention auth-token, got %q", err.Error())
+		}
+	})
+}
+
+func writeTempTokenFile(t *testing.T, token string) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "token-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(token); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return f.Name()
 }
 
 // TestGCEnvVarAliases exercises the canonical + deprecated env var

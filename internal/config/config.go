@@ -135,8 +135,8 @@ func envOrDurationWithAliases(flagVal int, keys ...string) (time.Duration, strin
 // environment variables"):
 //
 //  1. --auth-token flag (if explicitly set)
-//  2. DFLOCKD_AUTH_TOKEN env var
-//  3. --auth-token-file flag (if explicitly set)
+//  2. --auth-token-file flag (if explicitly set)
+//  3. DFLOCKD_AUTH_TOKEN env var
 //  4. DFLOCKD_AUTH_TOKEN_FILE env var
 //
 // flagTokenSet and flagTokenFileSet tell us whether the caller actually
@@ -144,29 +144,41 @@ func envOrDurationWithAliases(flagVal int, keys ...string) (time.Duration, strin
 // value doesn't accidentally override a set env var.
 func loadAuthToken(flagToken string, flagTokenSet bool, flagTokenFile string, flagTokenFileSet bool) (string, error) {
 	if flagTokenSet && flagToken != "" {
-		return flagToken, nil
+		return cleanAuthToken("--auth-token", flagToken)
+	}
+	if flagTokenFileSet && flagTokenFile != "" {
+		return readAuthTokenFile(flagTokenFile)
 	}
 	if v := os.Getenv("DFLOCKD_AUTH_TOKEN"); v != "" {
-		return v, nil
+		return cleanAuthToken("DFLOCKD_AUTH_TOKEN", v)
 	}
-	path := ""
-	if flagTokenFileSet && flagTokenFile != "" {
-		path = flagTokenFile
-	} else if v := os.Getenv("DFLOCKD_AUTH_TOKEN_FILE"); v != "" {
-		path = v
-	}
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return "", fmt.Errorf("reading auth token file %q: %w", path, err)
-		}
-		tok := strings.TrimSpace(string(data))
-		if tok == "" {
-			return "", fmt.Errorf("auth token file %q is empty", path)
-		}
-		return tok, nil
+	if v := os.Getenv("DFLOCKD_AUTH_TOKEN_FILE"); v != "" {
+		return readAuthTokenFile(v)
 	}
 	return "", nil
+}
+
+func cleanAuthToken(source, token string) (string, error) {
+	tok := strings.TrimSpace(token)
+	if tok == "" {
+		return "", fmt.Errorf("%s is empty", source)
+	}
+	if strings.ContainsAny(tok, "\n\r") {
+		return "", fmt.Errorf("%s must not contain newline characters", source)
+	}
+	return tok, nil
+}
+
+func readAuthTokenFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading auth token file %q: %w", path, err)
+	}
+	tok, err := cleanAuthToken(fmt.Sprintf("auth token file %q", path), string(data))
+	if err != nil {
+		return "", err
+	}
+	return tok, nil
 }
 
 func Load(args []string) (*Config, error) {

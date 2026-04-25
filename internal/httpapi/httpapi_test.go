@@ -521,6 +521,73 @@ func TestHTTPRejectsProtocolNewlinesInArguments(t *testing.T) {
 	}
 }
 
+func TestHTTPRejectsProtocolLineOverflow(t *testing.T) {
+	h := newHarness(t, testConfig())
+	id := h.createSession(t)
+	long := strings.Repeat("x", protocol.MaxLineBytes+1)
+
+	cases := []struct {
+		name string
+		path string
+		body any
+	}{
+		{
+			name: "lock key",
+			path: "/v1/locks/" + long,
+			body: acquireRequest{AcquireTimeoutS: 0},
+		},
+		{
+			name: "release token",
+			path: "/v1/locks/overflow/release",
+			body: releaseRequest{Token: long},
+		},
+		{
+			name: "renew token",
+			path: "/v1/locks/overflow/renew",
+			body: renewRequest{Token: long},
+		},
+		{
+			name: "renew argument",
+			path: "/v1/locks/overflow/renew",
+			body: renewRequest{Token: strings.Repeat("x", protocol.MaxLineBytes), LeaseTTLS: 1},
+		},
+		{
+			name: "signal channel",
+			path: "/v1/signals/" + long,
+			body: signalRequest{Payload: "payload"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := h.do(t, "POST", tc.path, id, tc.body)
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status: got %d want 400 body=%s", resp.StatusCode, string(body))
+			}
+			var body errorBody
+			decodeBody(t, resp, &body)
+			if body.Error != "bad_request" || !strings.Contains(body.Detail, "too long") {
+				t.Fatalf("body: %+v", body)
+			}
+		})
+	}
+
+	req, err := http.NewRequest("GET", h.http.URL+"/v1/signals?pattern=events.%3E&group="+long, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := h.http.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("SSE status: got %d want 400 body=%s", resp.StatusCode, string(body))
+	}
+}
+
 func TestHTTPRejectsInvalidSignalPayloads(t *testing.T) {
 	h := newHarness(t, testConfig())
 

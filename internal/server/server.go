@@ -621,7 +621,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: lease}
 
 	case "listen":
-		if max := s.cfg.MaxSubscriptions; max > 0 && cs.subscriptions >= max {
+		if max := s.cfg.MaxSubscriptions; max > 0 &&
+			cs.subscriptions >= max &&
+			!s.sig.HasListener(connID, req.Key, req.Group) {
 			return &protocol.Ack{Status: "error"}
 		}
 		listener := &signal.Listener{

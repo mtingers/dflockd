@@ -196,6 +196,20 @@ func (m *Manager) Listen(listener *Listener) (bool, error) {
 	return true, nil
 }
 
+// HasListener reports whether connID is already subscribed to pattern+group.
+// It lets transports preserve Listen's idempotent duplicate behavior while
+// enforcing per-connection subscription caps before adding new subscriptions.
+func (m *Manager) HasListener(connID uint64, pattern, group string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entries := m.connListeners[connID]
+	if entries == nil {
+		return false
+	}
+	_, ok := entries[listenerKey{pattern: pattern, group: group}]
+	return ok
+}
+
 // Unlisten removes a listener for a specific pattern, connID, and group.
 // Returns true if a listener was actually removed.
 // Returns an error if the pattern is invalid.

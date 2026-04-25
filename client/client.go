@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mtingers/dflockd/internal/protocol"
 )
 
 // Sentinel errors returned by protocol operations.
@@ -200,10 +202,20 @@ func validateKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("dflockd: empty key")
 	}
+	if len(key) > protocol.MaxLineBytes {
+		return fmt.Errorf("dflockd: key too long (max %d bytes)", protocol.MaxLineBytes)
+	}
 	for _, c := range key {
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
 			return fmt.Errorf("dflockd: key contains whitespace")
 		}
+	}
+	return nil
+}
+
+func validateProtocolLineLength(name, value string) error {
+	if len(value) > protocol.MaxLineBytes {
+		return fmt.Errorf("dflockd: %s too long (max %d bytes)", name, protocol.MaxLineBytes)
 	}
 	return nil
 }
@@ -251,6 +263,9 @@ func Acquire(c *Conn, key string, acquireTimeout time.Duration, opts ...Option) 
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
 	}
+	if err := validateProtocolLineLength("acquire argument", arg); err != nil {
+		return "", 0, err
+	}
 
 	resp, err := c.sendRecv("l", key, arg)
 	if err != nil {
@@ -265,6 +280,9 @@ func Release(c *Conn, key, token string) error {
 		return err
 	}
 	if err := validateValue(token); err != nil {
+		return err
+	}
+	if err := validateProtocolLineLength("token", token); err != nil {
 		return err
 	}
 	resp, err := c.sendRecv("r", key, token)
@@ -292,6 +310,9 @@ func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error
 	arg := token
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	if err := validateProtocolLineLength("renew argument", arg); err != nil {
+		return 0, err
 	}
 
 	resp, err := c.sendRecv("n", key, arg)
@@ -323,6 +344,9 @@ func Enqueue(c *Conn, key string, opts ...Option) (status, token string, leaseTT
 	arg := ""
 	if o.leaseTTL > 0 {
 		arg = strconv.Itoa(o.leaseTTL)
+	}
+	if err := validateProtocolLineLength("enqueue argument", arg); err != nil {
+		return "", "", 0, err
 	}
 
 	resp, err := c.sendRecv("e", key, arg)
@@ -368,6 +392,9 @@ func Wait(c *Conn, key string, waitTimeout time.Duration) (token string, leaseTT
 	if err != nil {
 		return "", 0, err
 	}
+	if err := validateProtocolLineLength("wait argument", arg); err != nil {
+		return "", 0, err
+	}
 	resp, err := c.sendRecv("w", key, arg)
 	if err != nil {
 		return "", 0, err
@@ -410,6 +437,9 @@ func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, op
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
 	}
+	if err := validateProtocolLineLength("semaphore acquire argument", arg); err != nil {
+		return "", 0, err
+	}
 
 	resp, err := c.sendRecv("sl", key, arg)
 	if err != nil {
@@ -424,6 +454,9 @@ func SemRelease(c *Conn, key, token string) error {
 		return err
 	}
 	if err := validateValue(token); err != nil {
+		return err
+	}
+	if err := validateProtocolLineLength("token", token); err != nil {
 		return err
 	}
 	resp, err := c.sendRecv("sr", key, token)
@@ -451,6 +484,9 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 	arg := token
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	if err := validateProtocolLineLength("semaphore renew argument", arg); err != nil {
+		return 0, err
 	}
 
 	resp, err := c.sendRecv("sn", key, arg)
@@ -482,6 +518,9 @@ func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token s
 	arg := strconv.Itoa(limit)
 	if o.leaseTTL > 0 {
 		arg += " " + strconv.Itoa(o.leaseTTL)
+	}
+	if err := validateProtocolLineLength("semaphore enqueue argument", arg); err != nil {
+		return "", "", 0, err
 	}
 
 	resp, err := c.sendRecv("se", key, arg)
@@ -523,6 +562,9 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	}
 	arg, err := timeoutArg(waitTimeout)
 	if err != nil {
+		return "", 0, err
+	}
+	if err := validateProtocolLineLength("semaphore wait argument", arg); err != nil {
 		return "", 0, err
 	}
 	resp, err := c.sendRecv("sw", key, arg)
@@ -728,6 +770,58 @@ func (r *renewableResource) connect(addr string, tlsCfg *tls.Config, authToken s
 	return nil
 }
 
+// abandonedGrantCleanupTimeout bounds best-effort cleanup for a token that was
+// granted just as the caller's context was cancelled. Release is a normal
+// protocol round trip, so do not let cleanup wedge the cancelled caller.
+const abandonedGrantCleanupTimeout = 2 * time.Second
+
+func tryReleaseWithDeadline(c *Conn, key, token string, releaseFn func(*Conn, string, string) error) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	_ = c.conn.SetDeadline(time.Now().Add(abandonedGrantCleanupTimeout))
+	err := releaseFn(c, key, token)
+	_ = c.conn.SetDeadline(time.Time{})
+	return err
+}
+
+func dialCleanupConn(addr string, tlsCfg *tls.Config, authToken string) (*Conn, error) {
+	var (
+		conn *Conn
+		err  error
+	)
+	if tlsCfg != nil {
+		conn, err = DialTLS(addr, tlsCfg)
+	} else {
+		conn, err = Dial(addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if authToken != "" {
+		if err := Authenticate(conn, authToken); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+func cleanupAbandonedGrant(conn *Conn, addr string, tlsCfg *tls.Config, authToken, key, token string, releaseFn func(*Conn, string, string) error) {
+	if token == "" {
+		return
+	}
+	if tryReleaseWithDeadline(conn, key, token, releaseFn) == nil {
+		return
+	}
+	cleanupConn, err := dialCleanupConn(addr, tlsCfg, authToken)
+	if err != nil {
+		return
+	}
+	defer cleanupConn.Close()
+	_ = tryReleaseWithDeadline(cleanupConn, key, token, releaseFn)
+}
+
 // defaultAcquireTimeout returns the given value, or 10s if unset.
 func defaultAcquireTimeout(t time.Duration) time.Duration {
 	if t > 0 {
@@ -895,7 +989,8 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}
 	l.mu.Lock()
 	l.stopRenew()
-	if err := l.connect(l.serverAddr(), l.TLSConfig, l.AuthToken); err != nil {
+	addr := l.serverAddr()
+	if err := l.connect(addr, l.TLSConfig, l.AuthToken); err != nil {
 		l.mu.Unlock()
 		return false, err
 	}
@@ -905,6 +1000,9 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	token, lease, err := Acquire(conn, l.Key, l.acquireTimeoutVal(), l.opts()...)
 	stopCancelWatch()
+	if err == nil && ctx.Err() != nil {
+		cleanupAbandonedGrant(conn, addr, l.TLSConfig, l.AuthToken, l.Key, token, Release)
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -932,8 +1030,9 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 
 	// Guard against the cancellation goroutine closing the connection
 	// after the operation succeeded (race between close(done) and ctx.Done()).
-	// Don't attempt Release — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
+	// The token was already explicitly released above. Closing the conn still
+	// tears down this abandoned high-level resource and is harmless if the
+	// cancellation watcher already closed it.
 	if ctx.Err() != nil {
 		conn.Close()
 		l.clearConnIfCurrent(conn)
@@ -956,7 +1055,8 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	}
 	l.mu.Lock()
 	l.stopRenew()
-	if err := l.connect(l.serverAddr(), l.TLSConfig, l.AuthToken); err != nil {
+	addr := l.serverAddr()
+	if err := l.connect(addr, l.TLSConfig, l.AuthToken); err != nil {
 		l.mu.Unlock()
 		return "", err
 	}
@@ -966,6 +1066,9 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	status, token, lease, err := Enqueue(conn, l.Key, l.opts()...)
 	stopCancelWatch()
+	if err == nil && ctx.Err() != nil && status == "acquired" {
+		cleanupAbandonedGrant(conn, addr, l.TLSConfig, l.AuthToken, l.Key, token, Release)
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -981,8 +1084,8 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	// Don't attempt Release — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
+	// If enqueue acquired immediately, the token was explicitly released above.
+	// If it only queued, closing the conn cancels the pending waiter.
 	if ctx.Err() != nil {
 		conn.Close()
 		l.clearConnIfCurrent(conn)
@@ -1011,11 +1114,15 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 		return false, ErrNotQueued
 	}
 	conn := l.conn
+	addr := l.serverAddr()
 	l.mu.Unlock()
 
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	token, lease, err := Wait(conn, l.Key, timeout)
 	stopCancelWatch()
+	if err == nil && ctx.Err() != nil {
+		cleanupAbandonedGrant(conn, addr, l.TLSConfig, l.AuthToken, l.Key, token, Release)
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1036,8 +1143,8 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 		return false, err
 	}
 
-	// Don't attempt Release — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
+	// The token was already explicitly released above. Closing the conn still
+	// tears down this abandoned high-level resource.
 	if ctx.Err() != nil {
 		conn.Close()
 		l.clearConnIfCurrent(conn)
@@ -1127,7 +1234,8 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	}
 	s.mu.Lock()
 	s.stopRenew()
-	if err := s.connect(s.serverAddr(), s.TLSConfig, s.AuthToken); err != nil {
+	addr := s.serverAddr()
+	if err := s.connect(addr, s.TLSConfig, s.AuthToken); err != nil {
 		s.mu.Unlock()
 		return false, err
 	}
@@ -1137,6 +1245,9 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	token, lease, err := SemAcquire(conn, s.Key, s.acquireTimeoutVal(), s.Limit, s.opts()...)
 	stopCancelWatch()
+	if err == nil && ctx.Err() != nil {
+		cleanupAbandonedGrant(conn, addr, s.TLSConfig, s.AuthToken, s.Key, token, SemRelease)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1157,8 +1268,8 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	// Don't attempt SemRelease — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
+	// The token was already explicitly released above. Closing the conn still
+	// tears down this abandoned high-level resource.
 	if ctx.Err() != nil {
 		conn.Close()
 		s.clearConnIfCurrent(conn)
@@ -1180,7 +1291,8 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	}
 	s.mu.Lock()
 	s.stopRenew()
-	if err := s.connect(s.serverAddr(), s.TLSConfig, s.AuthToken); err != nil {
+	addr := s.serverAddr()
+	if err := s.connect(addr, s.TLSConfig, s.AuthToken); err != nil {
 		s.mu.Unlock()
 		return "", err
 	}
@@ -1190,6 +1302,9 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	status, token, lease, err := SemEnqueue(conn, s.Key, s.Limit, s.opts()...)
 	stopCancelWatch()
+	if err == nil && ctx.Err() != nil && status == "acquired" {
+		cleanupAbandonedGrant(conn, addr, s.TLSConfig, s.AuthToken, s.Key, token, SemRelease)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1205,8 +1320,8 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	// Don't attempt SemRelease — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
+	// If enqueue acquired immediately, the token was explicitly released above.
+	// If it only queued, closing the conn cancels the pending waiter.
 	if ctx.Err() != nil {
 		conn.Close()
 		s.clearConnIfCurrent(conn)
@@ -1234,11 +1349,15 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 		return false, ErrNotQueued
 	}
 	conn := s.conn
+	addr := s.serverAddr()
 	s.mu.Unlock()
 
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
 	token, lease, err := SemWait(conn, s.Key, timeout)
 	stopCancelWatch()
+	if err == nil && ctx.Err() != nil {
+		cleanupAbandonedGrant(conn, addr, s.TLSConfig, s.AuthToken, s.Key, token, SemRelease)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1259,8 +1378,8 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 		return false, err
 	}
 
-	// Don't attempt SemRelease — the cancellation goroutine may have already
-	// closed the conn, and closing it below triggers server-side auto-release.
+	// The token was already explicitly released above. Closing the conn still
+	// tears down this abandoned high-level resource.
 	if ctx.Err() != nil {
 		conn.Close()
 		s.clearConnIfCurrent(conn)
@@ -1468,6 +1587,9 @@ func validateArg(name, value string) error {
 	if strings.ContainsAny(value, "\n\r") {
 		return fmt.Errorf("dflockd: %s contains newline", name)
 	}
+	if err := validateProtocolLineLength(name, value); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1524,6 +1646,12 @@ func (sc *SignalConn) Emit(channel, payload string) (int, error) {
 	if err := validateValue(payload); err != nil {
 		return 0, err
 	}
+	if maxPayload := protocol.MaxSignalPayloadBytes(channel); maxPayload < 0 || len(payload) > maxPayload {
+		if maxPayload < 0 {
+			maxPayload = 0
+		}
+		return 0, fmt.Errorf("dflockd: payload too large (max %d bytes)", maxPayload)
+	}
 	resp, err := sc.sendCmd("signal", channel, payload)
 	if err != nil {
 		return 0, err
@@ -1578,6 +1706,12 @@ func Emit(c *Conn, channel, payload string) (int, error) {
 	}
 	if err := validateValue(payload); err != nil {
 		return 0, err
+	}
+	if maxPayload := protocol.MaxSignalPayloadBytes(channel); maxPayload < 0 || len(payload) > maxPayload {
+		if maxPayload < 0 {
+			maxPayload = 0
+		}
+		return 0, fmt.Errorf("dflockd: payload too large (max %d bytes)", maxPayload)
 	}
 	resp, err := c.sendRecv("signal", channel, payload)
 	if err != nil {

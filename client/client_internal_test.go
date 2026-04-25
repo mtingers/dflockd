@@ -1,13 +1,19 @@
 package client
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mtingers/dflockd/internal/protocol"
 )
 
 type closeCountingConn struct {
@@ -122,4 +128,153 @@ func TestTimeoutArgRejectsOverflowAfterRounding(t *testing.T) {
 	if arg != "9223372036" {
 		t.Fatalf("arg: got %q", arg)
 	}
+}
+
+func TestClientRejectsProtocolLineOverflow(t *testing.T) {
+	long := strings.Repeat("x", protocol.MaxLineBytes+1)
+
+	if err := validateKey(long); err == nil {
+		t.Fatal("expected oversized key to fail")
+	}
+	if err := Release(&Conn{}, "k", long); err == nil {
+		t.Fatal("expected oversized release token to fail")
+	}
+	if _, err := Renew(&Conn{}, "k", strings.Repeat("x", protocol.MaxLineBytes), WithLeaseTTL(1)); err == nil {
+		t.Fatal("expected oversized renew argument to fail")
+	}
+	if _, err := Emit(&Conn{}, "events.large", strings.Repeat("x", protocol.MaxSignalPayloadBytes("events.large")+1)); err == nil {
+		t.Fatal("expected oversized signal payload to fail")
+	}
+}
+
+type errOnlyCanceledContext struct {
+	context.Context
+}
+
+func (errOnlyCanceledContext) Done() <-chan struct{} { return nil }
+func (errOnlyCanceledContext) Err() error            { return context.Canceled }
+
+func startGrantCleanupServer(t *testing.T, acquireCmd, releaseCmd string) (string, <-chan string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan string, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveGrantCleanupConn(conn, acquireCmd, releaseCmd, released)
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+	})
+	return ln.Addr().String(), released
+}
+
+func serveGrantCleanupConn(conn net.Conn, acquireCmd, releaseCmd string, released chan<- string) {
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	for {
+		cmd, err := readFakeLine(r)
+		if err != nil {
+			return
+		}
+		if _, err := readFakeLine(r); err != nil { // key
+			return
+		}
+		arg, err := readFakeLine(r)
+		if err != nil {
+			return
+		}
+		switch cmd {
+		case acquireCmd:
+			fmt.Fprint(conn, "ok abandoned-token 33\n")
+		case releaseCmd:
+			released <- arg
+			fmt.Fprint(conn, "ok\n")
+			return
+		default:
+			fmt.Fprint(conn, "error\n")
+		}
+	}
+}
+
+func readFakeLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func expectReleasedToken(t *testing.T, released <-chan string) {
+	t.Helper()
+	select {
+	case got := <-released:
+		if got != "abandoned-token" {
+			t.Fatalf("released token: got %q want abandoned-token", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("abandoned grant was not released")
+	}
+}
+
+func TestLockAcquireContextCanceledAfterGrantReleasesToken(t *testing.T) {
+	addr, released := startGrantCleanupServer(t, "l", "r")
+	l := &Lock{
+		Key:            "abandoned",
+		Servers:        []string{addr},
+		AcquireTimeout: time.Second,
+	}
+
+	ok, err := l.Acquire(errOnlyCanceledContext{Context: context.Background()})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err: got %v want context.Canceled", err)
+	}
+	if ok {
+		t.Fatal("acquire should report false after context cancellation")
+	}
+	if tok := l.Token(); tok != "" {
+		t.Fatalf("lock token after cancellation: got %q want empty", tok)
+	}
+	expectReleasedToken(t, released)
+}
+
+func TestSemaphoreAcquireContextCanceledAfterGrantReleasesToken(t *testing.T) {
+	addr, released := startGrantCleanupServer(t, "sl", "sr")
+	s := &Semaphore{
+		Key:            "abandoned",
+		Limit:          2,
+		Servers:        []string{addr},
+		AcquireTimeout: time.Second,
+	}
+
+	ok, err := s.Acquire(errOnlyCanceledContext{Context: context.Background()})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err: got %v want context.Canceled", err)
+	}
+	if ok {
+		t.Fatal("acquire should report false after context cancellation")
+	}
+	if tok := s.Token(); tok != "" {
+		t.Fatalf("semaphore token after cancellation: got %q want empty", tok)
+	}
+	expectReleasedToken(t, released)
+}
+
+func TestCleanupAbandonedGrantFallsBackToFreshConnection(t *testing.T) {
+	addr, released := startGrantCleanupServer(t, "unused", "r")
+	clientSide, serverSide := net.Pipe()
+	clientSide.Close()
+	serverSide.Close()
+	closedConn := &Conn{conn: clientSide, reader: bufio.NewReader(clientSide)}
+
+	cleanupAbandonedGrant(closedConn, addr, nil, "", "abandoned", "abandoned-token", Release)
+
+	expectReleasedToken(t, released)
 }

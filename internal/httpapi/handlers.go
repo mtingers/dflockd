@@ -515,6 +515,10 @@ func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, cmd, key st
 	if req.LeaseTTLS > 0 {
 		arg += " " + strconv.Itoa(req.LeaseTTLS)
 	}
+	if err := validateRESTLineField("renew argument", arg); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 	resp, err := s.command(cmd, key, arg)
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -657,6 +661,9 @@ func validateRESTKey(k string) error {
 	if k == "" {
 		return fmt.Errorf("empty key")
 	}
+	if len(k) > protocol.MaxLineBytes {
+		return fmt.Errorf("key too long (max %d bytes)", protocol.MaxLineBytes)
+	}
 	if strings.ContainsAny(k, " \t\n\r") {
 		return fmt.Errorf("key contains whitespace")
 	}
@@ -664,6 +671,9 @@ func validateRESTKey(k string) error {
 }
 
 func validateRESTToken(token string) error {
+	if len(token) > protocol.MaxLineBytes {
+		return fmt.Errorf("token too long (max %d bytes)", protocol.MaxLineBytes)
+	}
 	if strings.ContainsAny(token, " \t\n\r") {
 		return fmt.Errorf("token contains whitespace")
 	}
@@ -673,6 +683,9 @@ func validateRESTToken(token string) error {
 func validateRESTLineField(name, value string) error {
 	if strings.ContainsAny(value, "\n\r") {
 		return fmt.Errorf("%s must not contain newline characters", name)
+	}
+	if len(value) > protocol.MaxLineBytes {
+		return fmt.Errorf("%s too long (max %d bytes)", name, protocol.MaxLineBytes)
 	}
 	return nil
 }

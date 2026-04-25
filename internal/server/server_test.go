@@ -2350,6 +2350,12 @@ func TestIntegration_SignalMaxSubscriptions(t *testing.T) {
 	if resp != "ok" {
 		t.Fatalf("listen 2: expected ok, got %q", resp)
 	}
+	// Duplicate subscriptions are idempotent and should remain allowed even
+	// when the connection is already at the subscription cap.
+	resp = connSendCmd(t, conn, reader, "listen", "ch1", "")
+	if resp != "ok" {
+		t.Fatalf("duplicate listen at cap: expected ok, got %q", resp)
+	}
 	// Third should fail
 	resp = connSendCmd(t, conn, reader, "listen", "ch3", "")
 	if resp != "error" {
