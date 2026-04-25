@@ -1,8 +1,8 @@
 # dflockd
 
-A lightweight distributed lock server with FIFO ordering, automatic lease expiry, semaphores, and pub/sub signals. Single Go binary, zero dependencies.
+A lightweight distributed lock server with FIFO ordering, automatic lease expiry, semaphores, and pub/sub signals. Speaks both a line-based TCP protocol and an optional HTTP REST + SSE API on top of the same shared state. Single Go binary, zero dependencies.
 
-[Documentation](https://mtingers.github.io/dflockd/) · [Changelog](https://mtingers.github.io/dflockd/changelog/)
+[Documentation](https://mtingers.github.io/dflockd/) · [HTTP API](https://mtingers.github.io/dflockd/http-api/) · [Changelog](https://mtingers.github.io/dflockd/changelog/)
 
 ## Build & run
 
