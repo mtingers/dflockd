@@ -1858,6 +1858,74 @@ func TestIntegration_SemEnqueueAlreadyEnqueued(t *testing.T) {
 	}
 }
 
+// TestIntegration_AcquireLeaseExpiredAfterGrant exercises the wire-level
+// mapping of lock.ErrLeaseExpired → "error_lease_expired" for the
+// single-phase Acquire ("l") slow path. This race (token granted to a
+// waiter but the holder evicted before the waiter wakes) is non-trivial
+// to provoke from natural traffic, so we use ForceGrantWithoutHolderForTest
+// to inject the exact post-condition deterministically.
+func TestIntegration_AcquireLeaseExpiredAfterGrant(t *testing.T) {
+	cfg := testConfig()
+	cleanup, addr, lm := startServer(t, cfg)
+	defer cleanup()
+
+	// Conn 1 takes the slot so conn 2 must queue.
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	reader1 := bufio.NewReader(conn1)
+	resp := connSendCmd(t, conn1, reader1, "l", "k1", "5 30")
+	if !strings.HasPrefix(resp, "ok ") {
+		t.Fatalf("conn1 acquire: %q", resp)
+	}
+
+	// Conn 2 issues an Acquire that will block in the waiter slow path.
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	reader2 := bufio.NewReader(conn2)
+	done := make(chan string, 1)
+	go func() {
+		done <- connSendCmd(t, conn2, reader2, "l", "k1", "5 30")
+	}()
+
+	// Wait until conn 2's request is enqueued as a waiter.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		lm.LockKeyForTest(lock.LockPrefix + "k1")
+		rs := lm.ResourceForTest(lock.LockPrefix + "k1")
+		queued := rs != nil && len(rs.Waiters)-rs.WaiterHead > 0
+		lm.UnlockKeyForTest(lock.LockPrefix + "k1")
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("conn2 never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Force the slow-path post-condition: send a token to the waiter without
+	// adding a corresponding holder. The waiter wakes, finds st.Holders empty,
+	// and the lock manager returns ErrLeaseExpired.
+	if !lm.ForceGrantWithoutHolderForTest(lock.LockPrefix + "k1") {
+		t.Fatal("forced grant returned false")
+	}
+
+	select {
+	case got := <-done:
+		if got != "error_lease_expired" {
+			t.Fatalf("expected error_lease_expired, got %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("conn2 never returned")
+	}
+}
+
 func TestIntegration_WaitLeaseExpired(t *testing.T) {
 	cfg := testConfig()
 	cfg.LeaseSweepInterval = 50 * time.Millisecond

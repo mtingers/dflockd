@@ -58,6 +58,45 @@ func TestLoad_ValidationErrors(t *testing.T) {
 	}
 }
 
+// TestLoad_ValidatesPingIntervalAgainstIdleTimeout confirms that an
+// HTTP SSE ping interval >= the session idle timeout is rejected at
+// config load. The constraint exists so SSE streams refresh lastSeen
+// before the bridge sweeper's 2x-idleTimeout cutoff fires.
+func TestLoad_ValidatesPingIntervalAgainstIdleTimeout(t *testing.T) {
+	// ping >= idle is rejected.
+	_, err := Load([]string{
+		"--http-port", "9999",
+		"--http-sse-ping-interval", "30",
+		"--http-session-idle-timeout", "20",
+	})
+	if err == nil {
+		t.Fatal("expected validation error for ping >= idle")
+	}
+	if !strings.Contains(err.Error(), "http-sse-ping-interval") {
+		t.Fatalf("error should mention http-sse-ping-interval, got %q", err.Error())
+	}
+
+	// ping < idle passes.
+	_, err = Load([]string{
+		"--http-port", "9999",
+		"--http-sse-ping-interval", "10",
+		"--http-session-idle-timeout", "20",
+	})
+	if err != nil {
+		t.Fatalf("ping<idle should validate: %v", err)
+	}
+
+	// ping == idle is rejected (no margin against the sweeper).
+	_, err = Load([]string{
+		"--http-port", "9999",
+		"--http-sse-ping-interval", "20",
+		"--http-session-idle-timeout", "20",
+	})
+	if err == nil {
+		t.Fatal("expected error for ping == idle")
+	}
+}
+
 func TestLoad_ValidEdgeCases(t *testing.T) {
 	// write-timeout=0 is valid (disables write timeout)
 	_, err := Load([]string{"--write-timeout", "0"})

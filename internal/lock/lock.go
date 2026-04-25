@@ -1072,6 +1072,32 @@ func (lm *LockManager) ConnOwnedCountForTest() int {
 	return total
 }
 
+// ForceGrantWithoutHolderForTest dequeues the head waiter for the given
+// key and sends a fake token to its channel without recording a matching
+// holder in st.Holders. It deterministically reproduces the race the
+// Acquire slow-path's ErrLeaseExpired branch handles: a token was granted
+// but its holder vanished (typically via lease expiry) before the
+// receiving goroutine acquired sh.mu. Returns true on a successful
+// forced grant. For testing only.
+func (lm *LockManager) ForceGrantWithoutHolderForTest(key string) bool {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil || len(st.Waiters) <= st.WaiterHead {
+		return false
+	}
+	w := st.Waiters[st.WaiterHead]
+	st.Waiters[st.WaiterHead] = nil
+	st.WaiterHead++
+	select {
+	case w.ch <- "test-fake-token":
+		return true
+	default:
+		return false
+	}
+}
+
 // ResetLeaseForTest forces all holders of a key to expire immediately (for testing only).
 func (lm *LockManager) ResetLeaseForTest(key string) {
 	sh := lm.shardFor(key)
