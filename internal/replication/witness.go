@@ -18,6 +18,20 @@ import (
 // blips don't trigger spurious failovers.
 const WitnessLivenessThreshold = 3 * time.Second
 
+// WitnessStartupGrace is how long after a witness restart the
+// witness reports PrimaryAlive=true regardless of its own (empty)
+// heartbeat record. Without this, a fresh-started witness would
+// instantly tell any querying secondary that the primary is dead —
+// triggering a spurious auto-promote even though the live primary
+// just hasn't connected back yet. The grace gives the live primary
+// time to re-handshake; if it doesn't return within the grace, the
+// witness reverts to its normal "no heartbeats → not alive"
+// behaviour and a real failover proceeds.
+//
+// var (not const) so tests can shorten it. Operators should not
+// mutate this at runtime.
+var WitnessStartupGrace = 2 * WitnessLivenessThreshold
+
 // witnessPeerEntry tracks one connected peer's last-seen time and
 // claimed epoch. The witness keys the table by NodeID so reconnects
 // from the same node refresh the existing record rather than
@@ -38,6 +52,8 @@ type witnessPeerEntry struct {
 // WitnessLivenessThreshold-bounded recovery window.
 type WitnessServer struct {
 	log *slog.Logger
+
+	startedAt time.Time
 
 	mu       sync.Mutex
 	peers    map[string]*witnessPeerEntry // nodeID → entry
@@ -61,9 +77,10 @@ func NewWitnessServer(log *slog.Logger) *WitnessServer {
 		log = slog.Default()
 	}
 	return &WitnessServer{
-		log:   log,
-		peers: make(map[string]*witnessPeerEntry),
-		stop:  make(chan struct{}),
+		log:       log,
+		startedAt: time.Now(),
+		peers:     make(map[string]*witnessPeerEntry),
+		stop:      make(chan struct{}),
 	}
 }
 
@@ -84,7 +101,16 @@ func (w *WitnessServer) Start(ctx context.Context, listenAddr string, tlsCfg *tl
 	go func() {
 		defer w.wg.Done()
 		_ = runPeerListener(ctx, lis, func(pc *peerConn) {
-			w.handleConn(ctx, pc)
+			// Spawn per-connection so the witness can serve many
+			// peers concurrently (a primary stale-check may dial
+			// while a secondary's witness client is still
+			// heartbeating). Track on w.wg so Stop waits for all
+			// in-flight handlers to drain.
+			w.wg.Add(1)
+			go func() {
+				defer w.wg.Done()
+				w.handleConn(ctx, pc)
+			}()
 		})
 	}()
 	w.log.Info("witness: listening", "addr", lis.Addr())
@@ -180,11 +206,30 @@ func (w *WitnessServer) recordHeartbeat(nodeID string, role Role, epoch uint64) 
 		entry.epoch = epoch
 	}
 	entry.lastSeen = now
-	// Auto-update endorsement: if a primary connects with higher
-	// epoch than currently endorsed, accept it. This is how the
-	// witness recovers after its own restart — the live primary
-	// re-asserts itself on the next heartbeat.
-	if role == RolePrimary && epoch > w.endorsed.epoch {
+	// Endorsement update from heartbeat. The rules:
+	//   - If we have no endorsement yet (bootstrap or post-restart),
+	//     the first primary heartbeat we see takes the endorsement
+	//     at whatever epoch it advertises.
+	//   - If the same primary is already endorsed, refresh epoch
+	//     monotonically.
+	//   - If a different primary heartbeats with strictly higher
+	//     epoch, accept the failover. (Same-or-lower epoch from a
+	//     different node is treated as stale and ignored — that
+	//     primary is forbidden from serving.)
+	if role != RolePrimary {
+		return
+	}
+	switch {
+	case w.endorsed.nodeID == "":
+		w.endorsed = witnessEndorsement{nodeID: nodeID, epoch: epoch}
+	case w.endorsed.nodeID == nodeID:
+		if epoch > w.endorsed.epoch {
+			w.endorsed.epoch = epoch
+		}
+	case epoch > w.endorsed.epoch:
+		w.log.Warn("witness: heartbeat-driven failover endorsement",
+			"old_node", w.endorsed.nodeID, "old_epoch", w.endorsed.epoch,
+			"new_node", nodeID, "new_epoch", epoch)
 		w.endorsed = witnessEndorsement{nodeID: nodeID, epoch: epoch}
 	}
 }
@@ -217,6 +262,16 @@ func (w *WitnessServer) statusForQuery() *WitnessStatus {
 	st := &WitnessStatus{
 		EndorsedNodeID: w.endorsed.nodeID,
 		EndorsedEpoch:  w.endorsed.epoch,
+	}
+	// Startup grace: until WitnessStartupGrace has elapsed since
+	// startup, report PrimaryAlive=true regardless of (likely empty)
+	// heartbeat state. This blocks the "fresh-witness instantly
+	// reports primary dead and a secondary auto-promotes" race.
+	// The live primary's first heartbeat to the witness will
+	// repopulate state before the grace expires.
+	if now.Sub(w.startedAt) < WitnessStartupGrace {
+		st.PrimaryAlive = true
+		return st
 	}
 	if w.endorsed.nodeID != "" {
 		if entry, ok := w.peers[w.endorsed.nodeID]; ok {

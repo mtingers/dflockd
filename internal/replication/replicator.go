@@ -151,7 +151,12 @@ type Replicator struct {
 	outbound chan *Op
 
 	// Sync replication: callers waiting for a specific seq to be acked.
-	ackedSeq atomic.Uint64
+	// ackedSeq is the largest seq the peer has acked. ackAdvance is a
+	// chan closed (and replaced) whenever ackedSeq increases — it gives
+	// AwaitAcked a precise wakeup instead of poll-then-sleep.
+	ackedSeq   atomic.Uint64
+	ackMu      sync.Mutex
+	ackAdvance chan struct{}
 
 	// Loop lifecycle. loopMu serialises Start / Promote / Stop so
 	// concurrent calls don't double-spawn. loopCancel terminates the
@@ -181,13 +186,30 @@ func NewReplicator(cfg Config) *Replicator {
 		cfg.Log = slog.Default()
 	}
 	r := &Replicator{
-		cfg:      cfg,
-		log:      cfg.Log,
-		state:    StateInit,
-		outbound: make(chan *Op, outboundBufSize),
-		stop:     make(chan struct{}),
+		cfg:        cfg,
+		log:        cfg.Log,
+		state:      StateInit,
+		outbound:   make(chan *Op, outboundBufSize),
+		ackAdvance: make(chan struct{}),
+		stop:       make(chan struct{}),
 	}
 	return r
+}
+
+// advanceAcked records a new high-water-mark of acked seqs and wakes
+// any AwaitAcked callers. Idempotent on stale acks (caller verifies
+// before calling). Internally swaps the ackAdvance chan so existing
+// waiters see the closure and re-check.
+func (r *Replicator) advanceAcked(newSeq uint64) {
+	if newSeq <= r.ackedSeq.Load() {
+		return
+	}
+	r.ackedSeq.Store(newSeq)
+	r.ackMu.Lock()
+	old := r.ackAdvance
+	r.ackAdvance = make(chan struct{})
+	r.ackMu.Unlock()
+	close(old)
 }
 
 // Start spawns the replicator's worker goroutines for the configured
@@ -195,6 +217,14 @@ func NewReplicator(cfg Config) *Replicator {
 // replicator's overall lifetime. Loop lifecycles within that root
 // (e.g. across Promote calls) use child contexts and are tracked by
 // the internal WaitGroup.
+//
+// When a primary is configured with a witness, Start performs a
+// one-shot stale-check first: if the witness reports a different
+// node has been endorsed at a higher epoch, this primary is stale
+// (a returning original-primary after auto-failover) and Start
+// returns ErrStalePrimary. The caller (cmd/dflockd) treats this
+// as fatal — operators must reconfigure or wipe state before
+// rejoining.
 func (r *Replicator) Start(ctx context.Context) error {
 	r.loopMu.Lock()
 	defer r.loopMu.Unlock()
@@ -206,6 +236,14 @@ func (r *Replicator) Start(ctx context.Context) error {
 	nodeID := r.cfg.NodeID
 	epoch := r.epoch
 	r.mu.Unlock()
+
+	// Primary stale-check via witness, BEFORE we start serving.
+	if role == RolePrimary && witnessAddr != "" {
+		if err := r.checkNotStale(ctx, witnessAddr, tlsCfg, nodeID, epoch); err != nil {
+			return err
+		}
+	}
+
 	if witnessAddr != "" {
 		wc := newWitnessClient(witnessAddr, tlsCfg, role, nodeID, epoch, r.log)
 		wc.Start(ctx)
@@ -214,6 +252,74 @@ func (r *Replicator) Start(ctx context.Context) error {
 		r.mu.Unlock()
 	}
 	return r.startLoopLocked()
+}
+
+// ErrStalePrimary is returned from Start when the witness's endorsed
+// epoch is higher than ours and from a different node — i.e. a
+// failover already happened and we'd be a split-brain risk.
+var ErrStalePrimary = errors.New("replication: this node is stale; witness endorses a different primary at a higher epoch")
+
+// checkNotStale opens a one-shot connection to the witness and
+// verifies our epoch is consistent with what the witness has
+// endorsed. Waits up to WitnessStartupGrace + dial budget for the
+// witness to surface meaningful state — during the witness's own
+// startup grace it reports PrimaryAlive=true regardless, so we
+// extend our own check window enough to see post-grace state.
+func (r *Replicator) checkNotStale(ctx context.Context, witnessAddr string, tlsCfg *tls.Config, nodeID string, epoch uint64) error {
+	deadline := time.Now().Add(WitnessStartupGrace + 5*time.Second)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		st, err := oneShotWitnessQuery(ctx, witnessAddr, tlsCfg, r.cfg.Role, nodeID, epoch)
+		if err != nil {
+			r.log.Warn("witness stale-check: query failed, retrying", "err", err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if st.EndorsedNodeID != "" && st.EndorsedNodeID != nodeID && st.EndorsedEpoch > epoch {
+			r.log.Error("witness stale-check: this primary is stale",
+				"our_node", nodeID, "our_epoch", epoch,
+				"endorsed_node", st.EndorsedNodeID, "endorsed_epoch", st.EndorsedEpoch)
+			return ErrStalePrimary
+		}
+		// Witness is happy; either it endorses us, has no endorsement
+		// yet, or we have the highest epoch.
+		return nil
+	}
+	r.log.Warn("witness stale-check: gave up reaching witness; proceeding without fence",
+		"witness", witnessAddr)
+	return nil
+}
+
+// oneShotWitnessQuery dials the witness, sends hello + query, reads
+// the status, and closes the connection. Used by stale-check; not
+// suitable for ongoing communication (no heartbeats).
+func oneShotWitnessQuery(ctx context.Context, addr string, tlsCfg *tls.Config, role Role, nodeID string, epoch uint64) (*WitnessStatus, error) {
+	pc, err := dialPeer(ctx, addr, tlsCfg, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	defer pc.Close(nil)
+	if err := pc.WriteFrame(&Frame{
+		Type: FrameWitnessHello,
+		WitnessHello: &WitnessHello{
+			Role: role, NodeID: nodeID, Epoch: epoch, ProtoVer: ProtoVersion,
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("hello: %w", err)
+	}
+	if err := pc.WriteFrame(&Frame{Type: FrameWitnessQuery, WitnessQuery: &WitnessQuery{}}); err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	resp, err := pc.ReadFrame()
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	if resp.Type != FrameWitnessStatus || resp.WitnessStatus == nil {
+		return nil, fmt.Errorf("unexpected response: %s", resp.Type)
+	}
+	return resp.WitnessStatus, nil
 }
 
 // startLoopLocked spawns a fresh loop matching the current cfg.Role.
@@ -378,6 +484,10 @@ func (r *Replicator) Capture(m Mutation) uint64 {
 // ErrLostPeer if the peer link broke during ACTIVE mode (the caller
 // should reject the mutation with error_paused — the operation has
 // already been applied locally but is not durable across failover).
+//
+// Uses a chan-based notification (advanceAcked closes the current
+// ackAdvance chan when a new ack lands) so wakeup latency is
+// dominated by ack arrival, not by a polling tick.
 func (r *Replicator) AwaitAcked(ctx context.Context, seq uint64) error {
 	if seq == 0 {
 		return nil
@@ -397,15 +507,23 @@ func (r *Replicator) AwaitAcked(ctx context.Context, seq uint64) error {
 			// reach here for client-side mutations (gate refuses).
 			return ErrLostPeer
 		}
+		// Re-check ackedSeq under ackMu before subscribing, otherwise
+		// we could miss an advance that happened between the load
+		// above and chan capture.
+		r.ackMu.Lock()
+		if r.ackedSeq.Load() >= seq {
+			r.ackMu.Unlock()
+			return nil
+		}
+		ch := r.ackAdvance
+		r.ackMu.Unlock()
 		select {
+		case <-ch:
+			// Advance happened; loop back to re-check.
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-r.stop:
 			return ErrStopped
-		case <-time.After(5 * time.Millisecond):
-			// Short polling. A condvar would be tighter but couples
-			// awkwardly with ctx cancellation. 5ms keeps median sync
-			// latency well under 10ms in healthy conditions.
 		}
 	}
 }
@@ -623,8 +741,8 @@ func (r *Replicator) primaryReader(ctx context.Context, pc *peerConn) {
 		case FrameHeartbeat:
 			return nil
 		case FrameOpAck:
-			if f.OpAck != nil && f.OpAck.Seq > r.ackedSeq.Load() {
-				r.ackedSeq.Store(f.OpAck.Seq)
+			if f.OpAck != nil {
+				r.advanceAcked(f.OpAck.Seq)
 			}
 			return nil
 		case FrameSnapshotReq:

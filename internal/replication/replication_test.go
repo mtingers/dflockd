@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -410,6 +411,16 @@ func TestReplicator_PromoteAndRejoin(t *testing.T) {
 	}
 }
 
+// witnessGraceForTest temporarily reduces WitnessStartupGrace so
+// failover tests don't have to wait the production-grade 6s. Returns
+// a restore func to defer.
+func witnessGraceForTest(t *testing.T, d time.Duration) func() {
+	t.Helper()
+	old := WitnessStartupGrace
+	WitnessStartupGrace = d
+	return func() { WitnessStartupGrace = old }
+}
+
 // TestWitness_AutoPromoteOnPeerLoss is the headline witness test:
 //   1. Witness daemon starts.
 //   2. Primary + secondary connect to the witness, peer with each other.
@@ -419,6 +430,8 @@ func TestReplicator_PromoteAndRejoin(t *testing.T) {
 //      reports primary not alive.
 //   6. Secondary auto-promotes (without operator action).
 func TestWitness_AutoPromoteOnPeerLoss(t *testing.T) {
+	defer witnessGraceForTest(t, 100*time.Millisecond)()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -484,6 +497,102 @@ func TestWitness_AutoPromoteOnPeerLoss(t *testing.T) {
 	if sec.Epoch() == 0 {
 		t.Fatalf("epoch did not advance after auto-promote: %d", sec.Epoch())
 	}
+}
+
+// TestWitness_StartupGraceBlocksFalseFailover verifies that during
+// the witness's startup grace, a query returns PrimaryAlive=true
+// even though the witness has no heartbeat record yet. Without this,
+// a fresh-start witness would instantly tell a querying secondary
+// that the primary is dead.
+func TestWitness_StartupGraceBlocksFalseFailover(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := pickFreeAddr(t)
+	ws := NewWitnessServer(quietLog(t))
+	if err := ws.Start(ctx, addr, nil); err != nil {
+		t.Fatalf("witness start: %v", err)
+	}
+	defer ws.Stop()
+
+	// One-shot query DURING grace: should report PrimaryAlive=true.
+	st, err := oneShotWitnessQuery(ctx, addr, nil, RoleSecondary, "test-sec", 0)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !st.PrimaryAlive {
+		t.Fatal("witness should report PrimaryAlive=true during startup grace")
+	}
+}
+
+// TestReplicator_StaleStartupRefused verifies that a primary
+// starting with a stale epoch (witness has endorsed a different
+// node at a higher epoch) gets ErrStalePrimary from Start.
+func TestReplicator_StaleStartupRefused(t *testing.T) {
+	defer witnessGraceForTest(t, 100*time.Millisecond)()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	witnessAddr := pickFreeAddr(t)
+	ws := NewWitnessServer(quietLog(t))
+	if err := ws.Start(ctx, witnessAddr, nil); err != nil {
+		t.Fatalf("witness start: %v", err)
+	}
+	defer ws.Stop()
+
+	// Pre-populate the witness with an endorsement from a different node.
+	// Wait out the startup grace first so subsequent queries return real
+	// state. Use one-shot heartbeat to seed the endorsement.
+	time.Sleep(WitnessStartupGrace + 100*time.Millisecond)
+	if err := seedEndorsement(ctx, witnessAddr, "winner-node", 5); err != nil {
+		t.Fatalf("seed endorsement: %v", err)
+	}
+	// Brief settle so witness records the heartbeat.
+	time.Sleep(100 * time.Millisecond)
+
+	// Now bring up a primary at a lower epoch from a different node
+	// — it should be flagged stale.
+	stale := NewReplicator(Config{
+		Role:        RolePrimary,
+		NodeID:      "stale-node",
+		PeerAddr:    pickFreeAddr(t),
+		WitnessAddr: witnessAddr,
+		Snapshotter: fakeSnapshotter{},
+		Log:         quietLog(t),
+	})
+	err := stale.Start(ctx)
+	if !errors.Is(err, ErrStalePrimary) {
+		t.Fatalf("Start: got %v want ErrStalePrimary", err)
+	}
+}
+
+// seedEndorsement opens a witness connection, sends a primary hello at
+// the given epoch, briefly heartbeats, and closes. Used by the stale-
+// startup test to populate the witness's endorsement state.
+func seedEndorsement(ctx context.Context, witnessAddr, nodeID string, epoch uint64) error {
+	pc, err := dialPeer(ctx, witnessAddr, nil, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer pc.Close(nil)
+	if err := pc.WriteFrame(&Frame{
+		Type: FrameWitnessHello,
+		WitnessHello: &WitnessHello{
+			Role: RolePrimary, NodeID: nodeID, Epoch: epoch, ProtoVer: ProtoVersion,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := pc.WriteFrame(&Frame{
+		Type: FrameHeartbeat,
+		Heartbeat: &Heartbeat{Epoch: epoch, Now: time.Now().UnixNano()},
+	}); err != nil {
+		return err
+	}
+	// Hold connection briefly so the heartbeat is processed.
+	time.Sleep(50 * time.Millisecond)
+	return nil
 }
 
 // TestReplicator_RefuseMutationsOnSecondary verifies that the
