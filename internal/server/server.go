@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -483,25 +482,6 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, connID uint64) {
 	}
 }
 
-// lockPrefix and semPrefix separate lock and semaphore key namespaces so
-// that the same user-visible key can be used for both without conflict.
-const (
-	lockPrefix = "lock:"
-	semPrefix  = "sem:"
-)
-
-// stripKeyPrefix removes the internal namespace prefix from a key for
-// external display (e.g. stats output).
-func stripKeyPrefix(key string) string {
-	if after, ok := strings.CutPrefix(key, lockPrefix); ok {
-		return after
-	}
-	if after, ok := strings.CutPrefix(key, semPrefix); ok {
-		return after
-	}
-	return key
-}
-
 func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *connState) *protocol.Ack {
 	connID := cs.id
 	s.log.Debug("request", "conn", connID, "cmd", req.Cmd, "key", req.Key)
@@ -515,16 +495,16 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		st.SignalChannels = append(st.SignalChannels, s.sig.Stats()...)
 		// Strip internal key prefixes from stats output.
 		for i := range st.Locks {
-			st.Locks[i].Key = stripKeyPrefix(st.Locks[i].Key)
+			st.Locks[i].Key = lock.StripKeyPrefix(st.Locks[i].Key)
 		}
 		for i := range st.Semaphores {
-			st.Semaphores[i].Key = stripKeyPrefix(st.Semaphores[i].Key)
+			st.Semaphores[i].Key = lock.StripKeyPrefix(st.Semaphores[i].Key)
 		}
 		for i := range st.IdleLocks {
-			st.IdleLocks[i].Key = stripKeyPrefix(st.IdleLocks[i].Key)
+			st.IdleLocks[i].Key = lock.StripKeyPrefix(st.IdleLocks[i].Key)
 		}
 		for i := range st.IdleSemaphores {
-			st.IdleSemaphores[i].Key = stripKeyPrefix(st.IdleSemaphores[i].Key)
+			st.IdleSemaphores[i].Key = lock.StripKeyPrefix(st.IdleSemaphores[i].Key)
 		}
 		data, err := json.Marshal(st)
 		if err != nil {
@@ -534,10 +514,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "l", "sl":
 		limit := 1
-		key := lockPrefix + req.Key
+		key := lock.LockPrefix + req.Key
 		if req.Cmd == "sl" {
 			limit = req.Limit
-			key = semPrefix + req.Key
+			key = lock.SemPrefix + req.Key
 		}
 		tok, err := s.lm.Acquire(ctx, key, req.AcquireTimeout, req.LeaseTTL, connID, limit)
 		if err != nil {
@@ -549,6 +529,15 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 			}
 			if errors.Is(err, lock.ErrMaxWaiters) {
 				return &protocol.Ack{Status: "error_max_waiters"}
+			}
+			if errors.Is(err, lock.ErrLeaseExpired) {
+				// The slot was granted but its lease expired before we
+				// could observe it (rare; happens when leaseTTL is very
+				// short or the goroutine wake-up is delayed). Surfacing
+				// this distinct status mirrors the two-phase Wait path
+				// so single-phase callers can also distinguish it from
+				// a generic error.
+				return &protocol.Ack{Status: "error_lease_expired"}
 			}
 			if errors.Is(err, lock.ErrWaiterClosed) {
 				s.log.Debug("waiter closed during acquire", "key", req.Key, "conn", connID)
@@ -562,9 +551,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "ok", Token: tok, LeaseTTL: int(req.LeaseTTL.Seconds())}
 
 	case "r", "sr":
-		key := lockPrefix + req.Key
+		key := lock.LockPrefix + req.Key
 		if req.Cmd == "sr" {
-			key = semPrefix + req.Key
+			key = lock.SemPrefix + req.Key
 		}
 		if s.lm.Release(key, req.Token) {
 			return &protocol.Ack{Status: "ok"}
@@ -572,9 +561,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: "error"}
 
 	case "n", "sn":
-		key := lockPrefix + req.Key
+		key := lock.LockPrefix + req.Key
 		if req.Cmd == "sn" {
-			key = semPrefix + req.Key
+			key = lock.SemPrefix + req.Key
 		}
 		remaining, ok := s.lm.Renew(key, req.Token, req.LeaseTTL)
 		if !ok {
@@ -584,10 +573,10 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 
 	case "e", "se":
 		limit := 1
-		key := lockPrefix + req.Key
+		key := lock.LockPrefix + req.Key
 		if req.Cmd == "se" {
 			limit = req.Limit
-			key = semPrefix + req.Key
+			key = lock.SemPrefix + req.Key
 		}
 		status, tok, lease, err := s.lm.Enqueue(key, req.LeaseTTL, connID, limit)
 		if err != nil {
@@ -608,9 +597,9 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Request, cs *c
 		return &protocol.Ack{Status: status, Token: tok, LeaseTTL: lease}
 
 	case "w", "sw":
-		key := lockPrefix + req.Key
+		key := lock.LockPrefix + req.Key
 		if req.Cmd == "sw" {
-			key = semPrefix + req.Key
+			key = lock.SemPrefix + req.Key
 		}
 		tok, lease, err := s.lm.Wait(ctx, key, req.AcquireTimeout, connID)
 		if err != nil {

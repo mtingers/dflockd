@@ -258,7 +258,7 @@ func TestSessionSweeperDoesNotCloseActiveCommand(t *testing.T) {
 
 	idB := h.createSession(t)
 
-	token, err := h.lm.Acquire(context.Background(), lockPrefix+"active-wait", time.Second, 30*time.Second, 999, 1)
+	token, err := h.lm.Acquire(context.Background(), lock.LockPrefix+"active-wait", time.Second, 30*time.Second, 999, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestSessionSweeperDoesNotCloseActiveCommand(t *testing.T) {
 
 	// Let the sweeper pass the hard cutoff while B is still waiting.
 	time.Sleep(350 * time.Millisecond)
-	if !h.lm.Release(lockPrefix+"active-wait", token) {
+	if !h.lm.Release(lock.LockPrefix+"active-wait", token) {
 		t.Fatal("direct release failed")
 	}
 

@@ -386,5 +386,15 @@ func (c *Config) validate() error {
 	if c.HTTPSSEPingInterval < 0 {
 		return fmt.Errorf("--http-sse-ping-interval must be >= 0")
 	}
+	// The SSE handler relies on its internal pinger to refresh the
+	// session's lastSeen before the bridge sweeper reaps it. The sweeper
+	// cutoff is 2 * HTTPSessionIdleTimeout, so a ping firing later than
+	// that races the sweeper. Require pingInterval < idleTimeout to keep
+	// 2x margin.
+	if c.HTTPSSEPingInterval > 0 && c.HTTPSessionIdleTimeout > 0 &&
+		c.HTTPSSEPingInterval >= c.HTTPSessionIdleTimeout {
+		return fmt.Errorf("--http-sse-ping-interval (%s) must be less than --http-session-idle-timeout (%s)",
+			c.HTTPSSEPingInterval, c.HTTPSessionIdleTimeout)
+	}
 	return nil
 }

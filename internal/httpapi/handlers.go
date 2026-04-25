@@ -11,14 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
-)
-
-// Key namespaces match the TCP server's internal prefixes (server.go:298).
-// We prepend them so the protocol handler reaches the correct shard.
-const (
-	lockPrefix = "lock:"
-	semPrefix  = "sem:"
 )
 
 const maxProtocolSeconds = int64(math.MaxInt64) / int64(time.Second)
@@ -67,6 +61,17 @@ func (h *httpServer) handlePingSession(w http.ResponseWriter, r *http.Request, i
 		writeError(w, http.StatusGone, "session_gone", "")
 		return
 	}
+	// LookupSession already refreshed the bridge-level lastSeen. The
+	// remaining job for the protocol-level ping is to keep the underlying
+	// virtual conn's read deadline from firing — but if there's another
+	// command in flight, ServeConn isn't blocked in ReadRequest anyway,
+	// so the protocol ping is redundant. Skip it to avoid serializing
+	// behind reqMu for the duration of a long-poll Acquire/Wait, which
+	// would otherwise stall callers using pings as a liveness probe.
+	if s.inFlight.Load() > 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	resp, err := s.command("ping", "_", "")
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -94,28 +99,18 @@ func (h *httpServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats.SignalChannels = append(stats.SignalChannels, h.bridge.Signals().Stats()...)
 	// Strip key prefixes so the HTTP caller sees the logical key.
 	for i := range stats.Locks {
-		stats.Locks[i].Key = stripKeyPrefix(stats.Locks[i].Key)
+		stats.Locks[i].Key = lock.StripKeyPrefix(stats.Locks[i].Key)
 	}
 	for i := range stats.Semaphores {
-		stats.Semaphores[i].Key = stripKeyPrefix(stats.Semaphores[i].Key)
+		stats.Semaphores[i].Key = lock.StripKeyPrefix(stats.Semaphores[i].Key)
 	}
 	for i := range stats.IdleLocks {
-		stats.IdleLocks[i].Key = stripKeyPrefix(stats.IdleLocks[i].Key)
+		stats.IdleLocks[i].Key = lock.StripKeyPrefix(stats.IdleLocks[i].Key)
 	}
 	for i := range stats.IdleSemaphores {
-		stats.IdleSemaphores[i].Key = stripKeyPrefix(stats.IdleSemaphores[i].Key)
+		stats.IdleSemaphores[i].Key = lock.StripKeyPrefix(stats.IdleSemaphores[i].Key)
 	}
 	writeJSON(w, http.StatusOK, stats)
-}
-
-func stripKeyPrefix(k string) string {
-	if after, ok := strings.CutPrefix(k, lockPrefix); ok {
-		return after
-	}
-	if after, ok := strings.CutPrefix(k, semPrefix); ok {
-		return after
-	}
-	return k
 }
 
 // ---------------------------------------------------------------------------

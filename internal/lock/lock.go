@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,27 @@ var (
 	ErrLeaseExpired    = errors.New("lease expired before wait")
 	ErrWaiterClosed    = errors.New("waiter channel closed")
 )
+
+// LockPrefix and SemPrefix separate lock and semaphore key namespaces so
+// that the same user-visible key can be used for both without conflict.
+// Callers (server, httpapi) prepend these before invoking LockManager
+// methods, then strip them via StripKeyPrefix for stats output.
+const (
+	LockPrefix = "lock:"
+	SemPrefix  = "sem:"
+)
+
+// StripKeyPrefix removes the internal namespace prefix from a key for
+// external display (e.g. stats output).
+func StripKeyPrefix(key string) string {
+	if after, ok := strings.CutPrefix(key, LockPrefix); ok {
+		return after
+	}
+	if after, ok := strings.CutPrefix(key, SemPrefix); ok {
+		return after
+	}
+	return key
+}
 
 // tokenBuf amortises crypto/rand syscalls by buffering 4096 bytes (256 tokens)
 // and dispensing 16 bytes at a time.
@@ -136,10 +158,13 @@ func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
 }
 
 func shardIndex(key string) int {
-	h := uint32(2166136261) // FNV-32a offset basis
+	// FNV-1a (32-bit): XOR-then-multiply each byte against the FNV offset
+	// basis and prime. We hand-roll rather than use hash/fnv to avoid the
+	// allocation hash.New imposes on each call (this is on every lock op).
+	h := uint32(2166136261) // FNV offset basis
 	for i := 0; i < len(key); i++ {
 		h ^= uint32(key[i])
-		h *= 16777619 // FNV-32a prime
+		h *= 16777619 // FNV prime
 	}
 	return int(h % numShards)
 }
@@ -325,12 +350,6 @@ func (lm *LockManager) evictExpiredLocked(sh *shard, key string, st *ResourceSta
 		st.LastActivity = now
 		lm.grantNextWaiterLocked(sh, key, st)
 	}
-}
-
-// resourceCount returns total number of resources across all shards using
-// the atomic counter, which is safe to read without holding shard locks.
-func (lm *LockManager) resourceCount() int {
-	return int(lm.resourceTotal.Load())
 }
 
 func (lm *LockManager) getOrCreateLocked(sh *shard, key string, limit int) (*ResourceState, error) {
@@ -765,6 +784,12 @@ func (lm *LockManager) CleanupConnection(connID uint64) {
 		// Release owned slots only when configured to do so. Pending
 		// waiters/enqueued state above are always cleaned; a disconnected
 		// waiter can never observe a later grant.
+		//
+		// When AutoReleaseOnDisconnect is false, sh.connOwned[connID]
+		// intentionally persists: it's not a leak because each held token
+		// gets removed via connRemoveOwned as its lease expires (in
+		// evictExpiredLocked / LeaseExpiryLoop), and connRemoveOwned
+		// drops the inner conn entry once empty.
 		if lm.cfg.AutoReleaseOnDisconnect {
 			if owned, ok := sh.connOwned[connID]; ok {
 				for key, tokens := range owned {
@@ -1003,13 +1028,13 @@ func (lm *LockManager) ResourceForTest(key string) *ResourceState {
 }
 
 // ConnEnqueuedForTest returns the enqueued state for a given connKey (for testing only).
-// Must be called with the shard lock held (via LockShardForTest with the key).
+// Must be called with the shard lock held (via LockKeyForTest with the key).
 func (lm *LockManager) ConnEnqueuedForTest(ck connKey) *enqueuedState {
 	return lm.shardFor(ck.Key).connEnqueued[ck]
 }
 
 // ConnOwnedForTest returns the owned map for a connID in the shard for the given key (for testing only).
-// Must be called with the shard lock held (via LockShardForTest with the key).
+// Must be called with the shard lock held (via LockKeyForTest with the key).
 func (lm *LockManager) ConnOwnedForTest(connID uint64, key string) map[string]map[string]struct{} {
 	return lm.shardFor(key).connOwned[connID]
 }
@@ -1046,12 +1071,6 @@ func (lm *LockManager) ConnOwnedCountForTest() int {
 	}
 	return total
 }
-
-// LockShardForTest locks the shard for the given key (for testing only).
-func (lm *LockManager) LockShardForTest(key string) { lm.shardFor(key).mu.Lock() }
-
-// UnlockShardForTest unlocks the shard for the given key (for testing only).
-func (lm *LockManager) UnlockShardForTest(key string) { lm.shardFor(key).mu.Unlock() }
 
 // ResetLeaseForTest forces all holders of a key to expire immediately (for testing only).
 func (lm *LockManager) ResetLeaseForTest(key string) {

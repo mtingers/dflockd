@@ -561,6 +561,9 @@ func parseSemAcquireResponse(resp string) (string, int, error) {
 	if resp == "error_limit_mismatch" {
 		return "", 0, ErrLimitMismatch
 	}
+	if resp == "error_lease_expired" {
+		return "", 0, ErrLeaseExpired
+	}
 	return parseOKTokenLease(resp, "sem_acquire")
 }
 
@@ -576,6 +579,9 @@ func parseAcquireResponse(resp string) (string, int, error) {
 	}
 	if resp == "error_limit_mismatch" {
 		return "", 0, ErrLimitMismatch
+	}
+	if resp == "error_lease_expired" {
+		return "", 0, ErrLeaseExpired
 	}
 	return parseOKTokenLease(resp, "acquire")
 }

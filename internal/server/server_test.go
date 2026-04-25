@@ -472,7 +472,7 @@ func TestIntegration_DisconnectCancelsInFlightAcquire(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	internalKey := lockPrefix + "mykey"
+	internalKey := lock.LockPrefix + "mykey"
 	waitForWaiters(t, lm, internalKey, 1)
 
 	if err := conn2.Close(); err != nil {
@@ -504,7 +504,7 @@ func TestIntegration_DisconnectCancelsPipelinedInFlightAcquire(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	internalKey := lockPrefix + "mykey"
+	internalKey := lock.LockPrefix + "mykey"
 	waitForWaiters(t, lm, internalKey, 1)
 
 	if err := conn2.Close(); err != nil {
@@ -534,7 +534,7 @@ func TestIntegration_DisconnectCancelsFullBufferedPipelinedInFlightAcquire(t *te
 		t.Fatal(err)
 	}
 
-	internalKey := lockPrefix + "mykey"
+	internalKey := lock.LockPrefix + "mykey"
 	waitForWaiters(t, lm, internalKey, 1)
 
 	// Fill the server-side bufio.Reader while the acquire is blocked.
