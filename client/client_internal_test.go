@@ -177,6 +177,32 @@ func TestClientRejectsProtocolLineOverflow(t *testing.T) {
 	}
 }
 
+func TestClientRejectsInvalidSemaphoreLimit(t *testing.T) {
+	if _, _, err := SemAcquire(&Conn{}, "k", time.Second, 0); err == nil {
+		t.Fatal("expected SemAcquire with limit 0 to fail")
+	}
+	if _, _, _, err := SemEnqueue(&Conn{}, "k", -1); err == nil {
+		t.Fatal("expected SemEnqueue with negative limit to fail")
+	}
+
+	sem := &Semaphore{
+		Key:            "k",
+		Limit:          0,
+		AcquireTimeout: time.Second,
+		Servers:        []string{"127.0.0.1:1"},
+	}
+	ok, err := sem.Acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected high-level Semaphore.Acquire with limit 0 to fail")
+	}
+	if ok {
+		t.Fatal("invalid semaphore limit should not acquire")
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("error should mention limit, got %v", err)
+	}
+}
+
 type errOnlyCanceledContext struct {
 	context.Context
 }
@@ -307,4 +333,99 @@ func TestCleanupAbandonedGrantFallsBackToFreshConnection(t *testing.T) {
 	cleanupAbandonedGrant(closedConn, addr, nil, "", "abandoned", "abandoned-token", Release)
 
 	expectReleasedToken(t, released)
+}
+
+func startHungReleaseServer(t *testing.T, acquireCmd string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		cmd, err := readFakeLine(r)
+		if err != nil || cmd != acquireCmd {
+			return
+		}
+		if _, err := readFakeLine(r); err != nil { // key
+			return
+		}
+		if _, err := readFakeLine(r); err != nil { // arg
+			return
+		}
+		fmt.Fprint(conn, "ok release-context-token 33\n")
+
+		for i := 0; i < 3; i++ {
+			if _, err := readFakeLine(r); err != nil {
+				return
+			}
+		}
+		// Intentionally do not answer the release; the client should use
+		// ctx cancellation to close the connection and unblock itself.
+		_, _ = r.ReadString('\n')
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+	})
+	return ln.Addr().String()
+}
+
+func TestLockReleaseHonorsContext(t *testing.T) {
+	addr := startHungReleaseServer(t, "l")
+	l := &Lock{
+		Key:            "release-context",
+		AcquireTimeout: time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if !ok {
+		t.Fatal("acquire returned !ok")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = l.Release(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("release error: got %v want context deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("release ignored context and took %s", elapsed)
+	}
+}
+
+func TestSemaphoreReleaseHonorsContext(t *testing.T) {
+	addr := startHungReleaseServer(t, "sl")
+	s := &Semaphore{
+		Key:            "release-context",
+		Limit:          1,
+		AcquireTimeout: time.Second,
+		Servers:        []string{addr},
+	}
+	ok, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if !ok {
+		t.Fatal("acquire returned !ok")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = s.Release(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("release error: got %v want context deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("release ignored context and took %s", elapsed)
+	}
 }

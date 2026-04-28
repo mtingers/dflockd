@@ -402,11 +402,18 @@ func (s *session) multiplex() {
 // line. Serializes through reqMu so that the respCh buffer (size 1) is
 // always drained by the corresponding caller.
 //
-// The call is NOT interrupted by ctx cancellation mid-way; the protocol's
-// own timeouts bound how long the server can block. If a caller abandons
-// the HTTP request mid-command, the response still arrives and is drained
-// by this function (so the next caller gets a clean slate).
+// command uses a background context. Callers that need HTTP request
+// cancellation to abort a blocking protocol operation should use
+// commandContext instead; cancellation closes this virtual connection,
+// which is the protocol-level cancellation mechanism.
 func (s *session) command(cmd, key, arg string) (string, error) {
+	return s.commandContext(context.Background(), cmd, key, arg)
+}
+
+func (s *session) commandContext(ctx context.Context, cmd, key, arg string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if s.dead.Load() {
 		return "", ErrSessionGone
 	}
@@ -426,6 +433,13 @@ func (s *session) command(cmd, key, arg string) (string, error) {
 	default:
 	}
 
+	select {
+	case <-ctx.Done():
+		s.close()
+		return "", ctx.Err()
+	default:
+	}
+
 	msg := cmd + "\n" + key + "\n" + arg + "\n"
 	if _, err := s.clientSide.Write([]byte(msg)); err != nil {
 		return "", err
@@ -435,6 +449,9 @@ func (s *session) command(cmd, key, arg string) (string, error) {
 	select {
 	case resp := <-s.respCh:
 		return resp, nil
+	case <-ctx.Done():
+		s.close()
+		return "", ctx.Err()
 	case <-s.ctx.Done():
 		return "", ErrSessionGone
 	case <-s.muxDone:

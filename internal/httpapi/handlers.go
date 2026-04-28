@@ -204,8 +204,12 @@ func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, k
 	if req.LeaseTTLS > 0 {
 		arg += " " + strconv.Itoa(req.LeaseTTLS)
 	}
-	resp, err := s.command("l", key, arg)
+	resp, err := s.commandContext(r.Context(), "l", key, arg)
 	if err != nil {
+		if r.Context().Err() != nil {
+			_ = h.bridge.DeleteSession(s.id)
+			return
+		}
 		writeError(w, http.StatusGone, "session_gone", err.Error())
 		return
 	}
@@ -261,8 +265,12 @@ func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, ke
 	if req.LeaseTTLS > 0 {
 		arg += " " + strconv.Itoa(req.LeaseTTLS)
 	}
-	resp, err := s.command("sl", key, arg)
+	resp, err := s.commandContext(r.Context(), "sl", key, arg)
 	if err != nil {
+		if r.Context().Err() != nil {
+			_ = h.bridge.DeleteSession(s.id)
+			return
+		}
 		writeError(w, http.StatusGone, "session_gone", err.Error())
 		return
 	}
@@ -581,8 +589,12 @@ func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, cmd, key str
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	resp, err := s.command(cmd, key, strconv.Itoa(req.TimeoutS))
+	resp, err := s.commandContext(r.Context(), cmd, key, strconv.Itoa(req.TimeoutS))
 	if err != nil {
+		if r.Context().Err() != nil {
+			_ = h.bridge.DeleteSession(s.id)
+			return
+		}
 		writeError(w, http.StatusGone, "session_gone", err.Error())
 		return
 	}

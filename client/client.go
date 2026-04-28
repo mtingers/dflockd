@@ -226,6 +226,13 @@ func validateProtocolLineLength(name, value string) error {
 	return nil
 }
 
+func validateSemaphoreLimit(limit int) error {
+	if limit <= 0 {
+		return fmt.Errorf("dflockd: semaphore limit must be > 0 (got %d)", limit)
+	}
+	return nil
+}
+
 // secondsCeil converts a duration to whole seconds, rounding up so that
 // sub-second durations are not silently truncated to zero.
 func secondsCeil(d time.Duration) int64 {
@@ -443,6 +450,9 @@ func SemAcquire(c *Conn, key string, acquireTimeout time.Duration, limit int, op
 	if err := validateKey(key); err != nil {
 		return "", 0, err
 	}
+	if err := validateSemaphoreLimit(limit); err != nil {
+		return "", 0, err
+	}
 	o, err := parseOptions(opts)
 	if err != nil {
 		return "", 0, err
@@ -533,6 +543,9 @@ func SemRenew(c *Conn, key, token string, opts ...Option) (remaining int, err er
 // ("acquired" or "queued"), and if acquired, the token and lease TTL.
 func SemEnqueue(c *Conn, key string, limit int, opts ...Option) (status, token string, leaseTTL int, err error) {
 	if err := validateKey(key); err != nil {
+		return "", "", 0, err
+	}
+	if err := validateSemaphoreLimit(limit); err != nil {
 		return "", "", 0, err
 	}
 	o, err := parseOptions(opts)
@@ -859,6 +872,22 @@ func cleanupAbandonedGrant(conn *Conn, addr string, tlsCfg *tls.Config, authToke
 	}
 	defer cleanupConn.Close()
 	_ = tryReleaseWithDeadline(cleanupConn, key, token, releaseFn)
+}
+
+func releaseWithContext(ctx context.Context, conn *Conn, key, token string, releaseFn func(*Conn, string, string) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopCancelWatch := closeConnOnContextDone(ctx, conn)
+	err := releaseFn(conn, key, token)
+	stopCancelWatch()
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // defaultAcquireTimeout returns the given value, or 10s if unset.
@@ -1247,7 +1276,8 @@ const stopRenewGrace = 2 * time.Second
 // period we force-close the underlying conn, which interrupts the Renew
 // I/O with an error; the goroutine then exits normally.
 // Release stops the renewal goroutine, releases the lock on the server, and
-// closes the connection. The ctx parameter is reserved for future use.
+// closes the connection. Cancelling ctx closes the connection to unblock a
+// release round trip that is stuck in network I/O.
 func (l *Lock) Release(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1258,7 +1288,7 @@ func (l *Lock) Release(ctx context.Context) error {
 		return nil
 	}
 
-	err := Release(l.conn, l.Key, l.token)
+	err := releaseWithContext(ctx, l.conn, l.Key, l.token, Release)
 	l.conn.Close()
 	l.conn = nil
 	l.token = ""
@@ -1307,6 +1337,9 @@ func (s *Semaphore) opts() []Option                   { return buildOpts(s.Lease
 // background lease renewal. Returns false (with nil error) on timeout.
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio, s.RenewJitter); err != nil {
+		return false, err
+	}
+	if err := validateSemaphoreLimit(s.Limit); err != nil {
 		return false, err
 	}
 	s.mu.Lock()
@@ -1364,6 +1397,9 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 // is closed which unblocks any in-progress server I/O.
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio, s.RenewJitter); err != nil {
+		return "", err
+	}
+	if err := validateSemaphoreLimit(s.Limit); err != nil {
 		return "", err
 	}
 	s.mu.Lock()
@@ -1470,7 +1506,8 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 }
 
 // Release stops renewal, releases the semaphore slot, and closes the connection.
-// The ctx parameter is reserved for future use.
+// Cancelling ctx closes the connection to unblock a release round trip that is
+// stuck in network I/O.
 func (s *Semaphore) Release(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1481,7 +1518,7 @@ func (s *Semaphore) Release(ctx context.Context) error {
 		return nil
 	}
 
-	err := SemRelease(s.conn, s.Key, s.token)
+	err := releaseWithContext(ctx, s.conn, s.Key, s.token, SemRelease)
 	s.conn.Close()
 	s.conn = nil
 	s.token = ""

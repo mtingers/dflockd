@@ -59,34 +59,34 @@ func envLookup(keys ...string) string {
 }
 
 // envOrInt returns the environment variable value parsed as int, or the flag
-// default if the env var is unset or unparseable.
-func envOrInt(envKey string, flagVal int) int {
+// default if the env var is unset. Malformed values are configuration errors.
+func envOrInt(envKey string, flagVal int) (int, error) {
 	v := os.Getenv(envKey)
 	if v == "" {
-		return flagVal
+		return flagVal, nil
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return flagVal
+		return 0, fmt.Errorf("%s must be an integer (got %q)", envKey, v)
 	}
-	return n
+	return n, nil
 }
 
 // envOrBool returns the environment variable value parsed as bool, or the flag
 // default if the env var is unset. Recognizes 1/yes/true as true and
-// 0/no/false as false; unrecognized values fall back to the flag default.
-func envOrBool(envKey string, flagVal bool) bool {
+// 0/no/false as false; unrecognized values are configuration errors.
+func envOrBool(envKey string, flagVal bool) (bool, error) {
 	v := os.Getenv(envKey)
 	if v == "" {
-		return flagVal
+		return flagVal, nil
 	}
 	switch strings.ToLower(v) {
 	case "1", "yes", "true":
-		return true
+		return true, nil
 	case "0", "no", "false":
-		return false
+		return false, nil
 	default:
-		return flagVal
+		return false, fmt.Errorf("%s must be a boolean (got %q)", envKey, v)
 	}
 }
 
@@ -127,7 +127,11 @@ func durationFromSeconds(label string, seconds int) (time.Duration, error) {
 // envOrDuration returns a time.Duration in seconds from the environment
 // variable, or converts the flag default (in seconds) if the env var is unset.
 func envOrDuration(envKey string, flagVal int) (time.Duration, error) {
-	return durationFromSeconds(envKey, envOrInt(envKey, flagVal))
+	n, err := envOrInt(envKey, flagVal)
+	if err != nil {
+		return 0, err
+	}
+	return durationFromSeconds(envKey, n)
 }
 
 // envOrDurationWithAliases is envOrDuration that also looks up deprecated
@@ -140,7 +144,7 @@ func envOrDurationWithAliases(flagVal int, keys ...string) (time.Duration, strin
 		if v := os.Getenv(k); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil {
-				continue
+				return 0, k, fmt.Errorf("%s must be an integer (got %q)", k, v)
 			}
 			d, err := durationFromSeconds(k, n)
 			return d, k, err
@@ -245,9 +249,9 @@ func Load(args []string) (*Config, error) {
 	fs.Visit(func(f *flag.Flag) {
 		setFlags[f.Name] = true
 	})
-	resolveInt := func(flagName, envKey string, flagVal int) int {
+	resolveInt := func(flagName, envKey string, flagVal int) (int, error) {
 		if setFlags[flagName] {
-			return flagVal
+			return flagVal, nil
 		}
 		return envOrInt(envKey, flagVal)
 	}
@@ -257,9 +261,9 @@ func Load(args []string) (*Config, error) {
 		}
 		return envOrString(envKey, flagVal)
 	}
-	resolveBool := func(flagName, envKey string, flagVal bool) bool {
+	resolveBool := func(flagName, envKey string, flagVal bool) (bool, error) {
 		if setFlags[flagName] {
-			return flagVal
+			return flagVal, nil
 		}
 		return envOrBool(envKey, flagVal)
 	}
@@ -333,42 +337,97 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 
-	resolvedHTTPRate := resolveInt("http-rate-limit-per-ip", "DFLOCKD_HTTP_RATE_LIMIT_PER_IP", *httpRateLimitPerIP)
-	resolvedHTTPBurst := resolveInt("http-rate-limit-burst", "DFLOCKD_HTTP_RATE_LIMIT_BURST", *httpRateLimitBurst)
+	resolvedHTTPRate, err := resolveInt("http-rate-limit-per-ip", "DFLOCKD_HTTP_RATE_LIMIT_PER_IP", *httpRateLimitPerIP)
+	if err != nil {
+		return nil, err
+	}
+	resolvedHTTPBurst, err := resolveInt("http-rate-limit-burst", "DFLOCKD_HTTP_RATE_LIMIT_BURST", *httpRateLimitBurst)
+	if err != nil {
+		return nil, err
+	}
 	if resolvedHTTPRate > 0 && resolvedHTTPBurst == 0 {
 		resolvedHTTPBurst = resolvedHTTPRate
 	}
 
+	resolvedPort, err := resolveInt("port", "DFLOCKD_PORT", *port)
+	if err != nil {
+		return nil, err
+	}
+	resolvedMaxLocks, err := resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks)
+	if err != nil {
+		return nil, err
+	}
+	resolvedMaxConnections, err := resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections)
+	if err != nil {
+		return nil, err
+	}
+	resolvedMaxConnectionsPerIP, err := resolveInt("max-connections-per-ip", "DFLOCKD_MAX_CONNECTIONS_PER_IP", *maxConnectionsPerIP)
+	if err != nil {
+		return nil, err
+	}
+	resolvedMaxWaiters, err := resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters)
+	if err != nil {
+		return nil, err
+	}
+	resolvedMaxSubscriptions, err := resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions)
+	if err != nil {
+		return nil, err
+	}
+	resolvedAutoRelease, err := resolveBool("auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)
+	if err != nil {
+		return nil, err
+	}
+	resolvedHTTPPort, err := resolveInt("http-port", "DFLOCKD_HTTP_PORT", *httpPort)
+	if err != nil {
+		return nil, err
+	}
+	resolvedHTTPMaxSessions, err := resolveInt("http-max-sessions", "DFLOCKD_HTTP_MAX_SESSIONS", *httpMaxSessions)
+	if err != nil {
+		return nil, err
+	}
+	resolvedHTTPMaxSessionsPerIP, err := resolveInt("http-max-sessions-per-ip", "DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", *httpMaxSessionsPerIP)
+	if err != nil {
+		return nil, err
+	}
+	resolvedHTTPMaxConnsPerIP, err := resolveInt("http-max-connections-per-ip", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP", *httpMaxConnsPerIP)
+	if err != nil {
+		return nil, err
+	}
+	resolvedDebug, err := resolveBool("debug", "DFLOCKD_DEBUG", *debug)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Host:                    resolveString("host", "DFLOCKD_HOST", *host),
-		Port:                    resolveInt("port", "DFLOCKD_PORT", *port),
+		Port:                    resolvedPort,
 		DefaultLeaseTTL:         defaultLeaseTTLDuration,
 		LeaseSweepInterval:      leaseSweepIntervalDuration,
 		GCInterval:              gcIntervalDuration,
 		GCMaxIdleTime:           gcMaxIdleDuration,
-		MaxLocks:                resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks),
-		MaxConnections:          resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections),
-		MaxConnectionsPerIP:     resolveInt("max-connections-per-ip", "DFLOCKD_MAX_CONNECTIONS_PER_IP", *maxConnectionsPerIP),
-		MaxWaiters:              resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters),
-		MaxSubscriptions:        resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions),
+		MaxLocks:                resolvedMaxLocks,
+		MaxConnections:          resolvedMaxConnections,
+		MaxConnectionsPerIP:     resolvedMaxConnectionsPerIP,
+		MaxWaiters:              resolvedMaxWaiters,
+		MaxSubscriptions:        resolvedMaxSubscriptions,
 		ReadTimeout:             readTimeoutDuration,
 		WriteTimeout:            writeTimeoutDuration,
 		ShutdownTimeout:         shutdownTimeoutDuration,
-		AutoReleaseOnDisconnect: resolveBool("auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease),
+		AutoReleaseOnDisconnect: resolvedAutoRelease,
 		TLSCert:                 resolveString("tls-cert", "DFLOCKD_TLS_CERT", *tlsCert),
 		TLSKey:                  resolveString("tls-key", "DFLOCKD_TLS_KEY", *tlsKey),
 		AuthToken:               authTok,
-		HTTPPort:                resolveInt("http-port", "DFLOCKD_HTTP_PORT", *httpPort),
+		HTTPPort:                resolvedHTTPPort,
 		HTTPHost:                resolveString("http-host", "DFLOCKD_HTTP_HOST", *httpHost),
 		HTTPSessionIdleTimeout:  httpIdleDuration,
-		HTTPMaxSessions:         resolveInt("http-max-sessions", "DFLOCKD_HTTP_MAX_SESSIONS", *httpMaxSessions),
-		HTTPMaxSessionsPerIP:    resolveInt("http-max-sessions-per-ip", "DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", *httpMaxSessionsPerIP),
-		HTTPMaxConnectionsPerIP: resolveInt("http-max-connections-per-ip", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP", *httpMaxConnsPerIP),
+		HTTPMaxSessions:         resolvedHTTPMaxSessions,
+		HTTPMaxSessionsPerIP:    resolvedHTTPMaxSessionsPerIP,
+		HTTPMaxConnectionsPerIP: resolvedHTTPMaxConnsPerIP,
 		HTTPRateLimitPerIP:      resolvedHTTPRate,
 		HTTPRateLimitBurst:      resolvedHTTPBurst,
 		HTTPSSEPingInterval:     httpSSEPingDuration,
 		HTTPCORSAllowedOrigins:  splitCSV(resolveString("http-cors-allowed-origins", "DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", *httpCORSOrigins)),
-		Debug:                   resolveBool("debug", "DFLOCKD_DEBUG", *debug),
+		Debug:                   resolvedDebug,
 		Version:                 *version,
 	}
 

@@ -172,6 +172,22 @@ func (h *testHarness) createSession(t *testing.T) string {
 	return body.SessionID
 }
 
+func waitForLockWaiters(t *testing.T, h *testHarness, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		stats := h.lm.Stats(0)
+		for _, li := range stats.Locks {
+			if li.Key == lock.LockPrefix+key && li.Waiters == want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stats := h.lm.Stats(0)
+	t.Fatalf("lock %q waiters did not reach %d; stats=%+v", key, want, stats.Locks)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: Session lifecycle
 // ---------------------------------------------------------------------------
@@ -505,6 +521,103 @@ func TestSessionSweeperDoesNotCloseActiveCommand(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("B acquire did not return")
+	}
+}
+
+func TestCanceledHTTPAcquireClosesSessionAndCancelsWaiter(t *testing.T) {
+	h := newHarness(t, testConfig())
+	idA := h.createSession(t)
+	idB := h.createSession(t)
+	idC := h.createSession(t)
+	key := "cancel-acquire"
+
+	resp := h.do(t, "POST", "/v1/locks/"+key, idA, acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	var aAck acquireResponse
+	decodeBody(t, resp, &aAck)
+	if aAck.Status != "ok" || aAck.Token == "" {
+		t.Fatalf("A acquire: %+v", aAck)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := h.doWithContext(t, ctx, "POST", "/v1/locks/"+key, idB, acquireRequest{AcquireTimeoutS: 60, LeaseTTLS: 30})
+		r.Body.Close()
+	}()
+
+	waitForLockWaiters(t, h, key, 1)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled acquire did not return promptly")
+	}
+	if _, err := h.bridge.LookupSession(idB); err != ErrSessionGone {
+		t.Fatalf("canceled acquire session lookup: got %v want %v", err, ErrSessionGone)
+	}
+
+	resp = h.do(t, "POST", "/v1/locks/"+key+"/release", idA, releaseRequest{Token: aAck.Token})
+	resp.Body.Close()
+
+	resp = h.do(t, "POST", "/v1/locks/"+key, idC, acquireRequest{AcquireTimeoutS: 0, LeaseTTLS: 30})
+	var cAck acquireResponse
+	decodeBody(t, resp, &cAck)
+	if cAck.Status != "ok" || cAck.Token == "" {
+		t.Fatalf("C acquire after cancellation: %+v, want immediate ok", cAck)
+	}
+}
+
+func TestCanceledHTTPWaitClosesSessionAndCancelsWaiter(t *testing.T) {
+	h := newHarness(t, testConfig())
+	idA := h.createSession(t)
+	idB := h.createSession(t)
+	idC := h.createSession(t)
+	key := "cancel-wait"
+
+	resp := h.do(t, "POST", "/v1/locks/"+key, idA, acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	var aAck acquireResponse
+	decodeBody(t, resp, &aAck)
+	if aAck.Status != "ok" || aAck.Token == "" {
+		t.Fatalf("A acquire: %+v", aAck)
+	}
+
+	resp = h.do(t, "POST", "/v1/locks/"+key+"/enqueue", idB, enqueueRequest{LeaseTTLS: 30})
+	var bEnq enqueueResponse
+	decodeBody(t, resp, &bEnq)
+	if bEnq.Status != "queued" {
+		t.Fatalf("B enqueue: %+v, want queued", bEnq)
+	}
+	waitForLockWaiters(t, h, key, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := h.doWithContext(t, ctx, "POST", "/v1/locks/"+key+"/wait", idB, waitRequest{TimeoutS: 60})
+		r.Body.Close()
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled wait did not return promptly")
+	}
+	if _, err := h.bridge.LookupSession(idB); err != ErrSessionGone {
+		t.Fatalf("canceled wait session lookup: got %v want %v", err, ErrSessionGone)
+	}
+
+	resp = h.do(t, "POST", "/v1/locks/"+key+"/release", idA, releaseRequest{Token: aAck.Token})
+	resp.Body.Close()
+
+	resp = h.do(t, "POST", "/v1/locks/"+key, idC, acquireRequest{AcquireTimeoutS: 0, LeaseTTLS: 30})
+	var cAck acquireResponse
+	decodeBody(t, resp, &cAck)
+	if cAck.Status != "ok" || cAck.Token == "" {
+		t.Fatalf("C acquire after canceled wait: %+v, want immediate ok", cAck)
 	}
 }
 

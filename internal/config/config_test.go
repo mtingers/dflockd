@@ -67,6 +67,33 @@ func TestLoad_ValidationErrors(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMalformedEnvValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+		want  string
+	}{
+		{name: "int", env: "DFLOCKD_MAX_CONNECTIONS", value: "100O", want: "DFLOCKD_MAX_CONNECTIONS"},
+		{name: "bool", env: "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", value: "flase", want: "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT"},
+		{name: "duration", env: "DFLOCKD_READ_TIMEOUT_S", value: "ten", want: "DFLOCKD_READ_TIMEOUT_S"},
+		{name: "deprecated duration alias", env: "DFLOCKD_GC_LOOP_SLEEP", value: "five", want: "DFLOCKD_GC_LOOP_SLEEP"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			_, err := Load([]string{})
+			if err == nil {
+				t.Fatal("expected malformed env var to fail")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q should contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_HTTPRateLimitBurstDefaultsToRate(t *testing.T) {
 	cfg, err := Load([]string{"--http-rate-limit-per-ip", "10"})
 	if err != nil {
