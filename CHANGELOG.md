@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.16.1] - 2026-04-27
+
+### Fixed
+
+- **Lock: `Acquire`/`Wait` success branch no longer hands a token to a cancelled caller.** The timeout branches already released a just-granted token when the parent ctx was cancelled simultaneously with the grant; the success branches did not. With `select` non-deterministic when both `w.ch` and `timeoutCtx.Done()` were ready, ~half of those races returned the token to a caller that had abandoned, leaking the lock until lease expiry. Both branches now check `ctx.Err()` and re-grant to the next waiter when cancelled.
+- **HTTP bridge: a grant that arrived just as the request was cancelled is no longer silently dropped.** `commandContext`'s `<-ctx.Done()` branch closed the session unconditionally, discarding any response already in `respCh`. A grant that landed between command-completion and HTTP cancellation was lost — `maybeCleanupOnDisconnect` never ran because the handler observed `ctx.Err()` instead of the grant. The branch now drains `respCh` first; if a response is queued the protocol command actually completed, so it is returned (the handler then releases the grant) and the session stays alive.
+- **HTTP bridge: `lastSeen` is refreshed on command exit, not entry.** `defer s.lastSeen.Store(time.Now().UnixNano())` evaluated `time.Now()` at registration (Go's deferred-arg semantics), so a long-poll `Wait` left `lastSeen` pointing at the entry time. With short `--http-session-idle-timeout` values, the bridge sweeper's 2× cutoff could reap a session moments after a successful long-poll response. The defer is now wrapped in a closure so the timestamp reflects the actual exit time.
+- **Lock: `Release`/`Renew` on a non-matching token no longer keep an empty resource alive past `--gc-max-idle`.** Both updated `LastActivity` before validating `Holders[token]`, so a caller spamming bogus tokens kept idle resources around indefinitely (defeating GC up to `--max-locks`). The `LastActivity` update now runs only after the token is confirmed to belong to a current holder.
+- **HTTP SSE: internal ping no longer blocks past client disconnect.** `handleSSE`'s ping used `s.command` (background context), so a hung or slow server pinned the SSE goroutine, virtual conn, and `ServeConn` worker even after the HTTP client had disconnected (the bridge sweeper's `inFlight` check kept the session alive throughout). The ping now uses `s.commandContext(r.Context(), …)` so client disconnect aborts the in-flight ping and tears the session down promptly.
+- **Bench: `cmd/bench` no longer panics when a worker's `Dial` partially fails.** The `conns` slice was pre-sized to `numConns` and assigned by index, so a later `Dial` failure left earlier nil slots; the deferred cleanup then dereferenced nil. The slice is now `make(..., 0, n)` plus `append`, so cleanup only sees successfully-dialed conns.
+
 ## [v1.16.0] - 2026-04-25
 
 ### Added
