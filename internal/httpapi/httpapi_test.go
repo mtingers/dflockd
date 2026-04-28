@@ -1321,6 +1321,65 @@ func TestInvalidSessionIDFormat_Returns400(t *testing.T) {
 // Phase 1: Idle sweeper
 // ---------------------------------------------------------------------------
 
+// TestIdleSweeper_LongPollRefreshesLastSeen verifies that a long-running
+// command refreshes lastSeen on EXIT (not entry). Before the fix, the
+// `defer s.lastSeen.Store(time.Now().UnixNano())` evaluated time.Now()
+// when the defer was registered (function entry), so a long-poll Wait
+// that took longer than the bridge sweeper's cutoff would leave lastSeen
+// pointing far in the past — and the sweeper could reap the session
+// moments after a successful response.
+//
+// Setup: idleTimeout=200ms (sweeper cutoff = 400ms). B starts a 600ms
+// long-poll. After it returns, lastSeen must be < 200ms old (i.e. close
+// to "now") rather than ~600ms old.
+func TestIdleSweeper_LongPollRefreshesLastSeen(t *testing.T) {
+	cfg := testConfig()
+	cfg.HTTPSessionIdleTimeout = 200 * time.Millisecond
+	h := newHarness(t, cfg)
+
+	idA := h.createSession(t)
+	idB := h.createSession(t)
+	key := "lastseen-longpoll"
+
+	// A holds the lock so B's Acquire blocks.
+	aResp := h.do(t, "POST", "/v1/locks/"+key, idA, acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	var aAck acquireResponse
+	decodeBody(t, aResp, &aAck)
+	if aAck.Status != "ok" {
+		t.Fatalf("A acquire: %+v", aAck)
+	}
+
+	// Capture B's session reference so we can read lastSeen later
+	// without going through LookupSession (which would refresh it).
+	sB, err := h.bridge.LookupSession(idB)
+	if err != nil {
+		t.Fatalf("lookup B: %v", err)
+	}
+
+	// Schedule A's release after 600ms — past the 2×idleTimeout=400ms cutoff.
+	const waitDur = 600 * time.Millisecond
+	go func() {
+		time.Sleep(waitDur)
+		h.do(t, "POST", "/v1/locks/"+key+"/release", idA, releaseRequest{Token: aAck.Token}).Body.Close()
+	}()
+
+	bResp := h.do(t, "POST", "/v1/locks/"+key, idB, acquireRequest{AcquireTimeoutS: 5, LeaseTTLS: 30})
+	exitTime := time.Now()
+	var bAck acquireResponse
+	decodeBody(t, bResp, &bAck)
+	if bAck.Status != "ok" || bAck.Token == "" {
+		t.Fatalf("B acquire: %+v", bAck)
+	}
+
+	// Read B's lastSeen directly (no refresh). It must reflect "near now",
+	// not "around when the call started ~600ms ago".
+	lastSeen := time.Unix(0, sB.lastSeen.Load())
+	gap := exitTime.Sub(lastSeen)
+	if gap > 100*time.Millisecond {
+		t.Fatalf("lastSeen is stale by %v — refresh did not happen on exit", gap)
+	}
+}
+
 func TestIdleSweeper_ClosesAbandonedSession(t *testing.T) {
 	cfg := testConfig()
 	cfg.HTTPSessionIdleTimeout = 200 * time.Millisecond

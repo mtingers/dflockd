@@ -752,14 +752,15 @@ func (lm *LockManager) Release(key, token string) bool {
 		return false
 	}
 
-	now := time.Now()
-	st.LastActivity = now
-
 	h, ok := st.Holders[token]
 	if !ok {
+		// Don't update LastActivity here: a bogus token must not keep an
+		// otherwise-empty resource alive past GCMaxIdleTime.
 		return false
 	}
 
+	now := time.Now()
+	st.LastActivity = now
 	sh.connRemoveOwned(h.connID, key, token)
 	eqKey := connKey{ConnID: h.connID, Key: key}
 	if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
@@ -783,13 +784,15 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 		return 0, false
 	}
 
-	now := time.Now()
-	st.LastActivity = now
-
 	h, ok := st.Holders[token]
 	if !ok {
+		// Don't update LastActivity here: a bogus token must not keep an
+		// otherwise-empty resource alive past GCMaxIdleTime.
 		return 0, false
 	}
+
+	now := time.Now()
+	st.LastActivity = now
 
 	// If already expired, reject and evict
 	if !h.leaseExpires.IsZero() && !now.Before(h.leaseExpires) {

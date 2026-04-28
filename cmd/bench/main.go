@@ -167,20 +167,20 @@ func validateBenchFlags(workers, rounds, timeoutSec, leaseTTL, connections, warm
 
 func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
 	// Open persistent connection(s) up front.
-	conns := make([]*client.Conn, numConns)
-	for i := range conns {
-		c, err := client.Dial(addr)
-		if err != nil {
-			warmupWg.Done() // unblock barrier so main doesn't hang
-			return nil, fmt.Errorf("dial: %w", err)
-		}
-		conns[i] = c
-	}
+	conns := make([]*client.Conn, 0, numConns)
 	defer func() {
 		for _, c := range conns {
 			c.Close()
 		}
 	}()
+	for i := 0; i < numConns; i++ {
+		c, err := client.Dial(addr)
+		if err != nil {
+			warmupWg.Done() // unblock barrier so main doesn't hang
+			return nil, fmt.Errorf("dial: %w", err)
+		}
+		conns = append(conns, c)
+	}
 
 	acquireTimeout := time.Duration(timeoutSec) * time.Second
 	var opts []client.Option

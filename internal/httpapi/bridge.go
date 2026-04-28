@@ -420,7 +420,13 @@ func (s *session) commandContext(ctx context.Context, cmd, key, arg string) (str
 
 	s.inFlight.Add(1)
 	defer s.inFlight.Add(-1)
-	defer s.lastSeen.Store(time.Now().UnixNano())
+	// Wrap in a closure so time.Now() is evaluated when the defer fires
+	// (i.e. on function exit), not when the defer is registered. Without
+	// the closure, deferred-arg evaluation would capture the *entry* time,
+	// so a long-poll Wait would leave lastSeen pointing far into the past
+	// — and the bridge sweeper could reap the session moments after a
+	// successful response.
+	defer func() { s.lastSeen.Store(time.Now().UnixNano()) }()
 
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()

@@ -989,6 +989,71 @@ func TestGC_PrunesIdle(t *testing.T) {
 	}
 }
 
+// TestGC_BogusReleaseDoesNotKeepEmptyResourceAlive verifies that a Release
+// with a non-matching token does NOT bump LastActivity. Before the fix,
+// LastActivity was updated unconditionally — so an attacker (or a buggy
+// client) could keep an idle, empty resource alive past GCMaxIdleTime by
+// spamming Release with random tokens, defeating GC.
+func TestGC_BogusReleaseDoesNotKeepEmptyResourceAlive(t *testing.T) {
+	lm := testManager()
+	lm.cfg.GCInterval = 50 * time.Millisecond
+	lm.cfg.GCMaxIdleTime = 0
+
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Release("k1", tok)
+	// Force idle.
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
+	lm.UnlockKeyForTest("k1")
+
+	// Bogus release — must NOT update LastActivity.
+	if ok := lm.Release("k1", "bogus-token"); ok {
+		t.Fatal("bogus release returned ok")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.GCLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	lm.LockKeyForTest("k1")
+	exists := lm.ResourceForTest("k1") != nil
+	lm.UnlockKeyForTest("k1")
+	if exists {
+		t.Fatal("k1 should have been GC'd despite bogus Release")
+	}
+}
+
+// TestGC_BogusRenewDoesNotKeepEmptyResourceAlive is the Renew counterpart of
+// TestGC_BogusReleaseDoesNotKeepEmptyResourceAlive.
+func TestGC_BogusRenewDoesNotKeepEmptyResourceAlive(t *testing.T) {
+	lm := testManager()
+	lm.cfg.GCInterval = 50 * time.Millisecond
+	lm.cfg.GCMaxIdleTime = 0
+
+	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	lm.Release("k1", tok)
+	lm.LockKeyForTest("k1")
+	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
+	lm.UnlockKeyForTest("k1")
+
+	if _, ok := lm.Renew("k1", "bogus-token", 30*time.Second); ok {
+		t.Fatal("bogus renew returned ok")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go lm.GCLoop(ctx)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	lm.LockKeyForTest("k1")
+	exists := lm.ResourceForTest("k1") != nil
+	lm.UnlockKeyForTest("k1")
+	if exists {
+		t.Fatal("k1 should have been GC'd despite bogus Renew")
+	}
+}
+
 func TestGC_DoesNotPruneHeld(t *testing.T) {
 	lm := testManager()
 	lm.cfg.GCInterval = 50 * time.Millisecond
