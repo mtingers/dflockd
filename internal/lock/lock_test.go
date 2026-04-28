@@ -206,12 +206,19 @@ func TestAcquire_CancelledCtxDoesNotLeakGrantedLock(t *testing.T) {
 			t.Fatalf("trial %d: A acquire: %v", trial, err)
 		}
 
-		// B waits with cancellable ctx.
+		// B waits with cancellable ctx. Capture B's returned token so the
+		// "B got the lock" branch can verify the lock-state actually
+		// agrees with the return value (catches a leak if a future
+		// regression returns nil-error while leaving the holder behind).
 		ctxB, cancelB := context.WithCancel(context.Background())
-		bDone := make(chan error, 1)
+		type bResult struct {
+			tok string
+			err error
+		}
+		bDone := make(chan bResult, 1)
 		go func() {
-			_, e := lm.Acquire(ctxB, key, time.Minute, 30*time.Second, 2, 1)
-			bDone <- e
+			tok, e := lm.Acquire(ctxB, key, time.Minute, 30*time.Second, 2, 1)
+			bDone <- bResult{tok, e}
 		}()
 
 		// Let B enqueue as waiter.
@@ -221,9 +228,13 @@ func TestAcquire_CancelledCtxDoesNotLeakGrantedLock(t *testing.T) {
 		go func() { lm.Release(key, tokA) }()
 		cancelB()
 
-		err = <-bDone
-		if errors.Is(err, context.Canceled) {
+		res := <-bDone
+		switch {
+		case errors.Is(res.err, context.Canceled):
 			cancelledWins++
+			if res.tok != "" {
+				t.Fatalf("trial %d: returned ctx.Canceled but also a non-empty token %q", trial, res.tok)
+			}
 			// Verify no leak: C should be able to acquire immediately.
 			tokC, err := lm.Acquire(bg(), key, 200*time.Millisecond, 30*time.Second, 3, 1)
 			if err != nil {
@@ -233,11 +244,16 @@ func TestAcquire_CancelledCtxDoesNotLeakGrantedLock(t *testing.T) {
 				t.Fatalf("trial %d: lock leaked (C acquire timed out)", trial)
 			}
 			_ = lm.Release(key, tokC)
-		} else if err == nil {
-			// B got the lock — cancel lost the race. Clean up.
-			// (We can't cleanly release B's token here since we don't
-			// have it returned from the goroutine; rely on the
-			// per-trial key to avoid cross-trial contamination.)
+		case res.err == nil:
+			// B got the lock — cancel lost the race. Verify the holder
+			// state matches the returned token, then release B so the
+			// next trial sees a clean slot.
+			if res.tok == "" {
+				t.Fatalf("trial %d: nil error but empty token", trial)
+			}
+			_ = lm.Release(key, res.tok)
+		default:
+			t.Fatalf("trial %d: unexpected error: %v", trial, res.err)
 		}
 	}
 

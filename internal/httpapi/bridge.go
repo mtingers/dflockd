@@ -450,6 +450,18 @@ func (s *session) commandContext(ctx context.Context, cmd, key, arg string) (str
 	case resp := <-s.respCh:
 		return resp, nil
 	case <-ctx.Done():
+		// Drain a response that arrived between the grant and ctx firing
+		// before we close. Without this, a token that was granted just as
+		// the HTTP request was cancelled is silently dropped — the
+		// handler's maybeCleanupOnDisconnect can't release it because we
+		// returned ErrCanceled instead of the grant. Returning the
+		// response here lets the handler clean up the grant; the session
+		// stays alive (the protocol command actually completed).
+		select {
+		case resp := <-s.respCh:
+			return resp, nil
+		default:
+		}
 		s.close()
 		return "", ctx.Err()
 	case <-s.ctx.Done():

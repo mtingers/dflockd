@@ -484,7 +484,21 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		}
 		sh.mu.Lock()
 		if s := sh.resources[key]; s != nil {
-			if _, ok := s.Holders[token]; ok {
+			if h, hOK := s.Holders[token]; hOK {
+				// Mirror the timeout branch: select is non-deterministic
+				// when both w.ch and timeoutCtx are ready. If the parent
+				// ctx was cancelled simultaneously with the grant, the
+				// caller asked to abandon — release the just-granted
+				// token and pass it to the next waiter instead of leaking
+				// it until lease expiry.
+				if ctx.Err() != nil {
+					sh.connRemoveOwned(h.connID, key, token)
+					delete(s.Holders, token)
+					s.LastActivity = time.Now()
+					lm.grantNextWaiterLocked(sh, key, s)
+					sh.mu.Unlock()
+					return "", ctx.Err()
+				}
 				s.LastActivity = time.Now()
 				sh.mu.Unlock()
 				return token, nil
@@ -659,6 +673,19 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		now := time.Now()
 		if st := sh.resources[key]; st != nil {
 			if h, hOK := st.Holders[token]; hOK {
+				// Mirror the timeout branch: if the parent ctx was
+				// cancelled simultaneously with the grant, release the
+				// just-granted token and pass it to the next waiter
+				// rather than handing the caller a slot they don't
+				// expect to own.
+				if ctx.Err() != nil {
+					sh.connRemoveOwned(h.connID, key, token)
+					delete(st.Holders, token)
+					st.LastActivity = now
+					lm.grantNextWaiterLocked(sh, key, st)
+					sh.mu.Unlock()
+					return "", 0, ctx.Err()
+				}
 				h.leaseExpires = now.Add(leaseTTL)
 				st.LastActivity = now
 				sh.mu.Unlock()
