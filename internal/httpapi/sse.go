@@ -127,7 +127,12 @@ func (h *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-pingTicker.C:
-			if _, err := s.command("ping", "_", ""); err != nil {
+			// Use commandContext so a hung/slow server can't block this
+			// handler past the HTTP client's disconnect. If ctx fires
+			// mid-ping, commandContext aborts (closing the session), the
+			// ping returns an error, and we return immediately — the
+			// deferred DeleteSession then completes teardown.
+			if _, err := s.commandContext(ctx, "ping", "_", ""); err != nil {
 				return
 			}
 		case line, ok := <-s.signals():
