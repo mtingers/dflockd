@@ -85,6 +85,9 @@ func (s *Server) RunOnListener(ctx context.Context, listener net.Listener) error
 }
 
 func (s *Server) serve(ctx context.Context, listener net.Listener) error {
+	serveCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
 	var wg sync.WaitGroup
 	var ipMu sync.Mutex
 	ipCounts := make(map[string]int)
@@ -119,16 +122,16 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.lm.LeaseExpiryLoop(ctx)
+		s.lm.LeaseExpiryLoop(serveCtx)
 	}()
 	go func() {
 		defer wg.Done()
-		s.lm.GCLoop(ctx)
+		s.lm.GCLoop(serveCtx)
 	}()
 
 	// Close listener on context cancellation
 	go func() {
-		<-ctx.Done()
+		<-serveCtx.Done()
 		listener.Close()
 	}()
 
@@ -142,10 +145,15 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 		conn, err := listener.Accept()
 		if err != nil {
 			select {
-			case <-ctx.Done():
+			case <-serveCtx.Done():
 				s.drain(&wg)
 				return nil
 			default:
+				if !isTemporaryNetErr(err) {
+					stop()
+					s.drain(&wg)
+					return fmt.Errorf("accept: %w", err)
+				}
 				if backoff == 0 {
 					backoff = 5 * time.Millisecond
 				} else {
@@ -157,7 +165,7 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 				s.log.Error("accept error, backing off", "err", err, "backoff", backoff)
 				select {
 				case <-time.After(backoff):
-				case <-ctx.Done():
+				case <-serveCtx.Done():
 					s.drain(&wg)
 					return nil
 				}
@@ -185,9 +193,23 @@ func (s *Server) serve(ctx context.Context, listener net.Listener) error {
 			defer s.connCount.Add(-1)
 			defer s.conns.Delete(conn)
 			defer releaseIPSlot(ip)
-			s.ServeConn(ctx, conn, connID)
+			s.ServeConn(serveCtx, conn, connID)
 		}()
 	}
+}
+
+func isTemporaryNetErr(err error) bool {
+	var ne net.Error
+	if !errors.As(err, &ne) {
+		return false
+	}
+	type temporary interface {
+		Temporary() bool
+	}
+	if te, ok := ne.(temporary); ok {
+		return te.Temporary()
+	}
+	return false
 }
 
 func remoteIP(addr string) string {

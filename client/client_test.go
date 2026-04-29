@@ -2628,7 +2628,7 @@ func TestLock_ReleaseTerminatesOnHungServer(t *testing.T) {
 	l := &client.Lock{
 		Key:            "hang-test",
 		AcquireTimeout: 2 * time.Second,
-		LeaseTTL:       2, // short so RenewRatio * lease clamps up to 1s interval
+		LeaseTTL:       2, // short so the first renewal fires quickly
 		Servers:        []string{ln.Addr().String()},
 		RenewRatio:     0.5,
 	}
@@ -2641,8 +2641,8 @@ func TestLock_ReleaseTerminatesOnHungServer(t *testing.T) {
 		t.Fatal("acquire returned !ok")
 	}
 
-	// Wait past the first renewal tick (clamped to 1s min) so the
-	// renewal goroutine is parked inside Renew's network I/O.
+	// Wait past the first renewal tick so the renewal goroutine is
+	// parked inside Renew's network I/O.
 	time.Sleep(1500 * time.Millisecond)
 
 	start := time.Now()

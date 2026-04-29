@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/server"
@@ -49,5 +50,51 @@ func TestCreateSessionAfterShutdown(t *testing.T) {
 	// The bridge's session count must remain zero — no leaked entry.
 	if got := bridge.SessionCount(); got != 0 {
 		t.Fatalf("session count after rejected create: %d, want 0", got)
+	}
+}
+
+func TestCanceledRequestBeforeCommandDoesNotDeleteSession(t *testing.T) {
+	h := newHarness(t, testConfig())
+	id := h.createSession(t)
+	s, err := h.bridge.LookupSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the per-session command gate so the request is cancelled before it
+	// can write any protocol bytes. That must not tear down unrelated session
+	// state.
+	<-s.reqMu
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resp := h.doWithContext(t, ctx, "POST", "/v1/locks/cancel-before-send", id, acquireRequest{AcquireTimeoutS: 1})
+	resp.Body.Close()
+	s.reqMu <- struct{}{}
+
+	if _, err := h.bridge.LookupSession(id); err != nil {
+		t.Fatalf("session was deleted even though canceled request sent no command: %v", err)
+	}
+}
+
+func TestSignalOverflowClosesHTTPSession(t *testing.T) {
+	h := newHarness(t, testConfig())
+	id := h.createSession(t)
+	s, err := h.bridge.LookupSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := s.command("listen", "overflow.test", ""); err != nil || resp != "ok" {
+		t.Fatalf("listen: resp=%q err=%v", resp, err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !s.dead.Load() && time.Now().Before(deadline) {
+		for i := 0; i < sigChBuffer+1; i++ {
+			h.bridge.Signals().Signal("overflow.test", "x")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !s.dead.Load() {
+		t.Fatal("session stayed alive after overflowing the bridge signal buffer")
 	}
 }

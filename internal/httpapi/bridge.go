@@ -155,9 +155,9 @@ type session struct {
 	serverSide net.Conn      // handed to ServeConn; we don't touch it after
 	reader     *bufio.Reader // wraps clientSide
 
-	reqMu  sync.Mutex  // serializes one protocol command at a time
-	respCh chan string // size 1; multiplexer → writeCmd
-	sigCh  chan string // size 64; multiplexer → SSE handler (may drop on overflow)
+	reqMu  chan struct{} // serializes one protocol command at a time
+	respCh chan string   // size 1; multiplexer → writeCmd
+	sigCh  chan string   // size 64; multiplexer → SSE handler (overflow closes session)
 
 	// ctx is the session's teardown signal. cancel() fires on close().
 	// The multiplex and command selects block on ctx.Done() to detect
@@ -355,6 +355,7 @@ func (b *Bridge) newSession(id string) (*session, error) {
 		clientSide: clientSide,
 		serverSide: serverSide,
 		reader:     bufio.NewReader(clientSide),
+		reqMu:      make(chan struct{}, 1),
 		respCh:     make(chan string, 1),
 		sigCh:      make(chan string, sigChBuffer),
 		ctx:        sessionCtx,
@@ -362,6 +363,7 @@ func (b *Bridge) newSession(id string) (*session, error) {
 		serveDone:  make(chan struct{}),
 		muxDone:    make(chan struct{}),
 	}
+	s.reqMu <- struct{}{}
 	s.lastSeen.Store(time.Now().UnixNano())
 
 	// ServeConn goroutine: reads protocol from serverSide, talks to
@@ -403,9 +405,12 @@ func (s *session) multiplex() {
 			case <-s.ctx.Done():
 				return
 			default:
-				// SSE consumer is slow; drop silently. Matches the TCP
-				// client library's behavior (client.go:1394). Caller can
-				// observe via an eventual disconnect if the backlog grows.
+				// The protocol server has already counted this as delivered
+				// to the virtual connection. If the bridge silently drops it
+				// here, SSE callers have no way to observe the loss, so tear
+				// down the session and let the HTTP stream close.
+				s.abort()
+				return
 			}
 			continue
 		}
@@ -429,6 +434,8 @@ func (s *session) command(cmd, key, arg string) (string, error) {
 	return s.commandContext(context.Background(), cmd, key, arg)
 }
 
+var errCommandNotSent = errors.New("command not sent")
+
 func (s *session) commandContext(ctx context.Context, cmd, key, arg string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -447,8 +454,14 @@ func (s *session) commandContext(ctx context.Context, cmd, key, arg string) (str
 	// successful response.
 	defer func() { s.lastSeen.Store(time.Now().UnixNano()) }()
 
-	s.reqMu.Lock()
-	defer s.reqMu.Unlock()
+	select {
+	case <-s.reqMu:
+	case <-ctx.Done():
+		return "", fmt.Errorf("%w: %w", errCommandNotSent, ctx.Err())
+	case <-s.ctx.Done():
+		return "", ErrSessionGone
+	}
+	defer func() { s.reqMu <- struct{}{} }()
 
 	// Drain any stale response that a previous abandoned caller left behind.
 	// In practice this shouldn't happen because reqMu serializes, but the
@@ -460,8 +473,7 @@ func (s *session) commandContext(ctx context.Context, cmd, key, arg string) (str
 
 	select {
 	case <-ctx.Done():
-		s.close()
-		return "", ctx.Err()
+		return "", fmt.Errorf("%w: %w", errCommandNotSent, ctx.Err())
 	default:
 	}
 
@@ -522,6 +534,14 @@ func (s *session) close() {
 	})
 	<-s.muxDone
 	<-s.serveDone
+}
+
+func (s *session) abort() {
+	s.closeOnce.Do(func() {
+		s.cancel()
+		s.clientSide.Close()
+		s.serverSide.Close()
+	})
 }
 
 // ---------------------------------------------------------------------------

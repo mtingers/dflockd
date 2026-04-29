@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -36,6 +37,36 @@ func testConfig() *config.Config {
 		panic(err)
 	}
 	return cfg
+}
+
+type failingListener struct {
+	err       error
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (l *failingListener) Accept() (net.Conn, error) { return nil, l.err }
+func (l *failingListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+func (l *failingListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+func TestServeReturnsOnPermanentAcceptError(t *testing.T) {
+	cfg := testConfig()
+	cfg.ShutdownTimeout = time.Second
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	lm := lock.NewLockManager(cfg, log)
+	srv := New(lm, cfg, log)
+
+	ln := &failingListener{
+		err:    errors.New("permanent accept failure"),
+		closed: make(chan struct{}),
+	}
+	err := srv.serve(context.Background(), ln)
+	if err == nil || !strings.Contains(err.Error(), "permanent accept failure") {
+		t.Fatalf("serve error: got %v want permanent accept failure", err)
+	}
 }
 
 // startServer creates a server on a random port and returns a cancel func and the address.

@@ -211,7 +211,9 @@ func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, k
 	resp, err := s.commandContext(r.Context(), "l", key, arg)
 	if err != nil {
 		if r.Context().Err() != nil {
-			_ = h.bridge.DeleteSession(s.id)
+			if !errors.Is(err, errCommandNotSent) {
+				_ = h.bridge.DeleteSession(s.id)
+			}
 			return
 		}
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -272,7 +274,9 @@ func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, ke
 	resp, err := s.commandContext(r.Context(), "sl", key, arg)
 	if err != nil {
 		if r.Context().Err() != nil {
-			_ = h.bridge.DeleteSession(s.id)
+			if !errors.Is(err, errCommandNotSent) {
+				_ = h.bridge.DeleteSession(s.id)
+			}
 			return
 		}
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -596,7 +600,9 @@ func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, cmd, key str
 	resp, err := s.commandContext(r.Context(), cmd, key, strconv.Itoa(req.TimeoutS))
 	if err != nil {
 		if r.Context().Err() != nil {
-			_ = h.bridge.DeleteSession(s.id)
+			if !errors.Is(err, errCommandNotSent) {
+				_ = h.bridge.DeleteSession(s.id)
+			}
 			return
 		}
 		writeError(w, http.StatusGone, "session_gone", err.Error())

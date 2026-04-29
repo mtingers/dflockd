@@ -936,6 +936,17 @@ func defaultRenewJitterValue(j float64) float64 {
 	return defaultRenewJitter
 }
 
+const minRenewInterval = time.Millisecond
+
+func renewInterval(leaseSec int, ratio float64) time.Duration {
+	leaseDur := time.Duration(leaseSec) * time.Second
+	interval := time.Duration(float64(leaseDur) * ratio)
+	if interval <= 0 {
+		return minRenewInterval
+	}
+	return interval
+}
+
 // defaultShardFunc returns the given ShardFunc, or CRC32Shard if unset.
 func defaultShardFunc(f ShardFunc) ShardFunc {
 	if f != nil {
@@ -974,11 +985,7 @@ func (r *renewableResource) startRenewLoop(key string, leaseSec int, ratio, jitt
 	done := make(chan struct{})
 	r.renewDone = done
 
-	leaseDur := time.Duration(leaseSec) * time.Second
-	interval := time.Duration(float64(leaseDur) * ratio)
-	if interval < 1*time.Second {
-		interval = 1 * time.Second
-	}
+	interval := renewInterval(leaseSec, ratio)
 
 	go func() {
 		defer close(done)
@@ -1109,12 +1116,12 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
 			l.clearConnIfCurrent(conn)
+			l.mu.Unlock()
 			return false, nil
 		}
 		// If context was cancelled, the conn.Close in the cancellation
@@ -1125,10 +1132,12 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 		if ctx.Err() != nil {
 			conn.Close()
 			l.clearConnIfCurrent(conn)
+			l.mu.Unlock()
 			return false, ctx.Err()
 		}
 		conn.Close()
 		l.clearConnIfCurrent(conn)
+		l.mu.Unlock()
 		return false, err
 	}
 
@@ -1140,12 +1149,20 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		conn.Close()
 		l.clearConnIfCurrent(conn)
+		l.mu.Unlock()
 		return false, ctx.Err()
+	}
+
+	if l.conn != conn {
+		l.mu.Unlock()
+		cleanupAbandonedGrant(conn, addr, l.TLSConfig, l.AuthToken, l.Key, token, Release)
+		return false, net.ErrClosed
 	}
 
 	l.token = token
 	l.lease = lease
 	l.startRenew()
+	l.mu.Unlock()
 	return true, nil
 }
 
@@ -1175,16 +1192,17 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	if err != nil {
 		if ctx.Err() != nil {
 			conn.Close()
 			l.clearConnIfCurrent(conn)
+			l.mu.Unlock()
 			return "", ctx.Err()
 		}
 		conn.Close()
 		l.clearConnIfCurrent(conn)
+		l.mu.Unlock()
 		return "", err
 	}
 
@@ -1193,7 +1211,18 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	if ctx.Err() != nil {
 		conn.Close()
 		l.clearConnIfCurrent(conn)
+		l.mu.Unlock()
 		return "", ctx.Err()
+	}
+
+	if l.conn != conn {
+		l.mu.Unlock()
+		if status == "acquired" {
+			cleanupAbandonedGrant(conn, addr, l.TLSConfig, l.AuthToken, l.Key, token, Release)
+		} else {
+			_ = conn.Close()
+		}
+		return "", net.ErrClosed
 	}
 
 	if status == "acquired" {
@@ -1201,6 +1230,7 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 		l.lease = lease
 		l.startRenew()
 	}
+	l.mu.Unlock()
 	return status, nil
 }
 
@@ -1229,21 +1259,23 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
 			l.clearConnIfCurrent(conn)
+			l.mu.Unlock()
 			return false, nil
 		}
 		if ctx.Err() != nil {
 			conn.Close()
 			l.clearConnIfCurrent(conn)
+			l.mu.Unlock()
 			return false, ctx.Err()
 		}
 		conn.Close()
 		l.clearConnIfCurrent(conn)
+		l.mu.Unlock()
 		return false, err
 	}
 
@@ -1252,12 +1284,20 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	if ctx.Err() != nil {
 		conn.Close()
 		l.clearConnIfCurrent(conn)
+		l.mu.Unlock()
 		return false, ctx.Err()
+	}
+
+	if l.conn != conn {
+		l.mu.Unlock()
+		cleanupAbandonedGrant(conn, addr, l.TLSConfig, l.AuthToken, l.Key, token, Release)
+		return false, net.ErrClosed
 	}
 
 	l.token = token
 	l.lease = lease
 	l.startRenew()
+	l.mu.Unlock()
 	return true, nil
 }
 
@@ -1369,21 +1409,23 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
 			s.clearConnIfCurrent(conn)
+			s.mu.Unlock()
 			return false, nil
 		}
 		if ctx.Err() != nil {
 			conn.Close()
 			s.clearConnIfCurrent(conn)
+			s.mu.Unlock()
 			return false, ctx.Err()
 		}
 		conn.Close()
 		s.clearConnIfCurrent(conn)
+		s.mu.Unlock()
 		return false, err
 	}
 
@@ -1392,12 +1434,20 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		conn.Close()
 		s.clearConnIfCurrent(conn)
+		s.mu.Unlock()
 		return false, ctx.Err()
+	}
+
+	if s.conn != conn {
+		s.mu.Unlock()
+		cleanupAbandonedGrant(conn, addr, s.TLSConfig, s.AuthToken, s.Key, token, SemRelease)
+		return false, net.ErrClosed
 	}
 
 	s.token = token
 	s.lease = lease
 	s.startRenew()
+	s.mu.Unlock()
 	return true, nil
 }
 
@@ -1429,16 +1479,17 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err != nil {
 		if ctx.Err() != nil {
 			conn.Close()
 			s.clearConnIfCurrent(conn)
+			s.mu.Unlock()
 			return "", ctx.Err()
 		}
 		conn.Close()
 		s.clearConnIfCurrent(conn)
+		s.mu.Unlock()
 		return "", err
 	}
 
@@ -1447,7 +1498,18 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	if ctx.Err() != nil {
 		conn.Close()
 		s.clearConnIfCurrent(conn)
+		s.mu.Unlock()
 		return "", ctx.Err()
+	}
+
+	if s.conn != conn {
+		s.mu.Unlock()
+		if status == "acquired" {
+			cleanupAbandonedGrant(conn, addr, s.TLSConfig, s.AuthToken, s.Key, token, SemRelease)
+		} else {
+			_ = conn.Close()
+		}
+		return "", net.ErrClosed
 	}
 
 	if status == "acquired" {
@@ -1455,6 +1517,7 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 		s.lease = lease
 		s.startRenew()
 	}
+	s.mu.Unlock()
 	return status, nil
 }
 
@@ -1482,21 +1545,23 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			conn.Close()
 			s.clearConnIfCurrent(conn)
+			s.mu.Unlock()
 			return false, nil
 		}
 		if ctx.Err() != nil {
 			conn.Close()
 			s.clearConnIfCurrent(conn)
+			s.mu.Unlock()
 			return false, ctx.Err()
 		}
 		conn.Close()
 		s.clearConnIfCurrent(conn)
+		s.mu.Unlock()
 		return false, err
 	}
 
@@ -1505,12 +1570,20 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	if ctx.Err() != nil {
 		conn.Close()
 		s.clearConnIfCurrent(conn)
+		s.mu.Unlock()
 		return false, ctx.Err()
+	}
+
+	if s.conn != conn {
+		s.mu.Unlock()
+		cleanupAbandonedGrant(conn, addr, s.TLSConfig, s.AuthToken, s.Key, token, SemRelease)
+		return false, net.ErrClosed
 	}
 
 	s.token = token
 	s.lease = lease
 	s.startRenew()
+	s.mu.Unlock()
 	return true, nil
 }
 

@@ -124,6 +124,15 @@ func TestValidateRenewConfigRejectsBadJitter(t *testing.T) {
 	}
 }
 
+func TestRenewIntervalAllowsSubSecondLeases(t *testing.T) {
+	if got := renewInterval(1, 0.5); got != 500*time.Millisecond {
+		t.Fatalf("1s lease at 0.5 ratio: got %s want 500ms", got)
+	}
+	if got := renewInterval(2, 0.25); got != 500*time.Millisecond {
+		t.Fatalf("2s lease at 0.25 ratio: got %s want 500ms", got)
+	}
+}
+
 func TestJitteredRenewIntervalMovesEarlierOnly(t *testing.T) {
 	base := 10 * time.Second
 	for i := 0; i < 100; i++ {
@@ -270,10 +279,15 @@ func readFakeLine(r *bufio.Reader) (string, error) {
 
 func expectReleasedToken(t *testing.T, released <-chan string) {
 	t.Helper()
+	expectReleasedTokenValue(t, released, "abandoned-token")
+}
+
+func expectReleasedTokenValue(t *testing.T, released <-chan string, want string) {
+	t.Helper()
 	select {
 	case got := <-released:
-		if got != "abandoned-token" {
-			t.Fatalf("released token: got %q want abandoned-token", got)
+		if got != want {
+			t.Fatalf("released token: got %q want %q", got, want)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("abandoned grant was not released")
@@ -333,6 +347,117 @@ func TestCleanupAbandonedGrantFallsBackToFreshConnection(t *testing.T) {
 	cleanupAbandonedGrant(closedConn, addr, nil, "", "abandoned", "abandoned-token", Release)
 
 	expectReleasedToken(t, released)
+}
+
+func startDelayedGrantServer(t *testing.T, acquireCmd, releaseCmd string) (string, <-chan string, <-chan struct{}, chan<- struct{}) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan string, 1)
+	acquireRead := make(chan struct{})
+	grant := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		serveDelayedGrantConn(conn, acquireCmd, releaseCmd, released, acquireRead, grant)
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+	})
+	return ln.Addr().String(), released, acquireRead, grant
+}
+
+func serveDelayedGrantConn(conn net.Conn, acquireCmd, releaseCmd string, released chan<- string, acquireRead chan<- struct{}, grant <-chan struct{}) {
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	cmd, err := readFakeLine(r)
+	if err != nil {
+		return
+	}
+	if _, err := readFakeLine(r); err != nil { // key
+		return
+	}
+	if _, err := readFakeLine(r); err != nil { // arg
+		return
+	}
+	if cmd != acquireCmd {
+		return
+	}
+	close(acquireRead)
+	<-grant
+	fmt.Fprint(conn, "ok stale-token 33\n")
+
+	for {
+		cmd, err := readFakeLine(r)
+		if err != nil {
+			return
+		}
+		if _, err := readFakeLine(r); err != nil { // key
+			return
+		}
+		arg, err := readFakeLine(r)
+		if err != nil {
+			return
+		}
+		if cmd == releaseCmd {
+			released <- arg
+			fmt.Fprint(conn, "ok\n")
+			return
+		}
+		fmt.Fprint(conn, "error\n")
+	}
+}
+
+func TestLockAcquireStaleConnectionReleasesToken(t *testing.T) {
+	addr, released, acquireRead, grant := startDelayedGrantServer(t, "l", "r")
+	l := &Lock{
+		Key:            "stale",
+		AcquireTimeout: time.Second,
+		Servers:        []string{addr},
+	}
+
+	done := make(chan struct {
+		ok  bool
+		err error
+	}, 1)
+	go func() {
+		ok, err := l.Acquire(context.Background())
+		done <- struct {
+			ok  bool
+			err error
+		}{ok: ok, err: err}
+	}()
+
+	select {
+	case <-acquireRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive acquire")
+	}
+
+	l.mu.Lock()
+	l.conn = nil
+	l.mu.Unlock()
+	close(grant)
+
+	select {
+	case got := <-done:
+		if got.ok {
+			t.Fatal("stale acquire reported success")
+		}
+		if !errors.Is(got.err, net.ErrClosed) {
+			t.Fatalf("stale acquire error: got %v want net.ErrClosed", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquire did not return")
+	}
+	if tok := l.Token(); tok != "" {
+		t.Fatalf("token after stale acquire: got %q want empty", tok)
+	}
+	expectReleasedTokenValue(t, released, "stale-token")
 }
 
 func startHungReleaseServer(t *testing.T, acquireCmd string) string {
