@@ -171,11 +171,18 @@ func (h *httpServer) withAuth(next http.Handler) http.Handler {
 }
 
 func extractBearerToken(header string) string {
+	// RFC 7235 makes the auth-scheme token case-insensitive, so accept
+	// "Bearer", "bearer", "BEARER", etc. The credential portion remains
+	// case-sensitive and is compared with subtle.ConstantTimeCompare
+	// downstream.
 	const prefix = "Bearer "
-	if strings.HasPrefix(header, prefix) {
-		return strings.TrimSpace(header[len(prefix):])
+	if len(header) < len(prefix) {
+		return ""
 	}
-	return ""
+	if !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
 }
 
 func jsonRouteErrors(mux *http.ServeMux) http.Handler {

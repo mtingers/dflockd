@@ -512,6 +512,7 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 		sh.mu.Lock()
 		// Race check: token may have arrived between cancellation
 		// and acquiring the mutex.
+		grantExpired := false
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
@@ -536,7 +537,11 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 						return token, nil
 					}
 				}
-				// Token was granted but expired; fall through to cleanup.
+				// Token was granted but its holder is gone (lease
+				// expired between grant and receive). Mirror the
+				// channel-receive branch and surface ErrLeaseExpired
+				// rather than collapsing to a generic timeout.
+				grantExpired = true
 			}
 		default:
 		}
@@ -545,6 +550,9 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 			removeWaiterFromState(s, w)
 		}
 		sh.mu.Unlock()
+		if grantExpired {
+			return "", ErrLeaseExpired
+		}
 		// Distinguish parent context cancellation from timeout
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -622,11 +630,11 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	leaseSec := int(leaseTTL / time.Second)
 	esToken := es.token
 	w := es.waiter
-	sh.mu.Unlock()
 
-	// Fast path: already acquired during enqueue
+	// Fast path: already acquired during enqueue. We keep the shard
+	// mutex held through this branch so a lease-expiry sweep can't
+	// mutate the holder/connEnqueued state mid-check.
 	if esToken != "" {
-		sh.mu.Lock()
 		sh.connRemoveEnqueued(eqKey)
 		now := time.Now()
 		st := sh.resources[key]
@@ -655,6 +663,7 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 		sh.mu.Unlock()
 		return "", 0, ErrLeaseExpired
 	}
+	sh.mu.Unlock()
 
 	// Slow path: waiter is pending
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -699,6 +708,7 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	case <-timeoutCtx.Done():
 		sh.mu.Lock()
 		sh.connRemoveEnqueued(eqKey)
+		grantExpired := false
 		select {
 		case token, ok := <-w.ch:
 			if ok && token != "" {
@@ -723,7 +733,11 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 						return token, leaseSec, nil
 					}
 				}
-				// Token was granted but expired; fall through to cleanup.
+				// Token was granted but its holder is gone (lease
+				// expired between grant and receive). Mirror the
+				// channel-receive branch and surface ErrLeaseExpired
+				// rather than collapsing to a generic timeout.
+				grantExpired = true
 			}
 		default:
 		}
@@ -732,6 +746,9 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 			removeWaiterFromState(st, w)
 		}
 		sh.mu.Unlock()
+		if grantExpired {
+			return "", 0, ErrLeaseExpired
+		}
 		// Distinguish parent context cancellation from timeout
 		if ctx.Err() != nil {
 			return "", 0, ctx.Err()

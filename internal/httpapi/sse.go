@@ -62,6 +62,10 @@ func (h *httpServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "max_sessions_per_ip", "")
 			return
 		}
+		if errors.Is(err, ErrBridgeShutdown) {
+			writeError(w, http.StatusServiceUnavailable, "draining", "")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())
 		return
 	}

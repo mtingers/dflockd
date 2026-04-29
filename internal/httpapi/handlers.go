@@ -42,6 +42,10 @@ func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusServiceUnavailable, "max_sessions_per_ip", "")
 			return
 		}
+		if errors.Is(err, ErrBridgeShutdown) {
+			writeError(w, http.StatusServiceUnavailable, "draining", "")
+			return
+		}
 		// A bridge-auth failure here means our own configured --auth-token
 		// didn't work — i.e. something is misconfigured at the server.
 		writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())

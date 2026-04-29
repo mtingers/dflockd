@@ -1278,6 +1278,12 @@ const stopRenewGrace = 2 * time.Second
 // Release stops the renewal goroutine, releases the lock on the server, and
 // closes the connection. Cancelling ctx closes the connection to unblock a
 // release round trip that is stuck in network I/O.
+//
+// If the caller is queued (Enqueue returned "queued" but Wait has not yet
+// granted a token), there is no token to release; closing the connection is
+// the protocol-level signal to abandon the waiter, and Release returns nil
+// rather than surfacing a misleading "empty value" error from the wire-level
+// validator.
 func (l *Lock) Release(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1288,7 +1294,10 @@ func (l *Lock) Release(ctx context.Context) error {
 		return nil
 	}
 
-	err := releaseWithContext(ctx, l.conn, l.Key, l.token, Release)
+	var err error
+	if l.token != "" {
+		err = releaseWithContext(ctx, l.conn, l.Key, l.token, Release)
+	}
 	l.conn.Close()
 	l.conn = nil
 	l.token = ""
@@ -1508,6 +1517,12 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 // Release stops renewal, releases the semaphore slot, and closes the connection.
 // Cancelling ctx closes the connection to unblock a release round trip that is
 // stuck in network I/O.
+//
+// If the caller is queued (Enqueue returned "queued" but Wait has not yet
+// granted a token), there is no token to release; closing the connection is
+// the protocol-level signal to abandon the waiter, and Release returns nil
+// rather than surfacing a misleading "empty value" error from the wire-level
+// validator.
 func (s *Semaphore) Release(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1518,7 +1533,10 @@ func (s *Semaphore) Release(ctx context.Context) error {
 		return nil
 	}
 
-	err := releaseWithContext(ctx, s.conn, s.Key, s.token, SemRelease)
+	var err error
+	if s.token != "" {
+		err = releaseWithContext(ctx, s.conn, s.Key, s.token, SemRelease)
+	}
 	s.conn.Close()
 	s.conn = nil
 	s.token = ""
@@ -1603,11 +1621,17 @@ func NewSignalConn(c *Conn, opts ...SignalConnOption) *SignalConn {
 }
 
 func (sc *SignalConn) readLoop() {
+	// Defers run LIFO: respCh closes first, then sigCh, then done. Closing
+	// respCh on exit lets a sendCmd that's parked in <-sc.respCh observe
+	// (zero, false) and return cleanly. Closing sigCh is the canonical
+	// "no more signals" signal for Signals() consumers. done is the last
+	// to close so Close()'s `<-sc.done` rendezvous is the final wait.
 	defer close(sc.done)
+	defer close(sc.sigCh)
+	defer close(sc.respCh)
 	for {
 		line, err := sc.conn.readLine()
 		if err != nil {
-			close(sc.sigCh)
 			return
 		}
 		if strings.HasPrefix(line, "sig ") {
@@ -1630,9 +1654,16 @@ func (sc *SignalConn) readLoop() {
 			}
 		} else {
 			// Command responses must not be dropped — sendCmd serializes
-			// commands so at most one response is expected at a time.
-			// Blocking here is safe because the channel drains promptly.
-			sc.respCh <- line
+			// commands so under normal use respCh drains promptly. But if a
+			// misbehaving server emits an extra response no caller is
+			// waiting for, respCh's size-1 buffer fills and a second push
+			// blocks here. Watch closeCh so Close() can unblock us instead
+			// of deadlocking on `<-sc.done`.
+			select {
+			case sc.respCh <- line:
+			case <-sc.closeCh:
+				return
+			}
 		}
 	}
 }

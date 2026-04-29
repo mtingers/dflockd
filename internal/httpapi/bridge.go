@@ -135,6 +135,11 @@ var ErrMaxSessions = errors.New("max sessions reached")
 // ErrMaxSessionsPerIP is returned when one remote IP has reached its session cap.
 var ErrMaxSessionsPerIP = errors.New("max sessions per ip reached")
 
+// ErrBridgeShutdown is returned when CreateSession races a bridge Shutdown.
+// Distinct from ErrSessionGone (which means a known session no longer exists)
+// so callers can tell "the bridge is going away" from "this id is invalid".
+var ErrBridgeShutdown = errors.New("bridge is shutting down")
+
 // session represents a single HTTP-originated virtual connection into the
 // protocol handler. It owns:
 //   - one half of a net.Pipe (the other half is consumed by ServeConn)
@@ -180,6 +185,10 @@ func (b *Bridge) CreateSession(remoteIP ...string) (string, error) {
 		ownerIP = remoteIP[0]
 	}
 	b.mu.Lock()
+	if b.ctx.Err() != nil {
+		b.mu.Unlock()
+		return "", ErrBridgeShutdown
+	}
 	doomed := b.pruneDeadSessionsLocked()
 	if b.maxSessions > 0 && len(b.sessions) >= b.maxSessions {
 		b.mu.Unlock()
@@ -220,6 +229,16 @@ func (b *Bridge) CreateSession(remoteIP ...string) (string, error) {
 	}
 
 	b.mu.Lock()
+	// If Shutdown ran while we were creating + authenticating, b.ctx is
+	// cancelled and Shutdown has already snapshotted/emptied b.sessions.
+	// Adding now would leak a session whose sessionCtx is already cancelled
+	// but which no one owns — its ServeConn would only exit after the
+	// per-request ReadTimeout fires. Detect and refuse here.
+	if b.ctx.Err() != nil {
+		b.mu.Unlock()
+		s.close()
+		return "", ErrBridgeShutdown
+	}
 	doomed = b.pruneDeadSessionsLocked()
 	// Re-check the cap under lock to avoid a race that overshoots.
 	if b.maxSessions > 0 && len(b.sessions) >= b.maxSessions {
