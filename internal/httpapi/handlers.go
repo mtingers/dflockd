@@ -176,7 +176,6 @@ func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, k
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req acquireRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -187,6 +186,12 @@ func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, k
 	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	leaseTTL := h.leaseDuration(req.LeaseTTLS)
 	tok, err := h.sessions.LockManager().Acquire(
 		r.Context(), lock.LockPrefix+key, durSeconds(req.AcquireTimeoutS),
@@ -210,7 +215,6 @@ func (h *httpServer) handleEnqueueLock(w http.ResponseWriter, r *http.Request, k
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req enqueueRequest
 	if !decodeOptionalJSON(w, r, &req) {
 		return
@@ -218,6 +222,12 @@ func (h *httpServer) handleEnqueueLock(w http.ResponseWriter, r *http.Request, k
 	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	leaseTTL := h.leaseDuration(req.LeaseTTLS)
 	status, tok, leaseSec, err := h.sessions.LockManager().Enqueue(
 		lock.LockPrefix+key, leaseTTL, s.ConnID, 1)
@@ -235,7 +245,6 @@ func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, ke
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req semAcquireRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -250,6 +259,12 @@ func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, ke
 	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	leaseTTL := h.leaseDuration(req.LeaseTTLS)
 	tok, err := h.sessions.LockManager().Acquire(
 		r.Context(), lock.SemPrefix+key, durSeconds(req.AcquireTimeoutS),
@@ -273,7 +288,6 @@ func (h *httpServer) handleEnqueueSem(w http.ResponseWriter, r *http.Request, ke
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req semEnqueueRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -285,6 +299,12 @@ func (h *httpServer) handleEnqueueSem(w http.ResponseWriter, r *http.Request, ke
 	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	leaseTTL := h.leaseDuration(req.LeaseTTLS)
 	status, tok, leaseSec, err := h.sessions.LockManager().Enqueue(
 		lock.SemPrefix+key, leaseTTL, s.ConnID, req.Limit)
@@ -394,7 +414,6 @@ func (h *httpServer) doRelease(w http.ResponseWriter, r *http.Request, prefixedK
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req releaseRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -407,6 +426,12 @@ func (h *httpServer) doRelease(w http.ResponseWriter, r *http.Request, prefixedK
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	if h.sessions.LockManager().Release(prefixedKey, req.Token) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -420,7 +445,6 @@ func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, prefixedKey
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req renewRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -436,6 +460,12 @@ func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, prefixedKey
 	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	leaseTTL := h.leaseDuration(req.LeaseTTLS)
 	remaining, ok := h.sessions.LockManager().Renew(prefixedKey, req.Token, leaseTTL)
 	if !ok {
@@ -451,7 +481,6 @@ func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, prefixedKey 
 	if !ok {
 		return
 	}
-	defer s.BeginRequest()()
 	var req waitRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -459,6 +488,12 @@ func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, prefixedKey 
 	if !validateSecondsField(w, "timeout_s", req.TimeoutS) {
 		return
 	}
+	done, ok := s.BeginRequest()
+	if !ok {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return
+	}
+	defer done()
 	tok, leaseSec, err := h.sessions.LockManager().Wait(
 		r.Context(), prefixedKey, durSeconds(req.TimeoutS), s.ConnID)
 	if err != nil {

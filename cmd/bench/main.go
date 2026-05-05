@@ -2,20 +2,30 @@
 // repeatedly and report latency statistics. By default each worker uses a
 // unique key; --shared-key makes all workers contend on one lock.
 //
-// Each worker dials a persistent TCP connection and uses the low-level
-// Acquire/Release protocol, so the benchmark measures lock latency rather
-// than TCP connection overhead.
+// Two transports are supported:
+//
+//   - TCP (default): each worker dials a persistent TCP connection and
+//     uses the low-level Acquire/Release protocol.
+//
+//   - HTTP (--http): each worker creates one HTTP session, reuses an
+//     http.Client (keep-alive), and runs acquire/release via the REST
+//     endpoints. Use --servers with http://host:port URLs.
 //
 // Usage:
 //
 //	go run ./cmd/bench [--workers 10] [--rounds 50] [--key bench] \
 //	    [--servers host1:port1,host2:port2] [--connections 0]
+//	go run ./cmd/bench --http --servers http://127.0.0.1:6389 [...]
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -36,6 +46,8 @@ func main() {
 	warmup := flag.Int("warmup", 10, "warmup rounds per worker (not measured)")
 	sharedKey := flag.Bool("shared-key", false, "all workers contend on the literal --key value (measures single-key throughput). "+
 		"Default is to append the worker ID, so workers use unique keys and throughput scales with sharding.")
+	httpMode := flag.Bool("http", false, "drive the HTTP REST API instead of TCP. --servers entries must be http(s)://host:port.")
+	authToken := flag.String("auth-token", "", "shared secret for authentication (TCP: protocol auth; HTTP: Bearer header)")
 	flag.Parse()
 
 	addrs, connsPerWorker, err := validateBenchFlags(*workers, *rounds, *timeout, *leaseTTL, *connections, *warmup, *servers)
@@ -50,8 +62,16 @@ func main() {
 		mode = "shared key (contended)"
 		displayKey = *key
 	}
-	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d, %s)\n\n",
-		*workers, *rounds, displayKey, connsPerWorker, mode)
+	transport := "TCP"
+	if *httpMode {
+		transport = "HTTP"
+		if err := validateHTTPAddrs(addrs); err != nil {
+			fmt.Fprintf(os.Stderr, "bench: %v\n", err)
+			os.Exit(2)
+		}
+	}
+	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d, transport=%s, %s)\n\n",
+		*workers, *rounds, displayKey, connsPerWorker, transport, mode)
 
 	type result struct {
 		latencies []float64
@@ -71,7 +91,15 @@ func main() {
 			defer wg.Done()
 			workerKey := workerKeyFor(*key, id, *sharedKey)
 			addr := addrs[id%len(addrs)]
-			lats, err := worker(workerKey, addr, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
+			var (
+				lats []float64
+				err  error
+			)
+			if *httpMode {
+				lats, err = httpWorker(workerKey, addr, *authToken, *rounds, *timeout, *leaseTTL, *warmup, &warmupWg, startCh)
+			} else {
+				lats, err = worker(workerKey, addr, *authToken, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
+			}
 			results[id] = result{latencies: lats, err: err}
 		}(i)
 	}
@@ -165,7 +193,7 @@ func validateBenchFlags(workers, rounds, timeoutSec, leaseTTL, connections, warm
 	return addrs, connsPerWorker, nil
 }
 
-func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
+func worker(key, addr, authToken string, rounds, timeoutSec, leaseTTL, numConns, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
 	// Open persistent connection(s) up front.
 	conns := make([]*client.Conn, 0, numConns)
 	defer func() {
@@ -178,6 +206,12 @@ func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRoun
 		if err != nil {
 			warmupWg.Done() // unblock barrier so main doesn't hang
 			return nil, fmt.Errorf("dial: %w", err)
+		}
+		if authToken != "" {
+			if err := client.Authenticate(c, authToken); err != nil {
+				warmupWg.Done()
+				return nil, fmt.Errorf("auth: %w", err)
+			}
 		}
 		conns = append(conns, c)
 	}
@@ -227,6 +261,195 @@ func worker(key, addr string, rounds, timeoutSec, leaseTTL, numConns, warmupRoun
 		latencies = append(latencies, time.Since(t0).Seconds())
 	}
 	return latencies, nil
+}
+
+// validateHTTPAddrs rejects --servers entries that aren't http(s) URLs.
+func validateHTTPAddrs(addrs []string) error {
+	for _, a := range addrs {
+		if !strings.HasPrefix(a, "http://") && !strings.HasPrefix(a, "https://") {
+			return fmt.Errorf("--http requires http(s):// URLs, got %q", a)
+		}
+	}
+	return nil
+}
+
+// httpWorker is the HTTP equivalent of worker. Each worker creates one
+// session up front, reuses an http.Client (with keep-alive) for the
+// acquire/release rounds, and deletes the session on exit.
+func httpWorker(key, base, authToken string, rounds, timeoutSec, leaseTTL, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
+	// Tune the transport so per-worker keep-alive holds and connection
+	// reuse actually happens — http.DefaultTransport's defaults can
+	// cause idle conns to be evicted under our request rate.
+	tr := &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	hc := &http.Client{
+		Transport: tr,
+		Timeout:   time.Duration(timeoutSec+30) * time.Second,
+	}
+
+	authHdr := ""
+	if authToken != "" {
+		authHdr = "Bearer " + authToken
+	}
+
+	// Create a session and capture its ID.
+	sessionID, err := httpCreateSession(hc, base, authHdr)
+	if err != nil {
+		warmupWg.Done()
+		return nil, fmt.Errorf("session create: %w", err)
+	}
+	defer func() {
+		_ = httpDeleteSession(hc, base, authHdr, sessionID)
+		tr.CloseIdleConnections()
+	}()
+
+	// Pre-encode the acquire body — same fields every round.
+	acquireBody, err := json.Marshal(map[string]int{
+		"acquire_timeout_s": timeoutSec,
+		"lease_ttl_s":       leaseTTL,
+	})
+	if err != nil {
+		warmupWg.Done()
+		return nil, err
+	}
+
+	// Warmup: not measured.
+	for i := 0; i < warmupRounds; i++ {
+		token, err := httpAcquire(hc, base, authHdr, sessionID, key, acquireBody)
+		if err != nil {
+			warmupWg.Done()
+			return nil, fmt.Errorf("warmup acquire: %w", err)
+		}
+		if err := httpRelease(hc, base, authHdr, sessionID, key, token); err != nil {
+			warmupWg.Done()
+			return nil, fmt.Errorf("warmup release: %w", err)
+		}
+	}
+
+	warmupWg.Done()
+	<-startCh
+
+	latencies := make([]float64, 0, rounds)
+	for i := 0; i < rounds; i++ {
+		t0 := time.Now()
+		token, err := httpAcquire(hc, base, authHdr, sessionID, key, acquireBody)
+		if err != nil {
+			return nil, fmt.Errorf("acquire: %w", err)
+		}
+		if err := httpRelease(hc, base, authHdr, sessionID, key, token); err != nil {
+			return nil, fmt.Errorf("release: %w", err)
+		}
+		latencies = append(latencies, time.Since(t0).Seconds())
+	}
+	return latencies, nil
+}
+
+// httpCreateSession POSTs /v1/sessions and returns the session ID.
+func httpCreateSession(hc *http.Client, base, authHdr string) (string, error) {
+	req, err := http.NewRequest("POST", base+"/v1/sessions", nil)
+	if err != nil {
+		return "", err
+	}
+	if authHdr != "" {
+		req.Header.Set("Authorization", authHdr)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, body)
+	}
+	var v struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return "", err
+	}
+	return v.SessionID, nil
+}
+
+func httpDeleteSession(hc *http.Client, base, authHdr, sessionID string) error {
+	req, err := http.NewRequest("DELETE", base+"/v1/sessions/"+sessionID, nil)
+	if err != nil {
+		return err
+	}
+	if authHdr != "" {
+		req.Header.Set("Authorization", authHdr)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// httpAcquire posts the acquire request and returns the granted token.
+// Errors out if the server returned timeout — under unique keys this
+// should never happen at any concurrency level.
+func httpAcquire(hc *http.Client, base, authHdr, sessionID, key string, body []byte) (string, error) {
+	req, err := http.NewRequest("POST", base+"/v1/locks/"+key, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dflockd-Session", sessionID)
+	if authHdr != "" {
+		req.Header.Set("Authorization", authHdr)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
+	}
+	var v struct {
+		Status string `json:"status"`
+		Token  string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return "", err
+	}
+	if v.Status != "ok" {
+		return "", fmt.Errorf("unexpected status %q", v.Status)
+	}
+	return v.Token, nil
+}
+
+func httpRelease(hc *http.Client, base, authHdr, sessionID, key, token string) error {
+	body, err := json.Marshal(map[string]string{"token": token})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", base+"/v1/locks/"+key+"/release", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dflockd-Session", sessionID)
+	if authHdr != "" {
+		req.Header.Set("Authorization", authHdr)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 204 {
+		return fmt.Errorf("release status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func mean(data []float64) float64 {

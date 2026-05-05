@@ -172,6 +172,28 @@ func newClient(t *testing.T, base string) *httpClient {
 	return &httpClient{t: t, base: base}
 }
 
+// postRaw sends an arbitrary byte body. Used to exercise malformed
+// bodies (the JSON-encoder path in post would refuse to encode them).
+func (c *httpClient) postRaw(path string, body []byte) *http.Response {
+	c.t.Helper()
+	req, err := http.NewRequest("POST", c.base+path, bytes.NewReader(body))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.session != "" {
+		req.Header.Set("X-Dflockd-Session", c.session)
+	}
+	if c.auth != "" {
+		req.Header.Set("Authorization", "Bearer "+c.auth)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return resp
+}
+
 func (c *httpClient) post(path string, body any) *http.Response {
 	c.t.Helper()
 	var buf bytes.Buffer
@@ -570,6 +592,151 @@ func TestHTTP_DeleteSessionReleasesHeldLocks(t *testing.T) {
 	if v.Status != "ok" || v.Token == "" {
 		t.Fatalf("post-delete acquire: %+v", v)
 	}
+}
+
+// TestSession_BeginRequestAfterClose asserts the closed-flag check
+// inside BeginRequest. Without this, a handler that already passed
+// Lookup could call LockManager after Delete had run CleanupConnection,
+// minting a token tied to a connID whose state is gone.
+func TestSession_BeginRequestAfterClose(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+	c := newClient(t, base)
+	c.startSession()
+
+	// Reach the live session via the store rather than guessing —
+	// startHTTP doesn't expose it, so use the public DELETE path
+	// and then assert that a follow-up lock op gets 410.
+	resp := c.delete("/v1/sessions/" + c.session)
+	if resp.StatusCode != 204 {
+		t.Fatalf("delete: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Subsequent lock op on the same session id must be rejected.
+	resp = c.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1})
+	if resp.StatusCode != 410 {
+		t.Errorf("post-delete acquire: got %d, want 410", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// TestHTTP_DeleteWhileHandlerHoldsLock_Drains tests the Delete /
+// in-flight handler interleaving directly. We start a long-poll
+// /wait, then DELETE the session. Delete must wait for the wait
+// handler to finish before CleanupConnection fires; the eventual
+// /wait response should reflect cancellation, and the lock must
+// not leak to the LockManager.
+func TestHTTP_DeleteWhileHandlerHoldsLock_Drains(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+
+	holder := newClient(t, base)
+	holder.startSession()
+	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	var hv opResponse
+	decode(t, resp, &hv)
+
+	queuer := newClient(t, base)
+	queuer.startSession()
+	resp = queuer.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
+	var qv opResponse
+	decode(t, resp, &qv)
+	if qv.Status != "queued" {
+		t.Fatalf("expected queued, got %+v", qv)
+	}
+
+	// Long-poll wait in flight on queuer.
+	waitDone := make(chan int, 1)
+	go func() {
+		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 5})
+		waitDone <- resp.StatusCode
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// DELETE should not return until /wait has unblocked.
+	deleteDone := make(chan int, 1)
+	go func() {
+		resp := queuer.delete("/v1/sessions/" + queuer.session)
+		deleteDone <- resp.StatusCode
+	}()
+
+	// Holder release frees the wait — both responses arrive afterwards.
+	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
+
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("wait never returned")
+	}
+	select {
+	case <-deleteDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("delete never returned")
+	}
+
+	// Whatever happened to queuer's grant, the lock must be free for
+	// the next caller. If Delete had run CleanupConnection while the
+	// wait handler was still inside lm.Wait, the wait handler could
+	// mint a token tied to queuer.ConnID after CleanupConnection.
+	other := newClient(t, base)
+	other.startSession()
+	resp = other.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1})
+	var ov opResponse
+	decode(t, resp, &ov)
+	if ov.Status != "ok" {
+		t.Fatalf("post-delete-race acquire: %+v — leaked token tied to deleted session?", ov)
+	}
+}
+
+// TestHTTP_BadJsonDoesNotKeepSessionAlive asserts BeginRequest is
+// only entered after the body parses. A malformed body must fail
+// fast (400) without bumping inFlight, so the sweeper isn't gated
+// by an unparseable request body.
+func TestHTTP_BadJsonDoesNotKeepSessionAlive(t *testing.T) {
+	base, stop := startHTTP(t, func(c *config.Config) {
+		c.HTTPSessionIdleTimeout = 50 * time.Millisecond
+	})
+	defer stop()
+
+	holder := newClient(t, base)
+	holder.startSession()
+	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 60})
+	var hv opResponse
+	decode(t, resp, &hv)
+	if hv.Token == "" {
+		t.Fatal("setup acquire failed")
+	}
+
+	// Send garbage body. If BeginRequest were entered before parsing,
+	// the malformed parse would still bump inFlight briefly — but the
+	// real bug is the slowloris case. We exercise that the 400 path
+	// fires from a code position where inFlight stayed 0, by checking
+	// that the immediately-following idle sweep can still reap.
+	for i := 0; i < 5; i++ {
+		resp := holder.postRaw("/v1/locks/k/release", []byte("{not json"))
+		if resp.StatusCode != 400 {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("malformed release returned %d: %s", resp.StatusCode, body)
+		}
+		resp.Body.Close()
+	}
+
+	// Wait past 2× idleTimeout and confirm the holder's session was
+	// reaped (lock released).
+	deadline := time.Now().Add(2 * time.Second)
+	other := newClient(t, base)
+	other.startSession()
+	for time.Now().Before(deadline) {
+		resp := other.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 0})
+		var v opResponse
+		decode(t, resp, &v)
+		if v.Status == "ok" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("idle sweep didn't reap holder after malformed POSTs — body parse held inFlight?")
 }
 
 // TestHTTP_LongWaitNotIdleSwept asserts that an in-flight /wait

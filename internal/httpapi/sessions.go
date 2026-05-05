@@ -32,6 +32,7 @@ type Session struct {
 	ConnID   uint64
 	OwnerIP  string
 	mu       sync.Mutex
+	closed   atomic.Bool // true once Delete/sweep/shutdown has claimed this session
 	lastSeen atomic.Int64 // unix ns
 	inFlight atomic.Int64
 }
@@ -41,18 +42,39 @@ type Session struct {
 // the sweeper.
 func (s *Session) Touch() { s.lastSeen.Store(time.Now().UnixNano()) }
 
-// BeginRequest claims the per-session mutex and bumps inFlight so
-// the sweeper won't reap this session mid-handler. Callers MUST
-// defer the returned cleanup. Use from every handler that calls
-// LockManager; skip from cheap probes (/ping) and teardown (DELETE).
-func (s *Session) BeginRequest() func() {
+// BeginRequest claims the per-session mutex and bumps inFlight so the
+// sweeper won't reap this session mid-handler. Returns (done, true)
+// on success; the caller MUST defer done().
+//
+// Returns (nil, false) once the session has been closed (Delete,
+// idle sweep, or shutdown). Handlers must check ok and write 410
+// session_gone instead of touching LockManager — without that check
+// a handler running concurrently with Delete could mint a token
+// against a connID whose state has already been cleaned up.
+func (s *Session) BeginRequest() (func(), bool) {
 	s.inFlight.Add(1)
 	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		s.inFlight.Add(-1)
+		return nil, false
+	}
 	return func() {
 		s.mu.Unlock()
 		s.lastSeen.Store(time.Now().UnixNano())
 		s.inFlight.Add(-1)
-	}
+	}, true
+}
+
+// sealAndDrain marks the session closed and waits for any in-flight
+// handler to release s.mu. After this returns, no new handler can
+// observe an open session via BeginRequest, and any concurrent
+// handler that already started has finished its LockManager call.
+// Safe to follow with CleanupConnection.
+func (s *Session) sealAndDrain() {
+	s.closed.Store(true)
+	s.mu.Lock()
+	s.mu.Unlock()
 }
 
 // SessionStore tracks active sessions, enforces caps, and runs the
@@ -113,6 +135,7 @@ func (st *SessionStore) Shutdown() {
 	st.mu.Unlock()
 
 	for _, s := range sessions {
+		s.sealAndDrain()
 		st.srv.LockManager().CleanupConnection(s.ConnID)
 	}
 	<-st.sweeperDone
@@ -173,6 +196,12 @@ func (st *SessionStore) Lookup(id string) (*Session, error) {
 }
 
 // Delete removes the session and runs lock-state cleanup. Idempotent.
+//
+// Coordination: after pulling the session out of the map, sealAndDrain
+// blocks until any concurrently-running handler releases s.mu. This
+// closes the race where a handler that already passed Lookup but
+// hadn't yet finished its lm.Acquire could mint a token whose
+// connID we're about to wipe in CleanupConnection.
 func (st *SessionStore) Delete(id string) error {
 	st.mu.Lock()
 	s, ok := st.sessions[id]
@@ -189,6 +218,7 @@ func (st *SessionStore) Delete(id string) error {
 	if !ok {
 		return ErrSessionGone
 	}
+	s.sealAndDrain()
 	st.srv.LockManager().CleanupConnection(s.ConnID)
 	return nil
 }
@@ -276,6 +306,7 @@ func (st *SessionStore) sweepOnce(now time.Time) {
 	st.mu.Unlock()
 
 	for _, s := range doomed {
+		s.sealAndDrain()
 		st.srv.LockManager().CleanupConnection(s.ConnID)
 	}
 }
