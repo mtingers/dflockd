@@ -272,6 +272,12 @@ func parseEnqueue(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request
 		if len(parts) != 1 && len(parts) != 2 {
 			return nil, argErr("se arg must be: <limit> [<lease_ttl>]")
 		}
+	} else {
+		// e accepts at most one field. Reject extras so a typo like
+		// "30 junk" doesn't silently parse the lease and drop the rest.
+		if len(parts) > 1 {
+			return nil, argErr("e arg must be: [<lease_ttl>]")
+		}
 	}
 
 	req := &Request{Cmd: cmd, Key: key, LeaseTTL: defaultLeaseTTL}

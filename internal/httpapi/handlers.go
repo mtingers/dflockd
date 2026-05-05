@@ -176,6 +176,7 @@ func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, k
 	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req acquireRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -209,6 +210,7 @@ func (h *httpServer) handleEnqueueLock(w http.ResponseWriter, r *http.Request, k
 	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req enqueueRequest
 	if !decodeOptionalJSON(w, r, &req) {
 		return
@@ -233,6 +235,7 @@ func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, ke
 	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req semAcquireRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -270,6 +273,7 @@ func (h *httpServer) handleEnqueueSem(w http.ResponseWriter, r *http.Request, ke
 	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req semEnqueueRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -365,9 +369,15 @@ func (h *httpServer) renderEnqueueOutcome(w http.ResponseWriter, r *http.Request
 		case "acquired":
 			_ = h.sessions.LockManager().Release(prefix+key, tok)
 		case "queued":
-			// Issue a zero-timeout Wait to dequeue the waiter without
-			// holding any caller's slot.
-			_, _, _ = h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
+			// Issue a zero-timeout Wait to dequeue the waiter. Wait
+			// can still return a token if the waiter was promoted to
+			// holder between Enqueue and now (fast path or grant
+			// drain on timeout) — capture and release it instead of
+			// stranding the slot until lease expiry.
+			cleanupTok, _, _ := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
+			if cleanupTok != "" {
+				_ = h.sessions.LockManager().Release(prefix+key, cleanupTok)
+			}
 		}
 		return
 	}
@@ -380,9 +390,11 @@ func (h *httpServer) renderEnqueueOutcome(w http.ResponseWriter, r *http.Request
 
 // doRelease handles both lock and semaphore release.
 func (h *httpServer) doRelease(w http.ResponseWriter, r *http.Request, prefixedKey string) {
-	if _, ok := h.sessionOrGone(w, r); !ok {
+	s, ok := h.sessionOrGone(w, r)
+	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req releaseRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -404,9 +416,11 @@ func (h *httpServer) doRelease(w http.ResponseWriter, r *http.Request, prefixedK
 
 // doRenew handles both lock and semaphore renew.
 func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, prefixedKey string) {
-	if _, ok := h.sessionOrGone(w, r); !ok {
+	s, ok := h.sessionOrGone(w, r)
+	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req renewRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -437,6 +451,7 @@ func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, prefixedKey 
 	if !ok {
 		return
 	}
+	defer s.BeginRequest()()
 	var req waitRequest
 	if !decodeJSON(w, r, &req) {
 		return

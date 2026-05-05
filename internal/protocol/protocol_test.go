@@ -215,6 +215,21 @@ func TestParseRequest_SemWait(t *testing.T) {
 	}
 }
 
+func TestParseRequest_Enqueue_RejectsExtraFields(t *testing.T) {
+	// "e\nk\n30 junk\n" used to silently parse 30 as the lease and
+	// drop "junk". Symmetric with se's existing arg-count check.
+	if _, err := parseRequest("e", "k", "30 junk", time.Second); err == nil {
+		t.Fatal("expected error for extra field on e")
+	}
+	// Sanity: valid forms still parse.
+	if _, err := parseRequest("e", "k", "", time.Second); err != nil {
+		t.Errorf("e with no arg: %v", err)
+	}
+	if _, err := parseRequest("e", "k", "30", time.Second); err != nil {
+		t.Errorf("e with lease only: %v", err)
+	}
+}
+
 func TestParseRequest_BadCmd(t *testing.T) {
 	_, err := parseRequest("nope", "k", "", time.Second)
 	if err == nil {

@@ -18,17 +18,42 @@ import (
 // holds one and is the unit of cleanup. The session has no transport
 // of its own — it's pure metadata. Lock operations call LockManager
 // methods directly using session.ConnID.
+// mu serialises lock-modifying handlers (acquire/release/renew/
+// enqueue/wait) so the HTTP API behaves like a single virtual
+// connection — matching the old bridge's reqMu. /ping and DELETE
+// bypass it so they can't be starved by a long blocking op.
+//
+// inFlight tracks how many handlers are currently using this session.
+// The idle sweeper skips sessions with inFlight > 0 so a long-poll
+// /wait isn't reaped mid-flight; lastSeen is also refreshed on
+// handler exit so the next sweep cycle sees recent activity.
 type Session struct {
 	ID       string
 	ConnID   uint64
 	OwnerIP  string
+	mu       sync.Mutex
 	lastSeen atomic.Int64 // unix ns
+	inFlight atomic.Int64
 }
 
 // Touch records that this session was just used. Sessions whose
 // lastSeen falls behind 2× the configured idle timeout are reaped by
 // the sweeper.
 func (s *Session) Touch() { s.lastSeen.Store(time.Now().UnixNano()) }
+
+// BeginRequest claims the per-session mutex and bumps inFlight so
+// the sweeper won't reap this session mid-handler. Callers MUST
+// defer the returned cleanup. Use from every handler that calls
+// LockManager; skip from cheap probes (/ping) and teardown (DELETE).
+func (s *Session) BeginRequest() func() {
+	s.inFlight.Add(1)
+	s.mu.Lock()
+	return func() {
+		s.mu.Unlock()
+		s.lastSeen.Store(time.Now().UnixNano())
+		s.inFlight.Add(-1)
+	}
+}
 
 // SessionStore tracks active sessions, enforces caps, and runs the
 // idle sweeper. Construction starts the sweeper; Shutdown stops it.
@@ -229,6 +254,13 @@ func (st *SessionStore) sweepOnce(now time.Time) {
 	var doomed []*Session
 	st.mu.Lock()
 	for id, s := range st.sessions {
+		// In-flight handlers (e.g. a long-poll /wait) hold BeginRequest
+		// for the duration of the call. Reaping mid-handler would close
+		// the waiter channel and surface session_gone to a client whose
+		// request is still legitimately running.
+		if s.inFlight.Load() > 0 {
+			continue
+		}
 		last := time.Unix(0, s.lastSeen.Load())
 		if last.Before(cutoff) {
 			doomed = append(doomed, s)

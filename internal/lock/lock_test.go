@@ -650,6 +650,40 @@ func TestStress_ManyConcurrent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Wait(timeout=0) returns a token if the waiter was promoted to holder
+// before our cleanup arrived. Used by the HTTP queued-cleanup path —
+// the handler must capture this token and release it.
+// ---------------------------------------------------------------------------
+
+func TestWait_ZeroTimeoutAfterPromote_ReturnsToken(t *testing.T) {
+	lm := newTestManager(t, true)
+
+	// Holder on conn 1 occupies the slot.
+	tok1, _ := lm.Acquire(context.Background(), "k", time.Second, 30*time.Second, 1, 1)
+
+	// Conn 2 enqueues — gets "queued".
+	status, _, _, _ := lm.Enqueue("k", 30*time.Second, 2, 1)
+	if status != "queued" {
+		t.Fatalf("expected queued, got %q", status)
+	}
+
+	// Holder releases — conn 2's waiter is promoted (preToken set on
+	// the enqueued state).
+	lm.Release("k", tok1)
+
+	// Now Wait(timeout=0) MUST return the granted token, not silently
+	// drop it. The HTTP cleanup path relies on this so it can release
+	// instead of stranding.
+	tok2, _, err := lm.Wait(context.Background(), "k", 0, 2)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if tok2 == "" {
+		t.Fatal("Wait(0) must return the promoted grant — silent drop would leak a held slot")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Wait fast path: enqueue acquired immediately, wait should return token
 // ---------------------------------------------------------------------------
 

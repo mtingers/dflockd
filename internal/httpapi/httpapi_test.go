@@ -572,6 +572,125 @@ func TestHTTP_DeleteSessionReleasesHeldLocks(t *testing.T) {
 	}
 }
 
+// TestHTTP_LongWaitNotIdleSwept asserts that an in-flight /wait
+// outliving the idle timeout isn't reaped by the sweeper. Regression
+// test for the behavior the bridge had via inFlight gating.
+func TestHTTP_LongWaitNotIdleSwept(t *testing.T) {
+	base, stop := startHTTP(t, func(c *config.Config) {
+		// Tiny idle timeout so the sweeper would fire well before the
+		// /wait would naturally complete.
+		c.HTTPSessionIdleTimeout = 50 * time.Millisecond
+	})
+	defer stop()
+
+	holder := newClient(t, base)
+	holder.startSession()
+	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	var hv opResponse
+	decode(t, resp, &hv)
+
+	queuer := newClient(t, base)
+	queuer.startSession()
+	resp = queuer.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
+	var qv opResponse
+	decode(t, resp, &qv)
+	if qv.Status != "queued" {
+		t.Fatalf("expected queued, got %+v", qv)
+	}
+
+	// Block on /wait far longer than 2× idle timeout. The sweeper
+	// must skip this session because BeginRequest holds inFlight > 0.
+	done := make(chan opResponse, 1)
+	go func() {
+		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 2})
+		var v opResponse
+		decode(t, resp, &v)
+		done <- v
+	}()
+
+	// Sleep way past 2× idle timeout, then satisfy the wait.
+	time.Sleep(500 * time.Millisecond)
+	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
+
+	select {
+	case v := <-done:
+		if v.Status != "ok" || v.Token == "" {
+			t.Fatalf("long /wait got %+v — sweeper killed it?", v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("wait never returned")
+	}
+}
+
+// TestHTTP_PerSessionSerialization asserts that two concurrent lock
+// ops on the same session run sequentially rather than racing. The
+// HTTP API is supposed to model a single TCP connection.
+func TestHTTP_PerSessionSerialization(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+
+	c := newClient(t, base)
+	c.startSession()
+
+	// First request blocks: enqueue then wait on a contended key.
+	holder := newClient(t, base)
+	holder.startSession()
+	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	var hv opResponse
+	decode(t, resp, &hv)
+
+	resp = c.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
+	var qv opResponse
+	decode(t, resp, &qv)
+	if qv.Status != "queued" {
+		t.Fatalf("expected queued, got %+v", qv)
+	}
+
+	// Two concurrent /wait calls on the same session+key. Without
+	// per-session serialization, both can park on the same waiter
+	// channel and race. With it, the second blocks behind the first.
+	type result struct {
+		idx int
+		v   opResponse
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			resp := c.post("/v1/locks/k/wait", waitRequest{TimeoutS: 2})
+			var v opResponse
+			decode(t, resp, &v)
+			results <- result{i, v}
+		}()
+	}
+
+	// Release the holder; only one /wait should claim the grant.
+	time.Sleep(50 * time.Millisecond)
+	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
+
+	var grants, notQueued, timeouts int
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			switch r.v.Status {
+			case "ok":
+				grants++
+			case "timeout":
+				timeouts++
+			default:
+				// "not_enqueued" via the conflict mapping is also a
+				// valid second-call outcome under serialization.
+				notQueued++
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("call %d never returned", i)
+		}
+	}
+	if grants != 1 {
+		t.Errorf("got %d grants, want 1 (serialization broken)", grants)
+	}
+}
+
 // TestHTTP_IdleSweepReleasesHeldLocks drives the idle sweeper directly
 // to assert that an abandoned (no-DELETE) session's locks get released
 // once it ages past 2× idle timeout.
