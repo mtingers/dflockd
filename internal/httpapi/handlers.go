@@ -15,12 +15,10 @@ import (
 	"github.com/mtingers/dflockd/internal/protocol"
 )
 
-// maxRequestBody bounds JSON bodies. 1MB is generous; valid requests
-// are < 1KB. The cap protects against junk uploads.
+// maxRequestBody bounds JSON bodies; valid requests are < 1KB.
 const maxRequestBody = 1 << 20
 
-// maxProtocolSeconds matches the protocol's seconds cap so HTTP can
-// reject overflow values before they reach the protocol layer.
+// maxProtocolSeconds matches the protocol's seconds cap.
 var maxProtocolSeconds = int64(math.MaxInt64) / int64(time.Second)
 
 // ---------------------------------------------------------------------------
@@ -31,13 +29,10 @@ type statusResponse struct {
 	Status string `json:"status"`
 }
 
-// GET /health — unauthenticated liveness probe.
 func (h *httpServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
-// GET /ready — unauthenticated readiness probe. Reports "draining"
-// during graceful shutdown.
 func (h *httpServer) handleReady(w http.ResponseWriter, r *http.Request) {
 	if h.draining.Load() {
 		writeJSON(w, http.StatusServiceUnavailable, statusResponse{Status: "draining"})
@@ -46,27 +41,40 @@ func (h *httpServer) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
-// GET /v1/stats — direct LockManager snapshot. Includes both TCP and
-// HTTP connection counts in the Connections field.
 func (h *httpServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.currentStats())
 }
 
 func (h *httpServer) currentStats() *lock.Stats {
 	stats := h.sessions.LockManager().Stats(h.sessions.ConnCount() + int64(h.sessions.Count()))
-	for i := range stats.Locks {
-		stats.Locks[i].Key = lock.StripKeyPrefix(stats.Locks[i].Key)
-	}
-	for i := range stats.Semaphores {
-		stats.Semaphores[i].Key = lock.StripKeyPrefix(stats.Semaphores[i].Key)
-	}
-	for i := range stats.IdleLocks {
-		stats.IdleLocks[i].Key = lock.StripKeyPrefix(stats.IdleLocks[i].Key)
-	}
-	for i := range stats.IdleSemaphores {
-		stats.IdleSemaphores[i].Key = lock.StripKeyPrefix(stats.IdleSemaphores[i].Key)
-	}
+	stripStatsPrefixes(stats)
 	return stats
+}
+
+// stripStatsPrefixes turns internal lock:/sem: keys back into user keys.
+func stripStatsPrefixes(s *lock.Stats) {
+	stripLocks(s.Locks)
+	stripSems(s.Semaphores)
+	stripIdle(s.IdleLocks)
+	stripIdle(s.IdleSemaphores)
+}
+
+func stripLocks(xs []lock.LockInfo) {
+	for i := range xs {
+		xs[i].Key = lock.StripKeyPrefix(xs[i].Key)
+	}
+}
+
+func stripSems(xs []lock.SemInfo) {
+	for i := range xs {
+		xs[i].Key = lock.StripKeyPrefix(xs[i].Key)
+	}
+}
+
+func stripIdle(xs []lock.IdleInfo) {
+	for i := range xs {
+		xs[i].Key = lock.StripKeyPrefix(xs[i].Key)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -78,29 +86,31 @@ type createSessionResponse struct {
 	IdleTimeoutS int    `json:"idle_timeout_s"`
 }
 
-// POST /v1/sessions
 func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	s, err := h.sessions.Create(remoteIPFromAddr(r.RemoteAddr))
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrMaxSessions):
-			writeError(w, http.StatusServiceUnavailable, "max_sessions", "")
-		case errors.Is(err, ErrMaxSessionsPerIP):
-			writeError(w, http.StatusServiceUnavailable, "max_sessions_per_ip", "")
-		case errors.Is(err, ErrShuttingDown):
-			writeError(w, http.StatusServiceUnavailable, "draining", "")
-		default:
-			writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())
-		}
+		writeCreateSessionErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, createSessionResponse{
-		SessionID:    s.ID,
-		IdleTimeoutS: int(h.sessions.IdleTimeout().Seconds()),
+		SessionID: s.ID, IdleTimeoutS: int(h.sessions.IdleTimeout().Seconds()),
 	})
 }
 
-// DELETE /v1/sessions/{id}
+// writeCreateSessionErr maps Create errors to HTTP responses.
+func writeCreateSessionErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrMaxSessions):
+		writeError(w, http.StatusServiceUnavailable, "max_sessions", "")
+	case errors.Is(err, ErrMaxSessionsPerIP):
+		writeError(w, http.StatusServiceUnavailable, "max_sessions_per_ip", "")
+	case errors.Is(err, ErrShuttingDown):
+		writeError(w, http.StatusServiceUnavailable, "draining", "")
+	default:
+		writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())
+	}
+}
+
 func (h *httpServer) handleDeleteSession(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.sessions.Delete(id); err != nil {
 		writeError(w, http.StatusGone, "session_gone", "")
@@ -109,7 +119,6 @@ func (h *httpServer) handleDeleteSession(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// POST /v1/sessions/{id}/ping
 func (h *httpServer) handlePingSession(w http.ResponseWriter, r *http.Request, id string) {
 	if _, err := h.sessions.Lookup(id); err != nil {
 		writeError(w, http.StatusGone, "session_gone", "")
@@ -119,7 +128,7 @@ func (h *httpServer) handlePingSession(w http.ResponseWriter, r *http.Request, i
 }
 
 // ---------------------------------------------------------------------------
-// Lock and semaphore handlers
+// Lock and semaphore handlers — thin wrappers over shared serve* funcs
 // ---------------------------------------------------------------------------
 
 type acquireRequest struct {
@@ -160,314 +169,153 @@ type waitRequest struct {
 }
 
 // opResponse is the unified shape for acquire/enqueue/wait responses.
-//
-// Status: "ok" (granted), "timeout", "acquired" (two-phase fast path),
-// or "queued". Token + LeaseTTLS are populated only when the caller
-// now holds the slot.
 type opResponse struct {
 	Status    string `json:"status"`
 	Token     string `json:"token,omitempty"`
 	LeaseTTLS int    `json:"lease_ttl_s,omitempty"`
 }
 
-// POST /v1/locks/{key}
 func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, key string) {
-	s, ok := h.sessionOrGone(w, r)
-	if !ok {
-		return
-	}
-	var req acquireRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if !validateSecondsField(w, "acquire_timeout_s", req.AcquireTimeoutS) {
-		return
-	}
-	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return
-	}
-	defer done()
-	leaseTTL := h.leaseDuration(req.LeaseTTLS)
-	tok, err := h.sessions.LockManager().Acquire(
-		r.Context(), lock.LockPrefix+key, durSeconds(req.AcquireTimeoutS),
-		leaseTTL, s.ConnID, 1)
-	h.renderAcquireOutcome(w, r, s, key, lock.LockPrefix, tok, leaseTTL, err)
+	h.serveAcquireLock(w, r, key)
 }
 
-// POST /v1/locks/{key}/release
 func (h *httpServer) handleReleaseLock(w http.ResponseWriter, r *http.Request, key string) {
-	h.doRelease(w, r, lock.LockPrefix+key)
+	h.serveRelease(w, r, lock.LockPrefix+key)
 }
 
-// POST /v1/locks/{key}/renew
 func (h *httpServer) handleRenewLock(w http.ResponseWriter, r *http.Request, key string) {
-	h.doRenew(w, r, lock.LockPrefix+key)
+	h.serveRenew(w, r, lock.LockPrefix+key)
 }
 
-// POST /v1/locks/{key}/enqueue
 func (h *httpServer) handleEnqueueLock(w http.ResponseWriter, r *http.Request, key string) {
-	s, ok := h.sessionOrGone(w, r)
-	if !ok {
-		return
-	}
-	var req enqueueRequest
-	if !decodeOptionalJSON(w, r, &req) {
-		return
-	}
-	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return
-	}
-	defer done()
-	leaseTTL := h.leaseDuration(req.LeaseTTLS)
-	status, tok, leaseSec, err := h.sessions.LockManager().Enqueue(
-		lock.LockPrefix+key, leaseTTL, s.ConnID, 1)
-	h.renderEnqueueOutcome(w, r, s, key, lock.LockPrefix, status, tok, leaseSec, err)
+	h.serveEnqueueLock(w, r, key)
 }
 
-// POST /v1/locks/{key}/wait
 func (h *httpServer) handleWaitLock(w http.ResponseWriter, r *http.Request, key string) {
-	h.doWait(w, r, lock.LockPrefix+key)
+	h.serveWait(w, r, lock.LockPrefix+key)
 }
 
-// POST /v1/semaphores/{key}
 func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, key string) {
-	s, ok := h.sessionOrGone(w, r)
-	if !ok {
-		return
-	}
-	var req semAcquireRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if !validateSecondsField(w, "acquire_timeout_s", req.AcquireTimeoutS) {
-		return
-	}
-	if req.Limit <= 0 {
-		writeError(w, http.StatusBadRequest, "bad_request", "limit must be > 0")
-		return
-	}
-	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return
-	}
-	defer done()
-	leaseTTL := h.leaseDuration(req.LeaseTTLS)
-	tok, err := h.sessions.LockManager().Acquire(
-		r.Context(), lock.SemPrefix+key, durSeconds(req.AcquireTimeoutS),
-		leaseTTL, s.ConnID, req.Limit)
-	h.renderAcquireOutcome(w, r, s, key, lock.SemPrefix, tok, leaseTTL, err)
+	h.serveAcquireSem(w, r, key)
 }
 
-// POST /v1/semaphores/{key}/release
 func (h *httpServer) handleReleaseSem(w http.ResponseWriter, r *http.Request, key string) {
-	h.doRelease(w, r, lock.SemPrefix+key)
+	h.serveRelease(w, r, lock.SemPrefix+key)
 }
 
-// POST /v1/semaphores/{key}/renew
 func (h *httpServer) handleRenewSem(w http.ResponseWriter, r *http.Request, key string) {
-	h.doRenew(w, r, lock.SemPrefix+key)
+	h.serveRenew(w, r, lock.SemPrefix+key)
 }
 
-// POST /v1/semaphores/{key}/enqueue
 func (h *httpServer) handleEnqueueSem(w http.ResponseWriter, r *http.Request, key string) {
-	s, ok := h.sessionOrGone(w, r)
-	if !ok {
-		return
-	}
-	var req semEnqueueRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.Limit <= 0 {
-		writeError(w, http.StatusBadRequest, "bad_request", "limit must be > 0")
-		return
-	}
-	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return
-	}
-	defer done()
-	leaseTTL := h.leaseDuration(req.LeaseTTLS)
-	status, tok, leaseSec, err := h.sessions.LockManager().Enqueue(
-		lock.SemPrefix+key, leaseTTL, s.ConnID, req.Limit)
-	h.renderEnqueueOutcome(w, r, s, key, lock.SemPrefix, status, tok, leaseSec, err)
+	h.serveEnqueueSem(w, r, key)
 }
 
-// POST /v1/semaphores/{key}/wait
 func (h *httpServer) handleWaitSem(w http.ResponseWriter, r *http.Request, key string) {
-	h.doWait(w, r, lock.SemPrefix+key)
+	h.serveWait(w, r, lock.SemPrefix+key)
 }
 
 // ---------------------------------------------------------------------------
-// Shared handler helpers
+// serve* — orchestrate per-endpoint flow
 // ---------------------------------------------------------------------------
 
-// sessionOrGone resolves the X-Dflockd-Session header to a Session,
-// writing a 410 if missing/unknown. Returns (session, ok).
-func (h *httpServer) sessionOrGone(w http.ResponseWriter, r *http.Request) (*Session, bool) {
-	id := r.Header.Get("X-Dflockd-Session")
-	if id == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "X-Dflockd-Session header required")
-		return nil, false
-	}
-	s, err := h.sessions.Lookup(id)
-	if err != nil {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return nil, false
-	}
-	return s, true
-}
-
-// leaseDuration picks the request's lease TTL or falls back to the
-// configured default.
-func (h *httpServer) leaseDuration(reqLease int) time.Duration {
-	if reqLease > 0 {
-		return time.Duration(reqLease) * time.Second
-	}
-	return h.cfg.DefaultLeaseTTL
-}
-
-// renderAcquireOutcome writes the response for a single-phase acquire,
-// handling the disconnect-cleanup race where lm.Acquire returns a token
-// but the client is already gone.
-func (h *httpServer) renderAcquireOutcome(w http.ResponseWriter, r *http.Request, s *Session, key, prefix, tok string, leaseTTL time.Duration, err error) {
-	if err != nil {
-		// Context cancellation = client disconnected. Don't bother
-		// writing a body the client can't read.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		writeLockErr(w, err)
-		return
-	}
-	if tok == "" {
-		// Acquire timeout fired (no error, no token).
-		writeJSON(w, http.StatusOK, opResponse{Status: "timeout"})
-		return
-	}
-	if r.Context().Err() != nil {
-		// Race: granted but client already disconnected. Release so
-		// the slot doesn't sit until lease expiry.
-		_ = h.sessions.LockManager().Release(prefix+key, tok)
-		return
-	}
-	writeJSON(w, http.StatusOK, opResponse{
-		Status:    "ok",
-		Token:     tok,
-		LeaseTTLS: int(leaseTTL.Seconds()),
-	})
-}
-
-// renderEnqueueOutcome writes the response for a two-phase enqueue.
-func (h *httpServer) renderEnqueueOutcome(w http.ResponseWriter, r *http.Request, s *Session, key, prefix, status, tok string, leaseSec int, err error) {
-	if err != nil {
-		writeLockErr(w, err)
-		return
-	}
-	if r.Context().Err() != nil {
-		// Client gone before we could respond. Clean up whichever
-		// state Enqueue produced.
-		switch status {
-		case "acquired":
-			_ = h.sessions.LockManager().Release(prefix+key, tok)
-		case "queued":
-			// Issue a zero-timeout Wait to dequeue the waiter. Wait
-			// can still return a token if the waiter was promoted to
-			// holder between Enqueue and now (fast path or grant
-			// drain on timeout) — capture and release it instead of
-			// stranding the slot until lease expiry.
-			cleanupTok, _, _ := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
-			if cleanupTok != "" {
-				_ = h.sessions.LockManager().Release(prefix+key, cleanupTok)
-			}
-		}
-		return
-	}
-	writeJSON(w, http.StatusOK, opResponse{
-		Status:    status,
-		Token:     tok,
-		LeaseTTLS: leaseSec,
-	})
-}
-
-// doRelease handles both lock and semaphore release.
-func (h *httpServer) doRelease(w http.ResponseWriter, r *http.Request, prefixedKey string) {
-	s, ok := h.sessionOrGone(w, r)
+func (h *httpServer) serveAcquireLock(w http.ResponseWriter, r *http.Request, key string) {
+	s, req, done, ok := preludeJSON(h, w, r, validateAcquire)
 	if !ok {
-		return
-	}
-	var req releaseRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.Token == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "token required")
-		return
-	}
-	if err := validateProtocolField("token", req.Token); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
 		return
 	}
 	defer done()
-	if h.sessions.LockManager().Release(prefixedKey, req.Token) {
+	h.runAcquire(w, r, s, key, lock.LockPrefix, 1, req.AcquireTimeoutS, req.LeaseTTLS)
+}
+
+func (h *httpServer) serveAcquireSem(w http.ResponseWriter, r *http.Request, key string) {
+	s, req, done, ok := preludeJSON(h, w, r, validateSemAcquire)
+	if !ok {
+		return
+	}
+	defer done()
+	h.runAcquire(w, r, s, key, lock.SemPrefix, req.Limit, req.AcquireTimeoutS, req.LeaseTTLS)
+}
+
+func (h *httpServer) serveEnqueueLock(w http.ResponseWriter, r *http.Request, key string) {
+	s, req, done, ok := preludeOptionalJSON(h, w, r, validateEnqueue)
+	if !ok {
+		return
+	}
+	defer done()
+	h.runEnqueue(w, r, s, key, lock.LockPrefix, 1, req.LeaseTTLS)
+}
+
+func (h *httpServer) serveEnqueueSem(w http.ResponseWriter, r *http.Request, key string) {
+	s, req, done, ok := preludeJSON(h, w, r, validateSemEnqueue)
+	if !ok {
+		return
+	}
+	defer done()
+	h.runEnqueue(w, r, s, key, lock.SemPrefix, req.Limit, req.LeaseTTLS)
+}
+
+func (h *httpServer) serveWait(w http.ResponseWriter, r *http.Request, prefixedKey string) {
+	s, req, done, ok := preludeJSON(h, w, r, validateWait)
+	if !ok {
+		return
+	}
+	defer done()
+	h.runWait(w, r, s, prefixedKey, req.TimeoutS)
+}
+
+func (h *httpServer) serveRelease(w http.ResponseWriter, r *http.Request, prefixedKey string) {
+	_, req, done, ok := preludeJSON(h, w, r, validateRelease)
+	if !ok {
+		return
+	}
+	defer done()
+	h.runRelease(w, prefixedKey, req.Token)
+}
+
+func (h *httpServer) serveRenew(w http.ResponseWriter, r *http.Request, prefixedKey string) {
+	_, req, done, ok := preludeJSON(h, w, r, validateRenew)
+	if !ok {
+		return
+	}
+	defer done()
+	h.runRenew(w, prefixedKey, req.Token, req.LeaseTTLS)
+}
+
+// ---------------------------------------------------------------------------
+// run* — call LockManager and render result
+// ---------------------------------------------------------------------------
+
+func (h *httpServer) runAcquire(w http.ResponseWriter, r *http.Request, s *Session, key, prefix string, limit, timeoutS, leaseS int) {
+	leaseTTL := h.leaseDuration(leaseS)
+	tok, err := h.sessions.LockManager().Acquire(
+		r.Context(), prefix+key, durSeconds(timeoutS), leaseTTL, s.ConnID, limit)
+	h.renderAcquireOutcome(w, r, key, prefix, tok, leaseTTL, err)
+}
+
+func (h *httpServer) runEnqueue(w http.ResponseWriter, r *http.Request, s *Session, key, prefix string, limit, leaseS int) {
+	leaseTTL := h.leaseDuration(leaseS)
+	status, tok, leaseSec, err := h.sessions.LockManager().Enqueue(prefix+key, leaseTTL, s.ConnID, limit)
+	h.renderEnqueueOutcome(w, r, s, key, prefix, status, tok, leaseSec, err)
+}
+
+func (h *httpServer) runWait(w http.ResponseWriter, r *http.Request, s *Session, prefixedKey string, timeoutS int) {
+	tok, leaseSec, err := h.sessions.LockManager().Wait(
+		r.Context(), prefixedKey, durSeconds(timeoutS), s.ConnID)
+	h.renderWaitOutcome(w, r, prefixedKey, tok, leaseSec, err)
+}
+
+func (h *httpServer) runRelease(w http.ResponseWriter, prefixedKey, token string) {
+	if h.sessions.LockManager().Release(prefixedKey, token) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	writeError(w, http.StatusNotFound, "not_held", "")
 }
 
-// doRenew handles both lock and semaphore renew.
-func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, prefixedKey string) {
-	s, ok := h.sessionOrGone(w, r)
-	if !ok {
-		return
-	}
-	var req renewRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.Token == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "token required")
-		return
-	}
-	if err := validateProtocolField("token", req.Token); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if !validateOptionalLeaseField(w, req.LeaseTTLS) {
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return
-	}
-	defer done()
-	leaseTTL := h.leaseDuration(req.LeaseTTLS)
-	remaining, ok := h.sessions.LockManager().Renew(prefixedKey, req.Token, leaseTTL)
+func (h *httpServer) runRenew(w http.ResponseWriter, prefixedKey, token string, leaseS int) {
+	leaseTTL := h.leaseDuration(leaseS)
+	remaining, ok := h.sessions.LockManager().Renew(prefixedKey, token, leaseTTL)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_held", "")
 		return
@@ -475,96 +323,245 @@ func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, prefixedKey
 	writeJSON(w, http.StatusOK, renewResponse{RemainingS: remaining})
 }
 
-// doWait handles both lock and semaphore wait.
-func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, prefixedKey string) {
-	s, ok := h.sessionOrGone(w, r)
-	if !ok {
-		return
-	}
-	var req waitRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if !validateSecondsField(w, "timeout_s", req.TimeoutS) {
-		return
-	}
-	done, ok := s.BeginRequest()
-	if !ok {
-		writeError(w, http.StatusGone, "session_gone", "")
-		return
-	}
-	defer done()
-	tok, leaseSec, err := h.sessions.LockManager().Wait(
-		r.Context(), prefixedKey, durSeconds(req.TimeoutS), s.ConnID)
+// ---------------------------------------------------------------------------
+// render* — split outcome paths
+// ---------------------------------------------------------------------------
+
+func (h *httpServer) renderAcquireOutcome(w http.ResponseWriter, r *http.Request, key, prefix, tok string, leaseTTL time.Duration, err error) {
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		writeLockErr(w, err)
+		renderLockErr(w, err)
 		return
 	}
 	if tok == "" {
-		writeJSON(w, http.StatusOK, opResponse{Status: "timeout"})
+		renderTimeout(w)
+		return
+	}
+	if r.Context().Err() != nil {
+		h.cleanupCanceledGrant(prefix, key, tok)
+		return
+	}
+	renderToken(w, "ok", tok, int(leaseTTL.Seconds()))
+}
+
+func (h *httpServer) renderEnqueueOutcome(w http.ResponseWriter, r *http.Request, s *Session, key, prefix, status, tok string, leaseSec int, err error) {
+	if err != nil {
+		writeLockErr(w, err)
+		return
+	}
+	if r.Context().Err() != nil {
+		h.cleanupCanceledEnqueue(s, prefix, key, status, tok)
+		return
+	}
+	renderToken(w, status, tok, leaseSec)
+}
+
+func (h *httpServer) renderWaitOutcome(w http.ResponseWriter, r *http.Request, prefixedKey, tok string, leaseSec int, err error) {
+	if err != nil {
+		renderLockErr(w, err)
+		return
+	}
+	if tok == "" {
+		renderTimeout(w)
 		return
 	}
 	if r.Context().Err() != nil {
 		_ = h.sessions.LockManager().Release(prefixedKey, tok)
 		return
 	}
-	writeJSON(w, http.StatusOK, opResponse{
-		Status:    "ok",
-		Token:     tok,
-		LeaseTTLS: leaseSec,
-	})
+	renderToken(w, "ok", tok, leaseSec)
+}
+
+// renderLockErr writes the appropriate response for a LockManager
+// error, swallowing context cancellation (client gone).
+func renderLockErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	writeLockErr(w, err)
+}
+
+func renderTimeout(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, opResponse{Status: "timeout"})
+}
+
+func renderToken(w http.ResponseWriter, status, tok string, leaseSec int) {
+	writeJSON(w, http.StatusOK, opResponse{Status: status, Token: tok, LeaseTTLS: leaseSec})
+}
+
+// cleanupCanceledGrant releases a token whose owner disconnected
+// before we could write the response.
+func (h *httpServer) cleanupCanceledGrant(prefix, key, tok string) {
+	_ = h.sessions.LockManager().Release(prefix+key, tok)
+}
+
+// cleanupCanceledEnqueue handles both the "acquired fast path" and the
+// "queued + then promoted" cleanup variants.
+func (h *httpServer) cleanupCanceledEnqueue(s *Session, prefix, key, status, tok string) {
+	switch status {
+	case "acquired":
+		_ = h.sessions.LockManager().Release(prefix+key, tok)
+	case "queued":
+		h.dequeueAfterPromote(s, prefix, key)
+	}
+}
+
+// dequeueAfterPromote issues a 0-timeout Wait. If the waiter was
+// promoted between Enqueue and now, Wait returns the granted token;
+// release it instead of stranding the slot.
+func (h *httpServer) dequeueAfterPromote(s *Session, prefix, key string) {
+	cleanupTok, _, _ := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
+	if cleanupTok != "" {
+		_ = h.sessions.LockManager().Release(prefix+key, cleanupTok)
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Decoding and validation
+// Prelude helpers — shared session/decode/validate/claim flow
 // ---------------------------------------------------------------------------
 
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	return decodeJSONBody(w, r, v, false)
+// preludeJSON reads + validates the JSON body, then claims the session.
+// On any failure it writes the response itself and returns ok=false.
+func preludeJSON[T any](h *httpServer, w http.ResponseWriter, r *http.Request, validate func(http.ResponseWriter, *T) bool) (*Session, T, func(), bool) {
+	return preludeBody(h, w, r, validate, false)
 }
 
-func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	return decodeJSONBody(w, r, v, true)
+// preludeOptionalJSON is preludeJSON but treats a missing body as {} —
+// used by enqueue, where the body is optional.
+func preludeOptionalJSON[T any](h *httpServer, w http.ResponseWriter, r *http.Request, validate func(http.ResponseWriter, *T) bool) (*Session, T, func(), bool) {
+	return preludeBody(h, w, r, validate, true)
 }
 
-// decodeJSONBody reads exactly one JSON value from r.Body. allowEmpty
-// permits a missing/empty body. Unknown fields are rejected to catch
-// caller typos at request time rather than via silent drops.
-func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) bool {
-	if r.Body == nil {
-		if allowEmpty {
-			return true
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "missing body")
+// preludeBody is the shared implementation. allowEmpty toggles whether
+// a missing body is OK. The flow is: session → body → validate → claim.
+func preludeBody[T any](h *httpServer, w http.ResponseWriter, r *http.Request, validate func(http.ResponseWriter, *T) bool, allowEmpty bool) (*Session, T, func(), bool) {
+	s, req, ok := readSessionAndBody[T](h, w, r, allowEmpty, validate)
+	if !ok {
+		var zero T
+		return nil, zero, nil, false
+	}
+	return finalizeClaim(w, s, req)
+}
+
+// readSessionAndBody resolves the session header, decodes the body,
+// and runs the validator. Returns ok=false if any step writes a
+// response.
+func readSessionAndBody[T any](h *httpServer, w http.ResponseWriter, r *http.Request, allowEmpty bool, validate func(http.ResponseWriter, *T) bool) (*Session, T, bool) {
+	var req T
+	s, ok := h.sessionOrGone(w, r)
+	if !ok {
+		return nil, req, false
+	}
+	if !decodeJSONBody(w, r, &req, allowEmpty) {
+		return nil, req, false
+	}
+	if validate != nil && !validate(w, &req) {
+		return nil, req, false
+	}
+	return s, req, true
+}
+
+// finalizeClaim is the BeginRequest step common to every prelude.
+func finalizeClaim[T any](w http.ResponseWriter, s *Session, req T) (*Session, T, func(), bool) {
+	done, ok := s.BeginRequest()
+	if !ok {
+		var zero T
+		writeError(w, http.StatusGone, "session_gone", "")
+		return nil, zero, nil, false
+	}
+	return s, req, done, true
+}
+
+// sessionOrGone resolves the X-Dflockd-Session header.
+func (h *httpServer) sessionOrGone(w http.ResponseWriter, r *http.Request) (*Session, bool) {
+	id := r.Header.Get("X-Dflockd-Session")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "X-Dflockd-Session header required")
+		return nil, false
+	}
+	return lookupOrGone(w, h.sessions, id)
+}
+
+func lookupOrGone(w http.ResponseWriter, ss *SessionStore, id string) (*Session, bool) {
+	s, err := ss.Lookup(id)
+	if err != nil {
+		writeError(w, http.StatusGone, "session_gone", "")
+		return nil, false
+	}
+	return s, true
+}
+
+func (h *httpServer) leaseDuration(reqLease int) time.Duration {
+	if reqLease > 0 {
+		return time.Duration(reqLease) * time.Second
+	}
+	return h.cfg.DefaultLeaseTTL
+}
+
+// ---------------------------------------------------------------------------
+// Per-request validators
+// ---------------------------------------------------------------------------
+
+func validateAcquire(w http.ResponseWriter, req *acquireRequest) bool {
+	return validateSecondsField(w, "acquire_timeout_s", req.AcquireTimeoutS) &&
+		validateOptionalLeaseField(w, req.LeaseTTLS)
+}
+
+func validateSemAcquire(w http.ResponseWriter, req *semAcquireRequest) bool {
+	if !validateSecondsField(w, "acquire_timeout_s", req.AcquireTimeoutS) {
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		if allowEmpty && errors.Is(err, io.EOF) {
-			return true
-		}
+	if !validatePositiveLimit(w, req.Limit) {
+		return false
+	}
+	return validateOptionalLeaseField(w, req.LeaseTTLS)
+}
+
+func validateEnqueue(w http.ResponseWriter, req *enqueueRequest) bool {
+	return validateOptionalLeaseField(w, req.LeaseTTLS)
+}
+
+func validateSemEnqueue(w http.ResponseWriter, req *semEnqueueRequest) bool {
+	if !validatePositiveLimit(w, req.Limit) {
+		return false
+	}
+	return validateOptionalLeaseField(w, req.LeaseTTLS)
+}
+
+func validateWait(w http.ResponseWriter, req *waitRequest) bool {
+	return validateSecondsField(w, "timeout_s", req.TimeoutS)
+}
+
+func validateRelease(w http.ResponseWriter, req *releaseRequest) bool {
+	return validateNonEmptyToken(w, req.Token)
+}
+
+func validateRenew(w http.ResponseWriter, req *renewRequest) bool {
+	if !validateNonEmptyToken(w, req.Token) {
+		return false
+	}
+	return validateOptionalLeaseField(w, req.LeaseTTLS)
+}
+
+func validatePositiveLimit(w http.ResponseWriter, limit int) bool {
+	if limit <= 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "limit must be > 0")
+		return false
+	}
+	return true
+}
+
+func validateNonEmptyToken(w http.ResponseWriter, token string) bool {
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "token required")
+		return false
+	}
+	if err := validateProtocolField("token", token); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return false
 	}
-	var extra any
-	if err := dec.Decode(&extra); err != nil {
-		if errors.Is(err, io.EOF) {
-			return true
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return false
-	}
-	writeError(w, http.StatusBadRequest, "bad_request", "body must contain a single JSON value")
-	return false
+	return true
 }
 
-// validateSecondsField rejects negative or overflow seconds values
-// before we hand them to the LockManager.
 func validateSecondsField(w http.ResponseWriter, name string, value int) bool {
 	if value < 0 {
 		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("%s must be >= 0", name))
@@ -577,16 +574,74 @@ func validateSecondsField(w http.ResponseWriter, name string, value int) bool {
 	return true
 }
 
-// validateOptionalLeaseField allows a missing (zero) lease, but if
-// provided it must be non-negative and within range. The 0-means-default
-// rule is documented in the request structs.
 func validateOptionalLeaseField(w http.ResponseWriter, value int) bool {
 	return validateSecondsField(w, "lease_ttl_s", value)
 }
 
-// validateRESTKey is the HTTP equivalent of protocol.validateKey. We
-// re-implement it here so a malformed key can short-circuit before any
-// LockManager call.
+// ---------------------------------------------------------------------------
+// JSON body decoding
+// ---------------------------------------------------------------------------
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeJSONBody(w, r, v, false)
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) bool {
+	if r.Body == nil {
+		return handleNoBody(w, allowEmpty)
+	}
+	return decodeAndCheckTrailing(w, r, v, allowEmpty)
+}
+
+func handleNoBody(w http.ResponseWriter, allowEmpty bool) bool {
+	if allowEmpty {
+		return true
+	}
+	writeError(w, http.StatusBadRequest, "bad_request", "missing body")
+	return false
+}
+
+func decodeAndCheckTrailing(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if !decodeOnce(w, dec, v, allowEmpty) {
+		return false
+	}
+	return checkSingleValue(w, dec)
+}
+
+// decodeOnce reads the first JSON value. allowEmpty silences EOF.
+func decodeOnce(w http.ResponseWriter, dec *json.Decoder, v any, allowEmpty bool) bool {
+	if err := dec.Decode(v); err != nil {
+		if allowEmpty && errors.Is(err, io.EOF) {
+			return true
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return false
+	}
+	return true
+}
+
+// checkSingleValue rejects bodies that contain a second JSON value.
+func checkSingleValue(w http.ResponseWriter, dec *json.Decoder) bool {
+	var extra any
+	err := dec.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return false
+	}
+	writeError(w, http.StatusBadRequest, "bad_request", "body must contain a single JSON value")
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// REST-key-and-token validators
+// ---------------------------------------------------------------------------
+
 func validateRESTKey(k string) error {
 	if k == "" {
 		return fmt.Errorf("empty key")
@@ -600,8 +655,6 @@ func validateRESTKey(k string) error {
 	return nil
 }
 
-// validateProtocolField is the same validation applied to non-key
-// argument fields (tokens etc.).
 func validateProtocolField(name, value string) error {
 	if len(value) > protocol.MaxLineBytes {
 		return fmt.Errorf("%s too long (max %d bytes)", name, protocol.MaxLineBytes)

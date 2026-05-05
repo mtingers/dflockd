@@ -57,53 +57,59 @@ func (lm *LockManager) Stats(connections int64) *Stats {
 }
 
 func (s *Stats) appendResource(key string, st *ResourceState, now time.Time) {
-	nw := st.waiterCount()
 	if st.Limit == 1 {
-		switch {
-		case len(st.Holders) > 0:
-			var ownerConn uint64
-			var expires float64
-			for _, h := range st.Holders {
-				ownerConn = h.connID
-				expires = h.leaseExpires.Sub(now).Seconds()
-				if expires < 0 {
-					expires = 0
-				}
-			}
-			s.Locks = append(s.Locks, LockInfo{
-				Key:             key,
-				OwnerConnID:     ownerConn,
-				LeaseExpiresInS: expires,
-				Waiters:         nw,
-			})
-		case nw > 0:
-			s.Locks = append(s.Locks, LockInfo{Key: key, Waiters: nw})
-		default:
-			s.IdleLocks = append(s.IdleLocks, IdleInfo{
-				Key:   key,
-				IdleS: now.Sub(st.LastActivity).Seconds(),
-			})
-		}
+		s.appendLockOrIdle(key, st, now)
 		return
 	}
+	s.appendSemOrIdle(key, st, now)
+}
+
+// appendLockOrIdle classifies a Limit==1 resource into Locks/IdleLocks.
+func (s *Stats) appendLockOrIdle(key string, st *ResourceState, now time.Time) {
+	nw := st.waiterCount()
 	switch {
 	case len(st.Holders) > 0:
-		s.Semaphores = append(s.Semaphores, SemInfo{
-			Key:     key,
-			Limit:   st.Limit,
-			Holders: len(st.Holders),
-			Waiters: nw,
-		})
+		s.Locks = append(s.Locks, lockInfoFromHolders(key, st, now, nw))
 	case nw > 0:
-		s.Semaphores = append(s.Semaphores, SemInfo{
-			Key:     key,
-			Limit:   st.Limit,
-			Waiters: nw,
-		})
+		s.Locks = append(s.Locks, LockInfo{Key: key, Waiters: nw})
 	default:
-		s.IdleSemaphores = append(s.IdleSemaphores, IdleInfo{
-			Key:   key,
-			IdleS: now.Sub(st.LastActivity).Seconds(),
-		})
+		s.IdleLocks = append(s.IdleLocks, idleInfo(key, st, now))
 	}
+}
+
+// appendSemOrIdle is appendLockOrIdle for Limit>1 resources.
+func (s *Stats) appendSemOrIdle(key string, st *ResourceState, now time.Time) {
+	nw := st.waiterCount()
+	switch {
+	case len(st.Holders) > 0:
+		s.Semaphores = append(s.Semaphores, SemInfo{Key: key, Limit: st.Limit, Holders: len(st.Holders), Waiters: nw})
+	case nw > 0:
+		s.Semaphores = append(s.Semaphores, SemInfo{Key: key, Limit: st.Limit, Waiters: nw})
+	default:
+		s.IdleSemaphores = append(s.IdleSemaphores, idleInfo(key, st, now))
+	}
+}
+
+// lockInfoFromHolders builds the LockInfo for a held lock. Locks are
+// Limit==1 so there's exactly one holder; the for-range visits it once.
+func lockInfoFromHolders(key string, st *ResourceState, now time.Time, waiters int) LockInfo {
+	var owner uint64
+	var expires float64
+	for _, h := range st.Holders {
+		owner = h.connID
+		expires = secondsUntil(h.leaseExpires, now)
+	}
+	return LockInfo{Key: key, OwnerConnID: owner, LeaseExpiresInS: expires, Waiters: waiters}
+}
+
+func secondsUntil(deadline, now time.Time) float64 {
+	s := deadline.Sub(now).Seconds()
+	if s < 0 {
+		return 0
+	}
+	return s
+}
+
+func idleInfo(key string, st *ResourceState, now time.Time) IdleInfo {
+	return IdleInfo{Key: key, IdleS: now.Sub(st.LastActivity).Seconds()}
 }

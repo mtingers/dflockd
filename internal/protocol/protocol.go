@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -139,54 +140,93 @@ type Ack struct {
 // timeout sets the per-read deadline on conn.  defaultLeaseTTL is applied
 // when a command's lease argument is omitted.
 func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultLeaseTTL time.Duration) (*Request, error) {
+	frame, err := readRequestFrame(r, timeout, conn)
+	if err != nil {
+		return nil, err
+	}
+	return parseRequest(frame.cmd, frame.key, frame.arg, defaultLeaseTTL)
+}
+
+type requestFrame struct {
+	cmd, key, arg string
+}
+
+func readRequestFrame(r *bufio.Reader, timeout time.Duration, conn net.Conn) (requestFrame, error) {
 	cmd, err := readLine(r, timeout, conn, MaxLineBytes)
 	if err != nil {
-		return nil, err
+		return requestFrame{}, err
 	}
+	return readFrameAfterCmd(r, timeout, conn, cmd)
+}
+
+func readFrameAfterCmd(r *bufio.Reader, timeout time.Duration, conn net.Conn, cmd string) (requestFrame, error) {
 	key, err := readLine(r, timeout, conn, MaxLineBytes)
 	if err != nil {
-		return nil, err
+		return requestFrame{}, err
 	}
-	argMax := MaxLineBytes
-	if cmd == CmdAuth {
-		argMax = MaxAuthTokenBytes
-	}
-	arg, err := readLine(r, timeout, conn, argMax)
+	return readFrameArg(r, timeout, conn, cmd, key)
+}
+
+func readFrameArg(r *bufio.Reader, timeout time.Duration, conn net.Conn, cmd, key string) (requestFrame, error) {
+	arg, err := readLine(r, timeout, conn, argMaxBytes(cmd))
 	if err != nil {
-		return nil, err
+		return requestFrame{}, err
 	}
-	return parseRequest(cmd, key, arg, defaultLeaseTTL)
+	return requestFrame{cmd: cmd, key: key, arg: arg}, nil
+}
+
+func argMaxBytes(cmd string) int {
+	if cmd == CmdAuth {
+		return MaxAuthTokenBytes
+	}
+	return MaxLineBytes
 }
 
 // parseRequest dispatches to the per-command parser. Pure function for
 // easy testing without a network connection.
 func parseRequest(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, error) {
-	switch cmd {
-	case CmdPing:
-		return &Request{Cmd: cmd}, nil
-	case CmdStats:
-		return &Request{Cmd: cmd}, nil
-	case CmdAuth:
-		return &Request{Cmd: cmd, AuthToken: strings.TrimSpace(arg)}, nil
+	parser, ok := requestParsers[cmd]
+	if !ok {
+		return nil, invalidCmdErr(cmd)
 	}
+	return parser(cmd, key, arg, defaultLeaseTTL)
+}
 
+type requestParser func(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, error)
+
+var requestParsers = map[string]requestParser{
+	CmdPing: parseNoKeyCommand, CmdStats: parseNoKeyCommand,
+	CmdAuth:    parseAuthCommand,
+	CmdAcquire: parseKeyedCommand(parseAcquire), CmdSemAcquire: parseKeyedCommand(parseAcquire),
+	CmdRelease: parseKeyedCommand(parseReleaseCommand), CmdSemRelease: parseKeyedCommand(parseReleaseCommand),
+	CmdRenew: parseKeyedCommand(parseRenew), CmdSemRenew: parseKeyedCommand(parseRenew),
+	CmdEnqueue: parseKeyedCommand(parseEnqueue), CmdSemEnqueue: parseKeyedCommand(parseEnqueue),
+	CmdWait: parseKeyedCommand(parseWaitCommand), CmdSemWait: parseKeyedCommand(parseWaitCommand),
+}
+
+func parseNoKeyCommand(cmd, _, _ string, _ time.Duration) (*Request, error) {
+	return &Request{Cmd: cmd}, nil
+}
+
+func parseAuthCommand(cmd, _, arg string, _ time.Duration) (*Request, error) {
+	return &Request{Cmd: cmd, AuthToken: strings.TrimSpace(arg)}, nil
+}
+
+func parseKeyedCommand(parser requestParser) requestParser {
+	return func(cmd, key, arg string, ttl time.Duration) (*Request, error) {
+		return parseValidatedKeyCommand(parser, cmd, key, arg, ttl)
+	}
+}
+
+func parseValidatedKeyCommand(parser requestParser, cmd, key, arg string, ttl time.Duration) (*Request, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
+	return parser(cmd, key, arg, ttl)
+}
 
-	switch cmd {
-	case CmdAcquire, CmdSemAcquire:
-		return parseAcquire(cmd, key, arg, defaultLeaseTTL)
-	case CmdRelease, CmdSemRelease:
-		return parseRelease(cmd, key, arg)
-	case CmdRenew, CmdSemRenew:
-		return parseRenew(cmd, key, arg, defaultLeaseTTL)
-	case CmdEnqueue, CmdSemEnqueue:
-		return parseEnqueue(cmd, key, arg, defaultLeaseTTL)
-	case CmdWait, CmdSemWait:
-		return parseWait(cmd, key, arg)
-	}
-	return nil, &ProtocolError{Code: ErrCodeInvalidCmd, Message: fmt.Sprintf("invalid cmd %q", cmd)}
+func invalidCmdErr(cmd string) error {
+	return &ProtocolError{Code: ErrCodeInvalidCmd, Message: fmt.Sprintf("invalid cmd %q", cmd)}
 }
 
 // parseAcquire parses "l" / "sl" arguments:
@@ -195,39 +235,100 @@ func parseRequest(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request
 //	sl arg: <timeout> <limit> [<lease_ttl>]
 func parseAcquire(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, error) {
 	parts := strings.Fields(arg)
-	isSem := cmd == CmdSemAcquire
+	if err := requireArgCount(parts, acquireShape(cmd)); err != nil {
+		return nil, err
+	}
+	return buildAcquire(cmd, key, parts, defaultLeaseTTL)
+}
 
-	want := []int{1, 2}
-	if isSem {
-		want = []int{2, 3}
+type argShape struct {
+	counts []int
+	msg    string
+}
+
+var (
+	lockAcquireShape = argShape{[]int{1, 2}, "lock arg must be: <timeout> [<lease_ttl>]"}
+	semAcquireShape  = argShape{[]int{2, 3}, "sl arg must be: <timeout> <limit> [<lease_ttl>]"}
+	renewShape       = argShape{[]int{1, 2}, "renew arg must be: <token> [<lease_ttl>]"}
+	lockEnqueueShape = argShape{[]int{0, 1}, "e arg must be: [<lease_ttl>]"}
+	semEnqueueShape  = argShape{[]int{1, 2}, "se arg must be: <limit> [<lease_ttl>]"}
+)
+
+func acquireShape(cmd string) argShape {
+	if cmd == CmdSemAcquire {
+		return semAcquireShape
 	}
-	if !containsInt(want, len(parts)) {
-		if isSem {
-			return nil, argErr("sl arg must be: <timeout> <limit> [<lease_ttl>]")
-		}
-		return nil, argErr("lock arg must be: <timeout> [<lease_ttl>]")
+	return lockAcquireShape
+}
+
+func requireArgCount(parts []string, shape argShape) error {
+	if slices.Contains(shape.counts, len(parts)) {
+		return nil
 	}
-	timeoutDur, err := parseSeconds(parts[0], "timeout", 0, ErrCodeInvalidTimeout)
+	return argErr(shape.msg)
+}
+
+func buildAcquire(cmd, key string, parts []string, defaultLeaseTTL time.Duration) (*Request, error) {
+	req, err := baseAcquire(cmd, key, parts[0], defaultLeaseTTL)
 	if err != nil {
 		return nil, err
 	}
-	req := &Request{Cmd: cmd, Key: key, AcquireTimeout: timeoutDur, LeaseTTL: defaultLeaseTTL}
-	idx := 1
-	if isSem {
-		limit, err := parseLimit(parts[1])
-		if err != nil {
-			return nil, err
-		}
-		req.Limit = limit
-		idx = 2
+	return finishAcquire(req, parts)
+}
+
+func baseAcquire(cmd, key, timeout string, defaultLeaseTTL time.Duration) (*Request, error) {
+	timeoutDur, err := parseTimeout(timeout)
+	if err != nil {
+		return nil, err
 	}
-	if len(parts) > idx {
-		lease, err := parseSeconds(parts[idx], "lease_ttl", 1, ErrCodeInvalidLease)
-		if err != nil {
-			return nil, err
-		}
-		req.LeaseTTL = lease
+	return &Request{Cmd: cmd, Key: key, AcquireTimeout: timeoutDur, LeaseTTL: defaultLeaseTTL}, nil
+}
+
+func finishAcquire(req *Request, parts []string) (*Request, error) {
+	idx, err := applyAcquireLimit(req, parts)
+	if err != nil {
+		return nil, err
 	}
+	return applyOptionalLease(req, parts, idx)
+}
+
+func applyAcquireLimit(req *Request, parts []string) (int, error) {
+	if req.Cmd != CmdSemAcquire {
+		return 1, nil
+	}
+	return applySemLimit(req, parts[1], 2)
+}
+
+func applySemLimit(req *Request, raw string, next int) (int, error) {
+	limit, err := parseLimit(raw)
+	return applyParsedSemLimit(req, limit, err, next)
+}
+
+func applyParsedSemLimit(req *Request, limit int, err error, next int) (int, error) {
+	if err != nil {
+		return 0, err
+	}
+	req.Limit = limit
+	return next, nil
+}
+
+func applyOptionalLease(req *Request, parts []string, idx int) (*Request, error) {
+	if len(parts) <= idx {
+		return req, nil
+	}
+	return applyLease(req, parts[idx])
+}
+
+func applyLease(req *Request, raw string) (*Request, error) {
+	lease, err := parseLease(raw)
+	return applyParsedLease(req, lease, err)
+}
+
+func applyParsedLease(req *Request, lease time.Duration, err error) (*Request, error) {
+	if err != nil {
+		return nil, err
+	}
+	req.LeaseTTL = lease
 	return req, nil
 }
 
@@ -235,30 +336,30 @@ func parseAcquire(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request
 func parseRelease(cmd, key, arg string) (*Request, error) {
 	token := strings.TrimSpace(arg)
 	if token == "" {
-		return nil, &ProtocolError{Code: ErrCodeEmptyToken, Message: "empty token"}
+		return nil, emptyTokenErr()
 	}
 	return &Request{Cmd: cmd, Key: key, Token: token}, nil
+}
+
+func parseReleaseCommand(cmd, key, arg string, _ time.Duration) (*Request, error) {
+	return parseRelease(cmd, key, arg)
 }
 
 // parseRenew parses "n" / "sn" arguments: <token> [<lease_ttl>]
 func parseRenew(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, error) {
 	parts := strings.Fields(arg)
-	if len(parts) != 1 && len(parts) != 2 {
-		return nil, argErr("renew arg must be: <token> [<lease_ttl>]")
+	if err := requireArgCount(parts, renewShape); err != nil {
+		return nil, err
 	}
-	token := strings.TrimSpace(parts[0])
-	if token == "" {
-		return nil, &ProtocolError{Code: ErrCodeEmptyToken, Message: "empty token"}
+	return buildRenew(cmd, key, parts, defaultLeaseTTL)
+}
+
+func buildRenew(cmd, key string, parts []string, defaultLeaseTTL time.Duration) (*Request, error) {
+	req := &Request{Cmd: cmd, Key: key, Token: strings.TrimSpace(parts[0]), LeaseTTL: defaultLeaseTTL}
+	if req.Token == "" {
+		return nil, emptyTokenErr()
 	}
-	leaseTTL := defaultLeaseTTL
-	if len(parts) == 2 {
-		var err error
-		leaseTTL, err = parseSeconds(parts[1], "lease_ttl", 1, ErrCodeInvalidLease)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &Request{Cmd: cmd, Key: key, Token: token, LeaseTTL: leaseTTL}, nil
+	return applyOptionalLease(req, parts, 1)
 }
 
 // parseEnqueue parses "e" / "se" arguments:
@@ -267,37 +368,37 @@ func parseRenew(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, 
 //	se arg: <limit> [<lease_ttl>]
 func parseEnqueue(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, error) {
 	parts := strings.Fields(arg)
-	isSem := cmd == CmdSemEnqueue
-	if isSem {
-		if len(parts) != 1 && len(parts) != 2 {
-			return nil, argErr("se arg must be: <limit> [<lease_ttl>]")
-		}
-	} else {
-		// e accepts at most one field. Reject extras so a typo like
-		// "30 junk" doesn't silently parse the lease and drop the rest.
-		if len(parts) > 1 {
-			return nil, argErr("e arg must be: [<lease_ttl>]")
-		}
+	if err := requireArgCount(parts, enqueueShape(cmd)); err != nil {
+		return nil, err
 	}
+	return buildEnqueue(cmd, key, parts, defaultLeaseTTL)
+}
 
+func enqueueShape(cmd string) argShape {
+	if cmd == CmdSemEnqueue {
+		return semEnqueueShape
+	}
+	return lockEnqueueShape
+}
+
+func buildEnqueue(cmd, key string, parts []string, defaultLeaseTTL time.Duration) (*Request, error) {
 	req := &Request{Cmd: cmd, Key: key, LeaseTTL: defaultLeaseTTL}
-	idx := 0
-	if isSem {
-		limit, err := parseLimit(parts[0])
-		if err != nil {
-			return nil, err
-		}
-		req.Limit = limit
-		idx = 1
+	idx, err := applyEnqueueLimit(req, parts)
+	return finishEnqueue(req, parts, idx, err)
+}
+
+func finishEnqueue(req *Request, parts []string, idx int, err error) (*Request, error) {
+	if err != nil {
+		return nil, err
 	}
-	if len(parts) > idx {
-		lease, err := parseSeconds(parts[idx], "lease_ttl", 1, ErrCodeInvalidLease)
-		if err != nil {
-			return nil, err
-		}
-		req.LeaseTTL = lease
+	return applyOptionalLease(req, parts, idx)
+}
+
+func applyEnqueueLimit(req *Request, parts []string) (int, error) {
+	if req.Cmd != CmdSemEnqueue {
+		return 0, nil
 	}
-	return req, nil
+	return applySemLimit(req, parts[0], 1)
 }
 
 // parseWait parses "w" / "sw" arguments: <timeout>
@@ -306,7 +407,15 @@ func parseWait(cmd, key, arg string) (*Request, error) {
 	if stripped == "" {
 		return nil, argErr("wait arg must be: <timeout>")
 	}
-	timeoutDur, err := parseSeconds(stripped, "timeout", 0, ErrCodeInvalidTimeout)
+	return buildWait(cmd, key, stripped)
+}
+
+func parseWaitCommand(cmd, key, arg string, _ time.Duration) (*Request, error) {
+	return parseWait(cmd, key, arg)
+}
+
+func buildWait(cmd, key, timeout string) (*Request, error) {
+	timeoutDur, err := parseTimeout(timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -316,34 +425,30 @@ func parseWait(cmd, key, arg string) (*Request, error) {
 // FormatResponse encodes ack into the wire format. Returns a fresh byte
 // slice the caller may write directly.
 func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
-	switch ack.Status {
-	case StatusOK, StatusAcquired:
+	if responseMayCarryPayload(ack.Status) {
 		return formatGrantOrPlain(ack, defaultLeaseTTLSec)
-	case StatusQueued:
-		return respQueued
-	case StatusTimeout:
-		return respTimeout
-	case StatusError:
-		return respError
-	case StatusErrorAuth:
-		return respErrorAuth
-	case StatusErrorMaxLocks:
-		return respErrorMaxLocks
-	case StatusErrorMaxWaiters:
-		return respErrorMaxWaiters
-	case StatusErrorLimitMismatch:
-		return respErrorLimitMismatch
-	case StatusErrorNotEnqueued:
-		return respErrorNotEnqueued
-	case StatusErrorAlreadyEnqueued:
-		return respErrorAlreadyEnqueued
-	case StatusErrorLeaseExpired:
-		return respErrorLeaseExpired
-	case StatusErrorDraining:
-		return respErrorDraining
 	}
-	// Fallback for any custom status the caller injects (e.g. tests).
-	return []byte(ack.Status + "\n")
+	return formatPlainStatus(ack.Status)
+}
+
+func responseMayCarryPayload(status string) bool {
+	return status == StatusOK || status == StatusAcquired
+}
+
+func formatPlainStatus(status string) []byte {
+	if resp, ok := plainResponses[status]; ok {
+		return resp
+	}
+	return []byte(status + "\n")
+}
+
+var plainResponses = map[string][]byte{
+	StatusQueued: respQueued, StatusTimeout: respTimeout,
+	StatusError: respError, StatusErrorAuth: respErrorAuth,
+	StatusErrorMaxLocks: respErrorMaxLocks, StatusErrorMaxWaiters: respErrorMaxWaiters,
+	StatusErrorLimitMismatch: respErrorLimitMismatch, StatusErrorNotEnqueued: respErrorNotEnqueued,
+	StatusErrorAlreadyEnqueued: respErrorAlreadyEnqueued, StatusErrorLeaseExpired: respErrorLeaseExpired,
+	StatusErrorDraining: respErrorDraining,
 }
 
 // formatGrantOrPlain handles the two flavours of "ok" / "acquired":
@@ -352,34 +457,62 @@ func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
 //	<status> <extra>\n           when ack.Extra != ""
 //	<status>\n                   otherwise
 func formatGrantOrPlain(ack *Ack, defaultLeaseTTLSec int) []byte {
-	prefix := prefixOK
-	if ack.Status == StatusAcquired {
-		prefix = prefixAcquired
-	}
 	if ack.Token != "" {
-		lease := ack.LeaseTTL
-		if lease == 0 {
-			lease = defaultLeaseTTLSec
-		}
-		buf := make([]byte, 0, len(prefix)+len(ack.Token)+12)
-		buf = append(buf, prefix...)
-		buf = append(buf, ack.Token...)
-		buf = append(buf, ' ')
-		buf = strconv.AppendInt(buf, int64(lease), 10)
-		buf = append(buf, '\n')
-		return buf
+		return formatGrant(ack, defaultLeaseTTLSec)
 	}
+	return formatGrantWithoutToken(ack)
+}
+
+func formatGrantWithoutToken(ack *Ack) []byte {
 	if ack.Extra != "" {
-		buf := make([]byte, 0, len(prefix)+len(ack.Extra)+1)
-		buf = append(buf, prefix...)
-		buf = append(buf, ack.Extra...)
-		buf = append(buf, '\n')
-		return buf
+		return formatExtra(ack)
 	}
-	if ack.Status == StatusOK {
+	return plainGrantStatus(ack.Status)
+}
+
+func formatGrant(ack *Ack, defaultLeaseTTLSec int) []byte {
+	lease := responseLease(ack.LeaseTTL, defaultLeaseTTLSec)
+	buf := make([]byte, 0, len(statusPrefix(ack.Status))+len(ack.Token)+12)
+	return appendGrant(buf, ack, lease)
+}
+
+func appendGrant(buf []byte, ack *Ack, lease int) []byte {
+	buf = append(buf, statusPrefix(ack.Status)...)
+	buf = append(buf, ack.Token...)
+	buf = append(buf, ' ')
+	return appendLine(strconv.AppendInt(buf, int64(lease), 10))
+}
+
+func responseLease(lease, defaultLease int) int {
+	if lease == 0 {
+		return defaultLease
+	}
+	return lease
+}
+
+func formatExtra(ack *Ack) []byte {
+	buf := make([]byte, 0, len(statusPrefix(ack.Status))+len(ack.Extra)+1)
+	buf = append(buf, statusPrefix(ack.Status)...)
+	buf = append(buf, ack.Extra...)
+	return appendLine(buf)
+}
+
+func plainGrantStatus(status string) []byte {
+	if status == StatusOK {
 		return respOK
 	}
-	return []byte(ack.Status + "\n")
+	return []byte(status + "\n")
+}
+
+func statusPrefix(status string) []byte {
+	if status == StatusAcquired {
+		return prefixAcquired
+	}
+	return prefixOK
+}
+
+func appendLine(buf []byte) []byte {
+	return append(buf, '\n')
 }
 
 // readLine reads one newline-terminated line from r, enforcing max as the
@@ -389,60 +522,155 @@ func formatGrantOrPlain(ack *Ack, defaultLeaseTTLSec int) []byte {
 // backing array in that case so the common request triple causes zero
 // heap allocation.
 func readLine(r *bufio.Reader, timeout time.Duration, conn net.Conn, max int) (string, error) {
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return "", &ProtocolError{Code: ErrCodeReadTimeout, Message: "failed to set deadline"}
+	if err := setReadDeadline(conn, timeout); err != nil {
+		return "", err
 	}
-
 	var stackBuf [MaxLineBytes]byte
-	var buf []byte
-	if max <= MaxLineBytes {
-		buf = stackBuf[:0]
-	} else {
-		buf = make([]byte, 0, 256)
-	}
+	return readLineWithBuffer(r, lineBuffer(max, stackBuf[:0]), max)
+}
 
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				return "", &ProtocolError{Code: ErrCodeReadTimeout, Message: "read timeout"}
-			}
-			return "", &ProtocolError{Code: ErrCodeDisconnect, Message: "client disconnected"}
-		}
-		if b == '\n' {
-			break
-		}
-		if len(buf) >= max {
-			drainLine(r)
-			return "", &ProtocolError{Code: ErrCodeLineTooLong, Message: "line too long"}
-		}
-		buf = append(buf, b)
+func setReadDeadline(conn net.Conn, timeout time.Duration) error {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return readDeadlineErr()
 	}
-	return strings.TrimRight(string(buf), "\r"), nil
+	return nil
+}
+
+func lineBuffer(max int, stack []byte) []byte {
+	if max <= MaxLineBytes {
+		return stack
+	}
+	return make([]byte, 0, 256)
+}
+
+func readLineWithBuffer(r *bufio.Reader, buf []byte, max int) (string, error) {
+	lr := &lineReader{r: r, buf: buf, max: max}
+	return lr.read()
+}
+
+type lineReader struct {
+	r    *bufio.Reader
+	buf  []byte
+	max  int
+	step lineStep
+}
+
+func (lr *lineReader) read() (string, error) {
+	for {
+		if !lr.advance() {
+			return finishReadLine(lr.step)
+		}
+	}
+}
+
+func (lr *lineReader) advance() bool {
+	lr.step = readLineStep(lr.r, lr.buf, lr.max)
+	return lr.keepReading()
+}
+
+func (lr *lineReader) keepReading() bool {
+	if lr.step.done || lr.step.err != nil {
+		return false
+	}
+	lr.buf = lr.step.buf
+	return true
+}
+
+type lineStep struct {
+	done bool
+	buf  []byte
+	err  error
+}
+
+func readLineStep(r *bufio.Reader, buf []byte, max int) lineStep {
+	b, err := r.ReadByte()
+	if err != nil {
+		return failedLine(buf, readByteErr(err))
+	}
+	return readLineByte(r, b, buf, max)
+}
+
+func readLineByte(r *bufio.Reader, b byte, buf []byte, max int) lineStep {
+	if b == '\n' {
+		return completedLine(buf)
+	}
+	return readPayloadByte(r, b, buf, max)
+}
+
+func readPayloadByte(r *bufio.Reader, b byte, buf []byte, max int) lineStep {
+	if len(buf) >= max {
+		return failedLine(buf, lineTooLongAfterDrain(r))
+	}
+	return pendingLine(append(buf, b))
+}
+
+func finishReadLine(step lineStep) (string, error) {
+	if step.err != nil {
+		return "", step.err
+	}
+	return cleanLine(step.buf), nil
+}
+
+func completedLine(buf []byte) lineStep {
+	return lineStep{done: true, buf: buf}
+}
+
+func pendingLine(buf []byte) lineStep {
+	return lineStep{buf: buf}
+}
+
+func failedLine(buf []byte, err error) lineStep {
+	return lineStep{buf: buf, err: err}
+}
+
+func cleanLine(buf []byte) string {
+	return strings.TrimRight(string(buf), "\r")
+}
+
+func readByteErr(err error) error {
+	if isTimeoutErr(err) {
+		return readTimeoutErr()
+	}
+	return disconnectErr()
+}
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func lineTooLongAfterDrain(r *bufio.Reader) error {
+	drainLine(r)
+	return lineTooLongErr()
 }
 
 // drainLine consumes the rest of an oversized line so subsequent reads
 // remain framed.
 func drainLine(r *bufio.Reader) {
 	for {
-		c, err := r.ReadByte()
-		if err != nil || c == '\n' {
+		if drainLineDone(r) {
 			return
 		}
 	}
+}
+
+func drainLineDone(r *bufio.Reader) bool {
+	c, err := r.ReadByte()
+	return err != nil || c == '\n'
 }
 
 // validateKey rejects keys that are empty or contain whitespace. Whitespace
 // would desynchronise the line-oriented framing on the receiver.
 func validateKey(key string) error {
 	if key == "" {
-		return &ProtocolError{Code: ErrCodeInvalidKey, Message: "empty key"}
+		return invalidKeyErr("empty key")
 	}
-	for _, c := range key {
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			return &ProtocolError{Code: ErrCodeInvalidKey, Message: "key contains whitespace"}
-		}
+	return validateNonEmptyKey(key)
+}
+
+func validateNonEmptyKey(key string) error {
+	if strings.ContainsAny(key, " \t\n\r") {
+		return invalidKeyErr("key contains whitespace")
 	}
 	return nil
 }
@@ -451,43 +679,124 @@ func validateKey(key string) error {
 // rejecting overflow and out-of-range values. minSec sets the inclusive
 // lower bound (0 for timeouts, 1 for lease).
 func parseSeconds(s, what string, minSec, code int) (time.Duration, error) {
-	n, err := strconv.ParseInt(s, 10, 64)
+	n, err := parseSecondsInt(s, what)
+	return secondsDuration(n, err, what, minSec, code)
+}
+
+func secondsDuration(n int64, err error, what string, minSec, code int) (time.Duration, error) {
 	if err != nil {
-		return 0, &ProtocolError{Code: ErrCodeInvalidInt, Message: fmt.Sprintf("invalid %s: %q", what, s)}
+		return 0, err
 	}
-	if n < int64(minSec) {
-		if minSec == 0 {
-			return 0, &ProtocolError{Code: code, Message: fmt.Sprintf("%s must be >= 0", what)}
-		}
-		return 0, &ProtocolError{Code: code, Message: fmt.Sprintf("%s must be > 0", what)}
-	}
-	if n > maxSecondsValue {
-		return 0, &ProtocolError{Code: code, Message: fmt.Sprintf("%s too large (max %d)", what, maxSecondsValue)}
+	return checkedSecondsDuration(n, what, minSec, code)
+}
+
+func checkedSecondsDuration(n int64, what string, minSec, code int) (time.Duration, error) {
+	if err := validateSeconds(n, what, minSec, code); err != nil {
+		return 0, err
 	}
 	return time.Duration(n) * time.Second, nil
 }
 
+func parseTimeout(s string) (time.Duration, error) {
+	return parseSeconds(s, "timeout", 0, ErrCodeInvalidTimeout)
+}
+
+func parseLease(s string) (time.Duration, error) {
+	return parseSeconds(s, "lease_ttl", 1, ErrCodeInvalidLease)
+}
+
+func parseSecondsInt(s, what string) (int64, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, invalidIntErr(what, s)
+	}
+	return n, nil
+}
+
+func validateSeconds(n int64, what string, minSec, code int) error {
+	if err := validateSecondsMin(n, what, minSec, code); err != nil {
+		return err
+	}
+	return validateSecondsMax(n, what, code)
+}
+
+func validateSecondsMin(n int64, what string, minSec, code int) error {
+	if n < int64(minSec) {
+		return secondsMinErr(what, minSec, code)
+	}
+	return nil
+}
+
+func secondsMinErr(what string, minSec, code int) error {
+	if minSec == 0 {
+		return protocolErr(code, fmt.Sprintf("%s must be >= 0", what))
+	}
+	return protocolErr(code, fmt.Sprintf("%s must be > 0", what))
+}
+
+func validateSecondsMax(n int64, what string, code int) error {
+	if n > maxSecondsValue {
+		return protocolErr(code, fmt.Sprintf("%s too large (max %d)", what, maxSecondsValue))
+	}
+	return nil
+}
+
 // parseLimit parses a positive semaphore limit.
 func parseLimit(s string) (int, error) {
+	n, err := parseLimitInt(s)
+	if err != nil {
+		return 0, err
+	}
+	return validateLimit(n)
+}
+
+func parseLimitInt(s string) (int, error) {
 	n, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, &ProtocolError{Code: ErrCodeInvalidInt, Message: fmt.Sprintf("invalid limit: %q", s)}
+		return 0, invalidIntErr("limit", s)
 	}
+	return n, nil
+}
+
+func validateLimit(n int) (int, error) {
 	if n <= 0 {
-		return 0, &ProtocolError{Code: ErrCodeInvalidLimit, Message: "limit must be > 0"}
+		return 0, protocolErr(ErrCodeInvalidLimit, "limit must be > 0")
 	}
 	return n, nil
 }
 
 func argErr(msg string) error {
-	return &ProtocolError{Code: ErrCodeInvalidArg, Message: msg}
+	return protocolErr(ErrCodeInvalidArg, msg)
 }
 
-func containsInt(xs []int, v int) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
-		}
-	}
-	return false
+func emptyTokenErr() error {
+	return protocolErr(ErrCodeEmptyToken, "empty token")
+}
+
+func invalidKeyErr(msg string) error {
+	return protocolErr(ErrCodeInvalidKey, msg)
+}
+
+func invalidIntErr(what, raw string) error {
+	return protocolErr(ErrCodeInvalidInt, fmt.Sprintf("invalid %s: %q", what, raw))
+}
+
+func readDeadlineErr() error {
+	return protocolErr(ErrCodeReadTimeout, "failed to set deadline")
+}
+
+func readTimeoutErr() error {
+	return protocolErr(ErrCodeReadTimeout, "read timeout")
+}
+
+func disconnectErr() error {
+	return protocolErr(ErrCodeDisconnect, "client disconnected")
+}
+
+func lineTooLongErr() error {
+	return protocolErr(ErrCodeLineTooLong, "line too long")
+}
+
+func protocolErr(code int, msg string) error {
+	return &ProtocolError{Code: code, Message: msg}
 }

@@ -23,138 +23,150 @@ import (
 // URL plus a stop function.
 func startHTTP(t *testing.T, mods ...func(*config.Config)) (string, func()) {
 	t.Helper()
+	rt := newHTTPTestRuntime(t, mods...)
+	rt.start()
+	rt.waitReady(t)
+	return rt.base, rt.stop(t)
+}
+
+type httpTestRuntime struct {
+	cfg               *config.Config
+	log               *slog.Logger
+	srv               *server.Server
+	tcpL, httpL       net.Listener
+	ctx               context.Context
+	cancel            context.CancelFunc
+	tcpDone, httpDone chan struct{}
+	base              string
+	stopOnce          sync.Once
+}
+
+func newHTTPTestRuntime(t *testing.T, mods ...func(*config.Config)) *httpTestRuntime {
+	cfg := testHTTPConfig(mods...)
+	tcpL, httpL := testHTTPListeners(t, cfg)
+	log := discardLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	return &httpTestRuntime{cfg: cfg, log: log, srv: testTCPServer(cfg, log), tcpL: tcpL, httpL: httpL, ctx: ctx, cancel: cancel, tcpDone: make(chan struct{}), httpDone: make(chan struct{}), base: httpBase(cfg)}
+}
+
+func testHTTPConfig(mods ...func(*config.Config)) *config.Config {
 	cfg := defaultTestConfig()
 	for _, fn := range mods {
 		fn(cfg)
 	}
+	return cfg
+}
 
-	// TCP listener (server.NextConnID needs a Server even though no
-	// TCP test traffic is generated).
-	tcpL, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+func testHTTPListeners(t *testing.T, cfg *config.Config) (net.Listener, net.Listener) {
+	tcpL := mustListenLocal(t)
+	httpL := mustListenLocal(t)
 	cfg.Port = tcpL.Addr().(*net.TCPAddr).Port
-
-	// HTTP listener.
-	httpL, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg.HTTPPort = httpL.Addr().(*net.TCPAddr).Port
 	cfg.HTTPHost = "127.0.0.1"
+	return tcpL, httpL
+}
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	lm := lock.NewLockManager(cfg, log)
-	srv := server.New(lm, cfg, log)
+func mustListenLocal(t *testing.T) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	tcpDone := make(chan struct{})
-	httpDone := make(chan struct{})
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
-	go func() {
-		_ = srv.RunOnListener(ctx, tcpL)
-		close(tcpDone)
-	}()
-	go func() {
-		_ = runHTTPOnListener(ctx, srv, cfg, log, httpL)
-		close(httpDone)
-	}()
+func testTCPServer(cfg *config.Config, log *slog.Logger) *server.Server {
+	return server.New(lock.NewLockManager(cfg, log), cfg, log)
+}
 
-	base := fmt.Sprintf("http://127.0.0.1:%d", cfg.HTTPPort)
+func httpBase(cfg *config.Config) string {
+	return fmt.Sprintf("http://127.0.0.1:%d", cfg.HTTPPort)
+}
 
-	// Wait for the HTTP server to be ready.
+func (rt *httpTestRuntime) start() {
+	go rt.runTCP()
+	go rt.runHTTP()
+}
+
+func (rt *httpTestRuntime) runTCP() {
+	_ = rt.srv.RunOnListener(rt.ctx, rt.tcpL)
+	close(rt.tcpDone)
+}
+
+func (rt *httpTestRuntime) runHTTP() {
+	_ = runHTTPOnListener(rt.ctx, rt.srv, rt.cfg, rt.log, rt.httpL)
+	close(rt.httpDone)
+}
+
+func (rt *httpTestRuntime) waitReady(t *testing.T) {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(base + "/health")
-		if err == nil {
-			resp.Body.Close()
-			break
+		if healthReady(rt.base) {
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
 
-	stopOnce := sync.Once{}
-	return base, func() {
-		stopOnce.Do(func() {
-			cancel()
-			select {
-			case <-tcpDone:
-			case <-time.After(5 * time.Second):
-				t.Error("tcp didn't stop")
-			}
-			select {
-			case <-httpDone:
-			case <-time.After(5 * time.Second):
-				t.Error("http didn't stop")
-			}
-		})
+func healthReady(base string) bool {
+	resp, err := http.Get(base + "/health")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
+}
+
+func (rt *httpTestRuntime) stop(t *testing.T) func() {
+	return func() {
+		rt.stopOnce.Do(func() { rt.stopNow(t) })
+	}
+}
+
+func (rt *httpTestRuntime) stopNow(t *testing.T) {
+	rt.cancel()
+	waitStopped(t, "tcp", rt.tcpDone)
+	waitStopped(t, "http", rt.httpDone)
+}
+
+func waitStopped(t *testing.T, name string, done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Errorf("%s didn't stop", name)
 	}
 }
 
 // runHTTPOnListener mirrors Run but takes a pre-listening listener so
 // tests can pick a random port.
 func runHTTPOnListener(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger, listener net.Listener) error {
-	sessions := NewSessionStore(ctx, srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, cfg.HTTPMaxSessionsPerIP)
-	hs := &httpServer{
-		sessions: sessions,
-		cfg:      cfg,
-		log:      log,
-		metrics:  newMetricsRegistry(),
-		limiter:  newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
-	}
+	hs, startShutdown := buildHTTPServer(ctx, srv, cfg, log)
 	defer hs.limiter.Stop()
-
-	mux := http.NewServeMux()
-	hs.registerRoutes(mux)
-	connLimiter := newHTTPConnLimiter(cfg.HTTPMaxConnectionsPerIP)
-	hs.srv = &http.Server{
-		Handler:           hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux))))),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ConnState:         connLimiter.ConnState,
-	}
-	hs.srv.RegisterOnShutdown(func() { go sessions.Shutdown() })
-
-	serveErr := make(chan error, 1)
-	go func() {
-		err := hs.srv.Serve(listener)
-		if err != nil && err != http.ErrServerClosed {
-			serveErr <- err
-			return
-		}
-		serveErr <- nil
-	}()
-
-	select {
-	case <-ctx.Done():
-		hs.draining.Store(true)
-		go sessions.Shutdown()
-		shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = hs.srv.Shutdown(shCtx)
-		<-serveErr
-		return nil
-	case err := <-serveErr:
-		go sessions.Shutdown()
-		return err
-	}
+	return hs.serveUntilDone(ctx, listener, startShutdown, 2*time.Second)
 }
 
 func defaultTestConfig() *config.Config {
-	return &config.Config{
-		Host:                    "127.0.0.1",
-		MaxLocks:                1024,
-		DefaultLeaseTTL:         33 * time.Second,
-		LeaseSweepInterval:      time.Second,
-		GCInterval:              time.Second,
-		GCMaxIdleTime:           time.Minute,
-		ReadTimeout:             5 * time.Second,
-		WriteTimeout:            time.Second,
-		ShutdownTimeout:         time.Second,
-		AutoReleaseOnDisconnect: true,
-		HTTPSessionIdleTimeout:  5 * time.Second,
-	}
+	cfg := defaultHTTPConfigValue
+	return &cfg
+}
+
+var defaultHTTPConfigValue = config.Config{
+	Host:                    "127.0.0.1",
+	MaxLocks:                1024,
+	DefaultLeaseTTL:         33 * time.Second,
+	LeaseSweepInterval:      time.Second,
+	GCInterval:              time.Second,
+	GCMaxIdleTime:           time.Minute,
+	ReadTimeout:             5 * time.Second,
+	WriteTimeout:            time.Second,
+	ShutdownTimeout:         time.Second,
+	AutoReleaseOnDisconnect: true,
+	HTTPSessionIdleTimeout:  5 * time.Second,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,77 +184,65 @@ func newClient(t *testing.T, base string) *httpClient {
 	return &httpClient{t: t, base: base}
 }
 
+func startedClient(t *testing.T, base string) *httpClient {
+	c := newClient(t, base)
+	c.startSession()
+	return c
+}
+
 // postRaw sends an arbitrary byte body. Used to exercise malformed
 // bodies (the JSON-encoder path in post would refuse to encode them).
 func (c *httpClient) postRaw(path string, body []byte) *http.Response {
-	c.t.Helper()
-	req, err := http.NewRequest("POST", c.base+path, bytes.NewReader(body))
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.session != "" {
-		req.Header.Set("X-Dflockd-Session", c.session)
-	}
-	if c.auth != "" {
-		req.Header.Set("Authorization", "Bearer "+c.auth)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	return resp
+	return c.do(c.jsonRequest("POST", path, bytes.NewReader(body)))
 }
 
 func (c *httpClient) post(path string, body any) *http.Response {
-	c.t.Helper()
+	return c.do(c.jsonRequest("POST", path, encodedBody(c.t, body)))
+}
+
+func (c *httpClient) get(path string) *http.Response {
+	return c.do(c.request("GET", path, nil))
+}
+
+func (c *httpClient) delete(path string) *http.Response {
+	return c.do(c.request("DELETE", path, nil))
+}
+
+func encodedBody(t *testing.T, body any) *bytes.Buffer {
+	t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
-	req, err := http.NewRequest("POST", c.base+path, &buf)
+	return &buf
+}
+
+func (c *httpClient) jsonRequest(method, path string, body io.Reader) *http.Request {
+	req := c.request(method, path, body)
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func (c *httpClient) request(method, path string, body io.Reader) *http.Request {
+	c.t.Helper()
+	req, err := http.NewRequest(method, c.base+path, body)
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	c.addHeaders(req)
+	return req
+}
+
+func (c *httpClient) addHeaders(req *http.Request) {
 	if c.session != "" {
 		req.Header.Set("X-Dflockd-Session", c.session)
 	}
 	if c.auth != "" {
 		req.Header.Set("Authorization", "Bearer "+c.auth)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	return resp
 }
 
-func (c *httpClient) get(path string) *http.Response {
-	c.t.Helper()
-	req, err := http.NewRequest("GET", c.base+path, nil)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	if c.auth != "" {
-		req.Header.Set("Authorization", "Bearer "+c.auth)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	return resp
-}
-
-func (c *httpClient) delete(path string) *http.Response {
-	c.t.Helper()
-	req, err := http.NewRequest("DELETE", c.base+path, nil)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	if c.auth != "" {
-		req.Header.Set("Authorization", "Bearer "+c.auth)
-	}
+func (c *httpClient) do(req *http.Request) *http.Response {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		c.t.Fatal(err)
@@ -269,6 +269,170 @@ func (c *httpClient) startSession() {
 	var v createSessionResponse
 	decode(c.t, resp, &v)
 	c.session = v.SessionID
+}
+
+func (c *httpClient) acquireLock(key string, req acquireRequest) opResponse {
+	return c.lockOp("/v1/locks/"+key, req)
+}
+
+func (c *httpClient) enqueueLock(key string, req enqueueRequest) opResponse {
+	return c.lockOp("/v1/locks/"+key+"/enqueue", req)
+}
+
+func (c *httpClient) waitLock(key string, req waitRequest) opResponse {
+	return c.lockOp("/v1/locks/"+key+"/wait", req)
+}
+
+func (c *httpClient) lockOp(path string, body any) opResponse {
+	resp := c.post(path, body)
+	var v opResponse
+	decode(c.t, resp, &v)
+	return v
+}
+
+func (c *httpClient) releaseLock(key, token string) *http.Response {
+	return c.post("/v1/locks/"+key+"/release", releaseRequest{Token: token})
+}
+
+func (c *httpClient) waitLockAsync(key string, timeoutS int) <-chan opResponse {
+	done := make(chan opResponse, 1)
+	go func() { done <- c.waitLock(key, waitRequest{TimeoutS: timeoutS}) }()
+	return done
+}
+
+func (c *httpClient) waitLockStatusAsync(key string, timeoutS int) <-chan int {
+	done := make(chan int, 1)
+	go func() { done <- statusCode(c.post("/v1/locks/"+key+"/wait", waitRequest{TimeoutS: timeoutS})) }()
+	return done
+}
+
+func (c *httpClient) deleteSessionStatusAsync() <-chan int {
+	done := make(chan int, 1)
+	go func() { done <- statusCode(c.delete("/v1/sessions/" + c.session)) }()
+	return done
+}
+
+func statusCode(resp *http.Response) int {
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+func requireOpStatus(t *testing.T, v opResponse, status string) {
+	t.Helper()
+	if v.Status != status {
+		t.Fatalf("got %+v, want status %q", v, status)
+	}
+}
+
+func requireTokenStatus(t *testing.T, v opResponse, status string) {
+	t.Helper()
+	if v.Status != status || v.Token == "" {
+		t.Fatalf("got %+v, want %s with token", v, status)
+	}
+}
+
+func waitOp(t *testing.T, done <-chan opResponse, timeout time.Duration, msg string) opResponse {
+	t.Helper()
+	select {
+	case v := <-done:
+		return v
+	case <-time.After(timeout):
+		t.Fatal(msg)
+		return opResponse{}
+	}
+}
+
+func waitStatus(t *testing.T, done <-chan int, timeout time.Duration, msg string) int {
+	t.Helper()
+	select {
+	case status := <-done:
+		return status
+	case <-time.After(timeout):
+		t.Fatal(msg)
+		return 0
+	}
+}
+
+func setupQueuedLock(t *testing.T, base, key string) (*httpClient, *httpClient, opResponse) {
+	holder := startedClient(t, base)
+	hv := holder.acquireLock(key, acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
+	queuer := startedClient(t, base)
+	requireOpStatus(t, queuer.enqueueLock(key, enqueueRequest{LeaseTTLS: 30}), "queued")
+	return holder, queuer, hv
+}
+
+func postMalformedReleases(t *testing.T, c *httpClient, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		postMalformedRelease(t, c)
+	}
+}
+
+func postMalformedRelease(t *testing.T, c *httpClient) {
+	t.Helper()
+	resp := c.postRaw("/v1/locks/k/release", []byte("{not json"))
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		failHTTPStatus(t, resp, "malformed release")
+	}
+}
+
+func failHTTPStatus(t *testing.T, resp *http.Response, label string) {
+	body, _ := io.ReadAll(resp.Body)
+	t.Fatalf("%s returned %d: %s", label, resp.StatusCode, body)
+}
+
+func waitForAcquireOK(t *testing.T, c *httpClient, key string, timeout time.Duration) opResponse {
+	t.Helper()
+	return waitForAcquireStatus(t, c, key, "ok", timeout)
+}
+
+func waitForAcquireStatus(t *testing.T, c *httpClient, key, status string, timeout time.Duration) opResponse {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if v, ok := tryAcquireStatus(c, key, status); ok {
+			return v
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("lock %q never reached status %q", key, status)
+	return opResponse{}
+}
+
+func tryAcquireStatus(c *httpClient, key, status string) (opResponse, bool) {
+	v := c.acquireLock(key, acquireRequest{AcquireTimeoutS: 0})
+	return v, v.Status == status
+}
+
+type waitOutcomeCounts struct {
+	grants, timeouts, other int
+}
+
+func startWaiters(c *httpClient, key string, n, timeoutS int) <-chan opResponse {
+	results := make(chan opResponse, n)
+	for i := 0; i < n; i++ {
+		go func() { results <- c.waitLock(key, waitRequest{TimeoutS: timeoutS}) }()
+	}
+	return results
+}
+
+func collectWaitOutcomes(t *testing.T, results <-chan opResponse, n int) waitOutcomeCounts {
+	var counts waitOutcomeCounts
+	for i := 0; i < n; i++ {
+		counts.add(waitOp(t, results, 5*time.Second, "wait never returned"))
+	}
+	return counts
+}
+
+func (c *waitOutcomeCounts) add(v opResponse) {
+	switch v.Status {
+	case "ok":
+		c.grants++
+	case "timeout":
+		c.timeouts++
+	default:
+		c.other++
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -419,39 +583,11 @@ func TestHTTP_EnqueueWait(t *testing.T) {
 	base, stop := startHTTP(t)
 	defer stop()
 
-	holder := newClient(t, base)
-	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
-	var hv opResponse
-	decode(t, resp, &hv)
-
-	queuer := newClient(t, base)
-	queuer.startSession()
-	resp = queuer.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
-	var qv opResponse
-	decode(t, resp, &qv)
-	if qv.Status != "queued" {
-		t.Fatalf("got %q, want queued", qv.Status)
-	}
-
-	done := make(chan opResponse, 1)
-	go func() {
-		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 5})
-		var v opResponse
-		decode(t, resp, &v)
-		done <- v
-	}()
+	holder, queuer, hv := setupQueuedLock(t, base, "k")
+	done := queuer.waitLockAsync("k", 5)
 	time.Sleep(50 * time.Millisecond)
-	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
-
-	select {
-	case v := <-done:
-		if v.Status != "ok" || v.Token == "" {
-			t.Fatalf("wait: %+v", v)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("wait never returned")
-	}
+	holder.releaseLock("k", hv.Token).Body.Close()
+	requireTokenStatus(t, waitOp(t, done, 2*time.Second, "wait never returned"), "ok")
 }
 
 // ---------------------------------------------------------------------------
@@ -569,15 +705,10 @@ func TestHTTP_DeleteSessionReleasesHeldLocks(t *testing.T) {
 
 	holder := newClient(t, base)
 	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
-	var v opResponse
-	decode(t, resp, &v)
-	if v.Status != "ok" || v.Token == "" {
-		t.Fatalf("holder acquire: %+v", v)
-	}
+	requireTokenStatus(t, holder.acquireLock("k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30}), "ok")
 
 	// Holder vanishes without releasing.
-	resp = holder.delete("/v1/sessions/" + holder.session)
+	resp := holder.delete("/v1/sessions/" + holder.session)
 	if resp.StatusCode != 204 {
 		t.Fatalf("delete: %d", resp.StatusCode)
 	}
@@ -585,13 +716,8 @@ func TestHTTP_DeleteSessionReleasesHeldLocks(t *testing.T) {
 
 	// Another caller should now succeed within a short timeout (proving
 	// the slot was freed, not waiting for lease expiry).
-	other := newClient(t, base)
-	other.startSession()
-	resp = other.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1})
-	decode(t, resp, &v)
-	if v.Status != "ok" || v.Token == "" {
-		t.Fatalf("post-delete acquire: %+v", v)
-	}
+	v := startedClient(t, base).acquireLock("k", acquireRequest{AcquireTimeoutS: 1})
+	requireTokenStatus(t, v, "ok")
 }
 
 // TestSession_BeginRequestAfterClose asserts the closed-flag check
@@ -631,62 +757,22 @@ func TestHTTP_DeleteWhileHandlerHoldsLock_Drains(t *testing.T) {
 	base, stop := startHTTP(t)
 	defer stop()
 
-	holder := newClient(t, base)
-	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
-	var hv opResponse
-	decode(t, resp, &hv)
-
-	queuer := newClient(t, base)
-	queuer.startSession()
-	resp = queuer.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
-	var qv opResponse
-	decode(t, resp, &qv)
-	if qv.Status != "queued" {
-		t.Fatalf("expected queued, got %+v", qv)
-	}
-
-	// Long-poll wait in flight on queuer.
-	waitDone := make(chan int, 1)
-	go func() {
-		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 5})
-		waitDone <- resp.StatusCode
-	}()
+	holder, queuer, hv := setupQueuedLock(t, base, "k")
+	waitDone := queuer.waitLockStatusAsync("k", 5)
 	time.Sleep(50 * time.Millisecond)
-
-	// DELETE should not return until /wait has unblocked.
-	deleteDone := make(chan int, 1)
-	go func() {
-		resp := queuer.delete("/v1/sessions/" + queuer.session)
-		deleteDone <- resp.StatusCode
-	}()
+	deleteDone := queuer.deleteSessionStatusAsync()
 
 	// Holder release frees the wait — both responses arrive afterwards.
-	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
-
-	select {
-	case <-waitDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("wait never returned")
-	}
-	select {
-	case <-deleteDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("delete never returned")
-	}
+	holder.releaseLock("k", hv.Token).Body.Close()
+	waitStatus(t, waitDone, 3*time.Second, "wait never returned")
+	waitStatus(t, deleteDone, 3*time.Second, "delete never returned")
 
 	// Whatever happened to queuer's grant, the lock must be free for
 	// the next caller. If Delete had run CleanupConnection while the
 	// wait handler was still inside lm.Wait, the wait handler could
 	// mint a token tied to queuer.ConnID after CleanupConnection.
-	other := newClient(t, base)
-	other.startSession()
-	resp = other.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1})
-	var ov opResponse
-	decode(t, resp, &ov)
-	if ov.Status != "ok" {
-		t.Fatalf("post-delete-race acquire: %+v — leaked token tied to deleted session?", ov)
-	}
+	ov := startedClient(t, base).acquireLock("k", acquireRequest{AcquireTimeoutS: 1})
+	requireOpStatus(t, ov, "ok")
 }
 
 // TestHTTP_BadJsonDoesNotKeepSessionAlive asserts BeginRequest is
@@ -701,42 +787,18 @@ func TestHTTP_BadJsonDoesNotKeepSessionAlive(t *testing.T) {
 
 	holder := newClient(t, base)
 	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 60})
-	var hv opResponse
-	decode(t, resp, &hv)
-	if hv.Token == "" {
-		t.Fatal("setup acquire failed")
-	}
+	requireTokenStatus(t, holder.acquireLock("k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 60}), "ok")
 
 	// Send garbage body. If BeginRequest were entered before parsing,
 	// the malformed parse would still bump inFlight briefly — but the
 	// real bug is the slowloris case. We exercise that the 400 path
 	// fires from a code position where inFlight stayed 0, by checking
 	// that the immediately-following idle sweep can still reap.
-	for i := 0; i < 5; i++ {
-		resp := holder.postRaw("/v1/locks/k/release", []byte("{not json"))
-		if resp.StatusCode != 400 {
-			body, _ := io.ReadAll(resp.Body)
-			t.Fatalf("malformed release returned %d: %s", resp.StatusCode, body)
-		}
-		resp.Body.Close()
-	}
+	postMalformedReleases(t, holder, 5)
 
 	// Wait past 2× idleTimeout and confirm the holder's session was
 	// reaped (lock released).
-	deadline := time.Now().Add(2 * time.Second)
-	other := newClient(t, base)
-	other.startSession()
-	for time.Now().Before(deadline) {
-		resp := other.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 0})
-		var v opResponse
-		decode(t, resp, &v)
-		if v.Status == "ok" {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("idle sweep didn't reap holder after malformed POSTs — body parse held inFlight?")
+	waitForAcquireOK(t, startedClient(t, base), "k", 2*time.Second)
 }
 
 // TestHTTP_LongWaitNotIdleSwept asserts that an in-flight /wait
@@ -750,43 +812,16 @@ func TestHTTP_LongWaitNotIdleSwept(t *testing.T) {
 	})
 	defer stop()
 
-	holder := newClient(t, base)
-	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
-	var hv opResponse
-	decode(t, resp, &hv)
-
-	queuer := newClient(t, base)
-	queuer.startSession()
-	resp = queuer.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
-	var qv opResponse
-	decode(t, resp, &qv)
-	if qv.Status != "queued" {
-		t.Fatalf("expected queued, got %+v", qv)
-	}
+	holder, queuer, hv := setupQueuedLock(t, base, "k")
 
 	// Block on /wait far longer than 2× idle timeout. The sweeper
 	// must skip this session because BeginRequest holds inFlight > 0.
-	done := make(chan opResponse, 1)
-	go func() {
-		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 2})
-		var v opResponse
-		decode(t, resp, &v)
-		done <- v
-	}()
+	done := queuer.waitLockAsync("k", 2)
 
 	// Sleep way past 2× idle timeout, then satisfy the wait.
 	time.Sleep(500 * time.Millisecond)
-	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
-
-	select {
-	case v := <-done:
-		if v.Status != "ok" || v.Token == "" {
-			t.Fatalf("long /wait got %+v — sweeper killed it?", v)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("wait never returned")
-	}
+	holder.releaseLock("k", hv.Token).Body.Close()
+	requireTokenStatus(t, waitOp(t, done, 3*time.Second, "wait never returned"), "ok")
 }
 
 // TestHTTP_PerSessionSerialization asserts that two concurrent lock
@@ -796,65 +831,21 @@ func TestHTTP_PerSessionSerialization(t *testing.T) {
 	base, stop := startHTTP(t)
 	defer stop()
 
-	c := newClient(t, base)
-	c.startSession()
-
 	// First request blocks: enqueue then wait on a contended key.
-	holder := newClient(t, base)
-	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 30})
-	var hv opResponse
-	decode(t, resp, &hv)
-
-	resp = c.post("/v1/locks/k/enqueue", enqueueRequest{LeaseTTLS: 30})
-	var qv opResponse
-	decode(t, resp, &qv)
-	if qv.Status != "queued" {
-		t.Fatalf("expected queued, got %+v", qv)
-	}
+	holder, c, hv := setupQueuedLock(t, base, "k")
 
 	// Two concurrent /wait calls on the same session+key. Without
 	// per-session serialization, both can park on the same waiter
 	// channel and race. With it, the second blocks behind the first.
-	type result struct {
-		idx int
-		v   opResponse
-	}
-	results := make(chan result, 2)
-	for i := 0; i < 2; i++ {
-		i := i
-		go func() {
-			resp := c.post("/v1/locks/k/wait", waitRequest{TimeoutS: 2})
-			var v opResponse
-			decode(t, resp, &v)
-			results <- result{i, v}
-		}()
-	}
+	results := startWaiters(c, "k", 2, 2)
 
 	// Release the holder; only one /wait should claim the grant.
 	time.Sleep(50 * time.Millisecond)
-	holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
+	holder.releaseLock("k", hv.Token).Body.Close()
 
-	var grants, notQueued, timeouts int
-	for i := 0; i < 2; i++ {
-		select {
-		case r := <-results:
-			switch r.v.Status {
-			case "ok":
-				grants++
-			case "timeout":
-				timeouts++
-			default:
-				// "not_enqueued" via the conflict mapping is also a
-				// valid second-call outcome under serialization.
-				notQueued++
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("call %d never returned", i)
-		}
-	}
-	if grants != 1 {
-		t.Errorf("got %d grants, want 1 (serialization broken)", grants)
+	counts := collectWaitOutcomes(t, results, 2)
+	if counts.grants != 1 {
+		t.Errorf("got %d grants, want 1 (serialization broken)", counts.grants)
 	}
 }
 
@@ -868,14 +859,8 @@ func TestHTTP_IdleSweepReleasesHeldLocks(t *testing.T) {
 	})
 	defer stop()
 
-	holder := newClient(t, base)
-	holder.startSession()
-	resp := holder.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 60})
-	var v opResponse
-	decode(t, resp, &v)
-	if v.Status != "ok" {
-		t.Fatalf("holder: %+v", v)
-	}
+	holder := startedClient(t, base)
+	requireOpStatus(t, holder.acquireLock("k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 60}), "ok")
 
 	// Wait past 2× idle timeout, then trigger the sweep manually so the
 	// test doesn't depend on the background ticker firing.
@@ -885,18 +870,7 @@ func TestHTTP_IdleSweepReleasesHeldLocks(t *testing.T) {
 	// the sweeper indirectly: we drive the sweep through a small race
 	// by making the next request, which doesn't touch the holder's
 	// session. Wait for the periodic sweeper instead.
-	deadline := time.Now().Add(2 * time.Second)
-	other := newClient(t, base)
-	other.startSession()
-	for time.Now().Before(deadline) {
-		resp = other.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 0})
-		decode(t, resp, &v)
-		if v.Status == "ok" {
-			return // success: holder's lock was reaped
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("idle sweeper never released the orphaned lock; last status %q", v.Status)
+	waitForAcquireOK(t, startedClient(t, base), "k", 2*time.Second)
 }
 
 func TestRoutes_NotEmpty(t *testing.T) {

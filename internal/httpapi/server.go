@@ -42,37 +42,59 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 	if cfg.HTTPPort == 0 {
 		return nil
 	}
-	host := cfg.HTTPHost
-	if host == "" {
-		host = cfg.Host
+	listener, err := buildHTTPListener(cfg, log)
+	if err != nil {
+		return err
 	}
-	addr := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPPort))
+	hs, startShutdown := buildHTTPServer(ctx, srv, cfg, log)
+	defer hs.limiter.Stop()
+	log.Info("http listening", "addr", listener.Addr())
+	return hs.serveUntilDone(ctx, listener, startShutdown, cfg.ShutdownTimeout)
+}
 
+// buildHTTPListener resolves the bind address and wraps the listener
+// in TLS when configured.
+func buildHTTPListener(cfg *config.Config, log *slog.Logger) (net.Listener, error) {
+	addr := net.JoinHostPort(httpHostFor(cfg), strconv.Itoa(cfg.HTTPPort))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("http listen: %w", err)
+		return nil, fmt.Errorf("http listen: %w", err)
 	}
-	if cfg.TLSCert != "" && cfg.TLSKey != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
-		if err != nil {
-			listener.Close()
-			return fmt.Errorf("http tls: %w", err)
-		}
-		listener = tls.NewListener(listener, &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		})
-		log.Info("http TLS enabled")
-	}
+	return wrapTLSIfConfigured(listener, cfg, log)
+}
 
+func httpHostFor(cfg *config.Config) string {
+	if cfg.HTTPHost != "" {
+		return cfg.HTTPHost
+	}
+	return cfg.Host
+}
+
+func wrapTLSIfConfigured(listener net.Listener, cfg *config.Config, log *slog.Logger) (net.Listener, error) {
+	if cfg.TLSCert == "" || cfg.TLSKey == "" {
+		return listener, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("http tls: %w", err)
+	}
+	log.Info("http TLS enabled")
+	return tls.NewListener(listener, tlsConfig(cert)), nil
+}
+
+func tlsConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
+// buildHTTPServer wires the SessionStore, middleware chain, and
+// http.Server together. Returns the server plus a once-only
+// session-shutdown trigger.
+func buildHTTPServer(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger) (*httpServer, func()) {
 	sessions := NewSessionStore(ctx, srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, cfg.HTTPMaxSessionsPerIP)
-	var sessionsShutdownOnce sync.Once
-	startSessionsShutdown := func() {
-		sessionsShutdownOnce.Do(func() {
-			go sessions.Shutdown()
-		})
-	}
-
 	hs := &httpServer{
 		sessions: sessions,
 		cfg:      cfg,
@@ -80,52 +102,69 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 		metrics:  newMetricsRegistry(),
 		limiter:  newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
 	}
-	defer hs.limiter.Stop()
+	hs.srv = newStdHTTPServer(hs, cfg)
+	startShutdown := newOnceShutdown(sessions)
+	hs.srv.RegisterOnShutdown(startShutdown)
+	return hs, startShutdown
+}
 
+// newStdHTTPServer constructs the *http.Server with our middleware
+// chain and ConnState hook installed.
+func newStdHTTPServer(hs *httpServer, cfg *config.Config) *http.Server {
 	mux := http.NewServeMux()
 	hs.registerRoutes(mux)
 	connLimiter := newHTTPConnLimiter(cfg.HTTPMaxConnectionsPerIP)
-
-	hs.srv = &http.Server{
-		Handler: hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux))))),
-		// ReadTimeout/WriteTimeout left at 0 (unlimited) so long-poll
-		// waits aren't cut off; ReadHeaderTimeout still protects
-		// against slowloris.
+	return &http.Server{
+		Handler:           hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux))))),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ConnState:         connLimiter.ConnState,
 	}
-	hs.srv.RegisterOnShutdown(startSessionsShutdown)
+}
 
-	log.Info("http listening", "addr", addr)
+// newOnceShutdown returns a function that triggers session shutdown
+// at most once.
+func newOnceShutdown(sessions *SessionStore) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() { go sessions.Shutdown() })
+	}
+}
 
+// serveUntilDone runs the http.Server.Serve loop and blocks until ctx
+// is cancelled or Serve returns. On context cancellation it triggers
+// graceful shutdown bounded by shutdownTimeout.
+func (hs *httpServer) serveUntilDone(ctx context.Context, listener net.Listener, startShutdown func(), shutdownTimeout time.Duration) error {
 	serveErr := make(chan error, 1)
-	go func() {
-		err := hs.srv.Serve(listener)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr <- err
-			return
-		}
-		serveErr <- nil
-	}()
-
+	go func() { serveErr <- runServe(hs.srv, listener) }()
 	select {
 	case <-ctx.Done():
 		hs.draining.Store(true)
-		startSessionsShutdown()
-		shutdownTimeout := cfg.ShutdownTimeout
-		if shutdownTimeout <= 0 {
-			shutdownTimeout = 30 * time.Second
-		}
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = hs.srv.Shutdown(shutdownCtx)
+		hs.gracefulShutdown(startShutdown, shutdownTimeout)
 		<-serveErr
 		return nil
 	case err := <-serveErr:
-		startSessionsShutdown()
+		startShutdown()
 		return err
 	}
+}
+
+// runServe wraps Serve so http.ErrServerClosed becomes a nil return.
+func runServe(srv *http.Server, listener net.Listener) error {
+	if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func (hs *httpServer) gracefulShutdown(startShutdown func(), timeout time.Duration) {
+	startShutdown()
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = hs.srv.Shutdown(shutdownCtx)
 }
 
 // jsonRouteErrors wraps mux to ensure every 404/405 produces a JSON

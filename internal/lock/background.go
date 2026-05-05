@@ -5,92 +5,124 @@ import (
 	"time"
 )
 
-// LeaseExpiryLoop runs the periodic lease-expiry sweep. Runs until ctx
-// is cancelled.
+// LeaseExpiryLoop runs the periodic lease-expiry sweep until ctx is
+// cancelled.
 func (lm *LockManager) LeaseExpiryLoop(ctx context.Context) {
 	lm.log.Debug("lease_expiry_loop: starting")
-	ticker := time.NewTicker(lm.cfg.LeaseSweepInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			lm.sweepLeases(time.Now())
-		}
-	}
+	runTickerLoop(ctx, lm.cfg.LeaseSweepInterval, func(now time.Time) {
+		lm.sweepLeases(now)
+	})
 }
 
-// sweepLeases evicts every expired holder across all shards and grants
-// freed slots to the next waiters. Exposed for tests.
-func (lm *LockManager) sweepLeases(now time.Time) {
-	for i := range lm.shards {
-		sh := &lm.shards[i]
-		sh.mu.Lock()
-		for key, st := range sh.resources {
-			any := false
-			for token, h := range st.Holders {
-				if h.leaseExpires.IsZero() {
-					continue
-				}
-				if !now.Before(h.leaseExpires) {
-					lm.log.Warn("lease expired", "key", key, "conn", h.connID)
-					sh.removeOwned(h.connID, key, token)
-					eqKey := connKey{ConnID: h.connID, Key: key}
-					if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
-						sh.removeEnqueued(eqKey)
-					}
-					delete(st.Holders, token)
-					any = true
-				}
-			}
-			if any {
-				st.LastActivity = now
-				lm.grantNext(sh, key, st)
-			}
-		}
-		sh.mu.Unlock()
-	}
-}
-
-// GCLoop prunes resource state that has been idle for longer than
-// GCMaxIdleTime. A resource is idle when it has no holders, no waiters,
-// and LastActivity has not been touched within the cutoff.
+// GCLoop prunes resource state idle longer than GCMaxIdleTime.
 func (lm *LockManager) GCLoop(ctx context.Context) {
 	lm.log.Debug("lock_gc_loop: starting")
-	ticker := time.NewTicker(lm.cfg.GCInterval)
-	defer ticker.Stop()
+	runTickerLoop(ctx, lm.cfg.GCInterval, func(now time.Time) {
+		lm.gcOnce(now)
+	})
+}
 
+// runTickerLoop fires fn every interval until ctx is cancelled.
+func runTickerLoop(ctx context.Context, interval time.Duration, fn func(time.Time)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			lm.gcOnce(time.Now())
+		case now := <-ticker.C:
+			fn(now)
 		}
 	}
 }
 
-// gcOnce performs one GC pass. Exposed for tests.
+// sweepLeases evicts every expired holder across all shards.
+func (lm *LockManager) sweepLeases(now time.Time) {
+	for i := range lm.shards {
+		lm.sweepShard(&lm.shards[i], now)
+	}
+}
+
+// sweepShard runs one shard's sweep under sh.mu.
+func (lm *LockManager) sweepShard(sh *shard, now time.Time) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	for key, st := range sh.resources {
+		lm.sweepResource(sh, key, st, now)
+	}
+}
+
+// sweepResource evicts expired holders from one resource and grants
+// freed slots to waiters.
+func (lm *LockManager) sweepResource(sh *shard, key string, st *ResourceState, now time.Time) {
+	if !lm.evictExpiredHolders(sh, key, st, now) {
+		return
+	}
+	st.LastActivity = now
+	lm.grantNext(sh, key, st)
+}
+
+// evictExpiredHolders walks st.Holders and removes any expired
+// holders. Returns true if at least one was removed.
+func (lm *LockManager) evictExpiredHolders(sh *shard, key string, st *ResourceState, now time.Time) bool {
+	any := false
+	for token, h := range st.Holders {
+		if !leaseHasExpired(h, now) {
+			continue
+		}
+		lm.evictHolder(sh, st, key, h.connID, token)
+		any = true
+	}
+	return any
+}
+
+// evictHolder drops the (key, token) holder entry plus any matching
+// connEnqueued bookkeeping. Caller holds sh.mu.
+func (lm *LockManager) evictHolder(sh *shard, st *ResourceState, key string, connID uint64, token string) {
+	lm.log.Warn("lease expired", "key", key, "conn", connID)
+	sh.removeOwned(connID, key, token)
+	dropMatchingEnqueued(sh, connID, key, token)
+	delete(st.Holders, token)
+}
+
+// gcOnce performs one GC pass across all shards.
 func (lm *LockManager) gcOnce(now time.Time) {
 	for i := range lm.shards {
-		sh := &lm.shards[i]
-		sh.mu.Lock()
-		var expired []string
-		for key, st := range sh.resources {
-			idle := now.Sub(st.LastActivity)
-			if idle > lm.cfg.GCMaxIdleTime && len(st.Holders) == 0 && st.waiterCount() == 0 {
-				expired = append(expired, key)
-			}
+		lm.gcShard(&lm.shards[i], now)
+	}
+}
+
+// gcShard prunes idle resources in one shard.
+func (lm *LockManager) gcShard(sh *shard, now time.Time) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	expired := collectIdleKeys(sh, now, lm.cfg.GCMaxIdleTime)
+	if len(expired) == 0 {
+		return
+	}
+	lm.resourceTotal.Add(-int64(len(expired)))
+	lm.deleteResources(sh, expired)
+}
+
+// collectIdleKeys returns keys whose resources are idle and unheld.
+func collectIdleKeys(sh *shard, now time.Time, maxIdle time.Duration) []string {
+	var out []string
+	for key, st := range sh.resources {
+		if isIdleResource(st, now, maxIdle) {
+			out = append(out, key)
 		}
-		if n := len(expired); n > 0 {
-			lm.resourceTotal.Add(-int64(n))
-			for _, key := range expired {
-				lm.log.Debug("gc: pruning idle state", "key", key)
-				delete(sh.resources, key)
-			}
-		}
-		sh.mu.Unlock()
+	}
+	return out
+}
+
+func isIdleResource(st *ResourceState, now time.Time, maxIdle time.Duration) bool {
+	idle := now.Sub(st.LastActivity)
+	return idle > maxIdle && len(st.Holders) == 0 && st.waiterCount() == 0
+}
+
+func (lm *LockManager) deleteResources(sh *shard, keys []string) {
+	for _, key := range keys {
+		lm.log.Debug("gc: pruning idle state", "key", key)
+		delete(sh.resources, key)
 	}
 }

@@ -13,41 +13,52 @@ import (
 func withEnv(t *testing.T, env map[string]string) {
 	t.Helper()
 	for k, v := range env {
-		original, hadOriginal := os.LookupEnv(k)
-		os.Setenv(k, v)
-		t.Cleanup(func() {
-			if hadOriginal {
-				os.Setenv(k, original)
-			} else {
-				os.Unsetenv(k)
-			}
-		})
+		setEnvForTest(t, k, v)
 	}
+}
+
+func setEnvForTest(t *testing.T, key, value string) {
+	original, hadOriginal := os.LookupEnv(key)
+	os.Setenv(key, value)
+	t.Cleanup(func() { restoreEnv(key, original, hadOriginal) })
+}
+
+func restoreEnv(key, original string, hadOriginal bool) {
+	if hadOriginal {
+		os.Setenv(key, original)
+		return
+	}
+	os.Unsetenv(key)
 }
 
 // clearEnv ensures every env var the loader looks at is unset.
 func clearEnv(t *testing.T) {
-	keys := []string{
-		"DFLOCKD_HOST", "DFLOCKD_PORT", "DFLOCKD_DEFAULT_LEASE_TTL_S",
-		"DFLOCKD_LEASE_SWEEP_INTERVAL_S", "DFLOCKD_GC_INTERVAL_S",
-		"DFLOCKD_GC_MAX_IDLE_S", "DFLOCKD_MAX_LOCKS",
-		"DFLOCKD_MAX_CONNECTIONS", "DFLOCKD_MAX_CONNECTIONS_PER_IP",
-		"DFLOCKD_MAX_WAITERS", "DFLOCKD_READ_TIMEOUT_S",
-		"DFLOCKD_WRITE_TIMEOUT_S", "DFLOCKD_SHUTDOWN_TIMEOUT_S",
-		"DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "DFLOCKD_TLS_CERT", "DFLOCKD_TLS_KEY",
-		"DFLOCKD_AUTH_TOKEN", "DFLOCKD_AUTH_TOKEN_FILE",
-		"DFLOCKD_HTTP_PORT", "DFLOCKD_HTTP_HOST",
-		"DFLOCKD_HTTP_SESSION_IDLE_S", "DFLOCKD_HTTP_MAX_SESSIONS",
-		"DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP",
-		"DFLOCKD_HTTP_RATE_LIMIT_PER_IP", "DFLOCKD_HTTP_RATE_LIMIT_BURST",
-		"DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", "DFLOCKD_DEBUG",
+	for _, k := range configEnvKeys {
+		clearEnvKey(t, k)
 	}
-	for _, k := range keys {
-		original, had := os.LookupEnv(k)
-		os.Unsetenv(k)
-		if had {
-			t.Cleanup(func() { os.Setenv(k, original) })
-		}
+}
+
+var configEnvKeys = []string{
+	"DFLOCKD_HOST", "DFLOCKD_PORT", "DFLOCKD_DEFAULT_LEASE_TTL_S",
+	"DFLOCKD_LEASE_SWEEP_INTERVAL_S", "DFLOCKD_GC_INTERVAL_S",
+	"DFLOCKD_GC_MAX_IDLE_S", "DFLOCKD_MAX_LOCKS",
+	"DFLOCKD_MAX_CONNECTIONS", "DFLOCKD_MAX_CONNECTIONS_PER_IP",
+	"DFLOCKD_MAX_WAITERS", "DFLOCKD_READ_TIMEOUT_S",
+	"DFLOCKD_WRITE_TIMEOUT_S", "DFLOCKD_SHUTDOWN_TIMEOUT_S",
+	"DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "DFLOCKD_TLS_CERT", "DFLOCKD_TLS_KEY",
+	"DFLOCKD_AUTH_TOKEN", "DFLOCKD_AUTH_TOKEN_FILE",
+	"DFLOCKD_HTTP_PORT", "DFLOCKD_HTTP_HOST",
+	"DFLOCKD_HTTP_SESSION_IDLE_S", "DFLOCKD_HTTP_MAX_SESSIONS",
+	"DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP",
+	"DFLOCKD_HTTP_RATE_LIMIT_PER_IP", "DFLOCKD_HTTP_RATE_LIMIT_BURST",
+	"DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", "DFLOCKD_DEBUG",
+}
+
+func clearEnvKey(t *testing.T, key string) {
+	original, had := os.LookupEnv(key)
+	os.Unsetenv(key)
+	if had {
+		t.Cleanup(func() { os.Setenv(key, original) })
 	}
 }
 

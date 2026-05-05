@@ -175,6 +175,16 @@ func TestParseRequest_SemEnqueue(t *testing.T) {
 	}
 }
 
+func TestParseRequest_SemEnqueue_WithLease(t *testing.T) {
+	req, err := parseRequest("se", "k", "3 60", 33*time.Second)
+	if err != nil {
+		t.Fatalf("se: %v", err)
+	}
+	if req.Limit != 3 || req.LeaseTTL != 60*time.Second {
+		t.Errorf("got %+v", req)
+	}
+}
+
 func TestParseRequest_Wait(t *testing.T) {
 	req, err := parseRequest("w", "k", "5", 33*time.Second)
 	if err != nil {
@@ -215,6 +225,19 @@ func TestParseRequest_SemWait(t *testing.T) {
 	}
 }
 
+func TestParseRequest_ArgumentShapeErrors(t *testing.T) {
+	cases := []struct{ cmd, arg string }{
+		{"l", ""}, {"l", "1 2 3"},
+		{"sl", "1"}, {"sl", "1 2 3 4"},
+		{"e", "1 2"}, {"se", ""}, {"se", "1 2 3"},
+		{"n", ""}, {"n", "tok 1 2"}, {"w", ""},
+	}
+	for _, c := range cases {
+		_, err := parseRequest(c.cmd, "k", c.arg, time.Second)
+		assertProtocolCode(t, err, ErrCodeInvalidArg)
+	}
+}
+
 func TestParseRequest_Enqueue_RejectsExtraFields(t *testing.T) {
 	// "e\nk\n30 junk\n" used to silently parse 30 as the lease and
 	// drop "junk". Symmetric with se's existing arg-count check.
@@ -227,6 +250,14 @@ func TestParseRequest_Enqueue_RejectsExtraFields(t *testing.T) {
 	}
 	if _, err := parseRequest("e", "k", "30", time.Second); err != nil {
 		t.Errorf("e with lease only: %v", err)
+	}
+}
+
+func assertProtocolCode(t *testing.T, err error, code int) {
+	t.Helper()
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != code {
+		t.Fatalf("got %v, want protocol code %d", err, code)
 	}
 }
 

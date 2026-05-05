@@ -19,66 +19,109 @@ import (
 // (addr, stopFn). stopFn is safe to call multiple times.
 func startServer(t *testing.T, mods ...func(*config.Config)) (string, func()) {
 	t.Helper()
+	rt := newTCPTestRuntime(t, testServerConfig(mods...))
+	rt.start()
+	rt.waitReady(t)
+	return rt.addr, rt.stop(t)
+}
+
+type tcpTestRuntime struct {
+	listener net.Listener
+	ctx      context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+	addr     string
+	stopOnce sync.Once
+	srv      *Server
+}
+
+func newTCPTestRuntime(t *testing.T, cfg *config.Config) *tcpTestRuntime {
+	listener := mustListenTCP(t)
+	configureTCPListener(cfg, listener)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := New(lock.NewLockManager(cfg, log), cfg, log)
+	return &tcpTestRuntime{listener: listener, ctx: ctx, cancel: cancel, done: make(chan struct{}), addr: listener.Addr().String(), srv: srv}
+}
+
+func testServerConfig(mods ...func(*config.Config)) *config.Config {
 	cfg := defaultTestConfig()
 	for _, fn := range mods {
 		fn(cfg)
 	}
+	return cfg
+}
+
+func mustListenTCP(t *testing.T) net.Listener {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return listener
+}
+
+func configureTCPListener(cfg *config.Config, listener net.Listener) {
 	cfg.Port = listener.Addr().(*net.TCPAddr).Port
 	cfg.Host = "127.0.0.1"
+}
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	lm := lock.NewLockManager(cfg, log)
-	srv := New(lm, cfg, log)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+func (rt *tcpTestRuntime) start() {
 	go func() {
-		_ = srv.RunOnListener(ctx, listener)
-		close(done)
+		_ = rt.srv.RunOnListener(rt.ctx, rt.listener)
+		close(rt.done)
 	}()
+}
 
-	// Wait until the server is actually accepting.
-	addr := listener.Addr().String()
+func (rt *tcpTestRuntime) waitReady(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		c, err := net.Dial("tcp", addr)
-		if err == nil {
-			c.Close()
-			break
+		if canDial(rt.addr) {
+			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
 
-	stopOnce := sync.Once{}
-	return addr, func() {
-		stopOnce.Do(func() {
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Error("server didn't stop in time")
-			}
-		})
+func canDial(addr string) bool {
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
+}
+
+func (rt *tcpTestRuntime) stop(t *testing.T) func() {
+	return func() {
+		rt.stopOnce.Do(func() { rt.stopNow(t) })
+	}
+}
+
+func (rt *tcpTestRuntime) stopNow(t *testing.T) {
+	rt.cancel()
+	select {
+	case <-rt.done:
+	case <-time.After(5 * time.Second):
+		t.Error("server didn't stop in time")
 	}
 }
 
 func defaultTestConfig() *config.Config {
-	return &config.Config{
-		Host:                    "127.0.0.1",
-		MaxLocks:                1024,
-		DefaultLeaseTTL:         33 * time.Second,
-		LeaseSweepInterval:      time.Second,
-		GCInterval:              time.Second,
-		GCMaxIdleTime:           time.Minute,
-		ReadTimeout:             5 * time.Second,
-		WriteTimeout:            time.Second,
-		ShutdownTimeout:         time.Second,
-		AutoReleaseOnDisconnect: true,
-	}
+	cfg := defaultServerConfigValue
+	return &cfg
+}
+
+var defaultServerConfigValue = config.Config{
+	Host:                    "127.0.0.1",
+	MaxLocks:                1024,
+	DefaultLeaseTTL:         33 * time.Second,
+	LeaseSweepInterval:      time.Second,
+	GCInterval:              time.Second,
+	GCMaxIdleTime:           time.Minute,
+	ReadTimeout:             5 * time.Second,
+	WriteTimeout:            time.Second,
+	ShutdownTimeout:         time.Second,
+	AutoReleaseOnDisconnect: true,
 }
 
 // dial connects and returns a (conn, reader). The caller closes conn.

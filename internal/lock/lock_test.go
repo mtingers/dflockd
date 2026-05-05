@@ -14,7 +14,11 @@ import (
 
 func newTestManager(t *testing.T, autoRelease bool) *LockManager {
 	t.Helper()
-	cfg := &config.Config{
+	return NewLockManager(testManagerConfig(autoRelease), discardLockLogger())
+}
+
+func testManagerConfig(autoRelease bool) *config.Config {
+	return &config.Config{
 		MaxLocks:                1024,
 		MaxWaiters:              0,
 		DefaultLeaseTTL:         33 * time.Second,
@@ -23,7 +27,10 @@ func newTestManager(t *testing.T, autoRelease bool) *LockManager {
 		GCMaxIdleTime:           time.Minute,
 		AutoReleaseOnDisconnect: autoRelease,
 	}
-	return NewLockManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func discardLockLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // ---------------------------------------------------------------------------

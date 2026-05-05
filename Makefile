@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build test lint clean run docs-serve docs-build openapi-sync
+.PHONY: help build test lint clean run docs-serve docs-build complexity
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -28,5 +28,8 @@ docs-serve: ## Serve documentation locally
 docs-build: ## Build documentation site
 	uvx --with mkdocs-material mkdocs build --strict
 
-openapi-sync: ## Mirror the embedded OpenAPI spec into docs/
-	cp internal/httpapi/openapi.json docs/openapi.json
+complexity: ## Report per-function lines + cyclomatic complexity (production only)
+	go run ./tools/complexity -prod -top 30
+
+complexity-strict: ## Fail if any production function exceeds the targets
+	go run ./tools/complexity -prod -max-lines 5 -max-cyclo 3 -summary
