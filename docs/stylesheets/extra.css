@@ -1,0 +1,43 @@
+/* LIGHT MODE */
+
+:root {
+  --md-primary-fg-color: #18181b;
+  --md-primary-fg-color--light: #27272a;
+  --md-primary-fg-color--dark: #09090b;
+
+  --md-accent-fg-color: #3b82f6;
+
+  /* lighter links */
+  /* --md-typeset-a-color: #3b82f6;   /* blue-500 */ */
+  --md-typeset-a-color: #60a5fa;   /* blue-400 */
+}
+:root .md-typeset a {
+  color: #3b82f6; /* Tailwind blue-500 */
+}
+
+/* DARK MODE */
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #09090b;
+  --md-primary-fg-color--light: #18181b;
+  --md-primary-fg-color--dark: #000000;
+
+  --md-accent-fg-color: #60a5fa;
+
+  /* keep this since you said it looks good */
+  --md-typeset-a-color: #60a5fa;   /* blue-400 */
+}
+[data-md-color-scheme="slate"] .md-typeset a {
+  color: #60a5fa; /* Tailwind blue-400 */
+}
+.md-header {
+    box-shadow: none;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+.md-typeset a:hover {
+    text-decoration: underline;
+}
+
+[data-md-color-scheme="slate"] .md-header {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}

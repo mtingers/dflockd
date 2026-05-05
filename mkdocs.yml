@@ -1,6 +1,6 @@
 site_name: dflockd
 site_url: https://mtingers.github.io/dflockd/
-site_description: A lightweight distributed lock server with FIFO ordering, automatic lease expiry, semaphores, and pub/sub signals — speaks both a line-based TCP protocol and an HTTP REST + SSE API.
+site_description: A distributed FIFO lock server with leases and semaphores. Speaks a line-based TCP protocol and an optional HTTP REST API on top of the same shared state.
 repo_url: https://github.com/mtingers/dflockd
 repo_name: mtingers/dflockd
 

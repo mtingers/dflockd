@@ -1,0 +1,507 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "dflockd HTTP API",
+    "version": "2.0.0",
+    "summary": "REST surface for dflockd's distributed FIFO lock and semaphore primitives.",
+    "description": "dflockd is a distributed FIFO lock server with leases and semaphores. This HTTP API and the native line-based TCP protocol share the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.\n\n## Sessions\n\nTwo-phase operations (`enqueue` + `wait`) need a stable identity that survives across requests. That identity is a session: a server-side token bound to a unique `connID` in the LockManager.\n\n1. `POST /v1/sessions` mints an opaque ID and allocates a connID.\n2. Carry `X-Dflockd-Session: <id>` on every lock-modifying request.\n3. `DELETE /v1/sessions/{id}` synchronously releases anything still held.\n\n## Idle sessions\n\nA background sweeper reaps any session whose `lastSeen` falls behind 2× `--http-session-idle-timeout`. In-flight handlers (e.g. a long-poll `/wait`) are immune for the duration of the request. `POST /v1/sessions/{id}/ping` refreshes `lastSeen` without acquiring any lock.\n\n## Lease renewal\n\nAcquire returns a `token` and `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the slot and grants it to the next waiter. The Go client renews at 50% of the TTL with early-only jitter.\n\n## Auth, rate limit, CORS\n\nWhen `--auth-token` is set, every endpoint except `/health` and `/ready` requires `Authorization: Bearer <token>`. `--http-rate-limit-per-ip` enforces a token-bucket per remote IP and surfaces excess as `429 rate_limited`. `--http-cors-allowed-origins` controls cross-origin behaviour.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
+  },
+  "servers": [
+    {
+      "url": "http://{host}:{port}",
+      "description": "Configured HTTP API listener",
+      "variables": {
+        "host": {"default": "127.0.0.1"},
+        "port": {"default": "6389"}
+      }
+    }
+  ],
+  "security": [{"bearerAuth": []}],
+  "tags": [
+    {"name": "sessions", "description": "Create, ping, and close HTTP sessions. A session is the HTTP analogue of a persistent TCP connection."},
+    {"name": "locks", "description": "Exclusive lock primitives. Each key has at most one holder at a time. Acquires are FIFO across all transports."},
+    {"name": "semaphores", "description": "Counted semaphore primitives. Up to `limit` concurrent holders per key. The first acquirer sets the limit."},
+    {"name": "introspection", "description": "Server state and schema."}
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "Liveness probe",
+        "operationId": "getHealth",
+        "description": "Returns 200 while the process is alive. Exempt from bearer auth.",
+        "security": [],
+        "responses": {
+          "200": {"description": "Alive", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "ok"}}}}
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "Readiness probe",
+        "operationId": "getReady",
+        "description": "Returns 200 while the API should accept traffic and 503 during graceful shutdown. Exempt from bearer auth.",
+        "security": [],
+        "responses": {
+          "200": {"description": "Ready", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "ok"}}}},
+          "503": {"description": "Draining", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "draining"}}}}
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "Prometheus metrics",
+        "operationId": "getMetrics",
+        "description": "Prometheus text-format metrics: per-route HTTP request counts/durations plus lock-manager gauges. Subject to bearer auth when configured.",
+        "responses": {
+          "200": {"description": "Metrics", "content": {"text/plain": {"schema": {"type": "string"}}}}
+        }
+      }
+    },
+    "/v1/sessions": {
+      "post": {
+        "tags": ["sessions"],
+        "summary": "Create a session",
+        "operationId": "createSession",
+        "description": "Mints a new session with a server-generated 32-character lowercase hex ID. The response advertises the configured idle timeout so clients know how often to ping.",
+        "responses": {
+          "200": {"description": "Created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateSessionResponse"}, "example": {"session_id": "0fe1f0c5b6758b10fe1ce7df57c012ef", "idle_timeout_s": 20}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "503": {"description": "Cap reached or draining", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "examples": {"max_sessions": {"value": {"error": "max_sessions"}}, "max_sessions_per_ip": {"value": {"error": "max_sessions_per_ip"}}, "draining": {"value": {"error": "draining"}}}}}}
+        }
+      }
+    },
+    "/v1/sessions/{id}": {
+      "delete": {
+        "tags": ["sessions"],
+        "summary": "Delete a session",
+        "operationId": "deleteSession",
+        "description": "Synchronously closes the session. Held locks and semaphore slots are released. Idempotent; deleting an unknown id returns 410.",
+        "parameters": [{"$ref": "#/components/parameters/SessionIdPath"}],
+        "responses": {
+          "204": {"description": "Closed"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/sessions/{id}/ping": {
+      "post": {
+        "tags": ["sessions"],
+        "summary": "Refresh idle timer",
+        "operationId": "pingSession",
+        "description": "Refreshes the session's `lastSeen` so the idle sweeper won't reap it. Cheap; takes no locks.",
+        "parameters": [{"$ref": "#/components/parameters/SessionIdPath"}],
+        "responses": {
+          "204": {"description": "Refreshed"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/stats": {
+      "get": {
+        "tags": ["introspection"],
+        "summary": "LockManager snapshot",
+        "operationId": "getStats",
+        "description": "Returns active connections, held locks/semaphores with owner/lease info, and idle resources awaiting GC.",
+        "responses": {
+          "200": {"description": "Snapshot", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Stats"}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/v1/locks/{key}": {
+      "post": {
+        "tags": ["locks"],
+        "summary": "Acquire a lock",
+        "operationId": "acquireLock",
+        "description": "Single-phase acquire. Blocks server-side up to `acquire_timeout_s` (0 = non-blocking try-lock).",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/AcquireLock"},
+        "responses": {
+          "200": {"$ref": "#/components/responses/AcquireOutcome"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "408": {"$ref": "#/components/responses/ClientCanceled"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
+        }
+      }
+    },
+    "/v1/locks/{key}/release": {
+      "post": {
+        "tags": ["locks"],
+        "summary": "Release a held lock",
+        "operationId": "releaseLock",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Release"},
+        "responses": {
+          "204": {"description": "Released"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/locks/{key}/renew": {
+      "post": {
+        "tags": ["locks"],
+        "summary": "Renew a held lock's lease",
+        "operationId": "renewLock",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Renew"},
+        "responses": {
+          "200": {"description": "Renewed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenewResponse"}, "example": {"remaining_s": 60}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/locks/{key}/enqueue": {
+      "post": {
+        "tags": ["locks"],
+        "summary": "Two-phase enqueue (phase 1)",
+        "operationId": "enqueueLock",
+        "description": "Either grants the lock immediately (`acquired`) or registers a waiter (`queued`). Pair with `/wait` to block until grant.",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Enqueue"},
+        "responses": {
+          "200": {"$ref": "#/components/responses/EnqueueOutcome"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
+        }
+      }
+    },
+    "/v1/locks/{key}/wait": {
+      "post": {
+        "tags": ["locks"],
+        "summary": "Two-phase wait (phase 2)",
+        "operationId": "waitLock",
+        "description": "Blocks server-side up to `timeout_s` waiting for the grant from a prior `enqueue` on the same session.",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Wait"},
+        "responses": {
+          "200": {"$ref": "#/components/responses/AcquireOutcome"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "408": {"$ref": "#/components/responses/ClientCanceled"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/semaphores/{key}": {
+      "post": {
+        "tags": ["semaphores"],
+        "summary": "Acquire a semaphore slot",
+        "operationId": "acquireSem",
+        "description": "Single-phase acquire. The first acquirer for a key sets the `limit`; subsequent callers must match it or get `409 limit_mismatch`.",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/AcquireSem"},
+        "responses": {
+          "200": {"$ref": "#/components/responses/AcquireOutcome"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "408": {"$ref": "#/components/responses/ClientCanceled"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
+        }
+      }
+    },
+    "/v1/semaphores/{key}/release": {
+      "post": {
+        "tags": ["semaphores"],
+        "summary": "Release a semaphore slot",
+        "operationId": "releaseSem",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Release"},
+        "responses": {
+          "204": {"description": "Released"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/semaphores/{key}/renew": {
+      "post": {
+        "tags": ["semaphores"],
+        "summary": "Renew a semaphore slot's lease",
+        "operationId": "renewSem",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Renew"},
+        "responses": {
+          "200": {"description": "Renewed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenewResponse"}, "example": {"remaining_s": 60}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    },
+    "/v1/semaphores/{key}/enqueue": {
+      "post": {
+        "tags": ["semaphores"],
+        "summary": "Two-phase semaphore enqueue (phase 1)",
+        "operationId": "enqueueSem",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/EnqueueSem"},
+        "responses": {
+          "200": {"$ref": "#/components/responses/EnqueueOutcome"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
+        }
+      }
+    },
+    "/v1/semaphores/{key}/wait": {
+      "post": {
+        "tags": ["semaphores"],
+        "summary": "Two-phase semaphore wait (phase 2)",
+        "operationId": "waitSem",
+        "parameters": [{"$ref": "#/components/parameters/KeyPath"}, {"$ref": "#/components/parameters/SessionHeader"}],
+        "requestBody": {"$ref": "#/components/requestBodies/Wait"},
+        "responses": {
+          "200": {"$ref": "#/components/responses/AcquireOutcome"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "408": {"$ref": "#/components/responses/ClientCanceled"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "410": {"$ref": "#/components/responses/SessionGone"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {"type": "http", "scheme": "bearer", "description": "Shared-secret token configured via `--auth-token` / `--auth-token-file` / `DFLOCKD_AUTH_TOKEN[_FILE]`."}
+    },
+    "parameters": {
+      "KeyPath": {
+        "name": "key",
+        "in": "path",
+        "required": true,
+        "description": "Lock or semaphore key. Must not be empty or contain whitespace; max 256 bytes.",
+        "schema": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "SessionIdPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Session id (32 lowercase hex chars).",
+        "schema": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+      },
+      "SessionHeader": {
+        "name": "X-Dflockd-Session",
+        "in": "header",
+        "required": true,
+        "description": "Session id from `POST /v1/sessions`. Required on every lock-modifying request.",
+        "schema": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+      }
+    },
+    "requestBodies": {
+      "AcquireLock": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AcquireRequest"}, "example": {"acquire_timeout_s": 10, "lease_ttl_s": 60}}}
+      },
+      "AcquireSem": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SemAcquireRequest"}, "example": {"acquire_timeout_s": 10, "limit": 5, "lease_ttl_s": 60}}}
+      },
+      "Release": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReleaseRequest"}, "example": {"token": "7f4c1f2b3e9a"}}}
+      },
+      "Renew": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenewRequest"}, "example": {"token": "7f4c1f2b3e9a", "lease_ttl_s": 60}}}
+      },
+      "Enqueue": {
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EnqueueRequest"}, "example": {"lease_ttl_s": 60}}}
+      },
+      "EnqueueSem": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SemEnqueueRequest"}, "example": {"limit": 5, "lease_ttl_s": 60}}}
+      },
+      "Wait": {
+        "required": true,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WaitRequest"}, "example": {"timeout_s": 30}}}
+      }
+    },
+    "responses": {
+      "BadRequest": {"description": "Malformed request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "bad_request", "detail": "X-Dflockd-Session header required"}}}},
+      "Unauthorized": {"description": "Missing or invalid bearer token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "unauthorized"}}}},
+      "ClientCanceled": {"description": "Client disconnected during a long-poll", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "client_canceled"}}}},
+      "Conflict": {
+        "description": "Operation conflicts with existing state",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "examples": {
+          "limit_mismatch": {"value": {"error": "limit_mismatch"}},
+          "already_enqueued": {"value": {"error": "already_enqueued"}},
+          "not_enqueued": {"value": {"error": "not_enqueued"}},
+          "lease_expired": {"value": {"error": "lease_expired"}}
+        }}}
+      },
+      "SessionGone": {"description": "Session unknown, expired, or DELETEd", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "session_gone"}}}},
+      "CapacityExhausted": {
+        "description": "Server-side cap reached",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "examples": {
+          "max_locks": {"value": {"error": "max_locks"}},
+          "max_waiters": {"value": {"error": "max_waiters"}},
+          "draining": {"value": {"error": "draining"}}
+        }}}
+      },
+      "AcquireOutcome": {
+        "description": "Acquire/wait result",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpResponse"}, "examples": {
+          "granted": {"value": {"status": "ok", "token": "7f4c1f2b3e9a", "lease_ttl_s": 60}},
+          "timeout": {"value": {"status": "timeout"}}
+        }}}
+      },
+      "EnqueueOutcome": {
+        "description": "Enqueue result",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpResponse"}, "examples": {
+          "acquired": {"value": {"status": "acquired", "token": "7f4c1f2b3e9a", "lease_ttl_s": 60}},
+          "queued": {"value": {"status": "queued"}}
+        }}}
+      }
+    },
+    "schemas": {
+      "StatusResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {"status": {"type": "string", "enum": ["ok", "draining"]}}
+      },
+      "ErrorBody": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {"type": "string", "description": "Stable machine-readable code."},
+          "detail": {"type": "string", "description": "Optional human-readable note."}
+        }
+      },
+      "CreateSessionResponse": {
+        "type": "object",
+        "required": ["session_id", "idle_timeout_s"],
+        "properties": {
+          "session_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "idle_timeout_s": {"type": "integer", "minimum": 0, "description": "Advisory; ping at half this interval to be safe."}
+        }
+      },
+      "AcquireRequest": {
+        "type": "object",
+        "required": ["acquire_timeout_s"],
+        "properties": {
+          "acquire_timeout_s": {"type": "integer", "minimum": 0, "description": "0 = non-blocking try-lock."},
+          "lease_ttl_s": {"type": "integer", "minimum": 0, "description": "Omit or 0 = use server default."}
+        }
+      },
+      "SemAcquireRequest": {
+        "allOf": [
+          {"$ref": "#/components/schemas/AcquireRequest"},
+          {"type": "object", "required": ["limit"], "properties": {"limit": {"type": "integer", "minimum": 1}}}
+        ]
+      },
+      "ReleaseRequest": {
+        "type": "object",
+        "required": ["token"],
+        "properties": {"token": {"type": "string", "description": "Token returned by acquire/wait."}}
+      },
+      "RenewRequest": {
+        "type": "object",
+        "required": ["token"],
+        "properties": {
+          "token": {"type": "string"},
+          "lease_ttl_s": {"type": "integer", "minimum": 0}
+        }
+      },
+      "EnqueueRequest": {
+        "type": "object",
+        "properties": {
+          "lease_ttl_s": {"type": "integer", "minimum": 0}
+        }
+      },
+      "SemEnqueueRequest": {
+        "type": "object",
+        "required": ["limit"],
+        "properties": {
+          "limit": {"type": "integer", "minimum": 1},
+          "lease_ttl_s": {"type": "integer", "minimum": 0}
+        }
+      },
+      "WaitRequest": {
+        "type": "object",
+        "required": ["timeout_s"],
+        "properties": {"timeout_s": {"type": "integer", "minimum": 0}}
+      },
+      "OpResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"type": "string", "enum": ["ok", "acquired", "queued", "timeout"]},
+          "token": {"type": "string", "description": "Present on grant (status `ok` or `acquired`)."},
+          "lease_ttl_s": {"type": "integer", "description": "Present on grant; effective lease TTL."}
+        }
+      },
+      "RenewResponse": {
+        "type": "object",
+        "required": ["remaining_s"],
+        "properties": {"remaining_s": {"type": "integer", "minimum": 0}}
+      },
+      "Stats": {
+        "type": "object",
+        "required": ["connections", "locks", "semaphores", "idle_locks", "idle_semaphores"],
+        "properties": {
+          "connections": {"type": "integer", "description": "Active TCP connections plus active HTTP sessions."},
+          "locks": {"type": "array", "items": {"$ref": "#/components/schemas/LockInfo"}},
+          "semaphores": {"type": "array", "items": {"$ref": "#/components/schemas/SemInfo"}},
+          "idle_locks": {"type": "array", "items": {"$ref": "#/components/schemas/IdleInfo"}},
+          "idle_semaphores": {"type": "array", "items": {"$ref": "#/components/schemas/IdleInfo"}}
+        }
+      },
+      "LockInfo": {
+        "type": "object",
+        "required": ["key"],
+        "properties": {
+          "key": {"type": "string"},
+          "owner_conn_id": {"type": "integer", "description": "0 if there's no current holder."},
+          "lease_expires_in_s": {"type": "number"},
+          "waiters": {"type": "integer", "minimum": 0}
+        }
+      },
+      "SemInfo": {
+        "type": "object",
+        "required": ["key", "limit"],
+        "properties": {
+          "key": {"type": "string"},
+          "limit": {"type": "integer", "minimum": 1},
+          "holders": {"type": "integer", "minimum": 0},
+          "waiters": {"type": "integer", "minimum": 0}
+        }
+      },
+      "IdleInfo": {
+        "type": "object",
+        "required": ["key", "idle_s"],
+        "properties": {
+          "key": {"type": "string"},
+          "idle_s": {"type": "number", "description": "Seconds since last activity. Pruned by GC after `--gc-max-idle`."}
+        }
+      }
+    }
+  }
+}

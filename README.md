@@ -1,20 +1,21 @@
 # dflockd
 
-A lightweight distributed lock server with FIFO ordering, automatic lease expiry, semaphores, and pub/sub signals. Speaks both a line-based TCP protocol and an optional HTTP REST + SSE API on top of the same shared state. Single Go binary, zero dependencies.
+A distributed FIFO lock server with leases and semaphores. Single Go binary, zero runtime dependencies. Speaks a line-based TCP protocol and an optional HTTP REST API — both backed by the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.
 
-[Documentation](https://mtingers.github.io/dflockd/) · [HTTP API](https://mtingers.github.io/dflockd/http-api/) · [Changelog](https://mtingers.github.io/dflockd/changelog/)
+[Documentation](https://mtingers.github.io/dflockd/) · [HTTP API](https://mtingers.github.io/dflockd/http-api/) · [Changelog](https://github.com/mtingers/dflockd/blob/main/CHANGELOG.md)
 
 ## Build & run
 
 ```bash
-go build -o dflockd ./cmd/dflockd
-./dflockd  # listens on 127.0.0.1:6388
+go install github.com/mtingers/dflockd/cmd/dflockd@latest
+dflockd                                       # TCP only, on 127.0.0.1:6388
+dflockd --http-port 6389                      # TCP + HTTP REST
 ```
 
-Or install directly:
+Or from a checkout:
 
 ```bash
-go install github.com/mtingers/dflockd/cmd/dflockd@latest
+make build && ./dflockd
 ```
 
 ## Usage
@@ -22,38 +23,43 @@ go install github.com/mtingers/dflockd/cmd/dflockd@latest
 ### Go
 
 ```go
-import "github.com/mtingers/dflockd/client"
+import (
+    "context"
+    "time"
+
+    "github.com/mtingers/dflockd/client"
+)
 
 l := &client.Lock{
-    Key:            "my-resource",
+    Key:            "deploy-job",
     AcquireTimeout: 10 * time.Second,
+    LeaseTTL:       60,                       // seconds; 0 = server default
     Servers:        []string{"127.0.0.1:6388"},
 }
-ok, err := l.Acquire(context.Background())
-if err != nil || !ok { /* handle */ }
+got, err := l.Acquire(context.Background())
+if err != nil { /* network error */ }
+if !got     { /* timed out */ }
 defer l.Release(context.Background())
 ```
 
-See the [Go client reference](https://mtingers.github.io/dflockd/client/) for the full API (renewal, sharding, TLS, auth, SSE signal subscriptions).
+`Lock.Acquire` runs background lease renewal at half the TTL, so a holder that crashes loses the lock within `LeaseTTL` seconds without explicit pings. Same shape for `Semaphore` plus a `Limit` field. See the [Go client docs](https://mtingers.github.io/dflockd/client/) for the full API (two-phase enqueue/wait, sharding, TLS, auth).
 
 ### HTTP
 
-Start the server with `--http-port 6389` to enable the optional REST + SSE layer, then:
-
 ```bash
 sid=$(curl -sX POST http://localhost:6389/v1/sessions | jq -r .session_id)
-curl -sX POST http://localhost:6389/v1/locks/my-job \
+curl -sX POST http://localhost:6389/v1/locks/deploy-job \
      -H "X-Dflockd-Session: $sid" \
      -d '{"acquire_timeout_s": 10, "lease_ttl_s": 60}'
 # → {"status":"ok","token":"...","lease_ttl_s":60}
 curl -sX DELETE http://localhost:6389/v1/sessions/$sid
 ```
 
-See the [HTTP API docs](https://mtingers.github.io/dflockd/http-api/) and [OpenAPI spec](https://mtingers.github.io/dflockd/openapi.json).
+See the [HTTP API docs](https://mtingers.github.io/dflockd/http-api/) and [OpenAPI 3.1 spec](https://mtingers.github.io/dflockd/openapi.json).
 
 ### Raw TCP protocol
 
-The wire format is three newline-terminated UTF-8 lines (`command\nkey\narg\n`). Useful for debugging or minimal-footprint clients in languages without a ready-made library:
+The wire format is three newline-terminated UTF-8 lines (`command\nkey\narg\n`). Useful for debugging or for languages without a ready-made client:
 
 ```bash
 $ nc localhost 6388
@@ -67,11 +73,11 @@ abc123...
 ok
 ```
 
-The connection must stay open — by default, locks are auto-released on disconnect. See the [protocol reference](https://mtingers.github.io/dflockd/architecture/protocol/) for all commands.
+The connection must stay open. By default, locks are auto-released on disconnect. See the [protocol reference](https://mtingers.github.io/dflockd/architecture/protocol/) for every command.
 
 ## Performance
 
-Each operation is one lock acquire + release over a persistent TCP connection. Median of three runs on v1.16.0; Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost.
+One acquire + release per operation over a persistent TCP connection. Median of three runs on v1.16.0; Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost. Unique keys, no contention.
 
 | Workers | Rounds | Ops | Throughput | Mean | p50 | p99 |
 |---|---|---|---|---|---|---|
@@ -82,60 +88,42 @@ Each operation is one lock acquire + release over a persistent TCP connection. M
 | 200 | 1,000 | 200,000 | 89,706 ops/s | 2.200 ms | 1.864 ms | 7.892 ms |
 | 500 | 1,000 | 500,000 | 85,124 ops/s | 5.814 ms | 5.117 ms | 18.554 ms |
 
-All workers use unique keys (no contention). Run your own benchmarks with `go run ./cmd/bench --help`.
+The HTTP transport adds ~2× latency vs. raw TCP at the same concurrency (extra round trip overhead, JSON encode/decode, middleware chain). Run your own benchmarks with `go run ./cmd/bench --help`.
 
 ## Configuration
 
-CLI flags take precedence over environment variables.
+CLI flags take precedence over environment variables. The full table is in the [server docs](https://mtingers.github.io/dflockd/server/); the most common knobs:
 
-| Flag | Env var | Default | Description |
+| Flag | Env | Default | Description |
 |---|---|---|---|
 | `--host` | `DFLOCKD_HOST` | `127.0.0.1` | Bind address |
-| `--port` | `DFLOCKD_PORT` | `6388` | Bind port |
-| `--default-lease-ttl` | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lease duration (seconds) |
-| `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Max unique lock+semaphore keys |
-| `--max-connections` | `DFLOCKD_MAX_CONNECTIONS` | `0` | Max concurrent connections (0 = unlimited) |
-| `--max-connections-per-ip` | `DFLOCKD_MAX_CONNECTIONS_PER_IP` | `0` | Max concurrent TCP connections per remote IP (0 = unlimited) |
-| `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Max waiters per key (0 = unlimited) |
-| `--max-subscriptions` | `DFLOCKD_MAX_SUBSCRIPTIONS` | `0` | Max signal subscriptions per connection (0 = unlimited) |
-| `--read-timeout` | `DFLOCKD_READ_TIMEOUT_S` | `23` | Client read timeout (seconds) |
-| `--write-timeout` | `DFLOCKD_WRITE_TIMEOUT_S` | `5` | Client write timeout (seconds) |
-| `--shutdown-timeout` | `DFLOCKD_SHUTDOWN_TIMEOUT_S` | `30` | Graceful shutdown timeout (seconds, 0 = wait forever) |
-| `--tls-cert` | `DFLOCKD_TLS_CERT` | *(unset)* | TLS certificate PEM file |
-| `--tls-key` | `DFLOCKD_TLS_KEY` | *(unset)* | TLS private key PEM file |
-| `--auth-token` | `DFLOCKD_AUTH_TOKEN` | *(unset)* | Shared secret for authentication |
-| `--auth-token-file` | `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | File containing the auth token |
-| `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release held locks/semaphore slots on disconnect |
-| `--http-port` | `DFLOCKD_HTTP_PORT` | `0` | HTTP API port (0 = disabled) |
-| `--http-host` | `DFLOCKD_HTTP_HOST` | same as `--host` | HTTP API bind address |
-| `--http-session-idle-timeout` | `DFLOCKD_HTTP_SESSION_IDLE_S` | `20` | HTTP session idle timeout (seconds) |
-| `--http-max-sessions` | `DFLOCKD_HTTP_MAX_SESSIONS` | `0` | Max concurrent HTTP sessions (0 = unlimited) |
-| `--http-max-sessions-per-ip` | `DFLOCKD_HTTP_MAX_SESSIONS_PER_IP` | `0` | Max concurrent HTTP sessions per remote IP (0 = unlimited) |
-| `--http-max-connections-per-ip` | `DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP` | `0` | Max concurrent HTTP transport connections per remote IP (0 = unlimited) |
-| `--http-rate-limit-per-ip` | `DFLOCKD_HTTP_RATE_LIMIT_PER_IP` | `0` | HTTP requests per second per remote IP (0 = unlimited) |
-| `--http-rate-limit-burst` | `DFLOCKD_HTTP_RATE_LIMIT_BURST` | `0` | HTTP per-IP burst size (0 = same as rate when rate is set) |
-| `--http-cors-allowed-origins` | `DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS` | *(unset)* | Comma-separated CORS origins; `*` allows any origin |
-| `--http-sse-ping-interval` | `DFLOCKD_HTTP_SSE_PING_S` | `15` | Internal pinger interval for SSE streams (seconds) |
-| `--debug` | `DFLOCKD_DEBUG` | `false` | Enable debug logging |
-
-See the [server docs](https://mtingers.github.io/dflockd/server/) for GC tuning, TLS setup, authentication, and other advanced options.
+| `--port` | `DFLOCKD_PORT` | `6388` | TCP port |
+| `--http-port` | `DFLOCKD_HTTP_PORT` | `0` (disabled) | HTTP REST port |
+| `--default-lease-ttl` | `DFLOCKD_DEFAULT_LEASE_TTL_S` | `33` | Default lease TTL (seconds) |
+| `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Cluster-wide cap on unique keys |
+| `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Per-key waiter cap (0 = unlimited) |
+| `--max-connections-per-ip` | `DFLOCKD_MAX_CONNECTIONS_PER_IP` | `0` | Per-IP TCP cap |
+| `--http-rate-limit-per-ip` | `DFLOCKD_HTTP_RATE_LIMIT_PER_IP` | `0` | Per-IP HTTP req/s |
+| `--tls-cert` / `--tls-key` | `DFLOCKD_TLS_CERT` / `_KEY` | *(unset)* | Enable TLS on both listeners |
+| `--auth-token-file` | `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | Shared-secret auth token |
+| `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release tokens on disconnect |
 
 ## Client libraries
 
 - **Go** (in-repo) — `go get github.com/mtingers/dflockd/client` ([docs](https://mtingers.github.io/dflockd/client/))
-- **Python** — [dflockd-client-py](https://github.com/mtingers/dflockd-client-py) ([docs](https://mtingers.github.io/dflockd-client-py/))
-- **TypeScript** — [dflockd-client-ts](https://github.com/mtingers/dflockd-client-ts) ([docs](https://mtingers.github.io/dflockd-client-ts/))
+- **Python** — [dflockd-client-py](https://github.com/mtingers/dflockd-client-py)
+- **TypeScript** — [dflockd-client-ts](https://github.com/mtingers/dflockd-client-ts)
+
+The TCP wire format is stable; client libraries hash keys with CRC-32 (IEEE) so the same key resolves to the same server in any language.
 
 ## Tests
 
 ```bash
-go test ./... -v
+go test ./...             # full suite
+go test -race ./...       # with the race detector
+make complexity           # per-function lines + cyclomatic complexity
 ```
 
-## Benchmarking
+## Versioning
 
-```bash
-go run ./cmd/bench --workers 100 --rounds 500
-```
-
-See `go run ./cmd/bench --help` for all options.
+dflockd v2 dropped the pub/sub / SSE layer that earlier releases shipped. The pre-refactor source is preserved under `old/` (gitignored, build-tagged out) for reference. Current docs describe only the v2 surface.
