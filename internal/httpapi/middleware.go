@@ -16,15 +16,16 @@ import (
 
 // withAuth requires every protected endpoint to carry
 // Authorization: Bearer <token> when AuthToken is configured.
-// /health and /ready are intentionally exempt: they're load-balancer
-// probes and shouldn't need credentials.
+// /health, /ready, and /v1/openapi.json are intentionally exempt:
+// the probes are for load balancers and the spec describes auth, so
+// requiring auth to read it would be circular.
 func (h *httpServer) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.AuthToken == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		if isAuthExempt(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -35,6 +36,14 @@ func (h *httpServer) withAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isAuthExempt(path string) bool {
+	switch path {
+	case "/health", "/ready", "/v1/openapi.json":
+		return true
+	}
+	return false
 }
 
 // extractBearerToken parses an "Authorization: Bearer <token>" header.

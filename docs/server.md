@@ -107,6 +107,8 @@ When `--http-port` is set:
   `{"status":"ok"}`.
 - `GET /metrics` — Prometheus exposition. Includes per-route
   request counts/durations and lock-manager gauges.
+- `GET /v1/openapi.json` — unauthenticated. Serves the embedded
+  OpenAPI 3.1 spec for codegen tools.
 
 ## Graceful shutdown
 

@@ -45,6 +45,14 @@ func (h *httpServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.currentStats())
 }
 
+// handleOpenAPI serves the embedded OpenAPI 3.1 contract. Unauthenticated
+// (the spec describes auth, so requiring auth to read it would be circular).
+func (h *httpServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=60")
+	_, _ = w.Write(openAPISpec)
+}
+
 func (h *httpServer) currentStats() *lock.Stats {
 	stats := h.sessions.LockManager().Stats(h.sessions.ConnCount() + int64(h.sessions.Count()))
 	stripStatsPrefixes(stats)

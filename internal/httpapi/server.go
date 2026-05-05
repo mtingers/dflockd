@@ -9,6 +9,7 @@ package httpapi
 import (
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,14 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/server"
 )
+
+// openAPISpec is the embedded OpenAPI 3.1 contract. The canonical
+// source is internal/httpapi/openapi.json; `make openapi-sync` copies
+// it to docs/openapi.json for the docs site, and the drift test in
+// openapi_test.go fails if the two copies diverge.
+//
+//go:embed openapi.json
+var openAPISpec []byte
 
 // httpServer wires the HTTP listener to the SessionStore + LockManager.
 type httpServer struct {
@@ -226,6 +235,7 @@ var registeredRoutes = []RegisteredPath{
 	{Pattern: "/health", Methods: []string{"GET"}},
 	{Pattern: "/ready", Methods: []string{"GET"}},
 	{Pattern: "/metrics", Methods: []string{"GET"}},
+	{Pattern: "/v1/openapi.json", Methods: []string{"GET"}},
 	{Pattern: "/v1/sessions", Methods: []string{"POST"}},
 	{Pattern: "/v1/sessions/{id}", Methods: []string{"DELETE"}},
 	{Pattern: "/v1/sessions/{id}/ping", Methods: []string{"POST"}},
@@ -257,6 +267,7 @@ func (h *httpServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sessions/{id}/ping", withSessionID(h.handlePingSession))
 
 	mux.HandleFunc("GET /v1/stats", h.handleStats)
+	mux.HandleFunc("GET /v1/openapi.json", h.handleOpenAPI)
 
 	mux.HandleFunc("POST /v1/locks/{key}", withKey(h.handleAcquireLock))
 	mux.HandleFunc("POST /v1/locks/{key}/release", withKey(h.handleReleaseLock))

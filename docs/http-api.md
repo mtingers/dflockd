@@ -7,7 +7,13 @@ queue.
 
 The machine-readable contract is at
 [`/v1/openapi.json`](./openapi.json) — point any OpenAPI codegen at
-it.
+it. The same document is served live by the running server on the
+HTTP listener (auth-exempt, since the spec describes auth):
+
+```bash
+curl -sS http://localhost:6389/v1/openapi.json | jq .info.version
+# → "2.0.0"
+```
 
 ## Sessions
 
