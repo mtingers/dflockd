@@ -2,7 +2,7 @@
 
 A distributed FIFO lock server with leases and semaphores. Single Go binary, zero runtime dependencies. Speaks a line-based TCP protocol and an optional HTTP REST API — both backed by the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.
 
-[Documentation](https://mtingers.github.io/dflockd/) · [HTTP API](https://mtingers.github.io/dflockd/http-api/) · [Changelog](https://github.com/mtingers/dflockd/blob/main/CHANGELOG.md)
+[Documentation](https://mtingers.github.io/dflockd/) · [HTTP API](https://mtingers.github.io/dflockd/http-api/) · [OpenAPI](https://mtingers.github.io/dflockd/openapi.json) · [Changelog](https://github.com/mtingers/dflockd/blob/main/CHANGELOG.md)
 
 ## Build & run
 
@@ -55,7 +55,7 @@ curl -sX POST http://localhost:6389/v1/locks/deploy-job \
 curl -sX DELETE http://localhost:6389/v1/sessions/$sid
 ```
 
-See the [HTTP API docs](https://mtingers.github.io/dflockd/http-api/) and [OpenAPI 3.1 spec](https://mtingers.github.io/dflockd/openapi.json).
+See the [HTTP API docs](https://mtingers.github.io/dflockd/http-api/). The [OpenAPI 3.1 spec](https://mtingers.github.io/dflockd/openapi.json) is also served live by the running server at `GET /v1/openapi.json` (auth-exempt) for codegen tools.
 
 ### Raw TCP protocol
 
@@ -122,6 +122,7 @@ The TCP wire format is stable; client libraries hash keys with CRC-32 (IEEE) so 
 go test ./...             # full suite
 go test -race ./...       # with the race detector
 make complexity           # per-function lines + cyclomatic complexity
+make openapi-sync         # mirror internal/httpapi/openapi.json → docs/
 ```
 
 ## Versioning

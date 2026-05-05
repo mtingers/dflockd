@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.0.0] - 2026-05-05
+
+Major reset: dflockd is now exclusively a distributed FIFO lock server. The pub/sub layer that v1.11+ shipped has been removed. The pre-refactor source tree is preserved under `old/` (gitignored, build-tagged out) for reference.
+
+### Removed
+
+- **Pub/sub signal layer.** All wire commands (`listen`, `unlisten`, `signal`), the `internal/signal` package, the per-connection push-writer goroutine in the TCP server, the `--max-subscriptions` flag, and the corresponding env var.
+- **HTTP signal endpoints.** `POST /v1/signals/{channel}` and `GET /v1/signals` (SSE), along with the SSE keepalive ping (`--http-sse-ping-interval`) and the `signal_channels` field on `/v1/stats`.
+- **HTTP "bridge" architecture.** The previous design ran the line protocol over a `net.Pipe` per HTTP session, with a multiplexer goroutine splitting command responses from signal frames. The bridge has been removed entirely; HTTP handlers now call `LockManager` methods directly using the session's `connID`. One goroutine per HTTP request, no per-session multiplexer or push writer.
+- **Go client signal types.** `SignalConn`, `Signal`, `Listen`, `Unlisten`, `Emit`, `WithGroup`, `WithHeartbeatInterval`, `DroppedSignals`.
+
+### Changed
+
+- **HTTP session lifecycle is explicit.** Sessions are now plain metadata (`{ID, ConnID, OwnerIP, lastSeen, inFlight, closed, ctx, cancel}`). `BeginRequest` claims a per-session mutex and bumps an in-flight counter so the idle sweeper can't reap a session mid-handler. JSON body parsing happens *before* `BeginRequest`, so a slow body can't pin the session indefinitely.
+- **Session DELETE now drains correctly.** `sealAndDrain` cancels a session-lifetime context (waking any in-flight `lm.Acquire`/`lm.Wait` immediately), then waits for the handler's mutex before running `CleanupConnection`. A handler that already passed `Lookup` can no longer mint a token whose `connID` is being wiped.
+- **Codebase split for testability.** Production code rewritten with a per-function 5-line / cyclomatic-3 target. Function counts grew (many small helpers); the C≥10 outlier count went from 28 to 5 (the remaining five are in `cmd/bench` / `tools/complexity` / `testutil`, deferred deliberately). A `tools/complexity` AST reporter ships with the repo (`make complexity`).
+- **Lock manager: small-helper split.** `Acquire`, `Enqueue`, `Wait`, `Renew`, `Release`, `CleanupConnection`, and the background sweepers are now expressed as orchestration over named transition helpers (`tryFastAcquire`, `consumePreGrantedToken`, `evictHolder`, `cleanupShard`, etc.).
+- **Client: state-machine deduplication.** `Lock` and `Semaphore` share a `runAcquire` / `runEnqueue` / `runWait` flow parameterised by a `resourceOps` struct that captures the per-resource protocol functions. The two types' methods are now thin wrappers over shared helpers.
+- **Protocol package: table-driven.** Status formatting and per-command argument parsing are now table-driven; per-command parsers are 5 lines or fewer.
+- **Server lifecycle loops split.** `serve`, `ServeConn`, `watchPeerClose`, and the HTTP `Run` are decomposed into pure helpers plus thin orchestration.
+- **Config: validation and resolution split.** `Config.Validate` is now a slice of named single-purpose validators; `Load` is split into `defineFlags`, `resolveAll`, `applyDerivedDefaults`. Deprecated env-var aliases (`DFLOCKD_GC_LOOP_SLEEP`, `DFLOCKD_GC_MAX_UNUSED_TIME`) were dropped.
+- **Tests: scenario helpers extracted.** HTTP scenario builders, TCP server runtime, lock test fixtures, and config env helpers are reusable. Tests grew from 155 to 229 functions, but the >10-line count fell from 95 to 63.
+
+### Added
+
+- **`GET /v1/openapi.json` served by the running server.** OpenAPI 3.1 spec embedded via `go:embed`, exempt from bearer auth so codegen tools can fetch the schema without credentials. A drift test (`TestOpenAPI_DocsCopyMatchesEmbedded`) fails CI if `docs/openapi.json` falls out of sync; `make openapi-sync` mirrors the canonical copy. A second test (`TestOpenAPI_RoutesMatchSpec`) enforces 1:1 correspondence between registered routes and documented paths.
+- **HTTP bench mode.** `cmd/bench --http --servers http://host:port [--auth-token …]` drives the REST API (sessions + acquire + release). HTTP measures roughly 2× TCP latency at the same concurrency; baseline TCP perf is preserved.
+- **Per-function complexity tooling.** `tools/complexity` walks every active `.go` file and reports non-blank line count + cyclomatic complexity per function. `make complexity` and `make complexity-strict` are the entry points.
+
+### Fixed
+
+Fixes for issues identified during the refactor (all previously-shipped behaviour was preserved at the wire level):
+
+- **HTTP DELETE no longer blocks behind a long-poll `/wait`.** The session now exposes a session-lifetime context; `sealAndDrain` cancels it before waiting on the per-session mutex, so an in-flight `lm.Wait` returns `ctx.Canceled` within milliseconds instead of running to its `timeout_s`. Regression test in `TestHTTP_DeleteAbortsLongPollWait`.
+- **Stranded grant on cancelled enqueue.** The "queued" cleanup path issued `lm.Wait(timeout=0)` and discarded its return values. `lm.Wait` can still return a token when the waiter is promoted between `Enqueue` and the cleanup call; that token now goes through `lm.Release` instead of being silently dropped.
+- **Active long-poll requests are no longer reaped as idle.** The session sweeper now skips sessions with `inFlight > 0`. A `/wait` whose `timeout_s > 2 × HTTPSessionIdleTimeout` (default >40s) used to surface `session_gone` mid-flight.
+- **Per-session command serialisation restored.** Two concurrent `/wait` calls on the same `(session, key)` could both park on the same waiter channel; only one received the grant, the other returned timeout. The new per-session mutex (`BeginRequest`) gives the HTTP API the same single-virtual-connection contract the old bridge had via `reqMu`.
+- **Slow-body DoS closed.** `BeginRequest` is now claimed *after* JSON body parsing. A slowloris-style trickle on the body can no longer pin `inFlight=1` indefinitely; the sweeper reaps the stalled session after 2× idle timeout.
+- **Protocol enqueue arg validation.** `e\nk\n30 junk\n` used to silently parse `30` as the lease and drop the rest; `parseEnqueue` now matches `se`'s arg-count check.
+- **Bearer auth path simplification.** `/health`, `/ready`, and `/v1/openapi.json` are explicitly exempt; everything else requires `Authorization: Bearer …`.
+
+### Migration
+
+For most callers, the v1 → v2 migration is "drop pub/sub and update version". Specifically:
+
+- **Lock and semaphore APIs are unchanged.** TCP wire commands `l`/`r`/`n`/`e`/`w`/`sl`/`sr`/`sn`/`se`/`sw`/`ping`/`stats`/`auth` behave identically. `Lock` and `Semaphore` Go-client types keep the same fields, methods, and semantics. Same response codes.
+- **HTTP lock and semaphore endpoints are unchanged.** `POST /v1/locks/{key}`, `/v1/locks/{key}/release`, `/renew`, `/enqueue`, `/wait`, the semaphore equivalents, `/v1/sessions{,/{id},/{id}/ping}`, `/v1/stats`, `/health`, `/ready`, `/metrics` all keep the same shape.
+- **Pub/sub is gone.** Migrate to a dedicated message broker (NATS, Redis pub/sub) for the signal use case. The `signal_channels` array no longer appears in `/v1/stats`.
+- **Config: `--max-subscriptions` and `--http-sse-ping-interval` are removed.** Drop them from your config.
+- **Go client: `SignalConn` is gone.** Replace with the broker of your choice.
+
+[v2.0.0]: https://github.com/mtingers/dflockd/releases/tag/v2.0.0
+
 ## [v1.16.1] - 2026-04-27
 
 ### Fixed
@@ -109,7 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Bench: every worker hammered the same literal `--key`, which measured single-key contention instead of the scaling workload the docs describe.** Restored the documented behavior (each worker gets a `<key>_<id>` suffix) as the default and added a `--shared-key` flag for the opt-in contended workload. Defaults now reproduce the scaling numbers in `docs/index.md` (~90k ops/s at 100-500 workers on an M1 MacBook Air).
 - **Server: `watchPeerClose` stall on blocking-command response added up to 50 ms latency per op and deadlocked under contention.** `stopPeerWatch` waited on the watcher goroutine to exit, but the watcher was sitting in `reader.Peek(…)` with a 50 ms read deadline and couldn't observe `close(stop)` until that timer fired. Each blocking-command response therefore paid up to 50 ms of extra latency, and once per-round wait on a contended key crossed the watcher's 10 ms initial delay the overhead was self-reinforcing (longer responses → longer queue waits → more handlers entering the peek loop). In practice a 200-worker `cmd/bench` run on a single key collapsed to ~20 ops/s and took hours instead of seconds. `stopPeerWatch` now forces the in-flight Peek to return immediately via `conn.SetReadDeadline(aLongTimeAgo)` before waiting on `<-done`; the deadline is reset to zero once the watcher has exited. Regression test in `TestContendedAcquireDoesNotDeadlockOnPeerWatcher`.
 
-[Unreleased]: https://github.com/mtingers/dflockd/compare/v1.16.0...HEAD
+[Unreleased]: https://github.com/mtingers/dflockd/compare/v2.0.0...HEAD
 [v1.16.0]: https://github.com/mtingers/dflockd/releases/tag/v1.16.0
 [v1.15.0]: https://github.com/mtingers/dflockd/releases/tag/v1.15.0
 
