@@ -697,6 +697,8 @@ func parseOKTokenLease(resp, cmd string) (string, int, error) {
 // ---------------------------------------------------------------------------
 
 // ShardFunc maps a key to a server index given the number of servers.
+// It must return an index in [0, numServers); high-level APIs return an
+// error if a custom function returns an out-of-range index.
 type ShardFunc func(key string, numServers int) int
 
 // CRC32Shard returns a shard index using CRC-32 (IEEE). This matches the
@@ -957,12 +959,15 @@ func defaultShardFunc(f ShardFunc) ShardFunc {
 
 // resolveServerAddr picks the server for key based on the sharding
 // function. Defaults to 127.0.0.1:6388 if no servers are provided.
-func resolveServerAddr(key string, servers []string, f ShardFunc) string {
+func resolveServerAddr(key string, servers []string, f ShardFunc) (string, error) {
 	if len(servers) == 0 {
 		servers = []string{"127.0.0.1:6388"}
 	}
 	idx := defaultShardFunc(f)(key, len(servers))
-	return servers[idx]
+	if idx < 0 || idx >= len(servers) {
+		return "", fmt.Errorf("dflockd: shard function returned index %d for %d servers", idx, len(servers))
+	}
+	return servers[idx], nil
 }
 
 // buildOpts constructs the Option slice from a lease TTL value. Returns
@@ -1066,7 +1071,7 @@ type Lock struct {
 func (l *Lock) acquireTimeoutVal() time.Duration { return defaultAcquireTimeout(l.AcquireTimeout) }
 func (l *Lock) renewRatioVal() float64           { return defaultRenewRatio(l.RenewRatio) }
 func (l *Lock) renewJitterVal() float64          { return defaultRenewJitterValue(l.RenewJitter) }
-func (l *Lock) serverAddr() string               { return resolveServerAddr(l.Key, l.Servers, l.ShardFunc) }
+func (l *Lock) serverAddr() (string, error)      { return resolveServerAddr(l.Key, l.Servers, l.ShardFunc) }
 func (l *Lock) opts() []Option                   { return buildOpts(l.LeaseTTL) }
 
 // closeConnOnContextDone closes conn if ctx is cancelled before the returned
@@ -1098,9 +1103,16 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio, l.RenewJitter); err != nil {
 		return false, err
 	}
+	if err := validateKey(l.Key); err != nil {
+		return false, err
+	}
 	l.mu.Lock()
 	l.stopRenew()
-	addr := l.serverAddr()
+	addr, err := l.serverAddr()
+	if err != nil {
+		l.mu.Unlock()
+		return false, err
+	}
 	if err := l.connect(addr, l.TLSConfig, l.AuthToken); err != nil {
 		l.mu.Unlock()
 		return false, err
@@ -1174,9 +1186,16 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio, l.RenewJitter); err != nil {
 		return "", err
 	}
+	if err := validateKey(l.Key); err != nil {
+		return "", err
+	}
 	l.mu.Lock()
 	l.stopRenew()
-	addr := l.serverAddr()
+	addr, err := l.serverAddr()
+	if err != nil {
+		l.mu.Unlock()
+		return "", err
+	}
 	if err := l.connect(addr, l.TLSConfig, l.AuthToken); err != nil {
 		l.mu.Unlock()
 		return "", err
@@ -1242,13 +1261,20 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	if err := validateRenewConfig(l.LeaseTTL, l.RenewRatio, l.RenewJitter); err != nil {
 		return false, err
 	}
+	if err := validateKey(l.Key); err != nil {
+		return false, err
+	}
 	l.mu.Lock()
 	if l.conn == nil {
 		l.mu.Unlock()
 		return false, ErrNotQueued
 	}
 	conn := l.conn
-	addr := l.serverAddr()
+	addr, err := l.serverAddr()
+	if err != nil {
+		l.mu.Unlock()
+		return false, err
+	}
 	l.mu.Unlock()
 
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)
@@ -1379,8 +1405,10 @@ type Semaphore struct {
 func (s *Semaphore) acquireTimeoutVal() time.Duration { return defaultAcquireTimeout(s.AcquireTimeout) }
 func (s *Semaphore) renewRatioVal() float64           { return defaultRenewRatio(s.RenewRatio) }
 func (s *Semaphore) renewJitterVal() float64          { return defaultRenewJitterValue(s.RenewJitter) }
-func (s *Semaphore) serverAddr() string               { return resolveServerAddr(s.Key, s.Servers, s.ShardFunc) }
-func (s *Semaphore) opts() []Option                   { return buildOpts(s.LeaseTTL) }
+func (s *Semaphore) serverAddr() (string, error) {
+	return resolveServerAddr(s.Key, s.Servers, s.ShardFunc)
+}
+func (s *Semaphore) opts() []Option { return buildOpts(s.LeaseTTL) }
 
 // Acquire connects to the server, acquires a semaphore slot, and starts
 // background lease renewal. Returns false (with nil error) on timeout.
@@ -1391,9 +1419,16 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	if err := validateSemaphoreLimit(s.Limit); err != nil {
 		return false, err
 	}
+	if err := validateKey(s.Key); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	s.stopRenew()
-	addr := s.serverAddr()
+	addr, err := s.serverAddr()
+	if err != nil {
+		s.mu.Unlock()
+		return false, err
+	}
 	if err := s.connect(addr, s.TLSConfig, s.AuthToken); err != nil {
 		s.mu.Unlock()
 		return false, err
@@ -1461,9 +1496,16 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	if err := validateSemaphoreLimit(s.Limit); err != nil {
 		return "", err
 	}
+	if err := validateKey(s.Key); err != nil {
+		return "", err
+	}
 	s.mu.Lock()
 	s.stopRenew()
-	addr := s.serverAddr()
+	addr, err := s.serverAddr()
+	if err != nil {
+		s.mu.Unlock()
+		return "", err
+	}
 	if err := s.connect(addr, s.TLSConfig, s.AuthToken); err != nil {
 		s.mu.Unlock()
 		return "", err
@@ -1528,13 +1570,20 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	if err := validateRenewConfig(s.LeaseTTL, s.RenewRatio, s.RenewJitter); err != nil {
 		return false, err
 	}
+	if err := validateKey(s.Key); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	if s.conn == nil {
 		s.mu.Unlock()
 		return false, ErrNotQueued
 	}
 	conn := s.conn
-	addr := s.serverAddr()
+	addr, err := s.serverAddr()
+	if err != nil {
+		s.mu.Unlock()
+		return false, err
+	}
 	s.mu.Unlock()
 
 	stopCancelWatch := closeConnOnContextDone(ctx, conn)

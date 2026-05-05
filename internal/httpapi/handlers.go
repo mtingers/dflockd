@@ -84,6 +84,10 @@ func (h *httpServer) handlePingSession(w http.ResponseWriter, r *http.Request, i
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// Use background-context command: a ping is non-blocking on the server,
+	// so honoring r.Context() here would only open a small race where a
+	// cancelled-after-send ping closes the virtual conn — which would
+	// auto-release every other lock on this session via CleanupConnection.
 	resp, err := s.command("ping", "_", "")
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -208,15 +212,8 @@ func (h *httpServer) handleAcquireLock(w http.ResponseWriter, r *http.Request, k
 	if req.LeaseTTLS > 0 {
 		arg += " " + strconv.Itoa(req.LeaseTTLS)
 	}
-	resp, err := s.commandContext(r.Context(), "l", key, arg)
-	if err != nil {
-		if r.Context().Err() != nil {
-			if !errors.Is(err, errCommandNotSent) {
-				_ = h.bridge.DeleteSession(s.id)
-			}
-			return
-		}
-		writeError(w, http.StatusGone, "session_gone", err.Error())
+	resp, ok := h.runSessionCommand(w, r, s, "l", key, arg)
+	if !ok {
 		return
 	}
 	if maybeCleanupOnDisconnect(r, s, resp, key, "r") {
@@ -271,15 +268,8 @@ func (h *httpServer) handleAcquireSem(w http.ResponseWriter, r *http.Request, ke
 	if req.LeaseTTLS > 0 {
 		arg += " " + strconv.Itoa(req.LeaseTTLS)
 	}
-	resp, err := s.commandContext(r.Context(), "sl", key, arg)
-	if err != nil {
-		if r.Context().Err() != nil {
-			if !errors.Is(err, errCommandNotSent) {
-				_ = h.bridge.DeleteSession(s.id)
-			}
-			return
-		}
-		writeError(w, http.StatusGone, "session_gone", err.Error())
+	resp, ok := h.runSessionCommand(w, r, s, "sl", key, arg)
+	if !ok {
 		return
 	}
 	if maybeCleanupOnDisconnect(r, s, resp, key, "sr") {
@@ -333,6 +323,11 @@ func (h *httpServer) handleEnqueueLock(w http.ResponseWriter, r *http.Request, k
 	if req.LeaseTTLS > 0 {
 		arg = strconv.Itoa(req.LeaseTTLS)
 	}
+	// Enqueue is non-blocking on the server; using a background context
+	// avoids the cancelled-after-send race where commandContext closes
+	// the virtual conn and auto-releases unrelated locks on this session.
+	// maybeCleanupOnDisconnect still removes the queue waiter or grant
+	// if the HTTP client went away while the response was on the wire.
 	resp, err := s.command("e", key, arg)
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -371,6 +366,8 @@ func (h *httpServer) handleEnqueueSem(w http.ResponseWriter, r *http.Request, ke
 	if req.LeaseTTLS > 0 {
 		arg += " " + strconv.Itoa(req.LeaseTTLS)
 	}
+	// See handleEnqueueLock: background context here avoids the
+	// cancelled-after-send race that would tear down the session.
 	resp, err := s.command("se", key, arg)
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -458,6 +455,21 @@ func (h *httpServer) sessionOr410(w http.ResponseWriter, r *http.Request) (*sess
 	return s, true
 }
 
+func (h *httpServer) runSessionCommand(w http.ResponseWriter, r *http.Request, s *session, cmd, key, arg string) (string, bool) {
+	resp, err := s.commandContext(r.Context(), cmd, key, arg)
+	if err != nil {
+		if r.Context().Err() != nil {
+			if !errors.Is(err, errCommandNotSent) {
+				_ = h.bridge.DeleteSession(s.id)
+			}
+			return "", false
+		}
+		writeError(w, http.StatusGone, "session_gone", err.Error())
+		return "", false
+	}
+	return resp, true
+}
+
 // decodeJSON reads and decodes the JSON body. Writes 400 on parse error
 // and returns false so the caller can early-return.
 const maxRequestBody = 1 << 20 // 1MB
@@ -520,6 +532,10 @@ func (h *httpServer) doRelease(w http.ResponseWriter, r *http.Request, cmd, key 
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	// Release is non-blocking on the server. Use a background context so a
+	// cancelled HTTP request doesn't close the virtual conn between send
+	// and response — that close would auto-release every other lock held
+	// on this session via CleanupConnection.
 	resp, err := s.command(cmd, key, req.Token)
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -563,6 +579,8 @@ func (h *httpServer) doRenew(w http.ResponseWriter, r *http.Request, cmd, key st
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	// Renew is non-blocking on the server; same rationale as doRelease for
+	// using s.command rather than a request-context-bound command.
 	resp, err := s.command(cmd, key, arg)
 	if err != nil {
 		writeError(w, http.StatusGone, "session_gone", err.Error())
@@ -597,15 +615,8 @@ func (h *httpServer) doWait(w http.ResponseWriter, r *http.Request, cmd, key str
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	resp, err := s.commandContext(r.Context(), cmd, key, strconv.Itoa(req.TimeoutS))
-	if err != nil {
-		if r.Context().Err() != nil {
-			if !errors.Is(err, errCommandNotSent) {
-				_ = h.bridge.DeleteSession(s.id)
-			}
-			return
-		}
-		writeError(w, http.StatusGone, "session_gone", err.Error())
+	resp, ok := h.runSessionCommand(w, r, s, cmd, key, strconv.Itoa(req.TimeoutS))
+	if !ok {
 		return
 	}
 	releaseCmd := "r"

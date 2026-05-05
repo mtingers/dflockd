@@ -124,6 +124,92 @@ func TestValidateRenewConfigRejectsBadJitter(t *testing.T) {
 	}
 }
 
+func TestResolveServerAddrRejectsOutOfRangeShard(t *testing.T) {
+	cases := []struct {
+		name string
+		idx  int
+	}{
+		{name: "negative", idx: -1},
+		{name: "too large", idx: 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServerAddr("k", []string{"a:1", "b:1"}, func(string, int) int {
+				return tc.idx
+			})
+			if err == nil {
+				t.Fatal("expected shard range error")
+			}
+			if !strings.Contains(err.Error(), "shard function returned index") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestHighLevelLockValidatesKeyBeforeShard(t *testing.T) {
+	called := false
+	l := &Lock{
+		Key:     "bad key",
+		Servers: []string{"127.0.0.1:1"},
+		ShardFunc: func(string, int) int {
+			called = true
+			return 0
+		},
+	}
+
+	ok, err := l.Acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected key validation error")
+	}
+	if ok {
+		t.Fatal("invalid key should not acquire")
+	}
+	if called {
+		t.Fatal("shard function was called before key validation")
+	}
+}
+
+func TestHighLevelAcquireRejectsBadShardIndex(t *testing.T) {
+	l := &Lock{
+		Key:     "k",
+		Servers: []string{"127.0.0.1:1"},
+		ShardFunc: func(string, int) int {
+			return 1
+		},
+	}
+	ok, err := l.Acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected shard range error")
+	}
+	if ok {
+		t.Fatal("bad shard index should not acquire")
+	}
+	if !strings.Contains(err.Error(), "shard function returned index") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	s := &Semaphore{
+		Key:     "k",
+		Limit:   1,
+		Servers: []string{"127.0.0.1:1"},
+		ShardFunc: func(string, int) int {
+			return -1
+		},
+	}
+	ok, err = s.Acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected semaphore shard range error")
+	}
+	if ok {
+		t.Fatal("bad semaphore shard index should not acquire")
+	}
+	if !strings.Contains(err.Error(), "shard function returned index") {
+		t.Fatalf("unexpected semaphore error: %v", err)
+	}
+}
+
 func TestRenewIntervalAllowsSubSecondLeases(t *testing.T) {
 	if got := renewInterval(1, 0.5); got != 500*time.Millisecond {
 		t.Fatalf("1s lease at 0.5 ratio: got %s want 500ms", got)

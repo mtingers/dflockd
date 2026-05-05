@@ -508,3 +508,5 @@ The shard function signature is:
 ```go
 type ShardFunc func(key string, numServers int) int
 ```
+
+Custom shard functions must return an index in `[0, numServers)`. The high-level APIs return an error if the index is out of range.
