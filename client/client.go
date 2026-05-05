@@ -369,191 +369,254 @@ func SemWait(c *Conn, key string, waitTimeout time.Duration) (token string, leas
 	return doWait(c, "sw", key, waitTimeout)
 }
 
+// statusErrors maps every wire error code that any client command
+// can receive to its sentinel error. Per-command parsers consult
+// this table; codes not listed here surface as ErrServer (or as a
+// command-specific wrapper).
+var statusErrors = map[string]error{
+	"timeout":                ErrTimeout,
+	"error_max_locks":        ErrMaxLocks,
+	"error_max_waiters":      ErrMaxWaiters,
+	"error_limit_mismatch":   ErrLimitMismatch,
+	"error_already_enqueued": ErrAlreadyQueued,
+	"error_not_enqueued":     ErrNotQueued,
+	"error_lease_expired":    ErrLeaseExpired,
+	"error_draining":         ErrDraining,
+}
+
+// commandOp pairs the wire command with its operation label, used in
+// error messages so the caller knows which method failed.
+type commandOp struct {
+	cmd, op string
+}
+
+var (
+	releaseOp = map[string]commandOp{
+		"r":  {"r", "release"},
+		"sr": {"sr", "sem_release"},
+	}
+	renewOp = map[string]commandOp{
+		"n":  {"n", "renew"},
+		"sn": {"sn", "sem_renew"},
+	}
+	enqueueOp = map[string]commandOp{
+		"e":  {"e", "enqueue"},
+		"se": {"se", "sem_enqueue"},
+	}
+	waitOp = map[string]commandOp{
+		"w":  {"w", "wait"},
+		"sw": {"sw", "sem_wait"},
+	}
+)
+
 // doRelease is the common path for r and sr.
 func doRelease(c *Conn, cmd, key, token string) error {
-	if err := validateKey(key); err != nil {
-		return err
-	}
-	if err := validateToken(token); err != nil {
-		return err
-	}
-	if err := validateLineLength("token", token); err != nil {
+	if err := validateReleaseArgs(key, token); err != nil {
 		return err
 	}
 	resp, err := c.sendRecv(cmd, key, token)
 	if err != nil {
 		return err
 	}
+	return parseReleaseResp(resp, releaseOp[cmd].op)
+}
+
+func validateReleaseArgs(key, token string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if err := validateToken(token); err != nil {
+		return err
+	}
+	return validateLineLength("token", token)
+}
+
+func parseReleaseResp(resp, op string) error {
 	if resp == "ok" {
 		return nil
 	}
-	if resp == "error_draining" {
-		return ErrDraining
-	}
-	op := "release"
-	if cmd == "sr" {
-		op = "sem_release"
+	if e, ok := statusErrors[resp]; ok {
+		return e
 	}
 	return fmt.Errorf("%w: %s: %s", ErrServer, op, resp)
 }
 
 // doRenew is the common path for n and sn.
 func doRenew(c *Conn, cmd, key, token string, opts []Option) (int, error) {
-	if err := validateKey(key); err != nil {
-		return 0, err
-	}
-	if err := validateToken(token); err != nil {
-		return 0, err
-	}
-	o, err := parseOptions(opts)
+	arg, err := buildRenewArg(key, token, opts)
 	if err != nil {
-		return 0, err
-	}
-	arg := token
-	if o.leaseTTL > 0 {
-		arg += " " + strconv.Itoa(o.leaseTTL)
-	}
-	if err := validateLineLength("renew argument", arg); err != nil {
 		return 0, err
 	}
 	resp, err := c.sendRecv(cmd, key, arg)
 	if err != nil {
 		return 0, err
 	}
-	parts := strings.Fields(resp)
-	if len(parts) == 2 && parts[0] == "ok" {
-		n, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return 0, fmt.Errorf("%w: renew: bad remaining %q", ErrServer, parts[1])
-		}
+	return parseRenewResp(resp, renewOp[cmd].op)
+}
+
+func buildRenewArg(key, token string, opts []Option) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	if err := validateToken(token); err != nil {
+		return "", err
+	}
+	o, err := parseOptions(opts)
+	if err != nil {
+		return "", err
+	}
+	return formatRenewArg(token, o.leaseTTL)
+}
+
+func formatRenewArg(token string, leaseTTL int) (string, error) {
+	arg := token
+	if leaseTTL > 0 {
+		arg += " " + strconv.Itoa(leaseTTL)
+	}
+	if err := validateLineLength("renew argument", arg); err != nil {
+		return "", err
+	}
+	return arg, nil
+}
+
+func parseRenewResp(resp, op string) (int, error) {
+	if n, ok := parseRenewOK(resp); ok {
 		return n, nil
 	}
-	if resp == "error_draining" {
-		return 0, ErrDraining
+	if e, ok := statusErrors[resp]; ok {
+		return 0, e
 	}
-	op := "renew"
-	if cmd == "sn" {
-		op = "sem_renew"
+	if isBadRenewOK(resp) {
+		return 0, fmt.Errorf("%w: renew: bad remaining %q", ErrServer, strings.Fields(resp)[1])
 	}
 	return 0, fmt.Errorf("%w: %s: %s", ErrServer, op, resp)
 }
 
+func parseRenewOK(resp string) (int, bool) {
+	parts := strings.Fields(resp)
+	if len(parts) != 2 || parts[0] != "ok" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func isBadRenewOK(resp string) bool {
+	parts := strings.Fields(resp)
+	return len(parts) == 2 && parts[0] == "ok"
+}
+
 // doEnqueue is the common path for e and se. limit is unused for e.
 func doEnqueue(c *Conn, cmd, key string, limit int, opts []Option) (string, string, int, error) {
-	if err := validateKey(key); err != nil {
-		return "", "", 0, err
-	}
-	o, err := parseOptions(opts)
+	arg, err := buildEnqueueArg(cmd, key, limit, opts)
 	if err != nil {
-		return "", "", 0, err
-	}
-	var arg string
-	if cmd == "se" {
-		arg = strconv.Itoa(limit)
-	}
-	if o.leaseTTL > 0 {
-		if arg != "" {
-			arg += " "
-		}
-		arg += strconv.Itoa(o.leaseTTL)
-	}
-	if err := validateLineLength("enqueue argument", arg); err != nil {
 		return "", "", 0, err
 	}
 	resp, err := c.sendRecv(cmd, key, arg)
 	if err != nil {
 		return "", "", 0, err
 	}
+	return parseEnqueueResp(resp, enqueueOp[cmd].op)
+}
+
+func buildEnqueueArg(cmd, key string, limit int, opts []Option) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	o, err := parseOptions(opts)
+	if err != nil {
+		return "", err
+	}
+	arg := formatEnqueueArg(cmd, limit, o.leaseTTL)
+	if err := validateLineLength("enqueue argument", arg); err != nil {
+		return "", err
+	}
+	return arg, nil
+}
+
+func formatEnqueueArg(cmd string, limit, leaseTTL int) string {
+	arg := ""
+	if cmd == "se" {
+		arg = strconv.Itoa(limit)
+	}
+	if leaseTTL == 0 {
+		return arg
+	}
+	if arg != "" {
+		arg += " "
+	}
+	return arg + strconv.Itoa(leaseTTL)
+}
+
+func parseEnqueueResp(resp, op string) (string, string, int, error) {
 	if resp == "queued" {
 		return "queued", "", 0, nil
 	}
-	if e := mapEnqueueErr(resp); e != nil {
+	if e, ok := statusErrors[resp]; ok {
 		return "", "", 0, e
 	}
-	parts := strings.Fields(resp)
-	if len(parts) == 3 && parts[0] == "acquired" {
-		ttl, err := strconv.Atoi(parts[2])
-		if err != nil {
-			return "", "", 0, fmt.Errorf("%w: enqueue: bad lease %q", ErrServer, parts[2])
-		}
-		return "acquired", parts[1], ttl, nil
-	}
-	op := "enqueue"
-	if cmd == "se" {
-		op = "sem_enqueue"
+	if tok, ttl, ok := parseAcquiredGrant(resp); ok {
+		return "acquired", tok, ttl, nil
 	}
 	return "", "", 0, fmt.Errorf("%w: %s: %s", ErrServer, op, resp)
 }
 
-// mapEnqueueErr returns the sentinel error for an enqueue rejection or
-// nil if resp isn't a known error code.
-func mapEnqueueErr(resp string) error {
-	switch resp {
-	case "error_max_locks":
-		return ErrMaxLocks
-	case "error_max_waiters":
-		return ErrMaxWaiters
-	case "error_already_enqueued":
-		return ErrAlreadyQueued
-	case "error_limit_mismatch":
-		return ErrLimitMismatch
-	case "error_draining":
-		return ErrDraining
+func parseAcquiredGrant(resp string) (string, int, bool) {
+	parts := strings.Fields(resp)
+	if len(parts) != 3 || parts[0] != "acquired" {
+		return "", 0, false
 	}
-	return nil
+	ttl, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return "", 0, false
+	}
+	return parts[1], ttl, true
 }
 
 // doWait is the common path for w and sw.
 func doWait(c *Conn, cmd, key string, waitTimeout time.Duration) (string, int, error) {
-	if err := validateKey(key); err != nil {
-		return "", 0, err
-	}
-	arg, err := timeoutArg(waitTimeout)
+	arg, err := buildWaitArg(key, waitTimeout)
 	if err != nil {
-		return "", 0, err
-	}
-	if err := validateLineLength("wait argument", arg); err != nil {
 		return "", 0, err
 	}
 	resp, err := c.sendRecv(cmd, key, arg)
 	if err != nil {
 		return "", 0, err
 	}
-	switch resp {
-	case "timeout":
-		return "", 0, ErrTimeout
-	case "error_not_enqueued":
-		return "", 0, ErrNotQueued
-	case "error_lease_expired":
-		return "", 0, ErrLeaseExpired
-	case "error":
-		return "", 0, ErrServer
-	case "error_draining":
-		return "", 0, ErrDraining
+	return parseWaitResp(resp, waitOp[cmd].op)
+}
+
+func buildWaitArg(key string, waitTimeout time.Duration) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", err
 	}
-	op := "wait"
-	if cmd == "sw" {
-		op = "sem_wait"
+	arg, err := timeoutArg(waitTimeout)
+	if err != nil {
+		return "", err
+	}
+	if err := validateLineLength("wait argument", arg); err != nil {
+		return "", err
+	}
+	return arg, nil
+}
+
+func parseWaitResp(resp, op string) (string, int, error) {
+	if e, ok := statusErrors[resp]; ok {
+		return "", 0, e
+	}
+	if resp == "error" {
+		return "", 0, ErrServer
 	}
 	return parseGrantResponse(resp, op)
 }
 
-// parseAcquireGrant decodes a single-phase acquire response into
-// (token, lease, err).
+// parseAcquireGrant decodes a single-phase acquire response.
 func parseAcquireGrant(resp, op string) (string, int, error) {
-	switch resp {
-	case "timeout":
-		return "", 0, ErrTimeout
-	case "error_max_locks":
-		return "", 0, ErrMaxLocks
-	case "error_max_waiters":
-		return "", 0, ErrMaxWaiters
-	case "error_limit_mismatch":
-		return "", 0, ErrLimitMismatch
-	case "error_lease_expired":
-		return "", 0, ErrLeaseExpired
-	case "error_draining":
-		return "", 0, ErrDraining
+	if e, ok := statusErrors[resp]; ok {
+		return "", 0, e
 	}
 	return parseGrantResponse(resp, op)
 }

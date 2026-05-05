@@ -62,36 +62,69 @@ func (h *httpServer) withCORS(next http.Handler) http.Handler {
 	if len(h.cfg.HTTPCORSAllowedOrigins) == 0 {
 		return next
 	}
-	allowAll := false
-	allowed := make(map[string]struct{}, len(h.cfg.HTTPCORSAllowedOrigins))
-	for _, origin := range h.cfg.HTTPCORSAllowedOrigins {
-		if origin == "*" {
-			allowAll = true
+	policy := newCORSPolicy(h.cfg.HTTPCORSAllowedOrigins)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveCORS(w, r, policy, next)
+	})
+}
+
+// corsPolicy is the parsed origin allow-list.
+type corsPolicy struct {
+	allowAll bool
+	allowed  map[string]struct{}
+}
+
+func newCORSPolicy(origins []string) *corsPolicy {
+	p := &corsPolicy{allowed: make(map[string]struct{}, len(origins))}
+	for _, o := range origins {
+		if o == "*" {
+			p.allowAll = true
 			continue
 		}
-		allowed[origin] = struct{}{}
+		p.allowed[o] = struct{}{}
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" {
-			if allowAll {
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else if _, ok := allowed[origin]; ok {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
-			}
-			if w.Header().Get("Access-Control-Allow-Origin") != "" {
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Dflockd-Session")
-				w.Header().Set("Access-Control-Max-Age", "300")
-			}
-		}
-		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return p
+}
+
+// serveCORS writes the CORS response headers (when applicable),
+// short-circuits preflights, and otherwise delegates to next.
+func serveCORS(w http.ResponseWriter, r *http.Request, p *corsPolicy, next http.Handler) {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		writeCORSHeaders(w, origin, p)
+	}
+	if isCORSPreflight(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	next.ServeHTTP(w, r)
+}
+
+// writeCORSHeaders emits the per-request CORS headers. The full set
+// is only written when an Allow-Origin was set.
+func writeCORSHeaders(w http.ResponseWriter, origin string, p *corsPolicy) {
+	setCORSAllowOrigin(w, origin, p)
+	if w.Header().Get("Access-Control-Allow-Origin") == "" {
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Dflockd-Session")
+	w.Header().Set("Access-Control-Max-Age", "300")
+}
+
+func setCORSAllowOrigin(w http.ResponseWriter, origin string, p *corsPolicy) {
+	if p.allowAll {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		return
+	}
+	if _, ok := p.allowed[origin]; !ok {
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Vary", "Origin")
+}
+
+func isCORSPreflight(r *http.Request) bool {
+	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
 }
 
 // ---------------------------------------------------------------------------

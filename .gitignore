@@ -18,6 +18,7 @@ site/
 dflockd
 /bench
 /bench-redis
+/complexity
 
 .DS_Store
 

@@ -147,36 +147,55 @@ func (st *SessionStore) Create(ownerIP string) (*Session, error) {
 	if st.ctx.Err() != nil {
 		return nil, ErrShuttingDown
 	}
+	s, err := newSession(st.srv, ownerIP)
+	if err != nil {
+		return nil, err
+	}
+	return st.installSession(s, ownerIP)
+}
+
+// newSession allocates a fresh Session with a random ID and a fresh
+// connID, but doesn't add it to the store.
+func newSession(srv *server.Server, ownerIP string) (*Session, error) {
 	id, err := mintSessionID()
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{
-		ID:      id,
-		ConnID:  st.srv.NextConnID(),
-		OwnerIP: ownerIP,
-	}
+	s := &Session{ID: id, ConnID: srv.NextConnID(), OwnerIP: ownerIP}
 	s.Touch()
+	return s, nil
+}
 
+// installSession adds s to the store under st.mu, applying every
+// cap. Returns the populated session or the appropriate sentinel.
+func (st *SessionStore) installSession(s *Session, ownerIP string) (*Session, error) {
 	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := st.checkInstallable(ownerIP); err != nil {
+		return nil, err
+	}
+	st.recordSession(s, ownerIP)
+	return s, nil
+}
+
+func (st *SessionStore) checkInstallable(ownerIP string) error {
 	if st.ctx.Err() != nil {
-		st.mu.Unlock()
-		return nil, ErrShuttingDown
+		return ErrShuttingDown
 	}
 	if st.max > 0 && len(st.sessions) >= st.max {
-		st.mu.Unlock()
-		return nil, ErrMaxSessions
+		return ErrMaxSessions
 	}
 	if st.maxPerIP > 0 && ownerIP != "" && st.ipCounts[ownerIP] >= st.maxPerIP {
-		st.mu.Unlock()
-		return nil, ErrMaxSessionsPerIP
+		return ErrMaxSessionsPerIP
 	}
-	st.sessions[id] = s
+	return nil
+}
+
+func (st *SessionStore) recordSession(s *Session, ownerIP string) {
+	st.sessions[s.ID] = s
 	if ownerIP != "" {
 		st.ipCounts[ownerIP]++
 	}
-	st.mu.Unlock()
-	return s, nil
 }
 
 // Lookup returns the session for id and refreshes its lastSeen, or
@@ -279,35 +298,44 @@ func (st *SessionStore) sweepOnce(now time.Time) {
 	if st.idleTimeout <= 0 {
 		return
 	}
-	cutoff := now.Add(-2 * st.idleTimeout)
-
-	var doomed []*Session
-	st.mu.Lock()
-	for id, s := range st.sessions {
-		// In-flight handlers (e.g. a long-poll /wait) hold BeginRequest
-		// for the duration of the call. Reaping mid-handler would close
-		// the waiter channel and surface session_gone to a client whose
-		// request is still legitimately running.
-		if s.inFlight.Load() > 0 {
-			continue
-		}
-		last := time.Unix(0, s.lastSeen.Load())
-		if last.Before(cutoff) {
-			doomed = append(doomed, s)
-			delete(st.sessions, id)
-			if s.OwnerIP != "" {
-				st.ipCounts[s.OwnerIP]--
-				if st.ipCounts[s.OwnerIP] <= 0 {
-					delete(st.ipCounts, s.OwnerIP)
-				}
-			}
-		}
-	}
-	st.mu.Unlock()
-
+	doomed := st.collectIdleSessions(now.Add(-2 * st.idleTimeout))
 	for _, s := range doomed {
 		s.sealAndDrain()
 		st.srv.LockManager().CleanupConnection(s.ConnID)
+	}
+}
+
+// collectIdleSessions removes every reapable session from the map
+// and returns it. In-flight handlers protect their session from
+// being reaped (long-poll /wait would otherwise see session_gone).
+func (st *SessionStore) collectIdleSessions(cutoff time.Time) []*Session {
+	var doomed []*Session
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for id, s := range st.sessions {
+		if isReapable(s, cutoff) {
+			st.removeFromMap(id, s)
+			doomed = append(doomed, s)
+		}
+	}
+	return doomed
+}
+
+func isReapable(s *Session, cutoff time.Time) bool {
+	if s.inFlight.Load() > 0 {
+		return false
+	}
+	return time.Unix(0, s.lastSeen.Load()).Before(cutoff)
+}
+
+func (st *SessionStore) removeFromMap(id string, s *Session) {
+	delete(st.sessions, id)
+	if s.OwnerIP == "" {
+		return
+	}
+	st.ipCounts[s.OwnerIP]--
+	if st.ipCounts[s.OwnerIP] <= 0 {
+		delete(st.ipCounts, s.OwnerIP)
 	}
 }
 
