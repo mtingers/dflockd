@@ -801,6 +801,54 @@ func TestHTTP_BadJsonDoesNotKeepSessionAlive(t *testing.T) {
 	waitForAcquireOK(t, startedClient(t, base), "k", 2*time.Second)
 }
 
+// TestHTTP_DeleteAbortsLongPollWait asserts that DELETE doesn't get
+// stuck behind a long-poll /wait on the same session: the wait
+// should be cancelled within milliseconds, not block until its own
+// timeout. Old-bridge semantics (session.close() cancels in-flight
+// commands) should be preserved.
+func TestHTTP_DeleteAbortsLongPollWait(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+
+	// Holder takes the lock so the queuer's wait will actually block.
+	holder := newClient(t, base)
+	holder.startSession()
+	hv := holder.acquireLock("k", acquireRequest{AcquireTimeoutS: 1, LeaseTTLS: 60})
+	defer holder.post("/v1/locks/k/release", releaseRequest{Token: hv.Token})
+
+	queuer := newClient(t, base)
+	queuer.startSession()
+	if qv := queuer.enqueueLock("k", enqueueRequest{LeaseTTLS: 60}); qv.Status != "queued" {
+		t.Fatalf("queued: %+v", qv)
+	}
+
+	// Wait with a long timeout (60s); we expect DELETE to cut it short.
+	waitDone := make(chan int, 1)
+	go func() {
+		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 60})
+		waitDone <- resp.StatusCode
+	}()
+	time.Sleep(50 * time.Millisecond) // let the wait reach lm.Wait
+
+	deleteDone := make(chan int, 1)
+	go func() {
+		resp := queuer.delete("/v1/sessions/" + queuer.session)
+		deleteDone <- resp.StatusCode
+	}()
+
+	select {
+	case <-deleteDone:
+		// good — DELETE didn't get held hostage by the 60s wait
+	case <-time.After(2 * time.Second):
+		t.Fatal("DELETE blocked by long-poll /wait — session ctx never cancelled")
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("/wait never returned after DELETE — handler still parked")
+	}
+}
+
 // TestHTTP_LongWaitNotIdleSwept asserts that an in-flight /wait
 // outliving the idle timeout isn't reaped by the sweeper. Regression
 // test for the behavior the bridge had via inFlight gating.

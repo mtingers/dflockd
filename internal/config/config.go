@@ -104,19 +104,19 @@ func applyDerivedDefaults(c *Config) {
 // flagPtrs holds every *T returned by flag.Set.* — Load fills it once,
 // then resolvers read through the pointers as their flag default.
 type flagPtrs struct {
-	host, tlsCert, tlsKey                                 *string
-	authToken, authTokenFile                              *string
-	httpHost, httpCORSOrigins                             *string
-	port, maxLocks                                        *int
-	maxConnections, maxConnectionsPerIP, maxWaiters       *int
-	defaultLeaseTTL, leaseSweepInterval                   *int
-	gcInterval, gcMaxIdle                                 *int
-	readTimeout, writeTimeout, shutdownTimeout            *int
-	httpPort, httpIdle                                    *int
-	httpMaxSessions, httpMaxSessionsPerIP                 *int
-	httpMaxConnsPerIP                                     *int
-	httpRateLimitPerIP, httpRateLimitBurst                *int
-	autoRelease, debug, version                           *bool
+	host, tlsCert, tlsKey                           *string
+	authToken, authTokenFile                        *string
+	httpHost, httpCORSOrigins                       *string
+	port, maxLocks                                  *int
+	maxConnections, maxConnectionsPerIP, maxWaiters *int
+	defaultLeaseTTL, leaseSweepInterval             *int
+	gcInterval, gcMaxIdle                           *int
+	readTimeout, writeTimeout, shutdownTimeout      *int
+	httpPort, httpIdle                              *int
+	httpMaxSessions, httpMaxSessionsPerIP           *int
+	httpMaxConnsPerIP                               *int
+	httpRateLimitPerIP, httpRateLimitBurst          *int
+	autoRelease, debug, version                     *bool
 }
 
 // newFlagSet defines every flag and returns the FlagSet plus the

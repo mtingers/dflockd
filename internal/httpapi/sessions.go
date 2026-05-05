@@ -18,6 +18,7 @@ import (
 // holds one and is the unit of cleanup. The session has no transport
 // of its own — it's pure metadata. Lock operations call LockManager
 // methods directly using session.ConnID.
+//
 // mu serialises lock-modifying handlers (acquire/release/renew/
 // enqueue/wait) so the HTTP API behaves like a single virtual
 // connection — matching the old bridge's reqMu. /ping and DELETE
@@ -27,14 +28,22 @@ import (
 // The idle sweeper skips sessions with inFlight > 0 so a long-poll
 // /wait isn't reaped mid-flight; lastSeen is also refreshed on
 // handler exit so the next sweep cycle sees recent activity.
+//
+// ctx is the session-lifetime context. sealAndDrain cancels it so
+// any in-flight LockManager call wakes immediately rather than
+// blocking sealAndDrain on the handler's mu. Handlers obtain a
+// merged context from RequestContext() that fires on either the
+// HTTP request cancelling or the session being closed.
 type Session struct {
 	ID       string
 	ConnID   uint64
 	OwnerIP  string
 	mu       sync.Mutex
-	closed   atomic.Bool // true once Delete/sweep/shutdown has claimed this session
+	closed   atomic.Bool  // true once Delete/sweep/shutdown has claimed this session
 	lastSeen atomic.Int64 // unix ns
 	inFlight atomic.Int64
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // Touch records that this session was just used. Sessions whose
@@ -66,13 +75,26 @@ func (s *Session) BeginRequest() (func(), bool) {
 	}, true
 }
 
-// sealAndDrain marks the session closed and waits for any in-flight
-// handler to release s.mu. After this returns, no new handler can
-// observe an open session via BeginRequest, and any concurrent
-// handler that already started has finished its LockManager call.
-// Safe to follow with CleanupConnection.
+// RequestContext returns a context that fires when either the HTTP
+// request is cancelled or the session is closed (Delete / sweep /
+// shutdown). Pass this to LockManager calls so a session DELETE
+// can immediately wake a long-poll /wait or /acquire instead of
+// waiting for it to time out naturally. The caller MUST call the
+// returned cancel.
+func (s *Session) RequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.ctx, cancel)
+	return ctx, func() { stop(); cancel() }
+}
+
+// sealAndDrain marks the session closed, wakes any LockManager call
+// blocked on the session ctx, then waits for in-flight handlers to
+// release s.mu. After this returns, no new handler can observe an
+// open session via BeginRequest and any concurrent handler has
+// finished. Safe to follow with CleanupConnection.
 func (s *Session) sealAndDrain() {
 	s.closed.Store(true)
+	s.cancel()
 	s.mu.Lock()
 	s.mu.Unlock()
 }
@@ -151,7 +173,12 @@ func (st *SessionStore) Create(ownerIP string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return st.installSession(s, ownerIP)
+	installed, err := st.installSession(s, ownerIP)
+	if err != nil {
+		s.cancel() // session never reached the map; release its ctx resources
+		return nil, err
+	}
+	return installed, nil
 }
 
 // newSession allocates a fresh Session with a random ID and a fresh
@@ -161,7 +188,11 @@ func newSession(srv *server.Server, ownerIP string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{ID: id, ConnID: srv.NextConnID(), OwnerIP: ownerIP}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Session{
+		ID: id, ConnID: srv.NextConnID(), OwnerIP: ownerIP,
+		ctx: ctx, cancel: cancel,
+	}
 	s.Touch()
 	return s, nil
 }

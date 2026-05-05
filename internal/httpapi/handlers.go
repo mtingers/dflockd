@@ -296,8 +296,10 @@ func (h *httpServer) serveRenew(w http.ResponseWriter, r *http.Request, prefixed
 
 func (h *httpServer) runAcquire(w http.ResponseWriter, r *http.Request, s *Session, key, prefix string, limit, timeoutS, leaseS int) {
 	leaseTTL := h.leaseDuration(leaseS)
+	ctx, cancel := s.RequestContext(r.Context())
+	defer cancel()
 	tok, err := h.sessions.LockManager().Acquire(
-		r.Context(), prefix+key, durSeconds(timeoutS), leaseTTL, s.ConnID, limit)
+		ctx, prefix+key, durSeconds(timeoutS), leaseTTL, s.ConnID, limit)
 	h.renderAcquireOutcome(w, r, key, prefix, tok, leaseTTL, err)
 }
 
@@ -308,8 +310,10 @@ func (h *httpServer) runEnqueue(w http.ResponseWriter, r *http.Request, s *Sessi
 }
 
 func (h *httpServer) runWait(w http.ResponseWriter, r *http.Request, s *Session, prefixedKey string, timeoutS int) {
+	ctx, cancel := s.RequestContext(r.Context())
+	defer cancel()
 	tok, leaseSec, err := h.sessions.LockManager().Wait(
-		r.Context(), prefixedKey, durSeconds(timeoutS), s.ConnID)
+		ctx, prefixedKey, durSeconds(timeoutS), s.ConnID)
 	h.renderWaitOutcome(w, r, prefixedKey, tok, leaseSec, err)
 }
 

@@ -123,4 +123,3 @@ func repoRelPath(t *testing.T, rel string) string {
 	t.Fatalf("couldn't find go.mod above %s", file)
 	return ""
 }
-
