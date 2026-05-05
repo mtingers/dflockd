@@ -54,7 +54,9 @@ func (h *httpServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpServer) currentStats() *lock.Stats {
-	stats := h.sessions.LockManager().Stats(h.sessions.ConnCount() + int64(h.sessions.Count()))
+	// Use the server's unified counter so /v1/stats and the TCP
+	// "stats" command always report the same connections number.
+	stats := h.sessions.LockManager().Stats(h.sessions.TotalConnCount())
 	stripStatsPrefixes(stats)
 	return stats
 }

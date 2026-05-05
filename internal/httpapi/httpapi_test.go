@@ -147,6 +147,8 @@ func waitStopped(t *testing.T, name string, done <-chan struct{}) {
 func runHTTPOnListener(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger, listener net.Listener) error {
 	hs, startShutdown := buildHTTPServer(ctx, srv, cfg, log)
 	defer hs.limiter.Stop()
+	srv.SetExtraConnCounter(func() int64 { return int64(hs.sessions.Count()) })
+	defer srv.SetExtraConnCounter(nil)
 	return hs.serveUntilDone(ctx, listener, startShutdown, 2*time.Second)
 }
 
@@ -465,6 +467,30 @@ func TestHTTP_Stats(t *testing.T) {
 	}
 }
 
+// TestHTTP_StatsConnectionsIncludesSessions guards the unified
+// connection counter: TCP "stats" and HTTP "/v1/stats" must report
+// the same Connections value, and that value must include the
+// active HTTP session count.
+func TestHTTP_StatsConnectionsIncludesSessions(t *testing.T) {
+	rt := newHTTPTestRuntime(t)
+	rt.start()
+	rt.waitReady(t)
+	defer rt.stop(t)()
+
+	c := newClient(t, rt.base)
+	c.startSession()
+
+	resp := c.get("/v1/stats")
+	var stats lock.Stats
+	decode(t, resp, &stats)
+	if stats.Connections < 1 {
+		t.Fatalf("expected /v1/stats Connections >= 1 with one session active, got %d", stats.Connections)
+	}
+	if got := rt.srv.TotalConnCount(); got != stats.Connections {
+		t.Fatalf("Server.TotalConnCount=%d, /v1/stats Connections=%d (must match)", got, stats.Connections)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
@@ -647,6 +673,28 @@ func TestHTTP_AuthRequired(t *testing.T) {
 		t.Errorf("health: %d, want 200", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+// TestHTTP_AuthFailureSlowdown verifies HTTP auth failures incur the
+// brute-force-defense delay, matching the TCP server's rejectAuth
+// sleep so HTTP isn't a faster credential-stuffing surface than TCP.
+func TestHTTP_AuthFailureSlowdown(t *testing.T) {
+	base, stop := startHTTP(t, func(c *config.Config) { c.AuthToken = "secret" })
+	defer stop()
+
+	c := newClient(t, base)
+	start := time.Now()
+	resp := c.post("/v1/sessions", nil)
+	elapsed := time.Since(start)
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("got %d, want 401", resp.StatusCode)
+	}
+	// Allow generous slack: middleware sleeps 100ms; we just need to
+	// confirm the delay is applied (i.e. >= ~80ms after RTT/jitter).
+	if elapsed < 80*time.Millisecond {
+		t.Errorf("auth-failure response returned in %s, expected >=80ms slowdown", elapsed)
+	}
 }
 
 // ---------------------------------------------------------------------------

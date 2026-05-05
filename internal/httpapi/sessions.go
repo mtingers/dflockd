@@ -293,10 +293,17 @@ func (st *SessionStore) LockManager() *lock.LockManager {
 	return st.srv.LockManager()
 }
 
-// ConnCount returns active TCP-side connections; handlers add it to
-// the HTTP session count for the /v1/stats Connections field.
+// ConnCount returns active TCP-side connections only.
 func (st *SessionStore) ConnCount() int64 {
 	return st.srv.ConnCount()
+}
+
+// TotalConnCount returns active TCP connections plus any extras the
+// server is tracking (HTTP sessions, when the HTTP API has registered
+// itself). Handlers use this for the /v1/stats Connections field so
+// the value matches the TCP "stats" command.
+func (st *SessionStore) TotalConnCount() int64 {
+	return st.srv.TotalConnCount()
 }
 
 // sweeperLoop reaps sessions whose lastSeen has fallen behind the

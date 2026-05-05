@@ -45,6 +45,12 @@ Fixes for issues identified during the refactor (all previously-shipped behaviou
 - **Slow-body DoS closed.** `BeginRequest` is now claimed *after* JSON body parsing. A slowloris-style trickle on the body can no longer pin `inFlight=1` indefinitely; the sweeper reaps the stalled session after 2× idle timeout.
 - **Protocol enqueue arg validation.** `e\nk\n30 junk\n` used to silently parse `30` as the lease and drop the rest; `parseEnqueue` now matches `se`'s arg-count check.
 - **Bearer auth path simplification.** `/health`, `/ready`, and `/v1/openapi.json` are explicitly exempt; everything else requires `Authorization: Bearer …`.
+- **`connections` count is consistent across transports.** TCP `stats` previously reported only TCP connections while HTTP `/v1/stats` reported TCP plus HTTP sessions. The HTTP server now registers a contributor on the TCP server (`SetExtraConnCounter`); both endpoints route through `Server.TotalConnCount()` so they always agree, and the Prometheus `dflockd_connections` gauge stays correct.
+- **Bench: TCP worker no longer leaks the just-dialled conn on auth failure.** `cmd/bench` dialed before authenticating, but the deferred close iterated the `conns` slice — and the conn wasn't appended until after auth succeeded. An `Authenticate` failure therefore returned with the socket still open. The auth-failure branch now closes `c` explicitly.
+
+### Security
+
+- **HTTP auth failure now matches the TCP brute-force slowdown.** TCP's `rejectAuth` slept 100 ms before closing; the HTTP equivalent returned 401 instantly, leaving HTTP a faster credential-stuffing surface than TCP. The HTTP middleware now sleeps for the same 100 ms before writing the 401. Per-IP HTTP connection caps (`--http-max-connections-per-ip`) and rate limits (`--http-rate-limit-per-ip`) remain the recommended defenses for production exposure; both default to "unlimited" and should be set explicitly when the HTTP API is reachable from untrusted networks.
 
 ### Migration
 

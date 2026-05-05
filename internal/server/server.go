@@ -23,13 +23,18 @@ import (
 // Server accepts TCP connections and dispatches requests to the
 // LockManager. One Server per process.
 type Server struct {
-	lm        *lock.LockManager
-	cfg       *config.Config
-	log       *slog.Logger
-	connSeq   atomic.Uint64
-	connCount atomic.Int64
-	conns     sync.Map // net.Conn → struct{}
+	lm         *lock.LockManager
+	cfg        *config.Config
+	log        *slog.Logger
+	connSeq    atomic.Uint64
+	connCount  atomic.Int64
+	conns      sync.Map // net.Conn → struct{}
+	extraConns atomic.Pointer[connCounter]
 }
+
+// connCounter wraps a count function so we can store it through
+// atomic.Pointer (which can't directly hold a function value).
+type connCounter struct{ fn func() int64 }
 
 // New constructs a Server wrapping lm. The Server does not start any
 // background work until Run (or RunOnListener) is called.
@@ -50,6 +55,30 @@ func (s *Server) NextConnID() uint64 { return s.connSeq.Add(1) }
 
 // ConnCount returns the number of currently-active TCP connections.
 func (s *Server) ConnCount() int64 { return s.connCount.Load() }
+
+// SetExtraConnCounter installs (or clears with nil) a function whose
+// return value is added to ConnCount when callers ask for the total
+// connection count via TotalConnCount. The HTTP API uses this to
+// contribute its session count so /v1/stats and the TCP "stats"
+// command agree on the connections number.
+func (s *Server) SetExtraConnCounter(fn func() int64) {
+	if fn == nil {
+		s.extraConns.Store(nil)
+		return
+	}
+	s.extraConns.Store(&connCounter{fn: fn})
+}
+
+// TotalConnCount returns active TCP connections plus any registered
+// extras (e.g. HTTP sessions). When no extras are registered this
+// equals ConnCount.
+func (s *Server) TotalConnCount() int64 {
+	n := s.connCount.Load()
+	if c := s.extraConns.Load(); c != nil {
+		n += c.fn()
+	}
+	return n
+}
 
 // Run starts the listener on the configured host:port and blocks until
 // ctx is cancelled. Returns nil on clean shutdown.

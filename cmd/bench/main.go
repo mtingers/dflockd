@@ -209,6 +209,7 @@ func worker(key, addr, authToken string, rounds, timeoutSec, leaseTTL, numConns,
 		}
 		if authToken != "" {
 			if err := client.Authenticate(c, authToken); err != nil {
+				c.Close() // not yet appended to conns; the deferred close won't see it
 				warmupWg.Done()
 				return nil, fmt.Errorf("auth: %w", err)
 			}

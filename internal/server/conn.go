@@ -342,7 +342,7 @@ func (s *Server) handleStats() *protocol.Ack {
 }
 
 func (s *Server) statsJSON() (string, bool) {
-	st := s.lm.Stats(s.connCount.Load())
+	st := s.lm.Stats(s.TotalConnCount())
 	stripStatsKeys(st)
 	data, err := json.Marshal(st)
 	return string(data), err == nil

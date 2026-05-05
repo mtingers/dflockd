@@ -14,6 +14,11 @@ import (
 // Auth middleware
 // ---------------------------------------------------------------------------
 
+// authFailureDelay is the per-attempt slowdown applied to HTTP auth
+// failures, mirroring the TCP server's rejectAuth sleep so neither
+// transport is a faster brute-force surface than the other.
+const authFailureDelay = 100 * time.Millisecond
+
 // withAuth requires every protected endpoint to carry
 // Authorization: Bearer <token> when AuthToken is configured.
 // /health, /ready, and /v1/openapi.json are intentionally exempt:
@@ -31,6 +36,7 @@ func (h *httpServer) withAuth(next http.Handler) http.Handler {
 		}
 		got := extractBearerToken(r.Header.Get("Authorization"))
 		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(h.cfg.AuthToken)) != 1 {
+			time.Sleep(authFailureDelay)
 			writeError(w, http.StatusUnauthorized, "unauthorized", "")
 			return
 		}

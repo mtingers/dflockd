@@ -57,6 +57,8 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 	}
 	hs, startShutdown := buildHTTPServer(ctx, srv, cfg, log)
 	defer hs.limiter.Stop()
+	srv.SetExtraConnCounter(func() int64 { return int64(hs.sessions.Count()) })
+	defer srv.SetExtraConnCounter(nil)
 	log.Info("http listening", "addr", listener.Addr())
 	return hs.serveUntilDone(ctx, listener, startShutdown, cfg.ShutdownTimeout)
 }
