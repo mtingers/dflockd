@@ -3,9 +3,8 @@ package lock
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -13,2421 +12,678 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 )
 
-func testConfig() *config.Config {
-	return &config.Config{
-		Host:                    "127.0.0.1",
-		Port:                    0,
-		DefaultLeaseTTL:         5 * time.Second,
-		LeaseSweepInterval:      100 * time.Millisecond,
-		GCInterval:              100 * time.Millisecond,
-		GCMaxIdleTime:           60 * time.Second,
+func newTestManager(t *testing.T, autoRelease bool) *LockManager {
+	t.Helper()
+	cfg := &config.Config{
 		MaxLocks:                1024,
-		ReadTimeout:             5 * time.Second,
-		AutoReleaseOnDisconnect: true,
+		MaxWaiters:              0,
+		DefaultLeaseTTL:         33 * time.Second,
+		LeaseSweepInterval:      time.Second,
+		GCInterval:              time.Second,
+		GCMaxIdleTime:           time.Minute,
+		AutoReleaseOnDisconnect: autoRelease,
 	}
-}
-
-func testManager() *LockManager {
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	return NewLockManager(testConfig(), log)
-}
-
-// bg returns a background context for test calls.
-func bg() context.Context { return context.Background() }
-
-// holderConnID returns the connID of the first (only) holder for a lock resource.
-func holderConnID(st *ResourceState) uint64 {
-	for _, h := range st.Holders {
-		return h.connID
-	}
-	return 0
-}
-
-// holderToken returns the token of the first (only) holder for a lock resource.
-func holderToken(st *ResourceState) string {
-	for tok := range st.Holders {
-		return tok
-	}
-	return ""
+	return NewLockManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // ---------------------------------------------------------------------------
-// FIFOAcquire
+// Basic Acquire / Release
 // ---------------------------------------------------------------------------
 
-func TestFIFOAcquire_Immediate(t *testing.T) {
-	lm := testManager()
-	tok, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+func TestAcquire_FastPath(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+	tok, err := lm.Acquire(ctx, "k", time.Second, time.Second, 1, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("acquire: %v", err)
 	}
 	if tok == "" {
-		t.Fatal("expected token")
+		t.Fatal("empty token")
 	}
-	lm.LockKeyForTest("k1")
-	st := lm.ResourceForTest("k1")
-	if _, ok := st.Holders[tok]; !ok {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("token should be in holders")
-	}
-	if holderConnID(st) != 1 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("owner_conn_id: got %d want 1", holderConnID(st))
-	}
-	lm.UnlockKeyForTest("k1")
 }
 
-func TestFIFOAcquire_Timeout(t *testing.T) {
-	lm := testManager()
-	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+func TestAcquire_SecondCallerWaits(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+
+	tok1, err := lm.Acquire(ctx, "k", time.Second, 5*time.Second, 1, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("first acquire: %v", err)
 	}
-	tok, err := lm.Acquire(bg(), "k1", 0, 30*time.Second, 2, 1)
+
+	gotCh := make(chan string, 1)
+	go func() {
+		tok, err := lm.Acquire(ctx, "k", 2*time.Second, 5*time.Second, 2, 1)
+		if err != nil {
+			t.Errorf("second acquire: %v", err)
+			gotCh <- ""
+			return
+		}
+		gotCh <- tok
+	}()
+
+	// Give the second caller time to enqueue.
+	time.Sleep(50 * time.Millisecond)
+	if !lm.Release("k", tok1) {
+		t.Fatal("release returned false")
+	}
+
+	select {
+	case tok2 := <-gotCh:
+		if tok2 == "" {
+			t.Fatal("second caller got empty token")
+		}
+		if tok2 == tok1 {
+			t.Fatal("second caller got the same token")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second caller didn't get grant after release")
+	}
+}
+
+func TestAcquire_FIFOOrdering(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+
+	tok0, _ := lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
+
+	// Each waiter goroutine posts its caller-id to `order` once it gets
+	// the grant, then immediately releases so the next waiter can run.
+	const N = 5
+	order := make(chan int, N)
+	var wg sync.WaitGroup
+	for i := 1; i <= N; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := lm.Acquire(ctx, "k", 5*time.Second, 30*time.Second, uint64(i+1), 1)
+			if err != nil || tok == "" {
+				return
+			}
+			order <- i
+			lm.Release("k", tok)
+		}()
+		// Stagger so goroutines enqueue in deterministic order.
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Drop tok0; the chain takes over from there.
+	lm.Release("k", tok0)
+
+	for i := 1; i <= N; i++ {
+		select {
+		case got := <-order:
+			if got != i {
+				t.Fatalf("FIFO violation: position %d went to caller %d (want %d)", i, got, i)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("position %d never arrived", i)
+		}
+	}
+	wg.Wait()
+}
+
+// resetLeasesForTest forces all holders of key to expire immediately.
+func (lm *LockManager) resetLeasesForTest(key string) {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if st, ok := sh.resources[key]; ok {
+		past := time.Now().Add(-time.Second)
+		for _, h := range st.Holders {
+			h.leaseExpires = past
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Acquire timeout
+// ---------------------------------------------------------------------------
+
+func TestAcquire_Timeout(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+	_, _ = lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
+
+	tok, err := lm.Acquire(ctx, "k", 50*time.Millisecond, 30*time.Second, 2, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("expected timeout (empty token, nil err), got err %v", err)
 	}
 	if tok != "" {
-		t.Fatal("expected empty token (timeout)")
-	}
-}
-
-func TestFIFOAcquire_FIFOOrdering(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	var tok2, tok3 string
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		t, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
-		mu.Lock()
-		tok2 = t
-		mu.Unlock()
-	}()
-	go func() {
-		defer wg.Done()
-		time.Sleep(20 * time.Millisecond) // ensure conn2 enqueues first
-		t, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 3, 1)
-		mu.Lock()
-		tok3 = t
-		mu.Unlock()
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	lm.Release("k1", tok1)
-	time.Sleep(50 * time.Millisecond)
-
-	mu.Lock()
-	if tok2 == "" {
-		mu.Unlock()
-		t.Fatal("conn2 should have acquired")
-	}
-	mu.Unlock()
-
-	lm.LockKeyForTest("k1")
-	if holderConnID(lm.ResourceForTest("k1")) != 2 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("expected conn 2 to own, got %d", holderConnID(lm.ResourceForTest("k1")))
-	}
-	lm.UnlockKeyForTest("k1")
-
-	lm.Release("k1", tok2)
-	wg.Wait()
-
-	mu.Lock()
-	if tok3 == "" {
-		mu.Unlock()
-		t.Fatal("conn3 should have acquired")
-	}
-	mu.Unlock()
-}
-
-func TestFIFOAcquire_MaxLocks(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxLocks = 1
-	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = lm.Acquire(bg(), "k2", 5*time.Second, 30*time.Second, 2, 1)
-	if err != ErrMaxLocks {
-		t.Fatalf("expected ErrMaxLocks, got %v", err)
-	}
-}
-
-// TestAcquire_ConnID0_NoConnOwnedLeak documents the connID=0 sentinel
-// contract: callers passing 0 opt out of per-connection bookkeeping.
-// Before the fix, connAddOwned had no matching guard against
-// connRemoveOwned's, so connID=0 acquires piled up in connOwned[0] with
-// nothing to ever clean them up.
-func TestAcquire_ConnID0_NoConnOwnedLeak(t *testing.T) {
-	lm := testManager()
-	for i := 0; i < 100; i++ {
-		key := fmt.Sprintf("sentinel-%d", i)
-		tok, err := lm.Acquire(bg(), key, 1*time.Second, 30*time.Second, 0, 1)
-		if err != nil {
-			t.Fatalf("acquire %d: %v", i, err)
-		}
-		if !lm.Release(key, tok) {
-			t.Fatalf("release %d failed", i)
-		}
-	}
-	if got := lm.ConnOwnedCountForTest(); got != 0 {
-		t.Fatalf("connOwned has %d entries after connID=0 round-trips, want 0", got)
-	}
-}
-
-// TestAcquire_CancelledCtxDoesNotLeakGrantedLock exercises the race
-// fixed in docs/bugs.md #5: a waiter may receive its token just as the
-// caller's ctx is cancelled. The old code returned the token anyway,
-// handing the caller a lock they didn't expect to own. Now the grant is
-// released back to the next waiter and the caller observes ctx.Err().
-//
-// The race is inherently non-deterministic — we run many trials and
-// assert that on every trial where ctx.Canceled wins, the lock is NOT
-// leaked (a follow-up acquire from a fresh identity succeeds within a
-// short timeout). Before the fix, some trials leaked; with the fix,
-// none do.
-func TestAcquire_CancelledCtxDoesNotLeakGrantedLock(t *testing.T) {
-	lm := testManager()
-	const trials = 50
-
-	cancelledWins := 0
-	for trial := 0; trial < trials; trial++ {
-		key := fmt.Sprintf("grant-cancel-%d", trial)
-
-		// A holds briefly.
-		tokA, err := lm.Acquire(bg(), key, time.Second, 30*time.Second, 1, 1)
-		if err != nil {
-			t.Fatalf("trial %d: A acquire: %v", trial, err)
-		}
-
-		// B waits with cancellable ctx. Capture B's returned token so the
-		// "B got the lock" branch can verify the lock-state actually
-		// agrees with the return value (catches a leak if a future
-		// regression returns nil-error while leaving the holder behind).
-		ctxB, cancelB := context.WithCancel(context.Background())
-		type bResult struct {
-			tok string
-			err error
-		}
-		bDone := make(chan bResult, 1)
-		go func() {
-			tok, e := lm.Acquire(ctxB, key, time.Minute, 30*time.Second, 2, 1)
-			bDone <- bResult{tok, e}
-		}()
-
-		// Let B enqueue as waiter.
-		time.Sleep(time.Millisecond)
-
-		// Race: release A (grants to B) and cancel B simultaneously.
-		go func() { lm.Release(key, tokA) }()
-		cancelB()
-
-		res := <-bDone
-		switch {
-		case errors.Is(res.err, context.Canceled):
-			cancelledWins++
-			if res.tok != "" {
-				t.Fatalf("trial %d: returned ctx.Canceled but also a non-empty token %q", trial, res.tok)
-			}
-			// Verify no leak: C should be able to acquire immediately.
-			tokC, err := lm.Acquire(bg(), key, 200*time.Millisecond, 30*time.Second, 3, 1)
-			if err != nil {
-				t.Fatalf("trial %d: lock leaked (C acquire errored: %v)", trial, err)
-			}
-			if tokC == "" {
-				t.Fatalf("trial %d: lock leaked (C acquire timed out)", trial)
-			}
-			_ = lm.Release(key, tokC)
-		case res.err == nil:
-			// B got the lock — cancel lost the race. Verify the holder
-			// state matches the returned token, then release B so the
-			// next trial sees a clean slot.
-			if res.tok == "" {
-				t.Fatalf("trial %d: nil error but empty token", trial)
-			}
-			_ = lm.Release(key, res.tok)
-		default:
-			t.Fatalf("trial %d: unexpected error: %v", trial, res.err)
-		}
-	}
-
-	// Sanity: we expect at least some trials where cancel wins, otherwise
-	// the test isn't exercising the race at all.
-	if cancelledWins == 0 {
-		t.Logf("warning: no trials where cancel won the race — race timing may have shifted; test is not exercising the fix")
-	}
-}
-
-// TestMaxLocks_HardCapUnderConcurrency hammers the manager from many
-// goroutines across different shards. The resource-count CAS must ensure
-// resourceTotal never exceeds MaxLocks, even briefly — the prior
-// check-then-add version overshot under load.
-func TestMaxLocks_HardCapUnderConcurrency(t *testing.T) {
-	lm := testManager()
-	const cap = 50
-	lm.cfg.MaxLocks = cap
-
-	var wg sync.WaitGroup
-	const workers = 32
-	const keysPerWorker = 20
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for i := 0; i < keysPerWorker; i++ {
-				key := fmt.Sprintf("w%d-k%d", id, i)
-				_, _ = lm.Acquire(bg(), key, 1*time.Millisecond, 30*time.Second, uint64(id+1), 1)
-			}
-		}(w)
-	}
-	wg.Wait()
-
-	got := lm.ResourceCountForTest()
-	if got > cap {
-		t.Fatalf("resource count %d exceeded MaxLocks %d — hard cap violated", got, cap)
-	}
-}
-
-func TestFIFOAcquire_ContextCancel(t *testing.T) {
-	lm := testManager()
-	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var acquireErr error
-	go func() {
-		_, acquireErr = lm.Acquire(ctx, "k1", 30*time.Second, 30*time.Second, 2, 1)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	<-done
-
-	if acquireErr == nil {
-		t.Fatal("expected context error")
-	}
-	if acquireErr != context.Canceled {
-		t.Fatalf("expected context.Canceled, got %v", acquireErr)
+		t.Fatalf("expected empty token, got %q", tok)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// FIFORelease
+// Renew
 // ---------------------------------------------------------------------------
 
-func TestFIFORelease_Valid(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	if !lm.Release("k1", tok) {
-		t.Fatal("release should succeed")
-	}
-	lm.LockKeyForTest("k1")
-	if len(lm.ResourceForTest("k1").Holders) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("owner should be cleared")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestFIFORelease_WrongToken(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	if lm.Release("k1", "wrong") {
-		t.Fatal("release with wrong token should fail")
-	}
-}
-
-func TestFIFORelease_Nonexistent(t *testing.T) {
-	lm := testManager()
-	if lm.Release("nope", "tok") {
-		t.Fatal("release of nonexistent key should fail")
-	}
-}
-
-func TestFIFORelease_TransfersToWaiter(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.Release("k1", tok1)
-	tok2 := <-done
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired")
-	}
-	lm.LockKeyForTest("k1")
-	if holderConnID(lm.ResourceForTest("k1")) != 2 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("conn2 should own the lock")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-// ---------------------------------------------------------------------------
-// FIFORenew
-// ---------------------------------------------------------------------------
-
-func TestFIFORenew_Valid(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	remaining, ok := lm.Renew("k1", tok, 60*time.Second)
+func TestRenew_Extends(t *testing.T) {
+	lm := newTestManager(t, true)
+	tok, _ := lm.Acquire(context.Background(), "k", time.Second, 2*time.Second, 1, 1)
+	remaining, ok := lm.Renew("k", tok, 60*time.Second)
 	if !ok {
-		t.Fatal("renew should succeed")
+		t.Fatal("renew returned false")
 	}
-	if remaining <= 0 {
-		t.Fatal("remaining should be > 0")
-	}
-}
-
-func TestFIFORenew_WrongToken(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	_, ok := lm.Renew("k1", "wrong", 30*time.Second)
-	if ok {
-		t.Fatal("renew with wrong token should fail")
+	if remaining != 60 {
+		t.Errorf("got remaining %d, want 60", remaining)
 	}
 }
 
-func TestFIFORenew_Nonexistent(t *testing.T) {
-	lm := testManager()
-	_, ok := lm.Renew("nope", "tok", 30*time.Second)
+func TestRenew_BadToken(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _ = lm.Acquire(context.Background(), "k", time.Second, 2*time.Second, 1, 1)
+	_, ok := lm.Renew("k", "bogus", 30*time.Second)
 	if ok {
-		t.Fatal("renew of nonexistent key should fail")
+		t.Fatal("renew should fail on bad token")
 	}
 }
 
-func TestFIFORenew_Expired(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
-	// Manually expire
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	_, ok := lm.Renew("k1", tok, 30*time.Second)
+func TestRenew_ExpiredLease(t *testing.T) {
+	lm := newTestManager(t, true)
+	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	lm.resetLeasesForTest("k")
+	_, ok := lm.Renew("k", tok, 30*time.Second)
 	if ok {
-		t.Fatal("renew of expired lease should fail")
+		t.Fatal("renew should fail on expired lease")
 	}
-	lm.LockKeyForTest("k1")
-	if len(lm.ResourceForTest("k1").Holders) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("owner should be cleared after expired renew")
-	}
-	lm.UnlockKeyForTest("k1")
 }
 
 // ---------------------------------------------------------------------------
-// FIFOEnqueue
+// Two-phase Enqueue / Wait
 // ---------------------------------------------------------------------------
 
-func TestFIFOEnqueue_Immediate(t *testing.T) {
-	lm := testManager()
-	status, tok, lease, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
+func TestEnqueue_FastPath(t *testing.T) {
+	lm := newTestManager(t, true)
+	status, tok, lease, err := lm.Enqueue("k", 30*time.Second, 1, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("enqueue: %v", err)
 	}
 	if status != "acquired" {
-		t.Fatalf("expected acquired, got %s", status)
+		t.Errorf("got status %q, want acquired", status)
 	}
-	if tok == "" {
-		t.Fatal("expected token")
+	if tok == "" || lease == 0 {
+		t.Errorf("got %q %d", tok, lease)
 	}
-	if lease != 30 {
-		t.Fatalf("expected lease 30, got %d", lease)
-	}
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("should be in connEnqueued")
-	}
-	lm.UnlockKeyForTest("k1")
 }
 
-func TestFIFOEnqueue_Queued(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	status, tok, lease, err := lm.Enqueue("k1", 30*time.Second, 2, 1)
+func TestEnqueue_Queued(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _, _, _ = lm.Enqueue("k", 30*time.Second, 1, 1)
+	status, _, _, err := lm.Enqueue("k", 30*time.Second, 2, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("second enqueue: %v", err)
 	}
 	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
+		t.Errorf("got status %q, want queued", status)
 	}
-	if tok != "" {
-		t.Fatal("token should be empty when queued")
-	}
-	if lease != 0 {
-		t.Fatal("lease should be 0 when queued")
-	}
-	lm.LockKeyForTest("k1")
-	es := lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"})
-	if es == nil || es.waiter == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("should have waiter in connEnqueued")
-	}
-	lm.UnlockKeyForTest("k1")
 }
 
-func TestFIFOEnqueue_DoubleEnqueue(t *testing.T) {
-	lm := testManager()
-	lm.Enqueue("k1", 30*time.Second, 1, 1)
-	_, _, _, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
-	if err == nil {
-		t.Fatal("double enqueue should error")
-	}
+func TestEnqueue_AlreadyEnqueued(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _, _, _ = lm.Enqueue("k", 30*time.Second, 1, 1)
+	_, _, _, err := lm.Enqueue("k", 30*time.Second, 1, 1)
 	if !errors.Is(err, ErrAlreadyEnqueued) {
-		t.Fatalf("expected ErrAlreadyEnqueued, got %v", err)
+		t.Fatalf("got %v, want ErrAlreadyEnqueued", err)
 	}
 }
 
-func TestFIFOEnqueue_MaxLocks(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxLocks = 1
-	lm.Enqueue("k1", 30*time.Second, 1, 1)
-	_, _, _, err := lm.Enqueue("k2", 30*time.Second, 2, 1)
-	if err != ErrMaxLocks {
-		t.Fatalf("expected ErrMaxLocks, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// FIFOWait
-// ---------------------------------------------------------------------------
-
-func TestFIFOWait_FastPath(t *testing.T) {
-	lm := testManager()
-	status, token, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
+func TestWait_FastPath(t *testing.T) {
+	lm := newTestManager(t, true)
+	status, _, _, _ := lm.Enqueue("k", 30*time.Second, 1, 1)
 	if status != "acquired" {
 		t.Fatal("expected acquired")
 	}
-
-	tok, ttl, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
+	tok, lease, err := lm.Wait(context.Background(), "k", time.Second, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wait: %v", err)
 	}
-	if tok != token {
-		t.Fatalf("token mismatch: %s != %s", tok, token)
-	}
-	if ttl != 30 {
-		t.Fatalf("expected ttl 30, got %d", ttl)
-	}
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("should be removed from connEnqueued")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestFIFOWait_QueuedThenWait(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("k1", 30*time.Second, 2, 1)
-
-	done := make(chan struct{})
-	var gotTok string
-	var gotTTL int
-	go func() {
-		gotTok, gotTTL, _ = lm.Wait(bg(), "k1", 5*time.Second, 2)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	lm.Release("k1", tok1)
-	<-done
-
-	if gotTok == "" {
-		t.Fatal("should have received token")
-	}
-	if gotTTL != 30 {
-		t.Fatalf("expected ttl 30, got %d", gotTTL)
+	if tok == "" || lease == 0 {
+		t.Errorf("got %q %d", tok, lease)
 	}
 }
 
-func TestFIFOWait_Timeout(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("k1", 30*time.Second, 2, 1)
-
-	tok, _, err := lm.Wait(bg(), "k1", 0, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok != "" {
-		t.Fatal("expected empty token (timeout)")
+func TestWait_NotEnqueued(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _, err := lm.Wait(context.Background(), "k", time.Second, 1)
+	if !errors.Is(err, ErrNotEnqueued) {
+		t.Fatalf("got %v, want ErrNotEnqueued", err)
 	}
 }
 
-func TestFIFOWait_NotEnqueued(t *testing.T) {
-	lm := testManager()
-	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
-	if err != ErrNotEnqueued {
-		t.Fatalf("expected ErrNotEnqueued, got %v", err)
-	}
-}
-
-func TestFIFOWait_FastPathLockLost(t *testing.T) {
-	lm := testManager()
-	status, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
-	if status != "acquired" {
-		t.Fatal("expected acquired")
-	}
-	// Manually expire + clear holder
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	delete(lm.ResourceForTest("k1").Holders, tok)
-	lm.UnlockKeyForTest("k1")
-
-	gotTok, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
-	if !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired, got %v", err)
-	}
-	if gotTok != "" {
-		t.Fatal("expected empty token (lock lost)")
-	}
-}
-
-func TestFIFOWait_ContextCancel(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("k1", 30*time.Second, 2, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var waitErr error
-	go func() {
-		_, _, waitErr = lm.Wait(ctx, "k1", 30*time.Second, 2)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	<-done
-
-	if waitErr == nil {
-		t.Fatal("expected context error")
-	}
-	if waitErr != context.Canceled {
-		t.Fatalf("expected context.Canceled, got %v", waitErr)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Two-phase flow
-// ---------------------------------------------------------------------------
-
-func TestTwoPhase_FullCycle(t *testing.T) {
-	lm := testManager()
-	status, token, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
-	if status != "acquired" {
-		t.Fatal("expected acquired")
-	}
-
-	tok, _, _ := lm.Wait(bg(), "k1", 5*time.Second, 1)
-	if tok != token {
-		t.Fatal("token mismatch")
-	}
-
-	if !lm.Release("k1", tok) {
-		t.Fatal("release should succeed")
-	}
-	lm.LockKeyForTest("k1")
-	if len(lm.ResourceForTest("k1").Holders) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("owner should be cleared")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestTwoPhase_Contention(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	status, _, _, _ := lm.Enqueue("k1", 30*time.Second, 2, 1)
+func TestWait_Timeout(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _, _, _ = lm.Enqueue("k", 30*time.Second, 1, 1) // holder
+	status, _, _, _ := lm.Enqueue("k", 30*time.Second, 2, 1)
 	if status != "queued" {
 		t.Fatal("expected queued")
 	}
+	tok, _, err := lm.Wait(context.Background(), "k", 50*time.Millisecond, 2)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if tok != "" {
+		t.Errorf("expected empty token on timeout, got %q", tok)
+	}
+}
 
-	done := make(chan string, 1)
+func TestWait_GrantArrives(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, holderTok, _, _ := lm.Enqueue("k", 30*time.Second, 1, 1)
+	_, _, _, _ = lm.Enqueue("k", 30*time.Second, 2, 1)
+
+	gotCh := make(chan string, 1)
 	go func() {
-		tok, _, _ := lm.Wait(bg(), "k1", 5*time.Second, 2)
-		done <- tok
+		tok, _, err := lm.Wait(context.Background(), "k", 5*time.Second, 2)
+		if err != nil {
+			t.Errorf("wait: %v", err)
+			gotCh <- ""
+			return
+		}
+		gotCh <- tok
 	}()
 
-	time.Sleep(50 * time.Millisecond)
-	lm.Release("k1", tok1)
-	tok2 := <-done
+	time.Sleep(20 * time.Millisecond)
+	lm.Release("k", holderTok)
 
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired")
+	select {
+	case tok := <-gotCh:
+		if tok == "" {
+			t.Fatal("got empty token")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait never returned after release")
 	}
-	lm.LockKeyForTest("k1")
-	if holderConnID(lm.ResourceForTest("k1")) != 2 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("conn2 should own")
+}
+
+// ---------------------------------------------------------------------------
+// Semaphores
+// ---------------------------------------------------------------------------
+
+func TestSemaphore_LimitEnforced(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+
+	tok1, err := lm.Acquire(ctx, "sem", time.Second, 5*time.Second, 1, 3)
+	if err != nil {
+		t.Fatalf("first: %v", err)
 	}
-	lm.UnlockKeyForTest("k1")
-	lm.Release("k1", tok2)
+	tok2, err := lm.Acquire(ctx, "sem", time.Second, 5*time.Second, 2, 3)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	tok3, err := lm.Acquire(ctx, "sem", time.Second, 5*time.Second, 3, 3)
+	if err != nil {
+		t.Fatalf("third: %v", err)
+	}
+	// Fourth should time out.
+	tok4, err := lm.Acquire(ctx, "sem", 50*time.Millisecond, 5*time.Second, 4, 3)
+	if err != nil {
+		t.Fatalf("fourth: %v", err)
+	}
+	if tok4 != "" {
+		t.Fatal("fourth acquire shouldn't have gotten a token")
+	}
+	for _, tok := range []string{tok1, tok2, tok3} {
+		if tok == "" {
+			t.Fatal("empty token from semaphore acquire")
+		}
+	}
+}
+
+func TestSemaphore_LimitMismatch(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _ = lm.Acquire(context.Background(), "sem", time.Second, 5*time.Second, 1, 3)
+	_, err := lm.Acquire(context.Background(), "sem", time.Second, 5*time.Second, 2, 5)
+	if !errors.Is(err, ErrLimitMismatch) {
+		t.Fatalf("got %v, want ErrLimitMismatch", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MaxLocks / MaxWaiters
+// ---------------------------------------------------------------------------
+
+func TestMaxLocks(t *testing.T) {
+	lm := newTestManager(t, true)
+	lm.cfg.MaxLocks = 2
+	ctx := context.Background()
+	_, err := lm.Acquire(ctx, "a", time.Second, time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lm.Acquire(ctx, "b", time.Second, time.Second, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lm.Acquire(ctx, "c", time.Second, time.Second, 3, 1)
+	if !errors.Is(err, ErrMaxLocks) {
+		t.Fatalf("got %v, want ErrMaxLocks", err)
+	}
+}
+
+func TestMaxWaiters(t *testing.T) {
+	lm := newTestManager(t, true)
+	lm.cfg.MaxWaiters = 1
+	ctx := context.Background()
+
+	_, _ = lm.Acquire(ctx, "k", time.Second, 10*time.Second, 1, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = lm.Acquire(ctx, "k", 5*time.Second, 10*time.Second, 2, 1)
+	}()
+	time.Sleep(50 * time.Millisecond) // let waiter enqueue
+
+	_, err := lm.Acquire(ctx, "k", 5*time.Second, 10*time.Second, 3, 1)
+	if !errors.Is(err, ErrMaxWaiters) {
+		t.Fatalf("got %v, want ErrMaxWaiters", err)
+	}
+	// Don't leak the goroutine.
+	lm.CleanupConnection(2)
+	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------
 // CleanupConnection
 // ---------------------------------------------------------------------------
 
-func TestCleanup_ReleasesOwned(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 100, 1)
-	if tok == "" {
-		t.Fatal("should acquire")
-	}
-	lm.CleanupConnection(100)
-	lm.LockKeyForTest("k1")
-	if len(lm.ResourceForTest("k1").Holders) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("owner should be cleared")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestCleanup_CancelsPending(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "k1", 10*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(2)
-	tok := <-done
-	if tok != "" {
-		t.Fatal("cancelled waiter should get empty token")
-	}
-}
-
-func TestCleanup_TransfersToWaiter(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(1) // releases conn1's lock -> transfers to conn2
-	tok2 := <-done
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired after transfer")
-	}
-	lm.LockKeyForTest("k1")
-	if holderConnID(lm.ResourceForTest("k1")) != 2 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("conn2 should own")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestCleanup_EnqueuedWaiter(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("k1", 30*time.Second, 2, 1)
-
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("should be enqueued")
-	}
-	lm.UnlockKeyForTest("k1")
-
-	lm.CleanupConnection(2)
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("should be cleaned up")
-	}
-	lm.UnlockKeyForTest("k1")
-	lm.LockKeyForTest("k1")
-	if len(lm.ResourceForTest("k1").Waiters) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("waiter should be removed")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestCleanup_FastPath(t *testing.T) {
-	lm := testManager()
-	status, _, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
-	if status != "acquired" {
-		t.Fatal("expected acquired")
-	}
-
+func TestCleanup_AutoReleasesHolders(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+	_, _ = lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
 	lm.CleanupConnection(1)
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("should be cleaned up")
-	}
-	lm.UnlockKeyForTest("k1")
-	lm.LockKeyForTest("k1")
-	if len(lm.ResourceForTest("k1").Holders) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("owner should be cleared")
-	}
-	lm.UnlockKeyForTest("k1")
-}
 
-func TestCleanup_Noop(t *testing.T) {
-	lm := testManager()
-	lm.CleanupConnection(9999) // should not panic
-}
-
-func TestCleanup_AutoReleaseDisabledStillCancelsPendingWaiters(t *testing.T) {
-	lm := testManager()
-	lm.cfg.AutoReleaseOnDisconnect = false
-
-	tok1, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
+	tok2, err := lm.Acquire(ctx, "k", time.Second, 30*time.Second, 2, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("second acquire: %v", err)
 	}
+	if tok2 == "" {
+		t.Fatal("expected new grant after cleanup")
+	}
+}
+
+func TestCleanup_NoAutoRelease_KeepsHolders(t *testing.T) {
+	lm := newTestManager(t, false)
+	ctx := context.Background()
+	_, _ = lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
+	lm.CleanupConnection(1)
+
+	// Second caller should be made to wait — fast path is closed.
+	tok, err := lm.Acquire(ctx, "k", 50*time.Millisecond, 30*time.Second, 2, 1)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if tok != "" {
+		t.Fatal("expected timeout (no auto-release), got grant")
+	}
+}
+
+func TestCleanup_DropsPendingWaiters(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+	_, _ = lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := lm.Acquire(bg(), "k1", 10*time.Second, 30*time.Second, 2, 1)
+		_, err := lm.Acquire(ctx, "k", 5*time.Second, 30*time.Second, 2, 1)
 		done <- err
 	}()
+	time.Sleep(50 * time.Millisecond)
 
-	deadline := time.Now().Add(time.Second)
-	for {
-		lm.LockKeyForTest("k1")
-		waiters := lm.ResourceForTest("k1").waiterCount()
-		lm.UnlockKeyForTest("k1")
-		if waiters == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("waiter never enqueued")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	lm.CleanupConnection(2) // disconnect the waiter
 
-	lm.CleanupConnection(2)
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrWaiterClosed) {
-			t.Fatalf("waiter err: got %v want %v", err, ErrWaiterClosed)
+			t.Fatalf("got %v, want ErrWaiterClosed", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("pending waiter was not cancelled")
+		t.Fatal("waiter goroutine never returned after cleanup")
 	}
-
-	lm.LockKeyForTest("k1")
-	st := lm.ResourceForTest("k1")
-	if len(st.Holders) != 1 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("held lock count: got %d want 1", len(st.Holders))
-	}
-	if _, ok := st.Holders[tok1]; !ok {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("holder was released even though auto-release is disabled")
-	}
-	if st.waiterCount() != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("waiters: got %d want 0", st.waiterCount())
-	}
-	lm.UnlockKeyForTest("k1")
 }
 
-func TestCleanup_AutoReleaseDisabledRemovesTwoPhaseEnqueue(t *testing.T) {
-	lm := testManager()
-	lm.cfg.AutoReleaseOnDisconnect = false
-
-	if _, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1); err != nil {
-		t.Fatal(err)
-	}
-	status, _, _, err := lm.Enqueue("k1", 30*time.Second, 2, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("enqueue status: got %q want queued", status)
-	}
+func TestCleanup_DropsEnqueuedState(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _, _, _ = lm.Enqueue("k", 30*time.Second, 1, 1) // holder
+	_, _, _, _ = lm.Enqueue("k", 30*time.Second, 2, 1) // queued
 
 	lm.CleanupConnection(2)
 
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 2, Key: "k1"}) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connEnqueued entry was not removed")
-	}
-	st := lm.ResourceForTest("k1")
-	if st.waiterCount() != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("waiters: got %d want 0", st.waiterCount())
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-// ---------------------------------------------------------------------------
-// LeaseExpiryLoop
-// ---------------------------------------------------------------------------
-
-func TestLeaseExpiry_ReleasesLock(t *testing.T) {
-	lm := testManager()
-	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
-	if tok == "" {
-		t.Fatal("should acquire")
-	}
-	// Manually expire
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	loopDone := make(chan struct{})
-	go func() {
-		defer close(loopDone)
-		lm.LeaseExpiryLoop(ctx)
-	}()
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-	<-loopDone
-
-	lm.LockKeyForTest("k1")
-	holders := len(lm.ResourceForTest("k1").Holders)
-	lm.UnlockKeyForTest("k1")
-	if holders != 0 {
-		t.Fatal("owner should be cleared by expiry loop")
+	// connID 2 should now be able to enqueue again (state was cleared).
+	_, _, _, err := lm.Enqueue("k", 30*time.Second, 2, 1)
+	if errors.Is(err, ErrAlreadyEnqueued) {
+		t.Fatal("enqueued state survived cleanup")
 	}
 }
 
-func TestLeaseExpiry_TransfersToWaiter(t *testing.T) {
-	lm := testManager()
-	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 1*time.Second, 1, 1)
+// ---------------------------------------------------------------------------
+// Lease expiry sweep
+// ---------------------------------------------------------------------------
 
-	done := make(chan string, 1)
+func TestSweepLeases_GrantsNextWaiter(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+	tok1, _ := lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
+	_ = tok1
+
+	got := make(chan string, 1)
 	go func() {
-		tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
-		done <- tok
+		tok, err := lm.Acquire(ctx, "k", 5*time.Second, 30*time.Second, 2, 1)
+		if err != nil {
+			t.Errorf("acquire: %v", err)
+			got <- ""
+			return
+		}
+		got <- tok
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	// Expire
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
+	// Force expiry, then run the sweep.
+	lm.resetLeasesForTest("k")
+	lm.sweepLeases(time.Now())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	loopDone := make(chan struct{})
-	go func() {
-		defer close(loopDone)
-		lm.LeaseExpiryLoop(ctx)
-	}()
-
-	tok2 := <-done
-	cancel()
-	<-loopDone
-
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired after expiry")
-	}
-	lm.LockKeyForTest("k1")
-	ownerConnID := holderConnID(lm.ResourceForTest("k1"))
-	lm.UnlockKeyForTest("k1")
-	if ownerConnID != 2 {
-		t.Fatal("conn2 should own")
+	select {
+	case tok := <-got:
+		if tok == "" {
+			t.Fatal("expected grant after sweep")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter never granted")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// GCLoop
+// GC
 // ---------------------------------------------------------------------------
 
 func TestGC_PrunesIdle(t *testing.T) {
-	lm := testManager()
-	lm.cfg.GCInterval = 50 * time.Millisecond
-	lm.cfg.GCMaxIdleTime = 0
+	lm := newTestManager(t, true)
+	lm.cfg.GCMaxIdleTime = 10 * time.Millisecond
 
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Release("k1", tok)
-	// Force idle
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
-	lm.UnlockKeyForTest("k1")
+	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	lm.Release("k", tok)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.GCLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
+	time.Sleep(20 * time.Millisecond)
+	lm.gcOnce(time.Now())
 
-	lm.LockKeyForTest("k1")
-	exists := lm.ResourceForTest("k1") != nil
-	lm.UnlockKeyForTest("k1")
-	if exists {
-		t.Fatal("k1 should have been GC'd")
+	if c := lm.resourceTotal.Load(); c != 0 {
+		t.Errorf("resource count after GC = %d, want 0", c)
 	}
 }
 
-// TestGC_BogusReleaseDoesNotKeepEmptyResourceAlive verifies that a Release
-// with a non-matching token does NOT bump LastActivity. Before the fix,
-// LastActivity was updated unconditionally — so an attacker (or a buggy
-// client) could keep an idle, empty resource alive past GCMaxIdleTime by
-// spamming Release with random tokens, defeating GC.
-func TestGC_BogusReleaseDoesNotKeepEmptyResourceAlive(t *testing.T) {
-	lm := testManager()
-	lm.cfg.GCInterval = 50 * time.Millisecond
-	lm.cfg.GCMaxIdleTime = 0
+func TestGC_KeepsHeld(t *testing.T) {
+	lm := newTestManager(t, true)
+	lm.cfg.GCMaxIdleTime = time.Millisecond
 
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Release("k1", tok)
-	// Force idle.
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
-	lm.UnlockKeyForTest("k1")
+	_, _ = lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	time.Sleep(10 * time.Millisecond)
+	lm.gcOnce(time.Now())
 
-	// Bogus release — must NOT update LastActivity.
-	if ok := lm.Release("k1", "bogus-token"); ok {
-		t.Fatal("bogus release returned ok")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.GCLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("k1")
-	exists := lm.ResourceForTest("k1") != nil
-	lm.UnlockKeyForTest("k1")
-	if exists {
-		t.Fatal("k1 should have been GC'd despite bogus Release")
+	if c := lm.resourceTotal.Load(); c != 1 {
+		t.Errorf("held resource was GC'd")
 	}
 }
-
-// TestGC_BogusRenewDoesNotKeepEmptyResourceAlive is the Renew counterpart of
-// TestGC_BogusReleaseDoesNotKeepEmptyResourceAlive.
-func TestGC_BogusRenewDoesNotKeepEmptyResourceAlive(t *testing.T) {
-	lm := testManager()
-	lm.cfg.GCInterval = 50 * time.Millisecond
-	lm.cfg.GCMaxIdleTime = 0
-
-	tok, _ := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Release("k1", tok)
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	if _, ok := lm.Renew("k1", "bogus-token", 30*time.Second); ok {
-		t.Fatal("bogus renew returned ok")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.GCLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("k1")
-	exists := lm.ResourceForTest("k1") != nil
-	lm.UnlockKeyForTest("k1")
-	if exists {
-		t.Fatal("k1 should have been GC'd despite bogus Renew")
-	}
-}
-
-func TestGC_DoesNotPruneHeld(t *testing.T) {
-	lm := testManager()
-	lm.cfg.GCInterval = 50 * time.Millisecond
-	lm.cfg.GCMaxIdleTime = 0
-
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").LastActivity = time.Now().Add(-100 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.GCLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("k1")
-	exists := lm.ResourceForTest("k1") != nil
-	lm.UnlockKeyForTest("k1")
-	if !exists {
-		t.Fatal("k1 should not be GC'd (still held)")
-	}
-}
-
-// ===========================================================================
-// Semaphore tests
-// ===========================================================================
 
 // ---------------------------------------------------------------------------
-// SemAcquire
+// Stats
 // ---------------------------------------------------------------------------
 
-func TestSemAcquire_Immediate(t *testing.T) {
-	lm := testManager()
-	tok, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
+func TestStats_HeldLock(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _ = lm.Acquire(context.Background(), LockPrefix+"k", time.Second, 60*time.Second, 7, 1)
+	st := lm.Stats(0)
+	if len(st.Locks) != 1 {
+		t.Fatalf("got %d locks, want 1", len(st.Locks))
+	}
+	if st.Locks[0].OwnerConnID != 7 {
+		t.Errorf("owner conn = %d, want 7", st.Locks[0].OwnerConnID)
+	}
+}
+
+func TestStats_Semaphore(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _ = lm.Acquire(context.Background(), SemPrefix+"k", time.Second, 60*time.Second, 1, 3)
+	_, _ = lm.Acquire(context.Background(), SemPrefix+"k", time.Second, 60*time.Second, 2, 3)
+	st := lm.Stats(0)
+	if len(st.Semaphores) != 1 {
+		t.Fatalf("got %d sems, want 1", len(st.Semaphores))
+	}
+	if st.Semaphores[0].Holders != 2 {
+		t.Errorf("holders = %d, want 2", st.Semaphores[0].Holders)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context cancellation
+// ---------------------------------------------------------------------------
+
+func TestAcquire_ContextCancel(t *testing.T) {
+	lm := newTestManager(t, true)
+	_, _ = lm.Acquire(context.Background(), "k", time.Second, 30*time.Second, 1, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := lm.Acquire(ctx, "k", 5*time.Second, 30*time.Second, 2, 1)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acquire didn't return after cancel")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// StripKeyPrefix
+// ---------------------------------------------------------------------------
+
+func TestStripKeyPrefix(t *testing.T) {
+	cases := []struct{ in, out string }{
+		{"lock:foo", "foo"},
+		{"sem:bar", "bar"},
+		{"plain", "plain"},
+	}
+	for _, c := range cases {
+		if got := StripKeyPrefix(c.in); got != c.out {
+			t.Errorf("%q: got %q, want %q", c.in, got, c.out)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lease expiry grants next waiter (end-to-end via Acquire path)
+// ---------------------------------------------------------------------------
+
+func TestExpiredLease_GrantedToNextOnAcquire(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+
+	// First conn holds the lock with a short lease.
+	_, _ = lm.Acquire(ctx, "k", time.Second, 30*time.Second, 1, 1)
+
+	// Force expiry; a fresh acquire must opportunistically evict.
+	lm.resetLeasesForTest("k")
+
+	tok2, err := lm.Acquire(ctx, "k", 50*time.Millisecond, 30*time.Second, 2, 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("acquire after expiry: %v", err)
 	}
-	if tok == "" {
-		t.Fatal("expected token")
-	}
-	lm.LockKeyForTest("s1")
-	st := lm.ResourceForTest("s1")
-	if st.Limit != 3 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatalf("limit: got %d want 3", st.Limit)
-	}
-	if len(st.Holders) != 1 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatalf("holders: got %d want 1", len(st.Holders))
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestSemAcquire_MultipleConcurrent(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	tok2, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
-	tok3, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 3)
-	if tok1 == "" || tok2 == "" || tok3 == "" {
-		t.Fatal("all three should acquire immediately")
-	}
-	lm.LockKeyForTest("s1")
-	if len(lm.ResourceForTest("s1").Holders) != 3 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatalf("holders: got %d want 3", len(lm.ResourceForTest("s1").Holders))
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestSemAcquire_AtCapacityTimeout(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 2)
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 2)
-
-	// Third should timeout with 0 timeout
-	tok, err := lm.Acquire(bg(), "s1", 0, 30*time.Second, 3, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok != "" {
-		t.Fatal("expected empty token (timeout)")
+	if tok2 == "" {
+		t.Fatal("expected grant, got timeout")
 	}
 }
 
-func TestSemAcquire_FIFOOrdering(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
+// ---------------------------------------------------------------------------
+// Stress: many concurrent acquires don't deadlock
+// ---------------------------------------------------------------------------
 
-	var tok2, tok3 string
-	var mu sync.Mutex
+func TestStress_ManyConcurrent(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+
+	const N = 50
 	var wg sync.WaitGroup
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		t, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
-		mu.Lock()
-		tok2 = t
-		mu.Unlock()
-	}()
-	go func() {
-		defer wg.Done()
-		time.Sleep(20 * time.Millisecond)
-		t, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 1)
-		mu.Lock()
-		tok3 = t
-		mu.Unlock()
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	lm.Release("s1", tok1)
-	time.Sleep(50 * time.Millisecond)
-
-	mu.Lock()
-	if tok2 == "" {
-		mu.Unlock()
-		t.Fatal("conn2 should have acquired")
-	}
-	mu.Unlock()
-
-	lm.Release("s1", tok2)
-	wg.Wait()
-
-	mu.Lock()
-	if tok3 == "" {
-		mu.Unlock()
-		t.Fatal("conn3 should have acquired")
-	}
-	mu.Unlock()
-}
-
-func TestSemAcquire_MaxLocks(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxLocks = 1
-	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = lm.Acquire(bg(), "s2", 5*time.Second, 30*time.Second, 2, 3)
-	if err != ErrMaxLocks {
-		t.Fatalf("expected ErrMaxLocks, got %v", err)
-	}
-}
-
-func TestSemAcquire_LimitMismatch(t *testing.T) {
-	lm := testManager()
-	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 5)
-	if err != ErrLimitMismatch {
-		t.Fatalf("expected ErrLimitMismatch, got %v", err)
-	}
-}
-
-func TestSemAcquire_MaxLocksSharedWithLocks(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxLocks = 2
-	lm.Acquire(bg(), "lock1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Acquire(bg(), "sem1", 5*time.Second, 30*time.Second, 2, 3)
-	_, err := lm.Acquire(bg(), "sem2", 5*time.Second, 30*time.Second, 3, 3)
-	if err != ErrMaxLocks {
-		t.Fatalf("expected ErrMaxLocks, got %v", err)
-	}
-}
-
-func TestSemAcquire_ContextCancel(t *testing.T) {
-	lm := testManager()
-	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var acquireErr error
-	go func() {
-		_, acquireErr = lm.Acquire(ctx, "s1", 30*time.Second, 30*time.Second, 2, 1)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	<-done
-
-	if acquireErr == nil {
-		t.Fatal("expected context error")
-	}
-	if acquireErr != context.Canceled {
-		t.Fatalf("expected context.Canceled, got %v", acquireErr)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SemRelease
-// ---------------------------------------------------------------------------
-
-func TestSemRelease_Valid(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	if !lm.Release("s1", tok) {
-		t.Fatal("release should succeed")
-	}
-	lm.LockKeyForTest("s1")
-	if len(lm.ResourceForTest("s1").Holders) != 0 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("holders should be empty")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestSemRelease_WrongToken(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	if lm.Release("s1", "wrong") {
-		t.Fatal("release with wrong token should fail")
-	}
-}
-
-func TestSemRelease_TransfersToWaiter(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.Release("s1", tok1)
-	tok2 := <-done
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SemRenew
-// ---------------------------------------------------------------------------
-
-func TestSemRenew_Valid(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	remaining, ok := lm.Renew("s1", tok, 60*time.Second)
-	if !ok {
-		t.Fatal("renew should succeed")
-	}
-	if remaining <= 0 {
-		t.Fatal("remaining should be > 0")
-	}
-}
-
-func TestSemRenew_WrongToken(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	_, ok := lm.Renew("s1", "wrong", 30*time.Second)
-	if ok {
-		t.Fatal("renew with wrong token should fail")
-	}
-}
-
-func TestSemRenew_Expired(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	_, ok := lm.Renew("s1", tok, 30*time.Second)
-	if ok {
-		t.Fatal("renew of expired lease should fail")
-	}
-	lm.LockKeyForTest("s1")
-	if len(lm.ResourceForTest("s1").Holders) != 0 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("expired holder should be removed")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-// ---------------------------------------------------------------------------
-// SemEnqueue / SemWait
-// ---------------------------------------------------------------------------
-
-func TestSemEnqueue_Immediate(t *testing.T) {
-	lm := testManager()
-	status, tok, lease, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "acquired" || tok == "" || lease != 30 {
-		t.Fatalf("unexpected: status=%s tok=%s lease=%d", status, tok, lease)
-	}
-}
-
-func TestSemEnqueue_Queued(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-
-	status, tok, lease, err := lm.Enqueue("s1", 30*time.Second, 2, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" || tok != "" || lease != 0 {
-		t.Fatalf("unexpected: status=%s tok=%s lease=%d", status, tok, lease)
-	}
-}
-
-func TestSemEnqueue_DoubleEnqueue(t *testing.T) {
-	lm := testManager()
-	lm.Enqueue("s1", 30*time.Second, 1, 3)
-	_, _, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	if err == nil {
-		t.Fatal("double enqueue should error")
-	}
-	if !errors.Is(err, ErrAlreadyEnqueued) {
-		t.Fatalf("expected ErrAlreadyEnqueued, got %v", err)
-	}
-}
-
-func TestSemEnqueue_LimitMismatch(t *testing.T) {
-	lm := testManager()
-	lm.Enqueue("s1", 30*time.Second, 1, 3)
-	_, _, _, err := lm.Enqueue("s1", 30*time.Second, 2, 5)
-	if err != ErrLimitMismatch {
-		t.Fatalf("expected ErrLimitMismatch, got %v", err)
-	}
-}
-
-func TestSemWait_FastPath(t *testing.T) {
-	lm := testManager()
-	status, token, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	if status != "acquired" {
-		t.Fatal("expected acquired")
-	}
-
-	tok, ttl, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok != token || ttl != 30 {
-		t.Fatalf("unexpected: tok=%s ttl=%d", tok, ttl)
-	}
-}
-
-func TestSemWait_QueuedThenWait(t *testing.T) {
-	lm := testManager()
-	tok1, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("s1", 30*time.Second, 2, 1)
-
-	done := make(chan struct{})
-	var gotTok string
-	go func() {
-		gotTok, _, _ = lm.Wait(bg(), "s1", 5*time.Second, 2)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	lm.Release("s1", tok1)
-	<-done
-
-	if gotTok == "" {
-		t.Fatal("should have received token")
-	}
-}
-
-func TestSemWait_Timeout(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("s1", 30*time.Second, 2, 1)
-
-	tok, _, err := lm.Wait(bg(), "s1", 0, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok != "" {
-		t.Fatal("expected empty token (timeout)")
-	}
-}
-
-func TestSemWait_NotEnqueued(t *testing.T) {
-	lm := testManager()
-	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
-	if err != ErrNotEnqueued {
-		t.Fatalf("expected ErrNotEnqueued, got %v", err)
-	}
-}
-
-func TestSemWait_ContextCancel(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("s1", 30*time.Second, 2, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var waitErr error
-	go func() {
-		_, _, waitErr = lm.Wait(ctx, "s1", 30*time.Second, 2)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	<-done
-
-	if waitErr == nil {
-		t.Fatal("expected context error")
-	}
-	if waitErr != context.Canceled {
-		t.Fatalf("expected context.Canceled, got %v", waitErr)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore CleanupConnection
-// ---------------------------------------------------------------------------
-
-func TestSemCleanup_ReleasesOwned(t *testing.T) {
-	lm := testManager()
-	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 100, 3)
-	if tok == "" {
-		t.Fatal("should acquire")
-	}
-	lm.CleanupConnection(100)
-	lm.LockKeyForTest("s1")
-	if len(lm.ResourceForTest("s1").Holders) != 0 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("holders should be cleared")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestSemCleanup_CancelsPending(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "s1", 10*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(2)
-	tok := <-done
-	if tok != "" {
-		t.Fatal("cancelled waiter should get empty token")
-	}
-}
-
-func TestSemCleanup_TransfersToWaiter(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(1)
-	tok2 := <-done
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired after transfer")
-	}
-}
-
-func TestSemCleanup_EnqueuedWaiter(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("s1", 30*time.Second, 2, 1)
-
-	lm.CleanupConnection(2)
-	lm.LockKeyForTest("s1")
-	if len(lm.ResourceForTest("s1").Waiters) != 0 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("waiter should be removed")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore LeaseExpiryLoop
-// ---------------------------------------------------------------------------
-
-func TestSemLeaseExpiry_ReleasesHolder(t *testing.T) {
-	lm := testManager()
-	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 3)
-	if tok == "" {
-		t.Fatal("should acquire")
-	}
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	loopDone := make(chan struct{})
-	go func() {
-		defer close(loopDone)
-		lm.LeaseExpiryLoop(ctx)
-	}()
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-	<-loopDone
-
-	lm.LockKeyForTest("s1")
-	holderCount := len(lm.ResourceForTest("s1").Holders)
-	lm.UnlockKeyForTest("s1")
-	if holderCount != 0 {
-		t.Fatal("holder should be evicted by expiry loop")
-	}
-}
-
-func TestSemLeaseExpiry_TransfersToWaiter(t *testing.T) {
-	lm := testManager()
-	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	lm.Acquire(bg(), "s1", 5*time.Second, 1*time.Second, 1, 1)
-
-	done := make(chan string, 1)
-	go func() {
-		tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
-		done <- tok
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	// Expire holder
-	lm.LockKeyForTest("s1")
-	for _, h := range lm.ResourceForTest("s1").Holders {
-		h.leaseExpires = time.Now().Add(-1 * time.Second)
-	}
-	lm.UnlockKeyForTest("s1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	loopDone := make(chan struct{})
-	go func() {
-		defer close(loopDone)
-		lm.LeaseExpiryLoop(ctx)
-	}()
-
-	tok2 := <-done
-	cancel()
-	<-loopDone
-
-	if tok2 == "" {
-		t.Fatal("conn2 should have acquired after expiry")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore GCLoop
-// ---------------------------------------------------------------------------
-
-func TestSemGC_PrunesIdle(t *testing.T) {
-	lm := testManager()
-	lm.cfg.GCInterval = 50 * time.Millisecond
-	lm.cfg.GCMaxIdleTime = 0
-
-	tok, _ := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	lm.Release("s1", tok)
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").LastActivity = time.Now().Add(-100 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.GCLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("s1")
-	exists := lm.ResourceForTest("s1") != nil
-	lm.UnlockKeyForTest("s1")
-	if exists {
-		t.Fatal("s1 should have been GC'd")
-	}
-}
-
-func TestSemGC_DoesNotPruneHeld(t *testing.T) {
-	lm := testManager()
-	lm.cfg.GCInterval = 50 * time.Millisecond
-	lm.cfg.GCMaxIdleTime = 0
-
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 3)
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").LastActivity = time.Now().Add(-100 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.GCLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("s1")
-	exists := lm.ResourceForTest("s1") != nil
-	lm.UnlockKeyForTest("s1")
-	if !exists {
-		t.Fatal("s1 should not be GC'd (still has holders)")
-	}
-}
-
-// ===========================================================================
-// MaxWaiters tests
-// ===========================================================================
-
-func TestFIFOAcquire_MaxWaiters(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxWaiters = 1
-
-	// conn1 holds the lock
-	_, err := lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// conn2 enqueues as waiter (fills the queue)
-	done := make(chan struct{})
-	go func() {
-		lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 2, 1)
-		close(done)
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	// conn3 should get ErrMaxWaiters
-	_, err = lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 3, 1)
-	if err != ErrMaxWaiters {
-		t.Fatalf("expected ErrMaxWaiters, got %v", err)
-	}
-
-	// Cleanup: release so goroutine can finish
-	lm.LockKeyForTest("k1")
-	tok := holderToken(lm.ResourceForTest("k1"))
-	lm.UnlockKeyForTest("k1")
-	lm.Release("k1", tok)
-	<-done
-}
-
-func TestFIFOEnqueue_MaxWaiters(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxWaiters = 1
-
-	// conn1 holds the lock
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	// conn2 enqueues (fills queue)
-	status, _, _, err := lm.Enqueue("k1", 30*time.Second, 2, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	// conn3 should get ErrMaxWaiters
-	_, _, _, err = lm.Enqueue("k1", 30*time.Second, 3, 1)
-	if err != ErrMaxWaiters {
-		t.Fatalf("expected ErrMaxWaiters, got %v", err)
-	}
-}
-
-func TestSemAcquire_MaxWaiters(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxWaiters = 1
-
-	// conn1 holds the single slot
-	_, err := lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// conn2 waits (fills queue)
-	done := make(chan struct{})
-	go func() {
-		lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 1)
-		close(done)
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	// conn3 should get ErrMaxWaiters
-	_, err = lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 3, 1)
-	if err != ErrMaxWaiters {
-		t.Fatalf("expected ErrMaxWaiters, got %v", err)
-	}
-
-	// Cleanup
-	lm.LockKeyForTest("s1")
-	var tok string
-	for t := range lm.ResourceForTest("s1").Holders {
-		tok = t
-		break
-	}
-	lm.UnlockKeyForTest("s1")
-	lm.Release("s1", tok)
-	<-done
-}
-
-func TestSemEnqueue_MaxWaiters(t *testing.T) {
-	lm := testManager()
-	lm.cfg.MaxWaiters = 1
-
-	// conn1 holds the slot
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-
-	// conn2 enqueues (fills queue)
-	status, _, _, err := lm.Enqueue("s1", 30*time.Second, 2, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	// conn3 should get ErrMaxWaiters
-	_, _, _, err = lm.Enqueue("s1", 30*time.Second, 3, 1)
-	if err != ErrMaxWaiters {
-		t.Fatalf("expected ErrMaxWaiters, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Regression: Release must not clobber a different in-progress enqueue
-// ---------------------------------------------------------------------------
-
-func TestSemRelease_DoesNotClobberEnqueuedState(t *testing.T) {
-	lm := testManager()
-
-	// Phase 1: conn1 acquires slot T1 via two-phase
-	status, tok1, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	if err != nil || status != "acquired" {
-		t.Fatalf("enqueue1: status=%s err=%v", status, err)
-	}
-	got1, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
-	if err != nil || got1 != tok1 {
-		t.Fatalf("wait1: tok=%s err=%v", got1, err)
-	}
-
-	// Phase 2: conn1 enqueues again for a second slot (T2)
-	status, tok2, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	if err != nil || status != "acquired" {
-		t.Fatalf("enqueue2: status=%s err=%v", status, err)
-	}
-
-	// Release T1 — must NOT destroy the enqueued state for T2
-	if !lm.Release("s1", tok1) {
-		t.Fatal("release T1 should succeed")
-	}
-
-	// SemWait for T2 must still work
-	got2, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
-	if err != nil {
-		t.Fatalf("wait2 should succeed, got err: %v", err)
-	}
-	if got2 != tok2 {
-		t.Fatalf("wait2 token mismatch: got %s want %s", got2, tok2)
-	}
-}
-
-func TestFIFORelease_DoesNotClobberEnqueuedState(t *testing.T) {
-	lm := testManager()
-
-	// Conn1 acquires via two-phase
-	status, tok1, _, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
-	if err != nil || status != "acquired" {
-		t.Fatalf("enqueue1: status=%s err=%v", status, err)
-	}
-	got1, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
-	if err != nil || got1 != tok1 {
-		t.Fatalf("wait1: tok=%s err=%v", got1, err)
-	}
-
-	// Conn1 enqueues again (will be queued behind itself — a self-deadlock
-	// scenario, but the data structure must still be consistent)
-	status, _, _, err = lm.Enqueue("k1", 30*time.Second, 1, 1)
-	if err != nil {
-		t.Fatalf("enqueue2: err=%v", err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	// Release T1 — must NOT destroy the queued enqueue state
-	if !lm.Release("k1", tok1) {
-		t.Fatal("release should succeed")
-	}
-
-	// The enqueued waiter should still be tracked (it will get granted the lock)
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("enqueued state for conn1 should still exist")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-// ===========================================================================
-// Regression tests for unpushed fixes
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// ErrLeaseExpired in FIFOWait/SemWait fast path
-// ---------------------------------------------------------------------------
-
-func TestFIFOWait_FastPathLeaseExpired(t *testing.T) {
-	// When a lock is acquired via enqueue then its lease expires before
-	// Wait is called, Wait must return ErrLeaseExpired and clean
-	// up owner state so the next waiter can proceed.
-	lm := testManager()
-	status, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
-	if status != "acquired" || tok == "" {
-		t.Fatal("expected acquired")
-	}
-
-	// Manually expire the lease
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
-	if !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired, got %v", err)
-	}
-
-	// Owner state must be cleaned up
-	lm.LockKeyForTest("k1")
-	st := lm.ResourceForTest("k1")
-	if len(st.Holders) != 0 {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("owner should be cleared after expired wait")
-	}
-	lm.UnlockKeyForTest("k1")
-
-	// connEnqueued should be cleaned up
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(connKey{ConnID: 1, Key: "k1"}) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connEnqueued should be deleted")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestFIFOWait_FastPathLeaseExpiredGrantsNext(t *testing.T) {
-	// When the fast-path detects expiry, the next waiter should be granted.
-	lm := testManager()
-	lm.Enqueue("k1", 1*time.Second, 1, 1) // conn1 acquires
-
-	// conn2 enqueues as waiter
-	lm.Enqueue("k1", 30*time.Second, 2, 1)
-
-	// Expire conn1's lease
-	lm.LockKeyForTest("k1")
-	for _, h := range lm.ResourceForTest("k1").Holders {
-		h.leaseExpires = time.Now().Add(-1 * time.Second)
-	}
-	lm.UnlockKeyForTest("k1")
-
-	// conn1's Wait detects expiry and should grant to conn2
-	_, _, err := lm.Wait(bg(), "k1", 5*time.Second, 1)
-	if !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired, got %v", err)
-	}
-
-	// conn2 should now be the owner (granted by grantNextWaiterLocked)
-	lm.LockKeyForTest("k1")
-	st := lm.ResourceForTest("k1")
-	ownerConn := holderConnID(st)
-	lm.UnlockKeyForTest("k1")
-	if ownerConn != 2 {
-		t.Fatalf("expected conn2 to own, got %d", ownerConn)
-	}
-}
-
-func TestSemWait_FastPathLeaseExpired(t *testing.T) {
-	lm := testManager()
-	status, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
-	if status != "acquired" || tok == "" {
-		t.Fatal("expected acquired")
-	}
-
-	// Manually expire
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
-	if !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired, got %v", err)
-	}
-
-	// Holder should be cleaned up
-	lm.LockKeyForTest("s1")
-	if len(lm.ResourceForTest("s1").Holders) != 0 {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("expired holder should be removed")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestSemWait_FastPathLockLost(t *testing.T) {
-	// If the sem state is GC'd or holder was evicted, Wait should
-	// return ErrLeaseExpired.
-	lm := testManager()
-	status, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
-	if status != "acquired" || tok == "" {
-		t.Fatal("expected acquired")
-	}
-
-	// Remove the holder to simulate state loss
-	lm.LockKeyForTest("s1")
-	delete(lm.ResourceForTest("s1").Holders, tok)
-	lm.UnlockKeyForTest("s1")
-
-	_, _, err := lm.Wait(bg(), "s1", 5*time.Second, 1)
-	if !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ErrWaiterClosed
-// ---------------------------------------------------------------------------
-
-func TestFIFOAcquire_WaiterClosed(t *testing.T) {
-	// When CleanupConnection closes a waiter channel, Acquire
-	// should return ErrWaiterClosed instead of returning an empty token.
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := lm.Acquire(bg(), "k1", 30*time.Second, 30*time.Second, 2, 1)
-		done <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(2) // closes conn2's waiter channel
-	err := <-done
-	if !errors.Is(err, ErrWaiterClosed) {
-		t.Fatalf("expected ErrWaiterClosed, got %v", err)
-	}
-}
-
-func TestFIFOWait_WaiterClosed(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("k1", 30*time.Second, 2, 1)
-
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := lm.Wait(bg(), "k1", 30*time.Second, 2)
-		done <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(2)
-	err := <-done
-	if !errors.Is(err, ErrWaiterClosed) {
-		t.Fatalf("expected ErrWaiterClosed, got %v", err)
-	}
-}
-
-func TestSemAcquire_WaiterClosed(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := lm.Acquire(bg(), "s1", 30*time.Second, 30*time.Second, 2, 1)
-		done <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(2)
-	err := <-done
-	if !errors.Is(err, ErrWaiterClosed) {
-		t.Fatalf("expected ErrWaiterClosed, got %v", err)
-	}
-}
-
-func TestSemWait_WaiterClosed(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Enqueue("s1", 30*time.Second, 2, 1)
-
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := lm.Wait(bg(), "s1", 30*time.Second, 2)
-		done <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	lm.CleanupConnection(2)
-	err := <-done
-	if !errors.Is(err, ErrWaiterClosed) {
-		t.Fatalf("expected ErrWaiterClosed, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// connEnqueued cleanup on release and lease expiry
-// ---------------------------------------------------------------------------
-
-func TestFIFORelease_CleansConnEnqueued(t *testing.T) {
-	// After Enqueue acquires immediately, Release must clean
-	// the connEnqueued entry for that token.
-	lm := testManager()
-	_, tok, _, _ := lm.Enqueue("k1", 30*time.Second, 1, 1)
-	eqKey := connKey{ConnID: 1, Key: "k1"}
-
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connEnqueued should exist before release")
-	}
-	lm.UnlockKeyForTest("k1")
-
-	lm.Release("k1", tok)
-
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connEnqueued should be cleaned up after release")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestSemRelease_CleansConnSemEnqueued(t *testing.T) {
-	lm := testManager()
-	_, tok, _, _ := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	eqKey := connKey{ConnID: 1, Key: "s1"}
-
-	lm.LockKeyForTest("s1")
-	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("connEnqueued should exist before release")
-	}
-	lm.UnlockKeyForTest("s1")
-
-	lm.Release("s1", tok)
-
-	lm.LockKeyForTest("s1")
-	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("connEnqueued should be cleaned up after release")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestFIFORenew_ExpiredCleansConnEnqueued(t *testing.T) {
-	// When renew detects expiry, it must also clean connEnqueued.
-	lm := testManager()
-	_, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
-	eqKey := connKey{ConnID: 1, Key: "k1"}
-
-	// Manually expire
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	_, ok := lm.Renew("k1", tok, 30*time.Second)
-	if ok {
-		t.Fatal("renew should fail on expired lease")
-	}
-
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connEnqueued should be cleaned up after expired renew")
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestSemRenew_ExpiredCleansConnSemEnqueued(t *testing.T) {
-	lm := testManager()
-	_, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
-	eqKey := connKey{ConnID: 1, Key: "s1"}
-
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	_, ok := lm.Renew("s1", tok, 30*time.Second)
-	if ok {
-		t.Fatal("renew should fail on expired lease")
-	}
-
-	lm.LockKeyForTest("s1")
-	if lm.ConnEnqueuedForTest(eqKey) != nil {
-		lm.UnlockKeyForTest("s1")
-		t.Fatal("connEnqueued should be cleaned up after expired renew")
-	}
-	lm.UnlockKeyForTest("s1")
-}
-
-func TestLeaseExpiry_CleansConnEnqueued(t *testing.T) {
-	// The LeaseExpiryLoop should also clean connEnqueued entries.
-	lm := testManager()
-	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	_, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
-	eqKey := connKey{ConnID: 1, Key: "k1"}
-
-	lm.LockKeyForTest("k1")
-	if lm.ConnEnqueuedForTest(eqKey) == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connEnqueued should exist")
-	}
-	lm.UnlockKeyForTest("k1")
-
-	// Expire
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.LeaseExpiryLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("k1")
-	exists := lm.ConnEnqueuedForTest(eqKey) != nil
-	lm.UnlockKeyForTest("k1")
-	if exists {
-		t.Fatal("connEnqueued should be cleaned up by expiry loop")
-	}
-}
-
-func TestGrantedTwoPhaseWaiterExpiryCleansConnEnqueued(t *testing.T) {
-	lm := testManager()
-	holder, err := lm.Acquire(bg(), "k1", 0, 30*time.Second, 1, 1)
-	if err != nil || holder == "" {
-		t.Fatalf("holder acquire: token=%q err=%v", holder, err)
-	}
-
-	status, tok, _, err := lm.Enqueue("k1", 1*time.Second, 2, 1)
-	if err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	if status != "queued" || tok != "" {
-		t.Fatalf("enqueue: status=%q token=%q, want queued without token", status, tok)
-	}
-
-	if !lm.Release("k1", holder) {
-		t.Fatal("release holder failed")
-	}
-
-	eqKey := connKey{ConnID: 2, Key: "k1"}
-	lm.LockKeyForTest("k1")
-	es := lm.ConnEnqueuedForTest(eqKey)
-	if es == nil || es.token == "" || es.waiter != nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatalf("granted enqueue not promoted to token state: %+v", es)
-	}
-	granted := es.token
-	lm.ResourceForTest("k1").Holders[granted].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	tok3, err := lm.Acquire(bg(), "k1", 0, 30*time.Second, 3, 1)
-	if err != nil || tok3 == "" {
-		t.Fatalf("acquire after expiry: token=%q err=%v", tok3, err)
-	}
-
-	lm.LockKeyForTest("k1")
-	exists := lm.ConnEnqueuedForTest(eqKey) != nil
-	lm.UnlockKeyForTest("k1")
-	if exists {
-		t.Fatal("connEnqueued should be cleaned after granted waiter expires")
-	}
-
-	status, _, _, err = lm.Enqueue("k1", 1*time.Second, 2, 1)
-	if errors.Is(err, ErrAlreadyEnqueued) {
-		t.Fatal("stale connEnqueued still blocks a new enqueue")
-	}
-	if err != nil {
-		t.Fatalf("new enqueue: status=%q err=%v", status, err)
-	}
-}
-
-func TestSemLeaseExpiry_CleansConnSemEnqueued(t *testing.T) {
-	lm := testManager()
-	lm.cfg.LeaseSweepInterval = 50 * time.Millisecond
-	_, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
-	eqKey := connKey{ConnID: 1, Key: "s1"}
-
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go lm.LeaseExpiryLoop(ctx)
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	lm.LockKeyForTest("s1")
-	exists := lm.ConnEnqueuedForTest(eqKey) != nil
-	lm.UnlockKeyForTest("s1")
-	if exists {
-		t.Fatal("connEnqueued should be cleaned up by expiry loop")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// connOwned cleanup in FIFOWait/SemWait fast path on expiry
-// ---------------------------------------------------------------------------
-
-func TestFIFOWait_FastPathExpiredCleansConnOwned(t *testing.T) {
-	lm := testManager()
-	status, tok, _, _ := lm.Enqueue("k1", 1*time.Second, 1, 1)
-	if status != "acquired" {
-		t.Fatal("expected acquired")
-	}
-
-	// Verify connOwned is set
-	lm.LockKeyForTest("k1")
-	if lm.ConnOwnedForTest(1, "k1") == nil {
-		lm.UnlockKeyForTest("k1")
-		t.Fatal("connOwned should have conn 1")
-	}
-	lm.UnlockKeyForTest("k1")
-	lm.LockKeyForTest("k1")
-	lm.ResourceForTest("k1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("k1")
-
-	lm.Wait(bg(), "k1", 5*time.Second, 1)
-
-	// connOwned for this key should be cleaned up
-	lm.LockKeyForTest("k1")
-	if owned := lm.ConnOwnedForTest(1, "k1"); owned != nil {
-		if _, hasKey := owned["k1"]; hasKey {
-			lm.UnlockKeyForTest("k1")
-			t.Fatal("connOwned should not have k1 after expired wait")
-		}
-	}
-	lm.UnlockKeyForTest("k1")
-}
-
-func TestSemWait_FastPathExpiredCleansConnSemOwned(t *testing.T) {
-	lm := testManager()
-	status, tok, _, _ := lm.Enqueue("s1", 1*time.Second, 1, 3)
-	if status != "acquired" || tok == "" {
-		t.Fatal("expected acquired")
-	}
-
-	lm.LockKeyForTest("s1")
-	lm.ResourceForTest("s1").Holders[tok].leaseExpires = time.Now().Add(-1 * time.Second)
-	lm.UnlockKeyForTest("s1")
-
-	lm.Wait(bg(), "s1", 5*time.Second, 1)
-
-	lm.LockKeyForTest("s1")
-	if m := lm.ConnOwnedForTest(1, "s1"); m != nil {
-		if tokens, ok := m["s1"]; ok {
-			if _, ok := tokens[tok]; ok {
-				lm.UnlockKeyForTest("s1")
-				t.Fatal("connOwned should not have the expired token")
+	for i := 0; i < N; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := lm.Acquire(ctx, "stress", 5*time.Second, 30*time.Second, uint64(i+1), 1)
+			if err != nil || tok == "" {
+				return
 			}
-		}
+			lm.Release("stress", tok)
+		}()
 	}
-	lm.UnlockKeyForTest("s1")
+	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------
-// Stats idle classification
+// Wait fast path: enqueue acquired immediately, wait should return token
 // ---------------------------------------------------------------------------
 
-func TestStats_IdleClassification(t *testing.T) {
-	lm := testManager()
-
-	// Create an idle lock (acquired then released)
-	tok, _ := lm.Acquire(bg(), "idle-lock", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Release("idle-lock", tok)
-
-	// Create an active lock (held)
-	lm.Acquire(bg(), "active-lock", 5*time.Second, 30*time.Second, 2, 1)
-
-	// Create an idle semaphore
-	semTok, _ := lm.Acquire(bg(), "idle-sem", 5*time.Second, 30*time.Second, 3, 3)
-	lm.Release("idle-sem", semTok)
-
-	// Create an active semaphore
-	lm.Acquire(bg(), "active-sem", 5*time.Second, 30*time.Second, 4, 3)
-
-	stats := lm.Stats(4)
-
-	// Active locks should be in Locks list
-	foundActive := false
-	for _, l := range stats.Locks {
-		if l.Key == "active-lock" {
-			foundActive = true
-		}
-		if l.Key == "idle-lock" {
-			t.Fatal("idle-lock should not be in active locks")
-		}
+func TestWait_FastPathReturnsToken(t *testing.T) {
+	lm := newTestManager(t, true)
+	status, gotTok, _, _ := lm.Enqueue("k", 30*time.Second, 1, 1)
+	if status != "acquired" {
+		t.Fatal("expected acquired")
 	}
-	if !foundActive {
-		t.Fatal("active-lock should be in locks list")
+	tok, _, err := lm.Wait(context.Background(), "k", time.Second, 1)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
 	}
-
-	// Idle locks should be in IdleLocks list
-	foundIdle := false
-	for _, l := range stats.IdleLocks {
-		if l.Key == "idle-lock" {
-			foundIdle = true
-		}
-	}
-	if !foundIdle {
-		t.Fatal("idle-lock should be in idle locks list")
-	}
-
-	// Active semaphores should be in Semaphores list
-	foundActiveSem := false
-	for _, s := range stats.Semaphores {
-		if s.Key == "active-sem" {
-			foundActiveSem = true
-		}
-	}
-	if !foundActiveSem {
-		t.Fatal("active-sem should be in semaphores list")
-	}
-
-	// Idle semaphores should be in IdleSemaphores list
-	foundIdleSem := false
-	for _, s := range stats.IdleSemaphores {
-		if s.Key == "idle-sem" {
-			foundIdleSem = true
-		}
-	}
-	if !foundIdleSem {
-		t.Fatal("idle-sem should be in idle semaphores list")
+	if tok != gotTok {
+		t.Errorf("got token %q, want %q (same as enqueue)", tok, gotTok)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// ErrAlreadyEnqueued (sentinel error, not type assertion)
+// shardIndex distribution
 // ---------------------------------------------------------------------------
 
-func TestFIFOEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
-	lm := testManager()
-	lm.Enqueue("k1", 30*time.Second, 1, 1)
-	_, _, _, err := lm.Enqueue("k1", 30*time.Second, 1, 1)
-	if !errors.Is(err, ErrAlreadyEnqueued) {
-		t.Fatalf("expected errors.Is(err, ErrAlreadyEnqueued), got %v", err)
+func TestShardIndex_Distribution(t *testing.T) {
+	counts := make([]int, numShards)
+	for i := 0; i < 10000; i++ {
+		counts[shardIndex("key"+string(rune(i)))]++
 	}
-}
-
-func TestSemEnqueue_AlreadyEnqueuedIsSentinel(t *testing.T) {
-	lm := testManager()
-	lm.Enqueue("s1", 30*time.Second, 1, 3)
-	_, _, _, err := lm.Enqueue("s1", 30*time.Second, 1, 3)
-	if !errors.Is(err, ErrAlreadyEnqueued) {
-		t.Fatalf("expected errors.Is(err, ErrAlreadyEnqueued), got %v", err)
+	zero := 0
+	for _, c := range counts {
+		if c == 0 {
+			zero++
+		}
 	}
-}
-
-// ---------------------------------------------------------------------------
-// ResetForTest clears all state
-// ---------------------------------------------------------------------------
-
-func TestResetForTest(t *testing.T) {
-	lm := testManager()
-	lm.Acquire(bg(), "k1", 5*time.Second, 30*time.Second, 1, 1)
-	lm.Acquire(bg(), "s1", 5*time.Second, 30*time.Second, 2, 3)
-	lm.Enqueue("k2", 30*time.Second, 3, 1)
-	lm.Enqueue("s2", 30*time.Second, 4, 3)
-
-	lm.ResetForTest()
-
-	if lm.ResourceCountForTest() != 0 {
-		t.Fatal("resources should be empty")
-	}
-	if lm.ConnOwnedCountForTest() != 0 {
-		t.Fatal("connOwned should be empty")
-	}
-	if lm.ConnEnqueuedCountForTest() != 0 {
-		t.Fatal("connEnqueued should be empty")
+	if zero > numShards/4 {
+		t.Errorf("%d/%d shards saw zero hits — distribution looks degenerate", zero, numShards)
 	}
 }

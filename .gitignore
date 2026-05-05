@@ -24,3 +24,8 @@ dflockd
 .claude
 
 coverage.out
+
+# Pre-refactor source kept for reference (excluded from build via //go:build ignore).
+old/
+TASK.md
+.mcp.json

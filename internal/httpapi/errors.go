@@ -1,23 +1,27 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+
+	"github.com/mtingers/dflockd/internal/lock"
 )
 
-// errorBody is the common JSON shape for error responses.
+// errorBody is the JSON shape for every non-2xx response.
 //
 //	{"error": "<code>", "detail": "<optional human-readable>"}
 //
-// The `error` field is machine-readable (stable); `detail` is informational.
+// The `error` field is machine-readable and stable; `detail` is
+// informational and may change.
 type errorBody struct {
 	Error  string `json:"error"`
 	Detail string `json:"detail,omitempty"`
 }
 
-// writeJSON writes a JSON response with the given status code and body.
-// Marshal failures degrade to a plain 500 — this should never happen for
-// our own structs.
+// writeJSON encodes body with status. nil body writes only a status
+// line. Marshal failures fall through to a plain 500.
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -35,51 +39,37 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Write([]byte("\n"))
 }
 
-// writeError writes a JSON error response. Use for all non-2xx responses.
+// writeError is the canonical way to emit a non-2xx JSON response.
 func writeError(w http.ResponseWriter, status int, code, detail string) {
 	writeJSON(w, status, errorBody{Error: code, Detail: detail})
 }
 
-// mapProtocolError translates a protocol-layer response line that starts
-// with "error..." into an HTTP status + JSON body. Returns (status, body)
-// for callers that need to branch further; most callers use writeProtocolError.
-//
-// This is the single source of truth for the "protocol → HTTP" mapping
-// documented in docs/proposals/http-api.md.
-func mapProtocolError(resp, opContext string) (int, errorBody) {
-	switch resp {
-	case "error_auth":
-		return http.StatusUnauthorized, errorBody{Error: "unauthorized"}
-	case "error_max_locks":
-		return http.StatusServiceUnavailable, errorBody{Error: "max_locks"}
-	case "error_max_waiters":
-		return http.StatusServiceUnavailable, errorBody{Error: "max_waiters"}
-	case "error_limit_mismatch":
-		return http.StatusConflict, errorBody{Error: "limit_mismatch"}
-	case "error_already_enqueued":
-		return http.StatusConflict, errorBody{Error: "already_enqueued"}
-	case "error_not_enqueued":
-		return http.StatusConflict, errorBody{Error: "not_enqueued"}
-	case "error_lease_expired":
-		return http.StatusConflict, errorBody{Error: "lease_expired"}
-	case "error_draining":
-		return http.StatusServiceUnavailable, errorBody{Error: "draining"}
-	case "error":
-		// Generic protocol error on a state-mutating op usually means
-		// "token/key combination not held." 404 is friendlier than 400
-		// because it gives the caller a clear "this resource isn't
-		// yours (anymore)" signal.
-		return http.StatusNotFound, errorBody{Error: "not_held", Detail: opContext}
-	default:
-		return http.StatusInternalServerError, errorBody{
-			Error:  "unexpected_protocol_response",
-			Detail: resp,
-		}
+// httpStatusForLockErr maps a LockManager error to (http.Status, code).
+// Unrecognised errors map to 500 with code "internal".
+func httpStatusForLockErr(err error) (int, string) {
+	switch {
+	case errors.Is(err, lock.ErrMaxLocks):
+		return http.StatusServiceUnavailable, "max_locks"
+	case errors.Is(err, lock.ErrMaxWaiters):
+		return http.StatusServiceUnavailable, "max_waiters"
+	case errors.Is(err, lock.ErrLimitMismatch):
+		return http.StatusConflict, "limit_mismatch"
+	case errors.Is(err, lock.ErrAlreadyEnqueued):
+		return http.StatusConflict, "already_enqueued"
+	case errors.Is(err, lock.ErrNotEnqueued):
+		return http.StatusConflict, "not_enqueued"
+	case errors.Is(err, lock.ErrLeaseExpired):
+		return http.StatusConflict, "lease_expired"
+	case errors.Is(err, lock.ErrWaiterClosed):
+		return http.StatusGone, "session_gone"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return http.StatusRequestTimeout, "client_canceled"
 	}
+	return http.StatusInternalServerError, "internal"
 }
 
-// writeProtocolError maps a protocol response to an HTTP response.
-func writeProtocolError(w http.ResponseWriter, resp, opContext string) {
-	status, body := mapProtocolError(resp, opContext)
-	writeJSON(w, status, body)
+// writeLockErr writes the appropriate response for a LockManager error.
+func writeLockErr(w http.ResponseWriter, err error) {
+	status, code := httpStatusForLockErr(err)
+	writeError(w, status, code, err.Error())
 }

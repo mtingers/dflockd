@@ -1,10 +1,14 @@
+// Package httpapi implements the REST surface for dflockd.
+//
+// Architecture: HTTP requests bind a session to a connID, then call
+// LockManager methods directly. There is no virtual TCP transport,
+// no protocol parsing, and no SSE multiplexer — those layers exist
+// to support pub/sub which this server intentionally does not provide.
 package httpapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
-	_ "embed"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,17 +24,9 @@ import (
 	"github.com/mtingers/dflockd/internal/server"
 )
 
-// openAPISpec is the hand-authored OpenAPI 3.1 contract document for the
-// HTTP API. Mirrored to docs/openapi.json for tooling that prefers a
-// file reference. The drift test (openapi_test.go) enforces both copies
-// stay in sync with each other and with the registered routes.
-//
-//go:embed openapi.json
-var openAPISpec []byte
-
-// httpServer wraps a *http.Server plus the bridge it delegates to.
+// httpServer wires the HTTP listener to the SessionStore + LockManager.
 type httpServer struct {
-	bridge   *Bridge
+	sessions *SessionStore
 	cfg      *config.Config
 	log      *slog.Logger
 	srv      *http.Server
@@ -39,14 +35,12 @@ type httpServer struct {
 	draining atomic.Bool
 }
 
-// Run starts the HTTP API listener on the configured host+port and blocks
-// until ctx is cancelled, at which point it gracefully drains sessions
-// and closes the listener. Returns nil on clean shutdown.
-//
-// Run is the single public entry point used by cmd/dflockd/main.go.
+// Run starts the HTTP API on the configured host:port and blocks
+// until ctx is cancelled. Returns nil on clean shutdown. When
+// HTTPPort==0 returns immediately (HTTP API disabled).
 func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger) error {
 	if cfg.HTTPPort == 0 {
-		return nil // disabled
+		return nil
 	}
 	host := cfg.HTTPHost
 	if host == "" {
@@ -58,43 +52,35 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 	if err != nil {
 		return fmt.Errorf("http listen: %w", err)
 	}
-
-	// Reuse the TCP server's TLS cert/key if configured so operators only
-	// manage one set of certs.
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 		if err != nil {
 			listener.Close()
 			return fmt.Errorf("http tls: %w", err)
 		}
-		tlsCfg := &tls.Config{
+		listener = tls.NewListener(listener, &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-		}
-		listener = tls.NewListener(listener, tlsCfg)
+		})
 		log.Info("http TLS enabled")
 	}
 
-	bridge := NewBridge(ctx, srv, cfg, log, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions)
-	var bridgeShutdownOnce sync.Once
-	bridgeDone := make(chan struct{})
-	startBridgeShutdown := func() {
-		bridgeShutdownOnce.Do(func() {
-			go func() {
-				bridge.Shutdown()
-				close(bridgeDone)
-			}()
+	sessions := NewSessionStore(ctx, srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, cfg.HTTPMaxSessionsPerIP)
+	var sessionsShutdownOnce sync.Once
+	startSessionsShutdown := func() {
+		sessionsShutdownOnce.Do(func() {
+			go sessions.Shutdown()
 		})
 	}
 
 	hs := &httpServer{
-		bridge:  bridge,
-		cfg:     cfg,
-		log:     log,
-		metrics: newMetricsRegistry(),
-		limiter: newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
+		sessions: sessions,
+		cfg:      cfg,
+		log:      log,
+		metrics:  newMetricsRegistry(),
+		limiter:  newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
 	}
-	defer hs.limiter.Stop() // safe on nil receiver if rate limiting is disabled
+	defer hs.limiter.Stop()
 
 	mux := http.NewServeMux()
 	hs.registerRoutes(mux)
@@ -102,23 +88,21 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 
 	hs.srv = &http.Server{
 		Handler: hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux))))),
-		// Leave ReadTimeout/WriteTimeout at 0 (unlimited) so long-poll
-		// acquires with large --default-lease-ttl values aren't cut off.
-		// ReadHeaderTimeout still protects against slowloris.
+		// ReadTimeout/WriteTimeout left at 0 (unlimited) so long-poll
+		// waits aren't cut off; ReadHeaderTimeout still protects
+		// against slowloris.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		ErrorLog:          nil, // slog is our path; don't double-log
 		ConnState:         connLimiter.ConnState,
 	}
-	hs.srv.RegisterOnShutdown(startBridgeShutdown)
+	hs.srv.RegisterOnShutdown(startSessionsShutdown)
 
 	log.Info("http listening", "addr", addr)
 
-	// Run the HTTP server in its own goroutine so we can coordinate
-	// shutdown via ctx.
 	serveErr := make(chan error, 1)
 	go func() {
-		if err := hs.srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := hs.srv.Serve(listener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			return
 		}
@@ -128,7 +112,7 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 	select {
 	case <-ctx.Done():
 		hs.draining.Store(true)
-		startBridgeShutdown()
+		startSessionsShutdown()
 		shutdownTimeout := cfg.ShutdownTimeout
 		if shutdownTimeout <= 0 {
 			shutdownTimeout = 30 * time.Second
@@ -136,72 +120,33 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		_ = hs.srv.Shutdown(shutdownCtx)
-		<-bridgeDone
 		<-serveErr
 		return nil
 	case err := <-serveErr:
-		startBridgeShutdown()
-		<-bridgeDone
+		startSessionsShutdown()
 		return err
 	}
 }
 
-// withAuth wraps the mux with an auth check. If --auth-token is set, every
-// request must carry `Authorization: Bearer <token>`. The `/v1/openapi.json`
-// endpoint is exempt so the spec can be fetched by any tool.
-func (h *httpServer) withAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.AuthToken == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		// Exempt: the OpenAPI spec describes auth; it shouldn't itself
-		// require auth.
-		if r.URL.Path == "/v1/openapi.json" || r.URL.Path == "/health" || r.URL.Path == "/ready" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		got := extractBearerToken(r.Header.Get("Authorization"))
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(h.cfg.AuthToken)) != 1 {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func extractBearerToken(header string) string {
-	// RFC 7235 makes the auth-scheme token case-insensitive, so accept
-	// "Bearer", "bearer", "BEARER", etc. The credential portion remains
-	// case-sensitive and is compared with subtle.ConstantTimeCompare
-	// downstream.
-	const prefix = "Bearer "
-	if len(header) < len(prefix) {
-		return ""
-	}
-	if !strings.EqualFold(header[:len(prefix)], prefix) {
-		return ""
-	}
-	return strings.TrimSpace(header[len(prefix):])
-}
-
+// jsonRouteErrors wraps mux to ensure every 404/405 produces a JSON
+// errorBody rather than the default plain-text http.Error output.
 func jsonRouteErrors(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, pattern := mux.Handler(r); pattern != "" {
 			mux.ServeHTTP(w, r)
 			return
 		}
-
 		if allowed := allowedMethodsForPath(mux, r); len(allowed) > 0 {
 			w.Header().Set("Allow", strings.Join(allowed, ", "))
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 			return
 		}
-
 		writeError(w, http.StatusNotFound, "not_found", "")
 	})
 }
 
+// allowedMethodsForPath returns the HTTP methods registered for r.URL.Path.
+// Used by the 405 path to populate the Allow header.
 func allowedMethodsForPath(mux *http.ServeMux, r *http.Request) []string {
 	seen := make(map[string]bool)
 	var allowed []string
@@ -230,25 +175,14 @@ func appendAllowedMethodForPath(allowed []string, seen map[string]bool, mux *htt
 	return append(allowed, method)
 }
 
-// ---------------------------------------------------------------------------
-// Route registration
-// ---------------------------------------------------------------------------
-
-// RegisteredPath is a compile-time-visible list of every path the HTTP
-// server handles, with its method(s). The OpenAPI drift test (phase 4)
-// walks this list and asserts 1:1 correspondence with paths documented in
-// openapi.json.
+// RegisteredPath documents one route for tests/introspection.
 type RegisteredPath struct {
-	// Pattern is the human-readable path template using {placeholder}
-	// syntax. e.g. "/v1/locks/{key}".
 	Pattern string
-	// Methods is the set of HTTP methods this pattern handles.
 	Methods []string
 }
 
-// registeredRoutes is the canonical list. Keep in sync with
-// registerRoutes — the OpenAPI drift test enforces this. Kept as a
-// package-level var so we don't reallocate on every call.
+// registeredRoutes is the canonical list of routes. Keep in sync with
+// registerRoutes — Routes() exposes it for tests.
 var registeredRoutes = []RegisteredPath{
 	{Pattern: "/health", Methods: []string{"GET"}},
 	{Pattern: "/ready", Methods: []string{"GET"}},
@@ -267,64 +201,38 @@ var registeredRoutes = []RegisteredPath{
 	{Pattern: "/v1/semaphores/{key}/renew", Methods: []string{"POST"}},
 	{Pattern: "/v1/semaphores/{key}/enqueue", Methods: []string{"POST"}},
 	{Pattern: "/v1/semaphores/{key}/wait", Methods: []string{"POST"}},
-	{Pattern: "/v1/signals/{channel}", Methods: []string{"POST"}},
-	{Pattern: "/v1/signals", Methods: []string{"GET"}}, // SSE stream
-	{Pattern: "/v1/openapi.json", Methods: []string{"GET"}},
 }
 
-// Routes exposes the registered route list for tests.
+// Routes returns the registered route list for tests.
 func Routes() []RegisteredPath { return registeredRoutes }
 
-// registerRoutes wires up the ServeMux using Go 1.22+ method+pattern
-// syntax. Path parameters come from r.PathValue; each `{var}` matches a
-// single URL path segment, so a lock literally named "release" routes
-// to `POST /v1/locks/release` (acquire with key="release") while
-// `POST /v1/locks/release/release` correctly dispatches to the release
-// action on that key. Previously a manual last-segment split ambiguated
-// these cases.
-//
-// Keys with literal `/` must be percent-encoded by the caller (`%2F`);
-// ServeMux decodes path values so the handler sees the slash. However,
-// `{var}` only matches a single segment, so `POST /v1/locks/foo/bar`
-// (unencoded) falls through to 404 instead of misrouting — a
-// deliberate trade-off for predictable behavior.
+// registerRoutes wires the mux. Uses Go 1.22+ "METHOD /path" syntax;
+// {var} captures one path segment.
 func (h *httpServer) registerRoutes(mux *http.ServeMux) {
-	// Operational endpoints
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("GET /ready", h.handleReady)
 	mux.HandleFunc("GET /metrics", h.handleMetrics)
 
-	// Sessions
 	mux.HandleFunc("POST /v1/sessions", h.handleCreateSession)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", withSessionID(h.handleDeleteSession))
 	mux.HandleFunc("POST /v1/sessions/{id}/ping", withSessionID(h.handlePingSession))
 
-	// Introspection
 	mux.HandleFunc("GET /v1/stats", h.handleStats)
-	mux.HandleFunc("GET /v1/openapi.json", h.handleOpenAPI)
 
-	// Locks
 	mux.HandleFunc("POST /v1/locks/{key}", withKey(h.handleAcquireLock))
 	mux.HandleFunc("POST /v1/locks/{key}/release", withKey(h.handleReleaseLock))
 	mux.HandleFunc("POST /v1/locks/{key}/renew", withKey(h.handleRenewLock))
 	mux.HandleFunc("POST /v1/locks/{key}/enqueue", withKey(h.handleEnqueueLock))
 	mux.HandleFunc("POST /v1/locks/{key}/wait", withKey(h.handleWaitLock))
 
-	// Semaphores
 	mux.HandleFunc("POST /v1/semaphores/{key}", withKey(h.handleAcquireSem))
 	mux.HandleFunc("POST /v1/semaphores/{key}/release", withKey(h.handleReleaseSem))
 	mux.HandleFunc("POST /v1/semaphores/{key}/renew", withKey(h.handleRenewSem))
 	mux.HandleFunc("POST /v1/semaphores/{key}/enqueue", withKey(h.handleEnqueueSem))
 	mux.HandleFunc("POST /v1/semaphores/{key}/wait", withKey(h.handleWaitSem))
-
-	// Signals
-	mux.HandleFunc("POST /v1/signals/{channel}", withChannel(h.handlePublishSignal))
-	mux.HandleFunc("GET /v1/signals", h.handleSSE)
 }
 
-// withKey extracts and validates the `{key}` path param, then invokes fn.
-// On validation failure, writes 400 bad_request and returns without
-// invoking fn.
+// withKey extracts and validates the {key} path param.
 func withKey(fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
@@ -336,50 +244,15 @@ func withKey(fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFu
 	}
 }
 
-// withChannel is the signal-channel equivalent of withKey (validation
-// rules are identical; the parameter name differs for clarity in URLs).
-func withChannel(fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		channel := r.PathValue("channel")
-		if err := validateRESTKey(channel); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-		fn(w, r, channel)
-	}
-}
-
-// withSessionID extracts and validates the `{id}` path param
-// (32-char lowercase hex) before invoking fn.
+// withSessionID extracts and validates the {id} path param against
+// the format produced by mintSessionID (32 lowercase hex chars).
 func withSessionID(fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if !isValidSessionID(id) {
+		if !IsValidSessionID(id) {
 			writeError(w, http.StatusBadRequest, "bad_request", "invalid session id")
 			return
 		}
 		fn(w, r, id)
 	}
-}
-
-// isValidSessionID matches the format produced by mintSessionID: 32 hex chars.
-func isValidSessionID(id string) bool {
-	if len(id) != 32 {
-		return false
-	}
-	for _, c := range id {
-		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
-}
-
-// ---------------------------------------------------------------------------
-// OpenAPI handler stub (phase 4 will replace with embedded spec).
-// ---------------------------------------------------------------------------
-
-func (h *httpServer) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(openAPISpec)
 }

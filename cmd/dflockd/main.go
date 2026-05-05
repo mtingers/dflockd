@@ -1,3 +1,4 @@
+// Command dflockd is the distributed FIFO lock server.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"github.com/mtingers/dflockd/internal/server"
 )
 
+// version is set by the release tooling via -ldflags="-X main.version=...".
 var version = "dev"
 
 func main() {
@@ -23,19 +25,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
 		os.Exit(1)
 	}
-
 	if cfg.Version {
 		fmt.Println(version)
 		os.Exit(0)
 	}
 
-	logLevel := slog.LevelInfo
+	level := slog.LevelInfo
 	if cfg.Debug {
-		logLevel = slog.LevelDebug
+		level = slog.LevelDebug
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	lm := lock.NewLockManager(cfg, log)
 	srv := server.New(lm, cfg, log)
@@ -48,18 +47,17 @@ func main() {
 	go func() {
 		if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- fmt.Errorf("tcp server: %w", err)
-			cancel() // cascade shutdown to the HTTP server
+			cancel()
 			return
 		}
 		errCh <- nil
 	}()
-
 	if cfg.HTTPPort > 0 {
 		runners++
 		go func() {
 			if err := httpapi.Run(ctx, srv, cfg, log); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("http server: %w", err)
-				cancel() // cascade shutdown to the TCP server
+				cancel()
 				return
 			}
 			errCh <- nil

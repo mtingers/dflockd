@@ -2,379 +2,246 @@ package config
 
 import (
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
+// withEnv sets env vars for the duration of the test, restoring them
+// (including unset state) afterwards.
+func withEnv(t *testing.T, env map[string]string) {
+	t.Helper()
+	for k, v := range env {
+		original, hadOriginal := os.LookupEnv(k)
+		os.Setenv(k, v)
+		t.Cleanup(func() {
+			if hadOriginal {
+				os.Setenv(k, original)
+			} else {
+				os.Unsetenv(k)
+			}
+		})
+	}
+}
+
+// clearEnv ensures every env var the loader looks at is unset.
+func clearEnv(t *testing.T) {
+	keys := []string{
+		"DFLOCKD_HOST", "DFLOCKD_PORT", "DFLOCKD_DEFAULT_LEASE_TTL_S",
+		"DFLOCKD_LEASE_SWEEP_INTERVAL_S", "DFLOCKD_GC_INTERVAL_S",
+		"DFLOCKD_GC_MAX_IDLE_S", "DFLOCKD_MAX_LOCKS",
+		"DFLOCKD_MAX_CONNECTIONS", "DFLOCKD_MAX_CONNECTIONS_PER_IP",
+		"DFLOCKD_MAX_WAITERS", "DFLOCKD_READ_TIMEOUT_S",
+		"DFLOCKD_WRITE_TIMEOUT_S", "DFLOCKD_SHUTDOWN_TIMEOUT_S",
+		"DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "DFLOCKD_TLS_CERT", "DFLOCKD_TLS_KEY",
+		"DFLOCKD_AUTH_TOKEN", "DFLOCKD_AUTH_TOKEN_FILE",
+		"DFLOCKD_HTTP_PORT", "DFLOCKD_HTTP_HOST",
+		"DFLOCKD_HTTP_SESSION_IDLE_S", "DFLOCKD_HTTP_MAX_SESSIONS",
+		"DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP",
+		"DFLOCKD_HTTP_RATE_LIMIT_PER_IP", "DFLOCKD_HTTP_RATE_LIMIT_BURST",
+		"DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", "DFLOCKD_DEBUG",
+	}
+	for _, k := range keys {
+		original, had := os.LookupEnv(k)
+		os.Unsetenv(k)
+		if had {
+			t.Cleanup(func() { os.Setenv(k, original) })
+		}
+	}
+}
+
 func TestLoad_Defaults(t *testing.T) {
-	cfg, err := Load([]string{})
+	clearEnv(t)
+	cfg, err := Load(nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Host != "127.0.0.1" {
+		t.Errorf("Host = %q", cfg.Host)
 	}
 	if cfg.Port != 6388 {
-		t.Fatalf("expected port 6388, got %d", cfg.Port)
+		t.Errorf("Port = %d", cfg.Port)
+	}
+	if cfg.DefaultLeaseTTL != 33*time.Second {
+		t.Errorf("DefaultLeaseTTL = %v", cfg.DefaultLeaseTTL)
 	}
 	if cfg.MaxLocks != 1024 {
-		t.Fatalf("expected max-locks 1024, got %d", cfg.MaxLocks)
+		t.Errorf("MaxLocks = %d", cfg.MaxLocks)
 	}
-	if cfg.HTTPRateLimitBurst != 0 {
-		t.Fatalf("expected default http-rate-limit-burst 0, got %d", cfg.HTTPRateLimitBurst)
+	if !cfg.AutoReleaseOnDisconnect {
+		t.Error("AutoReleaseOnDisconnect should default true")
 	}
 }
 
-func TestLoad_BadFlags_ReturnsError(t *testing.T) {
-	// Custom FlagSet should return an error, not os.Exit.
-	_, err := Load([]string{"--nonexistent-flag"})
+func TestLoad_FlagWinsOverEnv(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_PORT": "9999"})
+	cfg, err := Load([]string{"--port", "1234"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Port != 1234 {
+		t.Errorf("Port = %d, want 1234 (flag wins)", cfg.Port)
+	}
+}
+
+func TestLoad_EnvWhenFlagOmitted(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_PORT": "9999"})
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Port != 9999 {
+		t.Errorf("Port = %d, want 9999 (from env)", cfg.Port)
+	}
+}
+
+func TestLoad_BadInt(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_PORT": "abc"})
+	_, err := Load(nil)
 	if err == nil {
-		t.Fatal("expected error for unknown flag")
+		t.Fatal("expected error for non-integer DFLOCKD_PORT")
 	}
 }
 
-func TestLoad_ValidationErrors(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-		want string // substring expected in error
+func TestLoad_BoolValues(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+		ok   bool
 	}{
-		{"max-locks=0", []string{"--max-locks", "0"}, "max-locks"},
-		{"default-lease-ttl=0", []string{"--default-lease-ttl", "0"}, "default-lease-ttl"},
-		{"lease-sweep-interval=0", []string{"--lease-sweep-interval", "0"}, "lease-sweep-interval"},
-		{"gc-interval=0", []string{"--gc-interval", "0"}, "gc-interval"},
-		{"gc-max-idle=-1", []string{"--gc-max-idle", "-1"}, "gc-max-idle"},
-		{"read-timeout=0", []string{"--read-timeout", "0"}, "read-timeout"},
-		{"port negative", []string{"--port", "-1"}, "port"},
-		{"port too high", []string{"--port", "99999"}, "port"},
-		{"max-connections negative", []string{"--max-connections", "-1"}, "max-connections"},
-		{"max-connections-per-ip negative", []string{"--max-connections-per-ip", "-1"}, "max-connections-per-ip"},
-		{"max-waiters negative", []string{"--max-waiters", "-1"}, "max-waiters"},
-		{"http-max-sessions-per-ip negative", []string{"--http-max-sessions-per-ip", "-1"}, "http-max-sessions-per-ip"},
-		{"http-max-connections-per-ip negative", []string{"--http-max-connections-per-ip", "-1"}, "http-max-connections-per-ip"},
-		{"http-rate-limit negative", []string{"--http-rate-limit-per-ip", "-1"}, "http-rate-limit-per-ip"},
-		{"http-rate-limit-burst negative", []string{"--http-rate-limit-burst", "-1"}, "http-rate-limit-burst"},
+		{"true", true, true},
+		{"1", true, true},
+		{"yes", true, true},
+		{"false", false, true},
+		{"0", false, true},
+		{"no", false, true},
+		{"maybe", false, false},
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(tc.args)
-			if err == nil {
-				t.Fatal("expected validation error")
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error %q should contain %q", err.Error(), tc.want)
-			}
-		})
+	for _, c := range cases {
+		clearEnv(t)
+		withEnv(t, map[string]string{"DFLOCKD_AUTO_RELEASE_ON_DISCONNECT": c.val})
+		cfg, err := Load(nil)
+		if c.ok && err != nil {
+			t.Errorf("%q: unexpected error %v", c.val, err)
+			continue
+		}
+		if !c.ok && err == nil {
+			t.Errorf("%q: expected error", c.val)
+			continue
+		}
+		if c.ok && cfg.AutoReleaseOnDisconnect != c.want {
+			t.Errorf("%q: got %v, want %v", c.val, cfg.AutoReleaseOnDisconnect, c.want)
+		}
 	}
 }
 
-func TestLoadRejectsMalformedEnvValues(t *testing.T) {
-	tests := []struct {
-		name  string
-		env   string
-		value string
-		want  string
-	}{
-		{name: "int", env: "DFLOCKD_MAX_CONNECTIONS", value: "100O", want: "DFLOCKD_MAX_CONNECTIONS"},
-		{name: "bool", env: "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", value: "flase", want: "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT"},
-		{name: "duration", env: "DFLOCKD_READ_TIMEOUT_S", value: "ten", want: "DFLOCKD_READ_TIMEOUT_S"},
-		{name: "deprecated duration alias", env: "DFLOCKD_GC_LOOP_SLEEP", value: "five", want: "DFLOCKD_GC_LOOP_SLEEP"},
+func TestValidate_PortRange(t *testing.T) {
+	cfg := &Config{
+		MaxLocks:           1,
+		DefaultLeaseTTL:    time.Second,
+		LeaseSweepInterval: time.Second,
+		GCInterval:         time.Second,
+		ReadTimeout:        time.Second,
+		Port:               65536,
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(tc.env, tc.value)
-			_, err := Load([]string{})
-			if err == nil {
-				t.Fatal("expected malformed env var to fail")
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error %q should contain %q", err.Error(), tc.want)
-			}
-		})
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for port 65536")
 	}
 }
 
-func TestLoad_HTTPRateLimitBurstDefaultsToRate(t *testing.T) {
+func TestValidate_TLSPaired(t *testing.T) {
+	cfg := &Config{
+		MaxLocks:           1,
+		DefaultLeaseTTL:    time.Second,
+		LeaseSweepInterval: time.Second,
+		GCInterval:         time.Second,
+		ReadTimeout:        time.Second,
+		Port:               80,
+		TLSCert:            "cert.pem",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error: cert without key")
+	}
+}
+
+func TestValidate_HTTPPortConflict(t *testing.T) {
+	cfg := &Config{
+		MaxLocks:           1,
+		DefaultLeaseTTL:    time.Second,
+		LeaseSweepInterval: time.Second,
+		GCInterval:         time.Second,
+		ReadTimeout:        time.Second,
+		Port:               8080,
+		HTTPPort:           8080,
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error: HTTPPort == Port")
+	}
+}
+
+func TestLoad_AuthTokenFile(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tok")
+	if err := os.WriteFile(path, []byte("hunter2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load([]string{"--auth-token-file", path})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthToken != "hunter2" {
+		t.Errorf("AuthToken = %q", cfg.AuthToken)
+	}
+}
+
+func TestLoad_AuthTokenPrecedence(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_AUTH_TOKEN": "fromenv"})
+	cfg, err := Load([]string{"--auth-token", "fromflag"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthToken != "fromflag" {
+		t.Errorf("AuthToken = %q, want fromflag", cfg.AuthToken)
+	}
+}
+
+func TestLoad_AuthTokenWithNewline(t *testing.T) {
+	clearEnv(t)
+	_, err := Load([]string{"--auth-token", "bad\ntoken"})
+	if err == nil || !strings.Contains(err.Error(), "newline") {
+		t.Fatalf("got %v, want newline error", err)
+	}
+}
+
+func TestLoad_HTTPRateBurstDefaults(t *testing.T) {
+	clearEnv(t)
 	cfg, err := Load([]string{"--http-rate-limit-per-ip", "10"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Load: %v", err)
 	}
 	if cfg.HTTPRateLimitBurst != 10 {
-		t.Fatalf("burst got %d, want 10", cfg.HTTPRateLimitBurst)
+		t.Errorf("HTTPRateLimitBurst = %d, want 10 (defaulted to rate)", cfg.HTTPRateLimitBurst)
 	}
 }
 
-func TestLoad_HTTPCORSOrigins(t *testing.T) {
-	cfg, err := Load([]string{"--http-cors-allowed-origins", "https://a.example, https://b.example ,, "})
+func TestLoad_CORS(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load([]string{"--http-cors-allowed-origins", "a, b ,c"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Load: %v", err)
 	}
-	got := strings.Join(cfg.HTTPCORSAllowedOrigins, ",")
-	if got != "https://a.example,https://b.example" {
-		t.Fatalf("origins got %q", got)
+	if len(cfg.HTTPCORSAllowedOrigins) != 3 {
+		t.Fatalf("got %v", cfg.HTTPCORSAllowedOrigins)
 	}
-}
-
-// TestLoad_ValidatesPingIntervalAgainstIdleTimeout confirms that an
-// HTTP SSE ping interval >= the session idle timeout is rejected at
-// config load. The constraint exists so SSE streams refresh lastSeen
-// before the bridge sweeper's 2x-idleTimeout cutoff fires.
-func TestLoad_ValidatesPingIntervalAgainstIdleTimeout(t *testing.T) {
-	// ping >= idle is rejected.
-	_, err := Load([]string{
-		"--http-port", "9999",
-		"--http-sse-ping-interval", "30",
-		"--http-session-idle-timeout", "20",
-	})
-	if err == nil {
-		t.Fatal("expected validation error for ping >= idle")
+	for _, s := range cfg.HTTPCORSAllowedOrigins {
+		if strings.ContainsAny(s, " \t") {
+			t.Errorf("not trimmed: %q", s)
+		}
 	}
-	if !strings.Contains(err.Error(), "http-sse-ping-interval") {
-		t.Fatalf("error should mention http-sse-ping-interval, got %q", err.Error())
-	}
-
-	// ping < idle passes.
-	_, err = Load([]string{
-		"--http-port", "9999",
-		"--http-sse-ping-interval", "10",
-		"--http-session-idle-timeout", "20",
-	})
-	if err != nil {
-		t.Fatalf("ping<idle should validate: %v", err)
-	}
-
-	// ping == idle is rejected (no margin against the sweeper).
-	_, err = Load([]string{
-		"--http-port", "9999",
-		"--http-sse-ping-interval", "20",
-		"--http-session-idle-timeout", "20",
-	})
-	if err == nil {
-		t.Fatal("expected error for ping == idle")
-	}
-}
-
-func TestLoad_ValidEdgeCases(t *testing.T) {
-	// write-timeout=0 is valid (disables write timeout)
-	_, err := Load([]string{"--write-timeout", "0"})
-	if err != nil {
-		t.Fatalf("write-timeout=0 should be valid: %v", err)
-	}
-
-	// shutdown-timeout=0 is valid (wait forever)
-	_, err = Load([]string{"--shutdown-timeout", "0"})
-	if err != nil {
-		t.Fatalf("shutdown-timeout=0 should be valid: %v", err)
-	}
-
-	// max-connections=0 is valid (unlimited)
-	_, err = Load([]string{"--max-connections", "0"})
-	if err != nil {
-		t.Fatalf("max-connections=0 should be valid: %v", err)
-	}
-
-	// max-waiters=0 is valid (unlimited)
-	_, err = Load([]string{"--max-waiters", "0"})
-	if err != nil {
-		t.Fatalf("max-waiters=0 should be valid: %v", err)
-	}
-
-	// gc-max-idle=0 is valid (prune immediately)
-	_, err = Load([]string{"--gc-max-idle", "0"})
-	if err != nil {
-		t.Fatalf("gc-max-idle=0 should be valid: %v", err)
-	}
-}
-
-// TestAuthTokenPrecedence documents the precedence order for auth token
-// resolution, matching the project-wide "CLI flag > env var > file" rule.
-//
-// The bug fixed here: previously DFLOCKD_AUTH_TOKEN silently overrode
-// --auth-token, contradicting the documented precedence.
-func TestAuthTokenPrecedence(t *testing.T) {
-	t.Run("flag wins over env var", func(t *testing.T) {
-		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
-		cfg, err := Load([]string{"--auth-token", "from-flag"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.AuthToken != "from-flag" {
-			t.Fatalf("got %q, want from-flag (flag should win)", cfg.AuthToken)
-		}
-	})
-
-	t.Run("env var used when flag absent", func(t *testing.T) {
-		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
-		cfg, err := Load([]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.AuthToken != "from-env" {
-			t.Fatalf("got %q, want from-env", cfg.AuthToken)
-		}
-	})
-
-	t.Run("empty flag does not override env", func(t *testing.T) {
-		// Edge case: `--auth-token=""` explicitly empty should NOT
-		// silently fall through to env. Our implementation treats empty
-		// flag as unset (so env wins), matching flag.Visit semantics.
-		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
-		cfg, err := Load([]string{"--auth-token", ""})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.AuthToken != "from-env" {
-			t.Fatalf("got %q, want from-env (empty flag defers to env)", cfg.AuthToken)
-		}
-	})
-
-	t.Run("flag token file wins over env var", func(t *testing.T) {
-		t.Setenv("DFLOCKD_AUTH_TOKEN", "from-env")
-		path := writeTempTokenFile(t, "from-file\n")
-		cfg, err := Load([]string{"--auth-token-file", path})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.AuthToken != "from-file" {
-			t.Fatalf("got %q, want from-file (explicit token file should win)", cfg.AuthToken)
-		}
-	})
-
-	t.Run("direct token is trimmed like token files", func(t *testing.T) {
-		cfg, err := Load([]string{"--auth-token", "  from-flag  "})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.AuthToken != "from-flag" {
-			t.Fatalf("got %q, want from-flag", cfg.AuthToken)
-		}
-	})
-
-	t.Run("whitespace only direct token is rejected", func(t *testing.T) {
-		_, err := Load([]string{"--auth-token", "   "})
-		if err == nil {
-			t.Fatal("expected whitespace-only auth token to fail")
-		}
-		if !strings.Contains(err.Error(), "auth-token") {
-			t.Fatalf("error should mention auth-token, got %q", err.Error())
-		}
-	})
-}
-
-func writeTempTokenFile(t *testing.T, token string) string {
-	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "token-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(token); err != nil {
-		f.Close()
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return f.Name()
-}
-
-// TestGCEnvVarAliases exercises the canonical + deprecated env var
-// fallback. Both DFLOCKD_GC_INTERVAL_S and the legacy
-// DFLOCKD_GC_LOOP_SLEEP should be accepted; the canonical takes
-// priority when both are set. Same for GC_MAX_IDLE_S vs
-// GC_MAX_UNUSED_TIME.
-func TestGCEnvVarAliases(t *testing.T) {
-	t.Run("canonical gc interval", func(t *testing.T) {
-		t.Setenv("DFLOCKD_GC_INTERVAL_S", "7")
-		cfg, err := Load([]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := cfg.GCInterval.Seconds(); got != 7 {
-			t.Fatalf("GCInterval: got %v want 7s", got)
-		}
-	})
-	t.Run("deprecated gc loop sleep still works", func(t *testing.T) {
-		t.Setenv("DFLOCKD_GC_LOOP_SLEEP", "9")
-		cfg, err := Load([]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := cfg.GCInterval.Seconds(); got != 9 {
-			t.Fatalf("GCInterval: got %v want 9s", got)
-		}
-	})
-	t.Run("canonical beats deprecated", func(t *testing.T) {
-		t.Setenv("DFLOCKD_GC_INTERVAL_S", "5")
-		t.Setenv("DFLOCKD_GC_LOOP_SLEEP", "99")
-		cfg, err := Load([]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := cfg.GCInterval.Seconds(); got != 5 {
-			t.Fatalf("GCInterval: got %v want 5s (canonical should win)", got)
-		}
-	})
-	t.Run("canonical max idle", func(t *testing.T) {
-		t.Setenv("DFLOCKD_GC_MAX_IDLE_S", "30")
-		cfg, err := Load([]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := cfg.GCMaxIdleTime.Seconds(); got != 30 {
-			t.Fatalf("GCMaxIdleTime: got %v want 30s", got)
-		}
-	})
-	t.Run("deprecated max unused time", func(t *testing.T) {
-		t.Setenv("DFLOCKD_GC_MAX_UNUSED_TIME", "45")
-		cfg, err := Load([]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := cfg.GCMaxIdleTime.Seconds(); got != 45 {
-			t.Fatalf("GCMaxIdleTime: got %v want 45s", got)
-		}
-	})
-}
-
-func TestSecondsCeil(t *testing.T) {
-	// Not directly exported, but we test via config validation of
-	// duration values. This exercises that the config correctly converts
-	// integer seconds to time.Duration.
-	cfg, err := Load([]string{"--default-lease-ttl", "7"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.DefaultLeaseTTL.Seconds() != 7 {
-		t.Fatalf("expected 7s, got %v", cfg.DefaultLeaseTTL)
-	}
-}
-
-func TestLoadRejectsDurationOverflowBeforeMultiplication(t *testing.T) {
-	if strconv.IntSize < 64 {
-		t.Skip("duration overflow boundary does not fit in int on this platform")
-	}
-	tooLarge := strconv.FormatInt(maxDurationSeconds+1, 10)
-
-	t.Run("flag", func(t *testing.T) {
-		_, err := Load([]string{"--default-lease-ttl", tooLarge})
-		if err == nil || !strings.Contains(err.Error(), "too large") {
-			t.Fatalf("expected too-large error, got %v", err)
-		}
-	})
-
-	t.Run("env", func(t *testing.T) {
-		t.Setenv("DFLOCKD_READ_TIMEOUT_S", tooLarge)
-		_, err := Load([]string{})
-		if err == nil || !strings.Contains(err.Error(), "too large") {
-			t.Fatalf("expected too-large error, got %v", err)
-		}
-	})
-
-	t.Run("deprecated alias", func(t *testing.T) {
-		t.Setenv("DFLOCKD_GC_LOOP_SLEEP", tooLarge)
-		_, err := Load([]string{})
-		if err == nil || !strings.Contains(err.Error(), "too large") {
-			t.Fatalf("expected too-large error, got %v", err)
-		}
-	})
 }

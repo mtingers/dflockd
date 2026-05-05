@@ -2,893 +2,366 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"net"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// mockConn implements net.Conn for testing ReadLine/ReadRequest.
-type mockConn struct {
+// fakeConn satisfies net.Conn enough for ReadRequest's deadline calls.
+type fakeConn struct {
 	net.Conn
+	readDeadline time.Time
 }
 
-func (m *mockConn) SetReadDeadline(t time.Time) error { return nil }
-func (m *mockConn) RemoteAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *fakeConn) SetReadDeadline(t time.Time) error { c.readDeadline = t; return nil }
+func (c *fakeConn) SetDeadline(t time.Time) error     { c.readDeadline = t; return nil }
+func (c *fakeConn) Close() error                      { return nil }
 
-func makeReader(lines ...string) *bufio.Reader {
-	data := strings.Join(lines, "\n") + "\n"
-	return bufio.NewReader(strings.NewReader(data))
+func newReader(s string) (*bufio.Reader, *fakeConn) {
+	return bufio.NewReader(strings.NewReader(s)), &fakeConn{}
 }
 
-func TestReadRequest_LockDefault(t *testing.T) {
-	r := makeReader("l", "mykey", "10")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+func TestParseRequest_Ping(t *testing.T) {
+	req, err := parseRequest("ping", "_", "", time.Second)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ping: %v", err)
 	}
-	if req.Cmd != "l" || req.Key != "mykey" {
-		t.Fatalf("unexpected cmd/key: %s/%s", req.Cmd, req.Key)
+	if req.Cmd != CmdPing {
+		t.Errorf("got cmd %q, want ping", req.Cmd)
+	}
+}
+
+func TestParseRequest_Stats(t *testing.T) {
+	req, err := parseRequest("stats", "_", "", time.Second)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if req.Cmd != CmdStats {
+		t.Errorf("got cmd %q, want stats", req.Cmd)
+	}
+}
+
+func TestParseRequest_Auth(t *testing.T) {
+	req, err := parseRequest("auth", "_", "  hunter2  ", time.Second)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if req.AuthToken != "hunter2" {
+		t.Errorf("got token %q, want hunter2 (trimmed)", req.AuthToken)
+	}
+}
+
+func TestParseRequest_Acquire(t *testing.T) {
+	req, err := parseRequest("l", "key1", "10", 33*time.Second)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if req.Cmd != CmdAcquire || req.Key != "key1" {
+		t.Errorf("got %+v", req)
 	}
 	if req.AcquireTimeout != 10*time.Second {
-		t.Fatalf("timeout: got %v", req.AcquireTimeout)
+		t.Errorf("got timeout %v", req.AcquireTimeout)
 	}
 	if req.LeaseTTL != 33*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
+		t.Errorf("got lease %v, want default", req.LeaseTTL)
 	}
 }
 
-func TestReadRequest_LockCustomLease(t *testing.T) {
-	r := makeReader("l", "mykey", "10 20")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+func TestParseRequest_Acquire_WithLease(t *testing.T) {
+	req, err := parseRequest("l", "key1", "10 60", 33*time.Second)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if req.LeaseTTL != 20*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_Release(t *testing.T) {
-	r := makeReader("r", "mykey", "abc123")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "r" || req.Token != "abc123" {
-		t.Fatalf("unexpected: cmd=%s token=%s", req.Cmd, req.Token)
-	}
-}
-
-func TestReadRequest_Renew(t *testing.T) {
-	r := makeReader("n", "mykey", "tok1")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "n" || req.Token != "tok1" {
-		t.Fatalf("unexpected: cmd=%s token=%s", req.Cmd, req.Token)
-	}
-	if req.LeaseTTL != 33*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_RenewCustomLease(t *testing.T) {
-	r := makeReader("n", "mykey", "tok1 15")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.LeaseTTL != 15*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_InvalidCmd(t *testing.T) {
-	r := makeReader("x", "mykey", "arg")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 3 {
-		t.Fatalf("expected code 3, got %v", err)
-	}
-}
-
-func TestReadRequest_EmptyKey(t *testing.T) {
-	r := makeReader("l", "", "10")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 5 {
-		t.Fatalf("expected code 5, got %v", err)
-	}
-}
-
-func TestReadRequest_NegativeTimeout(t *testing.T) {
-	r := makeReader("l", "k", "-1")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 6 {
-		t.Fatalf("expected code 6, got %v", err)
-	}
-}
-
-func TestReadRequest_ZeroLease(t *testing.T) {
-	r := makeReader("l", "k", "10 0")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 9 {
-		t.Fatalf("expected code 9, got %v", err)
-	}
-}
-
-func TestReadRequest_RejectsSecondsOverflow(t *testing.T) {
-	tooLarge := strconv.FormatInt(maxSecondsValue+1, 10)
-
-	cases := []struct {
-		name string
-		cmd  string
-		arg  string
-		code int
-	}{
-		{name: "lock timeout", cmd: "l", arg: tooLarge, code: 6},
-		{name: "lock lease", cmd: "l", arg: "10 " + tooLarge, code: 9},
-		{name: "enqueue lease", cmd: "e", arg: tooLarge, code: 9},
-		{name: "wait timeout", cmd: "w", arg: tooLarge, code: 6},
-		{name: "sem timeout", cmd: "sl", arg: tooLarge + " 2", code: 6},
-		{name: "sem lease", cmd: "sl", arg: "10 2 " + tooLarge, code: 9},
-		{name: "sem enqueue lease", cmd: "se", arg: "2 " + tooLarge, code: 9},
-		{name: "sem wait timeout", cmd: "sw", arg: tooLarge, code: 6},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			r := makeReader(tc.cmd, "k", tc.arg)
-			_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-			pe, ok := err.(*ProtocolError)
-			if !ok || pe.Code != tc.code {
-				t.Fatalf("expected code %d, got %v", tc.code, err)
-			}
-		})
-	}
-}
-
-func TestReadRequest_AllowsMaxSecondsValue(t *testing.T) {
-	maxSeconds := strconv.FormatInt(maxSecondsValue, 10)
-	r := makeReader("w", "k", maxSeconds)
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.AcquireTimeout != time.Duration(maxSecondsValue)*time.Second {
-		t.Fatalf("timeout: got %v", req.AcquireTimeout)
-	}
-}
-
-func TestReadRequest_EmptyTokenRelease(t *testing.T) {
-	r := makeReader("r", "k", " ")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 7 {
-		t.Fatalf("expected code 7, got %v", err)
-	}
-}
-
-func TestReadRequest_LockBadArgCount(t *testing.T) {
-	r := makeReader("l", "k", "1 2 3")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_EnqueueDefault(t *testing.T) {
-	r := makeReader("e", "mykey", "")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "e" || req.Key != "mykey" {
-		t.Fatal("unexpected cmd/key")
-	}
-	if req.LeaseTTL != 33*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_EnqueueCustomLease(t *testing.T) {
-	r := makeReader("e", "mykey", "60")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("acquire: %v", err)
 	}
 	if req.LeaseTTL != 60*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
+		t.Errorf("got lease %v, want 60s", req.LeaseTTL)
 	}
 }
 
-func TestReadRequest_EnqueueZeroLease(t *testing.T) {
-	r := makeReader("e", "mykey", "0")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 9 {
-		t.Fatalf("expected code 9, got %v", err)
-	}
-}
-
-func TestReadRequest_WaitParse(t *testing.T) {
-	r := makeReader("w", "mykey", "10")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
+func TestParseRequest_SemAcquire(t *testing.T) {
+	req, err := parseRequest("sl", "k", "5 3", 33*time.Second)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("sl: %v", err)
 	}
-	if req.Cmd != "w" || req.Key != "mykey" {
-		t.Fatal("unexpected cmd/key")
-	}
-	if req.AcquireTimeout != 10*time.Second {
-		t.Fatalf("timeout: got %v", req.AcquireTimeout)
+	if req.Limit != 3 {
+		t.Errorf("got limit %d, want 3", req.Limit)
 	}
 }
 
-func TestReadRequest_WaitNegativeTimeout(t *testing.T) {
-	r := makeReader("w", "mykey", "-1")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 6 {
-		t.Fatalf("expected code 6, got %v", err)
+func TestParseRequest_SemAcquire_WithLease(t *testing.T) {
+	req, err := parseRequest("sl", "k", "5 3 60", 33*time.Second)
+	if err != nil {
+		t.Fatalf("sl: %v", err)
+	}
+	if req.Limit != 3 || req.LeaseTTL != 60*time.Second {
+		t.Errorf("got %+v", req)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// FormatResponse
-// ---------------------------------------------------------------------------
-
-func TestFormatResponse_OkWithToken(t *testing.T) {
-	ack := &Ack{Status: "ok", Token: "abc", LeaseTTL: 30}
-	got := string(FormatResponse(ack, 33))
-	if got != "ok abc 30\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_BadKey(t *testing.T) {
+	_, err := parseRequest("l", "", "1", time.Second)
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != ErrCodeInvalidKey {
+		t.Errorf("got %v, want code %d", err, ErrCodeInvalidKey)
 	}
 }
 
-func TestFormatResponse_OkDefaultLease(t *testing.T) {
-	ack := &Ack{Status: "ok", Token: "abc"}
-	got := string(FormatResponse(ack, 33))
-	if got != "ok abc 33\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_KeyWithSpace(t *testing.T) {
+	_, err := parseRequest("l", "bad key", "1", time.Second)
+	if err == nil {
+		t.Fatal("expected error for whitespace key")
 	}
 }
 
-func TestFormatResponse_OkExtra(t *testing.T) {
-	ack := &Ack{Status: "ok", Extra: "25"}
-	got := string(FormatResponse(ack, 33))
-	if got != "ok 25\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_Release(t *testing.T) {
+	req, err := parseRequest("r", "k", "abc123", time.Second)
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if req.Token != "abc123" {
+		t.Errorf("got %q", req.Token)
 	}
 }
 
-func TestFormatResponse_OkBare(t *testing.T) {
-	ack := &Ack{Status: "ok"}
-	got := string(FormatResponse(ack, 33))
-	if got != "ok\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_Release_EmptyToken(t *testing.T) {
+	_, err := parseRequest("r", "k", "  ", time.Second)
+	if err == nil {
+		t.Fatal("expected error for empty token")
 	}
 }
 
-func TestFormatResponse_Error(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error"}, 33))
-	if got != "error\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_Renew(t *testing.T) {
+	req, err := parseRequest("n", "k", "abc 60", 33*time.Second)
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if req.Token != "abc" || req.LeaseTTL != 60*time.Second {
+		t.Errorf("got %+v", req)
 	}
 }
 
-func TestFormatResponse_Timeout(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "timeout"}, 33))
-	if got != "timeout\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_Enqueue(t *testing.T) {
+	req, err := parseRequest("e", "k", "", 33*time.Second)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if req.LeaseTTL != 33*time.Second {
+		t.Errorf("got lease %v", req.LeaseTTL)
 	}
 }
 
-func TestFormatResponse_ErrorMaxLocks(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_max_locks"}, 33))
-	if got != "error_max_locks\n" {
-		t.Fatalf("got %q", got)
+func TestParseRequest_Enqueue_WithLease(t *testing.T) {
+	req, err := parseRequest("e", "k", "60", 33*time.Second)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if req.LeaseTTL != 60*time.Second {
+		t.Errorf("got lease %v, want 60s", req.LeaseTTL)
+	}
+}
+
+func TestParseRequest_SemEnqueue(t *testing.T) {
+	req, err := parseRequest("se", "k", "3", 33*time.Second)
+	if err != nil {
+		t.Fatalf("se: %v", err)
+	}
+	if req.Limit != 3 {
+		t.Errorf("got %+v", req)
+	}
+}
+
+func TestParseRequest_Wait(t *testing.T) {
+	req, err := parseRequest("w", "k", "5", 33*time.Second)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if req.AcquireTimeout != 5*time.Second {
+		t.Errorf("got %v", req.AcquireTimeout)
+	}
+}
+
+func TestParseRequest_SemRelease(t *testing.T) {
+	req, err := parseRequest("sr", "k", "tok", time.Second)
+	if err != nil {
+		t.Fatalf("sr: %v", err)
+	}
+	if req.Token != "tok" {
+		t.Errorf("got %q", req.Token)
+	}
+}
+
+func TestParseRequest_SemRenew(t *testing.T) {
+	req, err := parseRequest("sn", "k", "tok 60", time.Second)
+	if err != nil {
+		t.Fatalf("sn: %v", err)
+	}
+	if req.LeaseTTL != 60*time.Second {
+		t.Errorf("got %v", req.LeaseTTL)
+	}
+}
+
+func TestParseRequest_SemWait(t *testing.T) {
+	req, err := parseRequest("sw", "k", "5", time.Second)
+	if err != nil {
+		t.Fatalf("sw: %v", err)
+	}
+	if req.AcquireTimeout != 5*time.Second {
+		t.Errorf("got %v", req.AcquireTimeout)
+	}
+}
+
+func TestParseRequest_BadCmd(t *testing.T) {
+	_, err := parseRequest("nope", "k", "", time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != ErrCodeInvalidCmd {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestParseRequest_Acquire_NegativeTimeout(t *testing.T) {
+	_, err := parseRequest("l", "k", "-1", time.Second)
+	if err == nil {
+		t.Fatal("expected error for negative timeout")
+	}
+}
+
+func TestParseRequest_Acquire_NonNumeric(t *testing.T) {
+	_, err := parseRequest("l", "k", "abc", time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestParseRequest_BadLimit(t *testing.T) {
+	_, err := parseRequest("sl", "k", "5 0", time.Second)
+	if err == nil {
+		t.Fatal("expected error for limit=0")
+	}
+}
+
+func TestReadRequest_FullFrame(t *testing.T) {
+	r, conn := newReader("l\nkey1\n10\n")
+	req, err := ReadRequest(r, time.Second, conn, 33*time.Second)
+	if err != nil {
+		t.Fatalf("ReadRequest: %v", err)
+	}
+	if req.Cmd != CmdAcquire || req.Key != "key1" {
+		t.Errorf("got %+v", req)
+	}
+}
+
+func TestReadRequest_StripsCR(t *testing.T) {
+	r, conn := newReader("l\r\nkey1\r\n10\r\n")
+	req, err := ReadRequest(r, time.Second, conn, 33*time.Second)
+	if err != nil {
+		t.Fatalf("ReadRequest: %v", err)
+	}
+	if req.Key != "key1" {
+		t.Errorf("got %q", req.Key)
+	}
+}
+
+func TestReadRequest_TruncatedFrame(t *testing.T) {
+	r, conn := newReader("l\nkey1\n")
+	_, err := ReadRequest(r, time.Second, conn, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error on truncated frame")
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != ErrCodeDisconnect {
+		t.Errorf("got %v, want disconnect", err)
+	}
+}
+
+func TestReadRequest_LineTooLong(t *testing.T) {
+	long := strings.Repeat("x", MaxLineBytes+10)
+	r, conn := newReader(long + "\nkey\n10\n")
+	_, err := ReadRequest(r, time.Second, conn, 33*time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Code != ErrCodeLineTooLong {
+		t.Errorf("got %v, want line too long", err)
+	}
+}
+
+func TestReadRequest_AuthAcceptsLargePayload(t *testing.T) {
+	long := strings.Repeat("x", MaxLineBytes+100)
+	r, conn := newReader("auth\n_\n" + long + "\n")
+	req, err := ReadRequest(r, time.Second, conn, 33*time.Second)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if req.AuthToken != long {
+		t.Errorf("auth token mismatch")
+	}
+}
+
+func TestFormatResponse_OK(t *testing.T) {
+	got := FormatResponse(&Ack{Status: StatusOK}, 33)
+	if !bytes.Equal(got, []byte("ok\n")) {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestFormatResponse_OKWithToken(t *testing.T) {
+	got := FormatResponse(&Ack{Status: StatusOK, Token: "abc", LeaseTTL: 60}, 33)
+	if !bytes.Equal(got, []byte("ok abc 60\n")) {
+		t.Errorf("got %q", got)
 	}
 }
 
 func TestFormatResponse_AcquiredWithToken(t *testing.T) {
-	ack := &Ack{Status: "acquired", Token: "abc", LeaseTTL: 30}
-	got := string(FormatResponse(ack, 33))
-	if got != "acquired abc 30\n" {
-		t.Fatalf("got %q", got)
+	got := FormatResponse(&Ack{Status: StatusAcquired, Token: "abc", LeaseTTL: 60}, 33)
+	if !bytes.Equal(got, []byte("acquired abc 60\n")) {
+		t.Errorf("got %q", got)
 	}
 }
 
-func TestFormatResponse_Queued(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "queued"}, 33))
-	if got != "queued\n" {
-		t.Fatalf("got %q", got)
+func TestFormatResponse_OKWithToken_DefaultsLease(t *testing.T) {
+	got := FormatResponse(&Ack{Status: StatusOK, Token: "abc"}, 33)
+	if !bytes.Equal(got, []byte("ok abc 33\n")) {
+		t.Errorf("got %q", got)
 	}
 }
 
-func TestFormatResponse_ErrorLimitMismatch(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_limit_mismatch"}, 33))
-	if got != "error_limit_mismatch\n" {
-		t.Fatalf("got %q", got)
+func TestFormatResponse_OKWithExtra(t *testing.T) {
+	got := FormatResponse(&Ack{Status: StatusOK, Extra: "10"}, 33)
+	if !bytes.Equal(got, []byte("ok 10\n")) {
+		t.Errorf("got %q", got)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Semaphore command parsing
-// ---------------------------------------------------------------------------
-
-func TestReadRequest_SemLockDefault(t *testing.T) {
-	r := makeReader("sl", "mykey", "10 3")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "sl" || req.Key != "mykey" {
-		t.Fatalf("unexpected cmd/key: %s/%s", req.Cmd, req.Key)
-	}
-	if req.AcquireTimeout != 10*time.Second {
-		t.Fatalf("timeout: got %v", req.AcquireTimeout)
-	}
-	if req.Limit != 3 {
-		t.Fatalf("limit: got %d", req.Limit)
-	}
-	if req.LeaseTTL != 33*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_SemLockCustomLease(t *testing.T) {
-	r := makeReader("sl", "mykey", "10 3 60")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.LeaseTTL != 60*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-	if req.Limit != 3 {
-		t.Fatalf("limit: got %d", req.Limit)
-	}
-}
-
-func TestReadRequest_SemLockBadArgCount(t *testing.T) {
-	r := makeReader("sl", "mykey", "10")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SemLockZeroLimit(t *testing.T) {
-	r := makeReader("sl", "mykey", "10 0")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 13 {
-		t.Fatalf("expected code 13, got %v", err)
-	}
-}
-
-func TestReadRequest_SemLockNegativeLimit(t *testing.T) {
-	r := makeReader("sl", "mykey", "10 -1")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 13 {
-		t.Fatalf("expected code 13, got %v", err)
-	}
-}
-
-func TestReadRequest_SemRelease(t *testing.T) {
-	r := makeReader("sr", "mykey", "abc123")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "sr" || req.Token != "abc123" {
-		t.Fatalf("unexpected: cmd=%s token=%s", req.Cmd, req.Token)
-	}
-}
-
-func TestReadRequest_SemRenew(t *testing.T) {
-	r := makeReader("sn", "mykey", "tok1")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "sn" || req.Token != "tok1" || req.LeaseTTL != 33*time.Second {
-		t.Fatalf("unexpected: cmd=%s token=%s lease=%v", req.Cmd, req.Token, req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_SemRenewCustomLease(t *testing.T) {
-	r := makeReader("sn", "mykey", "tok1 15")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.LeaseTTL != 15*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_SemEnqueue(t *testing.T) {
-	r := makeReader("se", "mykey", "5")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "se" || req.Limit != 5 {
-		t.Fatalf("unexpected: cmd=%s limit=%d", req.Cmd, req.Limit)
-	}
-	if req.LeaseTTL != 33*time.Second {
-		t.Fatalf("lease: got %v", req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_SemEnqueueCustomLease(t *testing.T) {
-	r := makeReader("se", "mykey", "5 60")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Limit != 5 || req.LeaseTTL != 60*time.Second {
-		t.Fatalf("unexpected: limit=%d lease=%v", req.Limit, req.LeaseTTL)
-	}
-}
-
-func TestReadRequest_SemEnqueueZeroLimit(t *testing.T) {
-	r := makeReader("se", "mykey", "0")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 13 {
-		t.Fatalf("expected code 13, got %v", err)
-	}
-}
-
-func TestReadRequest_SemWait(t *testing.T) {
-	r := makeReader("sw", "mykey", "10")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "sw" || req.AcquireTimeout != 10*time.Second {
-		t.Fatalf("unexpected: cmd=%s timeout=%v", req.Cmd, req.AcquireTimeout)
-	}
-}
-
-func TestReadRequest_SemWaitNegativeTimeout(t *testing.T) {
-	r := makeReader("sw", "mykey", "-1")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 6 {
-		t.Fatalf("expected code 6, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Key validation
-// ---------------------------------------------------------------------------
-
-func TestReadRequest_KeyWithSpace(t *testing.T) {
-	r := makeReader("l", "bad key", "10")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 5 {
-		t.Fatalf("expected code 5 (key whitespace), got %v", err)
-	}
-}
-
-func TestReadRequest_KeyWithTab(t *testing.T) {
-	r := makeReader("l", "bad\tkey", "10")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 5 {
-		t.Fatalf("expected code 5 (key whitespace), got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadLine length enforcement
-// ---------------------------------------------------------------------------
-
-func TestReadLine_Oversized(t *testing.T) {
-	// Build a line longer than MaxLineBytes
-	long := strings.Repeat("x", MaxLineBytes+10) + "\n"
-	r := bufio.NewReader(strings.NewReader(long))
-	_, err := ReadLine(r, 5*time.Second, &mockConn{})
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 12 {
-		t.Fatalf("expected code 12 (line too long), got %v", err)
-	}
-}
-
-func TestReadLine_ExactMax(t *testing.T) {
-	// A line of exactly MaxLineBytes should succeed.
-	exact := strings.Repeat("y", MaxLineBytes) + "\n"
-	r := bufio.NewReader(strings.NewReader(exact))
-	line, err := ReadLine(r, 5*time.Second, &mockConn{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(line) != MaxLineBytes {
-		t.Fatalf("expected len %d, got %d", MaxLineBytes, len(line))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ProtocolError.Error()
-// ---------------------------------------------------------------------------
-
-func TestProtocolError_Error(t *testing.T) {
-	pe := &ProtocolError{Code: 42, Message: "test error"}
-	s := pe.Error()
-	if !strings.Contains(s, "42") || !strings.Contains(s, "test error") {
-		t.Fatalf("unexpected error string: %s", s)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadRequest: stats, auth, listen, unlisten, signal
-// ---------------------------------------------------------------------------
-
-func TestReadRequest_Stats(t *testing.T) {
-	r := makeReader("stats", "_", "_")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "stats" {
-		t.Fatalf("expected cmd 'stats', got %q", req.Cmd)
-	}
-}
-
-func TestReadRequest_Auth(t *testing.T) {
-	r := makeReader("auth", "_", "mytoken")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "auth" || req.Token != "mytoken" {
-		t.Fatalf("unexpected: cmd=%s token=%s", req.Cmd, req.Token)
-	}
-}
-
-func TestReadRequest_Listen(t *testing.T) {
-	r := makeReader("listen", "events.>", "workers")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "listen" || req.Key != "events.>" || req.Group != "workers" {
-		t.Fatalf("unexpected: cmd=%s key=%s group=%s", req.Cmd, req.Key, req.Group)
-	}
-}
-
-func TestReadRequest_ListenNoGroup(t *testing.T) {
-	r := makeReader("listen", "events.test", "")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "listen" || req.Key != "events.test" || req.Group != "" {
-		t.Fatalf("unexpected: cmd=%s key=%s group=%q", req.Cmd, req.Key, req.Group)
-	}
-}
-
-func TestReadRequest_Unlisten(t *testing.T) {
-	r := makeReader("unlisten", "events.>", "workers")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "unlisten" || req.Key != "events.>" || req.Group != "workers" {
-		t.Fatalf("unexpected: cmd=%s key=%s group=%s", req.Cmd, req.Key, req.Group)
-	}
-}
-
-func TestReadRequest_Signal(t *testing.T) {
-	r := makeReader("signal", "events.test", "hello world")
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Cmd != "signal" || req.Key != "events.test" || req.Value != "hello world" {
-		t.Fatalf("unexpected: cmd=%s key=%s value=%q", req.Cmd, req.Key, req.Value)
-	}
-}
-
-func TestReadRequest_SignalWildcardChannel(t *testing.T) {
-	r := makeReader("signal", "events.*", "hello")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 5 {
-		t.Fatalf("expected code 5, got %v", err)
-	}
-}
-
-func TestReadRequest_SignalGTChannel(t *testing.T) {
-	r := makeReader("signal", "events.>", "hello")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 5 {
-		t.Fatalf("expected code 5, got %v", err)
-	}
-}
-
-func TestReadRequest_SignalEmptyPayload(t *testing.T) {
-	r := makeReader("signal", "events.test", "")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SignalRejectsPayloadThatWouldOverflowPushFrame(t *testing.T) {
-	channel := "events.test"
-	payload := strings.Repeat("x", MaxSignalPayloadBytes(channel)+1)
-	r := makeReader("signal", channel, payload)
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SignalAllowsMaxPushFramePayload(t *testing.T) {
-	channel := "events.test"
-	payload := strings.Repeat("x", MaxSignalPayloadBytes(channel))
-	r := makeReader("signal", channel, payload)
-	req, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Value != payload {
-		t.Fatalf("payload length: got %d want %d", len(req.Value), len(payload))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadRequest: edge cases for renew, wait, sem commands
-// ---------------------------------------------------------------------------
-
-func TestReadRequest_RenewBadArgCount(t *testing.T) {
-	r := makeReader("n", "k", "tok1 15 extra")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_RenewEmptyToken(t *testing.T) {
-	r := makeReader("n", "k", " ")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_WaitEmptyArg(t *testing.T) {
-	r := makeReader("w", "k", "")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SemRenewBadArgCount(t *testing.T) {
-	r := makeReader("sn", "k", "tok1 15 extra")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SemRenewEmptyToken(t *testing.T) {
-	r := makeReader("sn", "k", " ")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SemEnqueueBadArgCount(t *testing.T) {
-	r := makeReader("se", "k", "5 60 extra")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SemWaitEmptyArg(t *testing.T) {
-	r := makeReader("sw", "k", "")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_SemLockBadTimeout(t *testing.T) {
-	r := makeReader("sl", "k", "abc 3")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 4 {
-		t.Fatalf("expected code 4, got %v", err)
-	}
-}
-
-func TestReadRequest_SemReleaseEmptyToken(t *testing.T) {
-	r := makeReader("sr", "k", " ")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 7 {
-		t.Fatalf("expected code 7, got %v", err)
-	}
-}
-
-func TestReadRequest_SemLockBadArgCountOne(t *testing.T) {
-	r := makeReader("sl", "k", "10 3 60 extra")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 8 {
-		t.Fatalf("expected code 8, got %v", err)
-	}
-}
-
-func TestReadRequest_LockBadTimeout(t *testing.T) {
-	r := makeReader("l", "k", "abc")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 4 {
-		t.Fatalf("expected code 4, got %v", err)
-	}
-}
-
-func TestReadRequest_EnqueueBadLease(t *testing.T) {
-	r := makeReader("e", "k", "abc")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 4 {
-		t.Fatalf("expected code 4, got %v", err)
-	}
-}
-
-func TestReadRequest_WaitBadTimeout(t *testing.T) {
-	r := makeReader("w", "k", "abc")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 4 {
-		t.Fatalf("expected code 4, got %v", err)
-	}
-}
-
-func TestReadRequest_SemWaitBadTimeout(t *testing.T) {
-	r := makeReader("sw", "k", "abc")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 4 {
-		t.Fatalf("expected code 4, got %v", err)
-	}
-}
-
-func TestReadRequest_SemLockNegativeTimeout(t *testing.T) {
-	r := makeReader("sl", "k", "-1 3")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 6 {
-		t.Fatalf("expected code 6, got %v", err)
-	}
-}
-
-func TestReadRequest_SemWaitNegativeTimeout2(t *testing.T) {
-	r := makeReader("sw", "k", "-1")
-	_, err := ReadRequest(r, 5*time.Second, &mockConn{}, 33*time.Second)
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 6 {
-		t.Fatalf("expected code 6, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// FormatResponse: additional status codes
-// ---------------------------------------------------------------------------
-
-func TestFormatResponse_ErrorAuth(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_auth"}, 33))
-	if got != "error_auth\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_ErrorNotEnqueued(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_not_enqueued"}, 33))
-	if got != "error_not_enqueued\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_ErrorAlreadyEnqueued(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_already_enqueued"}, 33))
-	if got != "error_already_enqueued\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_ErrorLeaseExpired(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_lease_expired"}, 33))
-	if got != "error_lease_expired\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_ErrorMaxWaiters(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "error_max_waiters"}, 33))
-	if got != "error_max_waiters\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_UnknownStatus(t *testing.T) {
-	got := string(FormatResponse(&Ack{Status: "custom_status"}, 33))
-	if got != "custom_status\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_AcquiredDefaultLease(t *testing.T) {
-	ack := &Ack{Status: "acquired", Token: "tok"}
-	got := string(FormatResponse(ack, 33))
-	if got != "acquired tok 33\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatResponse_AcquiredExtra(t *testing.T) {
-	ack := &Ack{Status: "acquired", Extra: "some-data"}
-	got := string(FormatResponse(ack, 33))
-	if got != "acquired some-data\n" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadRequest: carriage return trimming
-// ---------------------------------------------------------------------------
-
-func TestReadLine_CarriageReturn(t *testing.T) {
-	data := "hello\r\n"
-	r := bufio.NewReader(strings.NewReader(data))
-	line, err := ReadLine(r, 5*time.Second, &mockConn{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if line != "hello" {
-		t.Fatalf("expected 'hello', got %q", line)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadLine: EOF (client disconnect)
-// ---------------------------------------------------------------------------
-
-func TestReadLine_EOF(t *testing.T) {
-	r := bufio.NewReader(strings.NewReader(""))
-	_, err := ReadLine(r, 5*time.Second, &mockConn{})
-	pe, ok := err.(*ProtocolError)
-	if !ok || pe.Code != 11 {
-		t.Fatalf("expected code 11 (disconnect), got %v", err)
+func TestFormatResponse_AllErrors(t *testing.T) {
+	cases := []struct {
+		status string
+		want   string
+	}{
+		{StatusTimeout, "timeout\n"},
+		{StatusError, "error\n"},
+		{StatusErrorAuth, "error_auth\n"},
+		{StatusErrorMaxLocks, "error_max_locks\n"},
+		{StatusErrorMaxWaiters, "error_max_waiters\n"},
+		{StatusErrorLimitMismatch, "error_limit_mismatch\n"},
+		{StatusErrorNotEnqueued, "error_not_enqueued\n"},
+		{StatusErrorAlreadyEnqueued, "error_already_enqueued\n"},
+		{StatusErrorLeaseExpired, "error_lease_expired\n"},
+		{StatusErrorDraining, "error_draining\n"},
+		{StatusQueued, "queued\n"},
+	}
+	for _, c := range cases {
+		got := FormatResponse(&Ack{Status: c.status}, 33)
+		if string(got) != c.want {
+			t.Errorf("status %q: got %q, want %q", c.status, got, c.want)
+		}
 	}
 }

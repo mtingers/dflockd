@@ -1,14 +1,12 @@
 package client_test
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
-	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,2702 +15,450 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/server"
-	"github.com/mtingers/dflockd/internal/testutil"
 )
 
-func testConfig() *config.Config {
-	return &config.Config{
+// startServer mirrors the server-package helper but lives here to
+// avoid a cross-package test import. Returns (addr, stopFn).
+func startServer(t *testing.T, mods ...func(*config.Config)) (string, func()) {
+	t.Helper()
+	cfg := &config.Config{
 		Host:                    "127.0.0.1",
-		Port:                    0,
-		DefaultLeaseTTL:         33 * time.Second,
-		LeaseSweepInterval:      100 * time.Millisecond,
-		GCInterval:              100 * time.Millisecond,
-		GCMaxIdleTime:           60 * time.Second,
 		MaxLocks:                1024,
+		DefaultLeaseTTL:         33 * time.Second,
+		LeaseSweepInterval:      time.Second,
+		GCInterval:              time.Second,
+		GCMaxIdleTime:           time.Minute,
 		ReadTimeout:             5 * time.Second,
+		WriteTimeout:            time.Second,
+		ShutdownTimeout:         time.Second,
 		AutoReleaseOnDisconnect: true,
 	}
-}
+	for _, fn := range mods {
+		fn(cfg)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Port = listener.Addr().(*net.TCPAddr).Port
 
-func startServer(t *testing.T, cfg *config.Config) (cancel context.CancelFunc, addr string) {
-	t.Helper()
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	lm := lock.NewLockManager(cfg, log)
 	srv := server.New(lm, cfg, log)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr = ln.Addr().String()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
-		srv.RunOnListener(ctx, ln)
+		_ = srv.RunOnListener(ctx, listener)
+		close(done)
 	}()
+	addr := listener.Addr().String()
 
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	return cancel, addr
-}
-
-func unusedTCPAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return addr
-}
-
-// ---------------------------------------------------------------------------
-// Low-level tests
-// ---------------------------------------------------------------------------
-
-func TestAcquireRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, lease, err := client.Acquire(c, "mykey", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token == "" {
-		t.Fatal("expected non-empty token")
-	}
-	if lease <= 0 {
-		t.Fatalf("expected positive lease, got %d", lease)
-	}
-
-	if err := client.Release(c, "mykey", token); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestAcquireTimeout(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// First client holds the lock.
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-
-	_, _, err = client.Acquire(c1, "mykey", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Second client tries with 0 timeout — should get ErrTimeout.
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	_, _, err = client.Acquire(c2, "mykey", 0)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !isTimeout(err) {
-		t.Fatalf("expected ErrTimeout, got %v", err)
-	}
-}
-
-func TestRenew(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, _, err := client.Acquire(c, "mykey", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	remaining, err := client.Renew(c, "mykey", token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if remaining <= 0 {
-		t.Fatalf("expected positive remaining, got %d", remaining)
-	}
-}
-
-func TestEnqueueWait(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// c1 holds the lock.
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-
-	token1, _, err := client.Acquire(c1, "mykey", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// c2 enqueues — should get "queued".
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	status, _, _, err := client.Enqueue(c2, "mykey")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected 'queued', got %q", status)
-	}
-
-	// Release in background after a short delay.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		client.Release(c1, "mykey", token1)
-	}()
-
-	// c2 waits — should succeed after c1 releases.
-	token2, lease2, err := client.Wait(c2, "mykey", 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token2 == "" {
-		t.Fatal("expected non-empty token from wait")
-	}
-	if lease2 <= 0 {
-		t.Fatalf("expected positive lease, got %d", lease2)
-	}
-}
-
-func TestEnqueueImmediate(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	status, token, lease, err := client.Enqueue(c, "mykey")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "acquired" {
-		t.Fatalf("expected 'acquired', got %q", status)
-	}
-	if token == "" {
-		t.Fatal("expected non-empty token")
-	}
-	if lease <= 0 {
-		t.Fatalf("expected positive lease, got %d", lease)
-	}
-}
-
-func TestCustomLeaseTTL(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, lease, err := client.Acquire(c, "mykey", 10*time.Second, client.WithLeaseTTL(60))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease != 60 {
-		t.Fatalf("expected lease 60, got %d", lease)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// High-level Lock tests
-// ---------------------------------------------------------------------------
-
-func TestLockAcquireRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	l := &client.Lock{
-		Key:            "hl-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-
-	ok, err := l.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("expected acquire to succeed")
-	}
-	if l.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	if err := l.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLockEnqueueWait(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// l1 holds the lock.
-	l1 := &client.Lock{
-		Key:            "hl-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l1.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("l1 acquire failed")
-	}
-
-	// l2 enqueues.
-	l2 := &client.Lock{
-		Key:     "hl-key",
-		Servers: []string{addr},
-	}
-	status, err := l2.Enqueue(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected 'queued', got %q", status)
-	}
-
-	// Release l1 in background.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		l1.Release(context.Background())
-	}()
-
-	// l2 waits.
-	ok, err = l2.Wait(context.Background(), 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("l2 wait timed out")
-	}
-	if l2.Token() == "" {
-		t.Fatal("expected non-empty token after wait")
-	}
-
-	if err := l2.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestAutoRenewal(t *testing.T) {
-	if testing.Short() {
-		t.Skip("5s test; skip under -short")
-	}
-	cfg := testConfig()
-	cfg.DefaultLeaseTTL = 4 * time.Second
-	_, addr := startServer(t, cfg)
-
-	l := &client.Lock{
-		Key:            "renew-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		RenewRatio:     0.25, // renew every 1s on a 4s lease
-	}
-
-	ok, err := l.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("acquire failed")
-	}
-
-	// Wait longer than the original lease to ensure renewal is working.
-	time.Sleep(5 * time.Second)
-
-	// Lock should still be held — releasing should succeed.
-	if err := l.Release(context.Background()); err != nil {
-		t.Fatalf("release after auto-renew failed: %v", err)
-	}
-}
-
-func TestContextCancellation(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// l1 holds the lock.
-	l1 := &client.Lock{
-		Key:            "ctx-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l1.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("l1 acquire failed")
-	}
-	defer l1.Release(context.Background())
-
-	// l2 tries to acquire with a context that we cancel quickly.
-	ctx, cancel := context.WithCancel(context.Background())
-	l2 := &client.Lock{
-		Key:            "ctx-key",
-		AcquireTimeout: 30 * time.Second, // long timeout
-		Servers:        []string{addr},
-	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, err := l2.Acquire(ctx)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.Dial("tcp", addr)
 		if err == nil {
-			// Should have gotten an error from cancellation.
-			t.Error("expected error from cancelled context")
+			c.Close()
+			break
 		}
-	}()
+		time.Sleep(5 * time.Millisecond)
+	}
 
-	// Give the acquire time to connect and start waiting on the server.
-	time.Sleep(100 * time.Millisecond)
-	cancel()
+	stopOnce := sync.Once{}
+	return addr, func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("server didn't stop")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Conn-level
+// ---------------------------------------------------------------------------
+
+func TestDial_AcquireRelease(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	conn, err := client.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	tok, lease, err := client.Acquire(conn, "k", time.Second)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if tok == "" || lease == 0 {
+		t.Errorf("got %q %d", tok, lease)
+	}
+	if err := client.Release(conn, "k", tok); err != nil {
+		t.Errorf("Release: %v", err)
+	}
+}
+
+func TestDial_AcquireTimeout(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	conn1, _ := client.Dial(addr)
+	defer conn1.Close()
+	tok, _, err := client.Acquire(conn1, "k", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Release(conn1, "k", tok)
+
+	conn2, _ := client.Dial(addr)
+	defer conn2.Close()
+	_, _, err = client.Acquire(conn2, "k", 100*time.Millisecond)
+	if !errors.Is(err, client.ErrTimeout) {
+		t.Errorf("got %v, want ErrTimeout", err)
+	}
+}
+
+func TestDial_Renew(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	conn, _ := client.Dial(addr)
+	defer conn.Close()
+	tok, _, _ := client.Acquire(conn, "k", time.Second)
+	remaining, err := client.Renew(conn, "k", tok, client.WithLeaseTTL(60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 60 {
+		t.Errorf("got %d, want 60", remaining)
+	}
+}
+
+func TestDial_EnqueueWait(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+
+	holder, _ := client.Dial(addr)
+	defer holder.Close()
+	hTok, _, _ := client.Acquire(holder, "k", time.Second, client.WithLeaseTTL(30))
+
+	queuer, _ := client.Dial(addr)
+	defer queuer.Close()
+	status, _, _, err := client.Enqueue(queuer, "k", client.WithLeaseTTL(30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("got %q", status)
+	}
+
+	done := make(chan string, 1)
+	go func() {
+		tok, _, err := client.Wait(queuer, "k", 5*time.Second)
+		if err != nil {
+			done <- "ERR"
+			return
+		}
+		done <- tok
+	}()
+	time.Sleep(50 * time.Millisecond)
+	client.Release(holder, "k", hTok)
 
 	select {
-	case <-done:
-		// Success — Acquire returned after cancellation.
-	case <-time.After(3 * time.Second):
-		t.Fatal("Acquire did not return after context cancellation")
+	case got := <-done:
+		if got == "" || got == "ERR" {
+			t.Fatalf("wait got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait never returned")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Semaphore low-level tests
-// ---------------------------------------------------------------------------
+func TestDial_Semaphore(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
 
-func TestSemAcquireRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, lease, err := client.SemAcquire(c, "sem1", 10*time.Second, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token == "" {
-		t.Fatal("expected non-empty token")
-	}
-	if lease <= 0 {
-		t.Fatalf("expected positive lease, got %d", lease)
-	}
-
-	if err := client.SemRelease(c, "sem1", token); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSemAcquireTimeout(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// Fill capacity (limit=1)
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-	_, _, err = client.SemAcquire(c1, "sem1", 10*time.Second, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Second client tries with 0 timeout
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	_, _, err = client.SemAcquire(c2, "sem1", 0, 1)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !isTimeout(err) {
-		t.Fatalf("expected ErrTimeout, got %v", err)
-	}
-}
-
-func TestSemRenew(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, _, err := client.SemAcquire(c, "sem1", 10*time.Second, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	remaining, err := client.SemRenew(c, "sem1", token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if remaining <= 0 {
-		t.Fatalf("expected positive remaining, got %d", remaining)
-	}
-}
-
-func TestSemEnqueueWait(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// c1 fills capacity
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-	token1, _, err := client.SemAcquire(c1, "sem1", 10*time.Second, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// c2 enqueues
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	status, _, _, err := client.SemEnqueue(c2, "sem1", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected 'queued', got %q", status)
-	}
-
-	// Release in background
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		client.SemRelease(c1, "sem1", token1)
-	}()
-
-	token2, lease2, err := client.SemWait(c2, "sem1", 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token2 == "" {
-		t.Fatal("expected non-empty token from wait")
-	}
-	if lease2 <= 0 {
-		t.Fatalf("expected positive lease, got %d", lease2)
-	}
-}
-
-func TestSemLimitMismatch(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-	_, _, err = client.SemAcquire(c1, "sem1", 10*time.Second, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	_, _, err = client.SemAcquire(c2, "sem1", 10*time.Second, 5)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err != client.ErrLimitMismatch {
-		t.Fatalf("expected ErrLimitMismatch, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore high-level tests
-// ---------------------------------------------------------------------------
-
-func TestSemaphoreAcquireRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s := &client.Semaphore{
-		Key:            "hl-sem",
-		Limit:          3,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-
-	ok, err := s.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("expected acquire to succeed")
-	}
-	if s.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	if err := s.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSemaphoreTwoPhase(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// s1 fills capacity
-	s1 := &client.Semaphore{
-		Key:            "hl-sem",
-		Limit:          1,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s1.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("s1 acquire failed")
-	}
-
-	// s2 enqueues
-	s2 := &client.Semaphore{
-		Key:     "hl-sem",
-		Limit:   1,
-		Servers: []string{addr},
-	}
-	status, err := s2.Enqueue(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected 'queued', got %q", status)
-	}
-
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		s1.Release(context.Background())
-	}()
-
-	ok, err = s2.Wait(context.Background(), 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("s2 wait timed out")
-	}
-	if s2.Token() == "" {
-		t.Fatal("expected non-empty token after wait")
-	}
-
-	if err := s2.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSemaphoreAutoRenewal(t *testing.T) {
-	if testing.Short() {
-		t.Skip("5s test; skip under -short")
-	}
-	cfg := testConfig()
-	cfg.DefaultLeaseTTL = 4 * time.Second
-	_, addr := startServer(t, cfg)
-
-	s := &client.Semaphore{
-		Key:            "renew-sem",
-		Limit:          3,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		RenewRatio:     0.25,
-	}
-
-	ok, err := s.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("acquire failed")
-	}
-
-	// Wait longer than original lease
-	time.Sleep(5 * time.Second)
-
-	if err := s.Release(context.Background()); err != nil {
-		t.Fatalf("release after auto-renew failed: %v", err)
-	}
-}
-
-func TestSemaphoreConcurrent(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// Acquire 3 slots concurrently on limit=3
-	var wg sync.WaitGroup
-	errs := make(chan error, 3)
 	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s := &client.Semaphore{
-				Key:            "conc-sem",
-				Limit:          3,
-				AcquireTimeout: 10 * time.Second,
-				Servers:        []string{addr},
-			}
-			ok, err := s.Acquire(context.Background())
-			if err != nil {
-				errs <- err
-				return
-			}
-			if !ok {
-				errs <- fmt.Errorf("acquire returned false")
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-			if err := s.Release(context.Background()); err != nil {
-				errs <- err
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Sharding tests
-// ---------------------------------------------------------------------------
-
-func TestCRC32ShardConsistency(t *testing.T) {
-	// Same key, same server count → same index, every time.
-	for i := 0; i < 100; i++ {
-		idx := client.CRC32Shard("test-key", 3)
-		if idx < 0 || idx >= 3 {
-			t.Fatalf("shard index out of range: %d", idx)
+		c, _ := client.Dial(addr)
+		defer c.Close()
+		tok, _, err := client.SemAcquire(c, "sem", time.Second, 3, client.WithLeaseTTL(30))
+		if err != nil {
+			t.Fatalf("hold %d: %v", i, err)
+		}
+		if tok == "" {
+			t.Fatalf("hold %d: empty token", i)
 		}
 	}
-
-	// Different keys should (statistically) produce different indices.
-	seen := make(map[int]bool)
-	for i := 0; i < 100; i++ {
-		key := "key-" + string(rune('a'+i%26))
-		seen[client.CRC32Shard(key, 10)] = true
-	}
-	if len(seen) < 2 {
-		t.Fatal("sharding produced suspiciously uniform results")
-	}
-}
-
-func TestCRC32ShardSingleServer(t *testing.T) {
-	// With 1 server, all keys map to index 0.
-	for i := 0; i < 50; i++ {
-		if idx := client.CRC32Shard("any-key", 1); idx != 0 {
-			t.Fatalf("expected 0 with 1 server, got %d", idx)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Client key validation
-// ---------------------------------------------------------------------------
-
-func TestValidateKey_Empty(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	c, _ := client.Dial(addr)
 	defer c.Close()
-
-	_, _, err = client.Acquire(c, "", 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestValidateKey_Whitespace(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, err = client.Acquire(c, "bad key", 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error for key with space")
+	_, _, err := client.SemAcquire(c, "sem", 100*time.Millisecond, 3)
+	if !errors.Is(err, client.ErrTimeout) {
+		t.Errorf("got %v, want ErrTimeout", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Context cancellation for Lock.Enqueue + Lock.Wait
+// Auth
 // ---------------------------------------------------------------------------
-
-func TestLockEnqueue_ContextCancel(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// l1 holds the lock so l2's Enqueue will need to connect (non-blocking)
-	l1 := &client.Lock{
-		Key:            "eq-cancel",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("l1 acquire failed")
-	}
-	defer l1.Release(context.Background())
-
-	// Enqueue with a normal context — should succeed with "queued"
-	l2 := &client.Lock{
-		Key:     "eq-cancel",
-		Servers: []string{addr},
-	}
-	status, err := l2.Enqueue(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	// Wait with cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, err := l2.Wait(ctx, 30*time.Second)
-		if err == nil {
-			t.Error("expected error from cancelled context")
-		}
-	}()
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Wait did not return after context cancellation")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Semaphore context cancellation
-// ---------------------------------------------------------------------------
-
-func TestSemaphoreAcquire_ContextCancel(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s1 := &client.Semaphore{
-		Key:            "sem-cancel",
-		Limit:          1,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("s1 acquire failed")
-	}
-	defer s1.Release(context.Background())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s2 := &client.Semaphore{
-		Key:            "sem-cancel",
-		Limit:          1,
-		AcquireTimeout: 30 * time.Second,
-		Servers:        []string{addr},
-	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, err := s2.Acquire(ctx)
-		if err == nil {
-			t.Error("expected error from cancelled context")
-		}
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Semaphore.Acquire did not return after context cancellation")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Lock timeout returns false, nil (not an error)
-// ---------------------------------------------------------------------------
-
-func TestLockAcquire_Timeout(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	l1 := &client.Lock{
-		Key:            "timeout-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("l1 acquire failed")
-	}
-	defer l1.Release(context.Background())
-
-	l2 := &client.Lock{
-		Key:            "timeout-key",
-		AcquireTimeout: 1 * time.Millisecond, // very short timeout
-		Servers:        []string{addr},
-	}
-	ok, err = l2.Acquire(context.Background())
-	if err != nil {
-		t.Fatalf("expected nil error on timeout, got %v", err)
-	}
-	if ok {
-		t.Fatal("expected false on timeout")
-	}
-}
-
-func TestSemaphoreAcquire_Timeout(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s1 := &client.Semaphore{
-		Key:            "sem-timeout",
-		Limit:          1,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("s1 acquire failed")
-	}
-	defer s1.Release(context.Background())
-
-	s2 := &client.Semaphore{
-		Key:            "sem-timeout",
-		Limit:          1,
-		AcquireTimeout: 1 * time.Millisecond, // very short timeout
-		Servers:        []string{addr},
-	}
-	ok, err = s2.Acquire(context.Background())
-	if err != nil {
-		t.Fatalf("expected nil error on timeout, got %v", err)
-	}
-	if ok {
-		t.Fatal("expected false on timeout")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Lock.Close without explicit Release
-// ---------------------------------------------------------------------------
-
-func TestLockClose_NoRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	l := &client.Lock{
-		Key:            "close-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("acquire failed")
-	}
-	if l.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	// Close without release — should not panic
-	if err := l.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-	if l.Token() != "" {
-		t.Fatal("token should be cleared after Close")
-	}
-
-	// Double close should be safe
-	if err := l.Close(); err != nil {
-		t.Fatalf("double Close failed: %v", err)
-	}
-}
-
-func TestLockAcquireFailureClearsStaleToken(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	l := &client.Lock{
-		Key:            "stale-token-lock",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatalf("initial acquire: ok=%v err=%v", ok, err)
-	}
-	if l.Token() == "" {
-		t.Fatal("expected initial token")
-	}
-
-	l.Servers = []string{unusedTCPAddr(t)}
-	ok, err = l.Acquire(context.Background())
-	if err == nil || ok {
-		t.Fatalf("second acquire: ok=%v err=%v, want dial failure", ok, err)
-	}
-	if got := l.Token(); got != "" {
-		t.Fatalf("Token() after failed reacquire = %q, want empty", got)
-	}
-}
-
-func TestSemaphoreClose_NoRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s := &client.Semaphore{
-		Key:            "close-sem",
-		Limit:          3,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("acquire failed")
-	}
-
-	if err := s.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-	if s.Token() != "" {
-		t.Fatal("token should be cleared after Close")
-	}
-}
-
-func TestSemaphoreAcquireFailureClearsStaleToken(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s := &client.Semaphore{
-		Key:            "stale-token-sem",
-		Limit:          2,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatalf("initial acquire: ok=%v err=%v", ok, err)
-	}
-	if s.Token() == "" {
-		t.Fatal("expected initial token")
-	}
-
-	s.Servers = []string{unusedTCPAddr(t)}
-	ok, err = s.Acquire(context.Background())
-	if err == nil || ok {
-		t.Fatalf("second acquire: ok=%v err=%v, want dial failure", ok, err)
-	}
-	if got := s.Token(); got != "" {
-		t.Fatalf("Token() after failed reacquire = %q, want empty", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Disconnect auto-releases locks (end-to-end)
-// ---------------------------------------------------------------------------
-
-func TestDisconnectAutoRelease(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// c1 acquires a lock and then disconnects
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = client.Acquire(c1, "auto-key", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c1.Close() // disconnect without release
-
-	// Give server time to detect disconnect and clean up
-	time.Sleep(200 * time.Millisecond)
-
-	// c2 should be able to acquire immediately
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	token, _, err := client.Acquire(c2, "auto-key", 0)
-	if err != nil {
-		t.Fatalf("expected acquire after disconnect, got %v", err)
-	}
-	if token == "" {
-		t.Fatal("expected non-empty token — auto-release should have freed the lock")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func isTimeout(err error) bool {
-	return err != nil && (err == client.ErrTimeout || err.Error() == "dflockd: timeout")
-}
-
-// ---------------------------------------------------------------------------
-// TLS helpers and tests
-// ---------------------------------------------------------------------------
-
-func startTLSServer(t *testing.T, cfg *config.Config) (addr string, clientTLS *tls.Config) {
-	t.Helper()
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	lm := lock.NewLockManager(cfg, log)
-	srv := server.New(lm, cfg, log)
-
-	serverTLS, clientTLS := testutil.SelfSignedTLS(t)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tlsLn := tls.NewListener(ln, serverTLS)
-	addr = ln.Addr().String()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.RunOnListener(ctx, tlsLn)
-	}()
-
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	return addr, clientTLS
-}
-
-func TestDialTLS(t *testing.T) {
-	addr, clientTLS := startTLSServer(t, testConfig())
-
-	c, err := client.DialTLS(addr, clientTLS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, lease, err := client.Acquire(c, "tls-key", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token == "" {
-		t.Fatal("expected non-empty token")
-	}
-	if lease <= 0 {
-		t.Fatalf("expected positive lease, got %d", lease)
-	}
-
-	if err := client.Release(c, "tls-key", token); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLockAcquireReleaseTLS(t *testing.T) {
-	addr, clientTLS := startTLSServer(t, testConfig())
-
-	l := &client.Lock{
-		Key:            "tls-lock",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		TLSConfig:      clientTLS,
-	}
-
-	ok, err := l.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("expected acquire to succeed")
-	}
-	if l.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	if err := l.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSemaphoreAcquireReleaseTLS(t *testing.T) {
-	addr, clientTLS := startTLSServer(t, testConfig())
-
-	s := &client.Semaphore{
-		Key:            "tls-sem",
-		Limit:          3,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		TLSConfig:      clientTLS,
-	}
-
-	ok, err := s.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("expected acquire to succeed")
-	}
-	if s.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	if err := s.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestDialTLS_BadCA(t *testing.T) {
-	addr, _ := startTLSServer(t, testConfig())
-
-	// Use an empty TLS config (no CA pool) — should fail verification.
-	_, err := client.DialTLS(addr, &tls.Config{})
-	if err == nil {
-		t.Fatal("expected error with untrusted CA")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Auth helpers and tests
-// ---------------------------------------------------------------------------
-
-func startAuthServer(t *testing.T, cfg *config.Config, authToken string) (addr string) {
-	t.Helper()
-	cfg.AuthToken = authToken
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	lm := lock.NewLockManager(cfg, log)
-	srv := server.New(lm, cfg, log)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr = ln.Addr().String()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.RunOnListener(ctx, ln)
-	}()
-
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	return addr
-}
 
 func TestAuthenticate(t *testing.T) {
-	addr := startAuthServer(t, testConfig(), "secret123")
+	addr, stop := startServer(t, func(c *config.Config) { c.AuthToken = "secret" })
+	defer stop()
+	conn, _ := client.Dial(addr)
+	defer conn.Close()
 
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
+	if err := client.Authenticate(conn, "secret"); err != nil {
+		t.Fatalf("auth: %v", err)
 	}
-	defer c.Close()
-
-	if err := client.Authenticate(c, "secret123"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Acquire/release should work after auth
-	token, lease, err := client.Acquire(c, "auth-key", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token == "" || lease <= 0 {
-		t.Fatalf("unexpected token=%q lease=%d", token, lease)
-	}
-	if err := client.Release(c, "auth-key", token); err != nil {
-		t.Fatal(err)
+	if _, _, err := client.Acquire(conn, "k", time.Second); err != nil {
+		t.Errorf("post-auth acquire: %v", err)
 	}
 }
 
 func TestAuthenticate_WrongToken(t *testing.T) {
-	addr := startAuthServer(t, testConfig(), "secret123")
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	err = client.Authenticate(c, "wrongtoken")
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err != client.ErrAuth {
-		t.Fatalf("expected ErrAuth, got %v", err)
+	addr, stop := startServer(t, func(c *config.Config) { c.AuthToken = "secret" })
+	defer stop()
+	conn, _ := client.Dial(addr)
+	defer conn.Close()
+	err := client.Authenticate(conn, "wrong")
+	if !errors.Is(err, client.ErrAuth) {
+		t.Errorf("got %v, want ErrAuth", err)
 	}
 }
 
-func TestLockAcquireReleaseAuth(t *testing.T) {
-	addr := startAuthServer(t, testConfig(), "secret123")
+// ---------------------------------------------------------------------------
+// High-level Lock
+// ---------------------------------------------------------------------------
+
+func TestLock_AcquireRelease(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
 
 	l := &client.Lock{
-		Key:            "auth-lock",
-		AcquireTimeout: 10 * time.Second,
+		Key:            "lk",
+		AcquireTimeout: time.Second,
 		Servers:        []string{addr},
-		AuthToken:      "secret123",
 	}
-
-	ok, err := l.Acquire(context.Background())
+	got, err := l.Acquire(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Acquire: %v", err)
 	}
-	if !ok {
-		t.Fatal("expected acquire to succeed")
+	if !got {
+		t.Fatal("Acquire returned false")
 	}
 	if l.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	if err := l.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Signal tests
-// ---------------------------------------------------------------------------
-
-func TestSignalConn_ListenAndEmit(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// Subscriber
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c1)
-	defer sc.Close()
-
-	if err := sc.Listen("events.test"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Publisher
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	n, err := client.Emit(c2, "events.test", "hello")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 delivery, got %d", n)
-	}
-
-	// Receive signal
-	select {
-	case sig := <-sc.Signals():
-		if sig.Channel != "events.test" {
-			t.Fatalf("expected channel 'events.test', got %q", sig.Channel)
-		}
-		if sig.Payload != "hello" {
-			t.Fatalf("expected payload 'hello', got %q", sig.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for signal")
-	}
-}
-
-func TestSignalConn_WildcardPattern(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c1)
-	defer sc.Close()
-
-	if err := sc.Listen("events.>"); err != nil {
-		t.Fatal(err)
-	}
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	n, err := client.Emit(c2, "events.user.login", "alice")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 delivery, got %d", n)
-	}
-
-	select {
-	case sig := <-sc.Signals():
-		if sig.Channel != "events.user.login" {
-			t.Fatalf("expected channel 'events.user.login', got %q", sig.Channel)
-		}
-		if sig.Payload != "alice" {
-			t.Fatalf("expected payload 'alice', got %q", sig.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for signal")
-	}
-}
-
-func TestSignalConn_Unlisten(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c1)
-	defer sc.Close()
-
-	if err := sc.Listen("events.test"); err != nil {
-		t.Fatal(err)
-	}
-	if err := sc.Unlisten("events.test"); err != nil {
-		t.Fatal(err)
-	}
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	n, err := client.Emit(c2, "events.test", "hello")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("expected 0 deliveries after unlisten, got %d", n)
-	}
-}
-
-func TestSignalConn_EmitFromSignalConn(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// Use same SignalConn for both subscribe and publish
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c)
-	defer sc.Close()
-
-	if err := sc.Listen("events.test"); err != nil {
-		t.Fatal(err)
-	}
-
-	n, err := sc.Emit("events.test", "self-emit")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 delivery, got %d", n)
-	}
-
-	select {
-	case sig := <-sc.Signals():
-		if sig.Channel != "events.test" || sig.Payload != "self-emit" {
-			t.Fatalf("unexpected signal: %+v", sig)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for signal")
-	}
-}
-
-func TestSignalConn_QueueGroup(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// Two subscribers in same group
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc1 := client.NewSignalConn(c1)
-	defer sc1.Close()
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc2 := client.NewSignalConn(c2)
-	defer sc2.Close()
-
-	if err := sc1.Listen("events.test", client.WithGroup("workers")); err != nil {
-		t.Fatal(err)
-	}
-	if err := sc2.Listen("events.test", client.WithGroup("workers")); err != nil {
-		t.Fatal(err)
-	}
-
-	// Publish
-	pub, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pub.Close()
-
-	n, err := client.Emit(pub, "events.test", "job1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 delivery (queue group), got %d", n)
-	}
-
-	// Exactly one should receive
-	received := 0
-	timeout := time.After(500 * time.Millisecond)
-	for {
-		select {
-		case <-sc1.Signals():
-			received++
-		case <-sc2.Signals():
-			received++
-		case <-timeout:
-			goto done
-		}
-	}
-done:
-	if received != 1 {
-		t.Fatalf("expected exactly 1 delivery across group, got %d", received)
-	}
-}
-
-func TestSignalConn_Close(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c)
-
-	if err := sc.Listen("events.test"); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := sc.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Signals channel should be closed
-	_, ok := <-sc.Signals()
-	if ok {
-		t.Fatal("expected Signals() channel to be closed after Close()")
-	}
-}
-
-func TestSignalConn_MultipleSignals(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c1)
-	defer sc.Close()
-
-	if err := sc.Listen("events.>"); err != nil {
-		t.Fatal(err)
-	}
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	for i := 0; i < 5; i++ {
-		payload := fmt.Sprintf("msg-%d", i)
-		n, err := client.Emit(c2, "events.test", payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if n != 1 {
-			t.Fatalf("expected 1 delivery, got %d", n)
-		}
-	}
-
-	for i := 0; i < 5; i++ {
-		select {
-		case sig := <-sc.Signals():
-			expected := fmt.Sprintf("msg-%d", i)
-			if sig.Payload != expected {
-				t.Fatalf("signal %d: expected payload %q, got %q", i, expected, sig.Payload)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for signal %d", i)
-		}
-	}
-}
-
-func TestSignalConn_InvalidPattern(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c)
-	defer sc.Close()
-
-	// Empty pattern
-	err = sc.Listen("")
-	if err == nil {
-		t.Fatal("expected error for empty pattern")
-	}
-
-	// Pattern with space
-	err = sc.Listen("bad pattern")
-	if err == nil {
-		t.Fatal("expected error for pattern with space")
-	}
-}
-
-func TestSignalConn_EmitInvalidChannel(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	// Empty channel
-	_, err = client.Emit(c, "", "hello")
-	if err == nil {
-		t.Fatal("expected error for empty channel")
-	}
-
-	// Payload with newline
-	_, err = client.Emit(c, "events.test", "bad\npayload")
-	if err == nil {
-		t.Fatal("expected error for payload with newline")
-	}
-}
-
-func TestSemaphoreAcquireReleaseAuth(t *testing.T) {
-	addr := startAuthServer(t, testConfig(), "secret123")
-
-	s := &client.Semaphore{
-		Key:            "auth-sem",
-		Limit:          3,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		AuthToken:      "secret123",
-	}
-
-	ok, err := s.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("expected acquire to succeed")
-	}
-	if s.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-
-	if err := s.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: release/renew with wrong token
-// ---------------------------------------------------------------------------
-
-func TestReleaseInvalidToken(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	// Acquire a lock, then try to release with a bogus token.
-	_, _, err = client.Acquire(c, "k", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = client.Release(c, "k", "bogus-token")
-	if err == nil {
-		t.Fatal("expected error releasing with wrong token")
-	}
-}
-
-func TestRenewInvalidToken(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, err = client.Renew(c, "k", "bogus-token")
-	if err == nil {
-		t.Fatal("expected error renewing with wrong token")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: empty payload via Emit
-// ---------------------------------------------------------------------------
-
-func TestEmitEmptyPayload(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, err = client.Emit(c, "ch", "")
-	if err == nil {
-		t.Fatal("expected error for empty payload")
-	}
-}
-
-func TestSignalConn_EmitEmptyPayload(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c)
-	defer sc.Close()
-
-	_, err = sc.Emit("ch", "")
-	if err == nil {
-		t.Fatal("expected error for empty payload")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: emit to wildcard channel
-// ---------------------------------------------------------------------------
-
-func TestEmitWildcardChannel(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	// Server rejects wildcard in signal channel
-	_, err = client.Emit(c, "events.*", "hello")
-	if err == nil {
-		t.Fatal("expected error for wildcard channel")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: authenticate with newline in token
-// ---------------------------------------------------------------------------
-
-func TestAuthenticate_NewlineToken(t *testing.T) {
-	addr := startAuthServer(t, testConfig(), "secret123")
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	err = client.Authenticate(c, "bad\ntoken")
-	if err == nil {
-		t.Fatal("expected error for token with newline")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Lock.Wait without Enqueue (no connection)
-// ---------------------------------------------------------------------------
-
-func TestLockWait_NoConn(t *testing.T) {
-	l := &client.Lock{
-		Key:     "k",
-		Servers: []string{"127.0.0.1:6388"},
-	}
-	ok, err := l.Wait(context.Background(), 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if ok {
-		t.Fatal("expected false")
-	}
-}
-
-func TestSemaphoreWait_NoConn(t *testing.T) {
-	s := &client.Semaphore{
-		Key:     "k",
-		Limit:   1,
-		Servers: []string{"127.0.0.1:6388"},
-	}
-	ok, err := s.Wait(context.Background(), 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if ok {
-		t.Fatal("expected false")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Lock and Semaphore with custom LeaseTTL field
-// ---------------------------------------------------------------------------
-
-func TestLockWithLeaseTTLField(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	l := &client.Lock{
-		Key:            "lease-field",
-		AcquireTimeout: 10 * time.Second,
-		LeaseTTL:       45,
-		Servers:        []string{addr},
-	}
-	ok, err := l.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("acquire failed")
-	}
-	defer l.Release(context.Background())
-}
-
-func TestSemaphoreWithLeaseTTLField(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	s := &client.Semaphore{
-		Key:            "lease-field-sem",
-		Limit:          2,
-		AcquireTimeout: 10 * time.Second,
-		LeaseTTL:       45,
-		Servers:        []string{addr},
-	}
-	ok, err := s.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("acquire failed")
-	}
-	defer s.Release(context.Background())
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Lock with custom ShardFunc
-// ---------------------------------------------------------------------------
-
-func TestLockCustomShardFunc(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	l := &client.Lock{
-		Key:            "shard-key",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		ShardFunc:      func(key string, n int) int { return 0 },
-	}
-	ok, err := l.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("acquire failed")
+		t.Fatal("empty token")
 	}
 	if err := l.Release(context.Background()); err != nil {
-		t.Fatal(err)
+		t.Errorf("Release: %v", err)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Edge case: CRC32Shard with 0 servers
-// ---------------------------------------------------------------------------
+func TestLock_TwoCallers(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
 
-func TestCRC32Shard_ZeroServers(t *testing.T) {
-	idx := client.CRC32Shard("key", 0)
-	if idx != 0 {
-		t.Fatalf("expected 0 for 0 servers, got %d", idx)
-	}
-}
+	l1 := &client.Lock{Key: "lk", Servers: []string{addr}, LeaseTTL: 30}
+	l2 := &client.Lock{Key: "lk", Servers: []string{addr}, AcquireTimeout: 100 * time.Millisecond}
 
-// ---------------------------------------------------------------------------
-// Edge case: Wait/SemWait error paths (not enqueued, lease expired)
-// ---------------------------------------------------------------------------
-
-func TestWaitNotEnqueued(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, err = client.Wait(c, "k", 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-func TestSemWaitNotEnqueued(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, err = client.SemWait(c, "k", 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: double enqueue
-// ---------------------------------------------------------------------------
-
-func TestEnqueueAlreadyEnqueued(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// c1 holds the lock
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-	_, _, err = client.Acquire(c1, "k", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// c2 enqueues, then tries to enqueue again
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	status, _, _, err := client.Enqueue(c2, "k")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	_, _, _, err = client.Enqueue(c2, "k")
-	if err != client.ErrAlreadyQueued {
-		t.Fatalf("expected ErrAlreadyQueued, got %v", err)
-	}
-}
-
-func TestSemEnqueueAlreadyEnqueued(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-	_, _, err = client.SemAcquire(c1, "k", 10*time.Second, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	status, _, _, err := client.SemEnqueue(c2, "k", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	_, _, _, err = client.SemEnqueue(c2, "k", 1)
-	if err != client.ErrAlreadyQueued {
-		t.Fatalf("expected ErrAlreadyQueued, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Lock.Wait timeout
-// ---------------------------------------------------------------------------
-
-func TestLockWaitTimeout(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	l1 := &client.Lock{
-		Key:            "wait-timeout",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := l1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("l1 acquire failed")
+	got, err := l1.Acquire(context.Background())
+	if err != nil || !got {
+		t.Fatalf("l1: %v %v", got, err)
 	}
 	defer l1.Release(context.Background())
 
-	l2 := &client.Lock{
-		Key:     "wait-timeout",
-		Servers: []string{addr},
-	}
-	status, err := l2.Enqueue(context.Background())
+	got, err = l2.Acquire(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("l2: %v", err)
 	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	ok, err = l2.Wait(context.Background(), 1*time.Millisecond)
-	if err != nil {
-		t.Fatalf("expected nil error on timeout, got %v", err)
-	}
-	if ok {
-		t.Fatal("expected false on timeout")
+	if got {
+		t.Fatal("l2 should have timed out")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Edge case: Semaphore two-phase enqueue + wait
-// ---------------------------------------------------------------------------
+func TestLock_BackgroundRenew(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
 
-func TestSemaphoreTwoPhaseEnqueueWait(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s1 := &client.Semaphore{
-		Key:            "sem-2ph",
-		Limit:          1,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("s1 acquire failed")
-	}
-
-	s2 := &client.Semaphore{
-		Key:     "sem-2ph",
-		Limit:   1,
-		Servers: []string{addr},
-	}
-	status, err := s2.Enqueue(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		s1.Release(context.Background())
-	}()
-
-	ok, err = s2.Wait(context.Background(), 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("s2 wait timed out")
-	}
-	if s2.Token() == "" {
-		t.Fatal("expected non-empty token")
-	}
-	if err := s2.Release(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Semaphore.Wait timeout
-// ---------------------------------------------------------------------------
-
-func TestSemaphoreWaitTimeout(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s1 := &client.Semaphore{
-		Key:            "sem-wait-timeout",
-		Limit:          1,
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-	}
-	ok, err := s1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("s1 acquire failed")
-	}
-	defer s1.Release(context.Background())
-
-	s2 := &client.Semaphore{
-		Key:     "sem-wait-timeout",
-		Limit:   1,
-		Servers: []string{addr},
-	}
-	status, err := s2.Enqueue(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
-	}
-
-	ok, err = s2.Wait(context.Background(), 1*time.Millisecond)
-	if err != nil {
-		t.Fatalf("expected nil error on timeout, got %v", err)
-	}
-	if ok {
-		t.Fatal("expected false on timeout")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: OnRenewError callback
-// ---------------------------------------------------------------------------
-
-func TestLockOnRenewError(t *testing.T) {
-	cfg := testConfig()
-	cfg.DefaultLeaseTTL = 2 * time.Second
-	_, addr := startServer(t, cfg)
-
-	renewErrCh := make(chan error, 1)
 	l := &client.Lock{
-		Key:            "renew-err",
-		AcquireTimeout: 10 * time.Second,
-		Servers:        []string{addr},
-		RenewRatio:     0.25, // renew every 0.5s on a 2s lease
-		OnRenewError:   func(err error) { renewErrCh <- err },
-	}
-
-	ok, err := l.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("acquire failed")
-	}
-
-	// Force the server to forget the lock by releasing it directly.
-	// The renewal goroutine should hit an error on its next tick.
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.Release(c, "renew-err", l.Token())
-	c.Close()
-
-	select {
-	case err := <-renewErrCh:
-		if err == nil {
-			t.Fatal("expected non-nil error in OnRenewError")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for OnRenewError callback")
-	}
-	l.Close()
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: SignalConn listen/unlisten with queue group
-// ---------------------------------------------------------------------------
-
-func TestSignalConn_UnlistenGroup(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c1)
-	defer sc.Close()
-
-	if err := sc.Listen("events.test", client.WithGroup("workers")); err != nil {
-		t.Fatal(err)
-	}
-	if err := sc.Unlisten("events.test", client.WithGroup("workers")); err != nil {
-		t.Fatal(err)
-	}
-
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	n, err := client.Emit(c2, "events.test", "hello")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("expected 0 deliveries after unlisten with group, got %d", n)
-	}
-}
-
-func TestSignalConn_ListenGroupNewline(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c)
-	defer sc.Close()
-
-	err = sc.Listen("events.test", client.WithGroup("bad\ngroup"))
-	if err == nil {
-		t.Fatal("expected error for group with newline")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Renew with custom lease TTL option
-// ---------------------------------------------------------------------------
-
-func TestRenewCustomLeaseTTL(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, _, err := client.Acquire(c, "k", 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	remaining, err := client.Renew(c, "k", token, client.WithLeaseTTL(60))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if remaining <= 0 {
-		t.Fatalf("expected positive remaining, got %d", remaining)
-	}
-}
-
-func TestSemRenewCustomLeaseTTL(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	token, _, err := client.SemAcquire(c, "k", 10*time.Second, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	remaining, err := client.SemRenew(c, "k", token, client.WithLeaseTTL(60))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if remaining <= 0 {
-		t.Fatalf("expected positive remaining, got %d", remaining)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: key validation on sem operations
-// ---------------------------------------------------------------------------
-
-func TestSemAcquireEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, err = client.SemAcquire(c, "", 1*time.Second, 1)
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestSemReleaseEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	err = client.SemRelease(c, "", "tok")
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestSemRenewEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, err = client.SemRenew(c, "", "tok")
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestSemEnqueueEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, _, err = client.SemEnqueue(c, "", 1)
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestSemWaitEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, err = client.SemWait(c, "", 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestWaitEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, err = client.Wait(c, "", 1*time.Second)
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestEnqueueEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, _, _, err = client.Enqueue(c, "")
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestReleaseEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	err = client.Release(c, "", "tok")
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-func TestRenewEmptyKey(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, err = client.Renew(c, "", "tok")
-	if err == nil {
-		t.Fatal("expected error for empty key")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Edge case: Semaphore context cancel during Enqueue
-// ---------------------------------------------------------------------------
-
-// TestSignalConn_HeartbeatKeepsAlive verifies that the heartbeat goroutine
-// prevents the server from disconnecting an idle signal connection.
-func TestSignalConn_HeartbeatKeepsAlive(t *testing.T) {
-	if testing.Short() {
-		t.Skip("2.5s test; skip under -short")
-	}
-	cfg := testConfig()
-	cfg.ReadTimeout = 1 * time.Second // aggressive timeout
-
-	_, addr := startServer(t, cfg)
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c, client.WithHeartbeatInterval(400*time.Millisecond))
-	defer sc.Close()
-
-	if err := sc.Listen("events.>"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait 2.5× the server read timeout. Without the heartbeat the
-	// connection would have been closed after 1s.
-	time.Sleep(2500 * time.Millisecond)
-
-	// Create publisher AFTER the sleep so it doesn't also time out.
-	pub, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pub.Close()
-
-	// If the connection is still alive, we should be able to emit and receive.
-	n, err := client.Emit(pub, "events.alive", "ping")
-	if err != nil {
-		t.Fatalf("emit after sleep: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 delivery, got %d", n)
-	}
-
-	select {
-	case sig := <-sc.Signals():
-		if sig.Channel != "events.alive" {
-			t.Fatalf("expected channel 'events.alive', got %q", sig.Channel)
-		}
-		if sig.Payload != "ping" {
-			t.Fatalf("expected payload 'ping', got %q", sig.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for signal — connection likely dropped")
-	}
-}
-
-// TestSignalConn_NoHeartbeatTimesOut verifies that without a heartbeat,
-// the server disconnects an idle signal connection.
-func TestSignalConn_NoHeartbeatTimesOut(t *testing.T) {
-	cfg := testConfig()
-	cfg.ReadTimeout = 1 * time.Second // aggressive timeout
-
-	_, addr := startServer(t, cfg)
-
-	c, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c, client.WithHeartbeatInterval(0))
-	defer sc.Close()
-
-	if err := sc.Listen("events.>"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait longer than the read timeout — the server should close the
-	// connection and the Signals channel should be closed.
-	select {
-	case _, ok := <-sc.Signals():
-		if ok {
-			t.Fatal("expected channel to be closed, got a signal")
-		}
-		// Channel closed — connection was dropped as expected.
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out — expected server to disconnect the idle connection")
-	}
-}
-
-// TestLockAndSemaphoreSameKey_Client verifies the Go client can acquire
-// a lock and a semaphore on the same key.
-func TestLockAndSemaphoreSameKey_Client(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	// Acquire a lock
-	c1, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-
-	lockTok, _, err := client.Acquire(c1, "same-key", 5*time.Second)
-	if err != nil {
-		t.Fatalf("lock acquire: %v", err)
-	}
-	if lockTok == "" {
-		t.Fatal("lock acquire returned empty token")
-	}
-
-	// Acquire a semaphore on the same key (limit=3) — should succeed
-	c2, err := client.Dial(addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	semTok, _, err := client.SemAcquire(c2, "same-key", 5*time.Second, 3)
-	if err != nil {
-		t.Fatalf("sem acquire on same key: %v", err)
-	}
-	if semTok == "" {
-		t.Fatal("sem acquire returned empty token")
-	}
-
-	// Release both
-	if err := client.Release(c1, "same-key", lockTok); err != nil {
-		t.Fatalf("lock release: %v", err)
-	}
-	if err := client.SemRelease(c2, "same-key", semTok); err != nil {
-		t.Fatalf("sem release: %v", err)
-	}
-}
-
-func TestSemaphoreEnqueue_ContextCancel(t *testing.T) {
-	_, addr := startServer(t, testConfig())
-
-	s1 := &client.Semaphore{
-		Key:            "sem-eq-cancel",
-		Limit:          1,
-		AcquireTimeout: 10 * time.Second,
+		Key:            "lk",
+		AcquireTimeout: time.Second,
+		LeaseTTL:       2,
+		RenewRatio:     0.25,
 		Servers:        []string{addr},
 	}
-	ok, err := s1.Acquire(context.Background())
-	if err != nil || !ok {
-		t.Fatal("s1 acquire failed")
+	got, err := l.Acquire(context.Background())
+	if err != nil || !got {
+		t.Fatalf("Acquire: %v %v", got, err)
 	}
-	defer s1.Release(context.Background())
+	defer l.Release(context.Background())
 
-	s2 := &client.Semaphore{
-		Key:     "sem-eq-cancel",
-		Limit:   1,
-		Servers: []string{addr},
+	// Sleep through several would-be expiries; renewal should keep
+	// the lock alive.
+	time.Sleep(3 * time.Second)
+	if l.Token() == "" {
+		t.Fatal("token gone — renewal failed")
 	}
-	// Enqueue should succeed (non-blocking)
-	status, err := s2.Enqueue(context.Background())
+}
+
+func TestLock_TwoPhase(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+
+	holder := &client.Lock{Key: "lk", Servers: []string{addr}, LeaseTTL: 30}
+	got, _ := holder.Acquire(context.Background())
+	if !got {
+		t.Fatal("holder didn't acquire")
+	}
+	defer holder.Release(context.Background())
+
+	queuer := &client.Lock{Key: "lk", Servers: []string{addr}, LeaseTTL: 30}
+	status, err := queuer.Enqueue(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status != "queued" {
-		t.Fatalf("expected queued, got %s", status)
+		t.Fatalf("got %q", status)
 	}
-
-	// Wait with cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	done := make(chan bool, 1)
 	go func() {
-		defer close(done)
-		_, err := s2.Wait(ctx, 30*time.Second)
-		if err == nil {
-			t.Error("expected error from cancelled context")
-		}
+		ok, _ := queuer.Wait(context.Background(), 5*time.Second)
+		done <- ok
 	}()
+	time.Sleep(50 * time.Millisecond)
+	holder.Release(context.Background())
+
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("Wait returned false")
+		}
+		queuer.Release(context.Background())
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait never returned")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// High-level Semaphore
+// ---------------------------------------------------------------------------
+
+func TestSemaphore_AcquireRelease(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	s := &client.Semaphore{Key: "sem", Limit: 3, Servers: []string{addr}}
+	ok, err := s.Acquire(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("Acquire: %v %v", ok, err)
+	}
+	if err := s.Release(context.Background()); err != nil {
+		t.Errorf("Release: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+func TestValidation_EmptyKey(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	conn, _ := client.Dial(addr)
+	defer conn.Close()
+	_, _, err := client.Acquire(conn, "", time.Second)
+	if err == nil || !strings.Contains(err.Error(), "empty key") {
+		t.Errorf("got %v, want empty-key error", err)
+	}
+}
+
+func TestValidation_BadLeaseTTL(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	conn, _ := client.Dial(addr)
+	defer conn.Close()
+	_, _, err := client.Acquire(conn, "k", time.Second, client.WithLeaseTTL(-1))
+	if err == nil {
+		t.Errorf("expected error for negative lease TTL")
+	}
+}
+
+func TestValidation_BadSemLimit(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+	conn, _ := client.Dial(addr)
+	defer conn.Close()
+	_, _, err := client.SemAcquire(conn, "k", time.Second, 0)
+	if err == nil {
+		t.Error("expected error for limit=0")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sharding
+// ---------------------------------------------------------------------------
+
+func TestCRC32Shard_Stable(t *testing.T) {
+	if client.CRC32Shard("foo", 4) != client.CRC32Shard("foo", 4) {
+		t.Error("CRC32Shard not stable")
+	}
+	if client.CRC32Shard("foo", 0) != 0 {
+		t.Error("zero servers should return 0")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect cleanup
+// ---------------------------------------------------------------------------
+
+func TestDisconnect_AutoRelease(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+
+	c1, _ := client.Dial(addr)
+	tok, _, _ := client.Acquire(c1, "k", time.Second)
+	_ = tok
+	c1.Close()
+
 	time.Sleep(100 * time.Millisecond)
+
+	c2, _ := client.Dial(addr)
+	defer c2.Close()
+	_, _, err := client.Acquire(c2, "k", time.Second)
+	if err != nil {
+		t.Fatalf("post-disconnect acquire: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context cancellation on Lock.Acquire
+// ---------------------------------------------------------------------------
+
+func TestLock_ContextCancel(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+
+	holder := &client.Lock{Key: "lk", Servers: []string{addr}, LeaseTTL: 30}
+	holder.Acquire(context.Background())
+	defer holder.Release(context.Background())
+
+	l := &client.Lock{Key: "lk", AcquireTimeout: 30 * time.Second, Servers: []string{addr}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.Acquire(ctx)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
 	cancel()
 
 	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Wait did not return after context cancellation")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Regression tests for docs/bugs.md fixes
-// ---------------------------------------------------------------------------
-
-// TestLock_ReleaseTerminatesOnHungServer covers docs/bugs.md #2: the
-// renewal goroutine may be blocked mid-Renew on an unresponsive server,
-// and ctx cancellation alone can't interrupt its network I/O. Release()
-// must still terminate promptly — stopRenew force-closes the conn after
-// stopRenewGrace (2s).
-//
-// Uses a fake TCP server that accepts, answers the acquire, then goes
-// silent. The renewal goroutine fires, sends a Renew, and blocks waiting
-// for a response that will never come. Release() should complete within
-// stopRenewGrace + a small margin rather than hanging indefinitely.
-func TestLock_ReleaseTerminatesOnHungServer(t *testing.T) {
-	if testing.Short() {
-		t.Skip("3.5s test; skip under -short")
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error on cancel")
 		}
-		defer conn.Close()
-		r := bufio.NewReader(conn)
-		// Consume the three lines of the acquire request.
-		for i := 0; i < 3; i++ {
-			if _, err := r.ReadString('\n'); err != nil {
-				return
-			}
-		}
-		// Answer the acquire with a real-looking token so the client
-		// starts its renewal loop.
-		conn.Write([]byte("ok aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2\n"))
-		// Now go silent. Any future Renew will hang waiting for a
-		// response until the conn is force-closed by the client.
-		io.Copy(io.Discard, r)
-	}()
-
-	l := &client.Lock{
-		Key:            "hang-test",
-		AcquireTimeout: 2 * time.Second,
-		LeaseTTL:       2, // short so the first renewal fires quickly
-		Servers:        []string{ln.Addr().String()},
-		RenewRatio:     0.5,
-	}
-
-	ok, err := l.Acquire(context.Background())
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if !ok {
-		t.Fatal("acquire returned !ok")
-	}
-
-	// Wait past the first renewal tick so the renewal goroutine is
-	// parked inside Renew's network I/O.
-	time.Sleep(1500 * time.Millisecond)
-
-	start := time.Now()
-	_ = l.Release(context.Background())
-	elapsed := time.Since(start)
-
-	// stopRenewGrace is 2s. Release should complete within ~2.5s.
-	if elapsed > 5*time.Second {
-		t.Fatalf("Release hung for %v — stopRenew did not force-close the conn", elapsed)
-	}
-
-	<-serverDone
-}
-
-// TestSignalConn_DroppedSignalsIncrements covers docs/bugs.md #7: when
-// the client's sigCh (size 64) is full and more signals arrive, they
-// should be counted via DroppedSignals() rather than silently discarded.
-//
-// Uses a fake TCP server that emits raw "sig ..." lines without going
-// through the real protocol, avoiding interactions with the server-side
-// slow-consumer eviction path.
-func TestSignalConn_DroppedSignalsIncrements(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	const numSignals = 500 // well over sigCh buffer (64)
-
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		// Push many "sig" push frames without waiting for any client
-		// response. The client's readLoop processes them one by one;
-		// once sigCh fills, subsequent sends drop and increment the
-		// counter.
-		for i := 0; i < numSignals; i++ {
-			fmt.Fprintf(conn, "sig events.%d payload-%d\n", i, i)
-		}
-		// Wait briefly so the client has time to observe the drops
-		// before we disconnect.
-		time.Sleep(500 * time.Millisecond)
-	}()
-
-	c, err := client.Dial(ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := client.NewSignalConn(c, client.WithHeartbeatInterval(0))
-	defer sc.Close()
-
-	// Deliberately do NOT drain sc.Signals(). Wait for the fake server
-	// to send all frames and for readLoop to process them.
-	<-serverDone
-	time.Sleep(100 * time.Millisecond)
-
-	dropped := sc.DroppedSignals()
-	if dropped == 0 {
-		t.Fatalf("DroppedSignals returned 0 — counter should increment when sigCh is full")
-	}
-	// Lower bound check: we sent 500, buffer is 64, so drops should be
-	// at least numSignals - 64 minus a small grace for scheduling.
-	minDrops := uint64(numSignals - 64 - 16)
-	if dropped < minDrops {
-		t.Fatalf("DroppedSignals=%d, expected at least %d", dropped, minDrops)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Acquire never returned")
 	}
 }

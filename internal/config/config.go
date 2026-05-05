@@ -1,3 +1,6 @@
+// Package config loads dflockd configuration from CLI flags and env vars.
+//
+// Precedence: explicit CLI flag > environment variable > flag default.
 package config
 
 import (
@@ -10,29 +13,30 @@ import (
 	"time"
 )
 
+// Config is the fully resolved server configuration.
 type Config struct {
+	// TCP server.
 	Host                    string
 	Port                    int
-	DefaultLeaseTTL         time.Duration
-	LeaseSweepInterval      time.Duration
-	GCInterval              time.Duration
-	GCMaxIdleTime           time.Duration
-	MaxLocks                int
-	MaxConnections          int
-	MaxConnectionsPerIP     int
-	MaxWaiters              int
-	MaxSubscriptions        int
 	ReadTimeout             time.Duration
 	WriteTimeout            time.Duration
 	ShutdownTimeout         time.Duration
+	MaxConnections          int
+	MaxConnectionsPerIP     int
 	AutoReleaseOnDisconnect bool
-	Debug                   bool
-	Version                 bool
 	TLSCert                 string
 	TLSKey                  string
 	AuthToken               string
 
-	// HTTP API (opt-in; HTTPPort=0 disables).
+	// Lock manager.
+	DefaultLeaseTTL    time.Duration
+	LeaseSweepInterval time.Duration
+	GCInterval         time.Duration
+	GCMaxIdleTime      time.Duration
+	MaxLocks           int
+	MaxWaiters         int
+
+	// HTTP API (HTTPPort=0 disables).
 	HTTPPort                int
 	HTTPHost                string
 	HTTPSessionIdleTimeout  time.Duration
@@ -41,172 +45,23 @@ type Config struct {
 	HTTPMaxConnectionsPerIP int
 	HTTPRateLimitPerIP      int
 	HTTPRateLimitBurst      int
-	HTTPSSEPingInterval     time.Duration
 	HTTPCORSAllowedOrigins  []string
+
+	// Diagnostics.
+	Debug   bool
+	Version bool
 }
 
-// envLookup returns the first non-empty env value from the given keys,
-// or "" if none are set. Used for canonical-plus-deprecated name lookup.
-// First key should be the canonical (new) name; subsequent keys are
-// deprecated aliases kept for backward compatibility.
-func envLookup(keys ...string) string {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// envOrInt returns the environment variable value parsed as int, or the flag
-// default if the env var is unset. Malformed values are configuration errors.
-func envOrInt(envKey string, flagVal int) (int, error) {
-	v := os.Getenv(envKey)
-	if v == "" {
-		return flagVal, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer (got %q)", envKey, v)
-	}
-	return n, nil
-}
-
-// envOrBool returns the environment variable value parsed as bool, or the flag
-// default if the env var is unset. Recognizes 1/yes/true as true and
-// 0/no/false as false; unrecognized values are configuration errors.
-func envOrBool(envKey string, flagVal bool) (bool, error) {
-	v := os.Getenv(envKey)
-	if v == "" {
-		return flagVal, nil
-	}
-	switch strings.ToLower(v) {
-	case "1", "yes", "true":
-		return true, nil
-	case "0", "no", "false":
-		return false, nil
-	default:
-		return false, fmt.Errorf("%s must be a boolean (got %q)", envKey, v)
-	}
-}
-
-// envOrString returns the environment variable value, or the flag default if
-// the env var is unset.
-func envOrString(envKey string, flagVal string) string {
-	v := os.Getenv(envKey)
-	if v == "" {
-		return flagVal
-	}
-	return v
-}
-
-func splitCSV(value string) []string {
-	if value == "" {
-		return nil
-	}
-	var out []string
-	for _, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
+// maxDurationSeconds caps the seconds-as-int conversions. time.Duration
+// runs out of range above ~292 years; values beyond that wrap negative.
 const maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
 
-func durationFromSeconds(label string, seconds int) (time.Duration, error) {
-	n := int64(seconds)
-	if n > maxDurationSeconds || n < -maxDurationSeconds {
-		return 0, fmt.Errorf("%s too large (max %d seconds)", label, maxDurationSeconds)
-	}
-	return time.Duration(n) * time.Second, nil
-}
-
-// envOrDuration returns a time.Duration in seconds from the environment
-// variable, or converts the flag default (in seconds) if the env var is unset.
-func envOrDuration(envKey string, flagVal int) (time.Duration, error) {
-	n, err := envOrInt(envKey, flagVal)
-	if err != nil {
-		return 0, err
-	}
-	return durationFromSeconds(envKey, n)
-}
-
-// envOrDurationWithAliases is envOrDuration that also looks up deprecated
-// env var names. Used to migrate from legacy names (DFLOCKD_GC_LOOP_SLEEP,
-// DFLOCKD_GC_MAX_UNUSED_TIME) to the canonical-matching-flag names
-// (DFLOCKD_GC_INTERVAL, DFLOCKD_GC_MAX_IDLE). Reports which name was used
-// via the returned string so the caller can log a deprecation warning.
-func envOrDurationWithAliases(flagVal int, keys ...string) (time.Duration, string, error) {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				return 0, k, fmt.Errorf("%s must be an integer (got %q)", k, v)
-			}
-			d, err := durationFromSeconds(k, n)
-			return d, k, err
-		}
-	}
-	d, err := durationFromSeconds(keys[0], flagVal)
-	return d, "", err
-}
-
-// loadAuthToken resolves the auth token following the same precedence the
-// rest of the config uses (README: "CLI flags take precedence over
-// environment variables"):
-//
-//  1. --auth-token flag (if explicitly set)
-//  2. --auth-token-file flag (if explicitly set)
-//  3. DFLOCKD_AUTH_TOKEN env var
-//  4. DFLOCKD_AUTH_TOKEN_FILE env var
-//
-// flagTokenSet and flagTokenFileSet tell us whether the caller actually
-// passed the flag (vs receiving the empty default), so an empty flag
-// value doesn't accidentally override a set env var.
-func loadAuthToken(flagToken string, flagTokenSet bool, flagTokenFile string, flagTokenFileSet bool) (string, error) {
-	if flagTokenSet && flagToken != "" {
-		return cleanAuthToken("--auth-token", flagToken)
-	}
-	if flagTokenFileSet && flagTokenFile != "" {
-		return readAuthTokenFile(flagTokenFile)
-	}
-	if v := os.Getenv("DFLOCKD_AUTH_TOKEN"); v != "" {
-		return cleanAuthToken("DFLOCKD_AUTH_TOKEN", v)
-	}
-	if v := os.Getenv("DFLOCKD_AUTH_TOKEN_FILE"); v != "" {
-		return readAuthTokenFile(v)
-	}
-	return "", nil
-}
-
-func cleanAuthToken(source, token string) (string, error) {
-	tok := strings.TrimSpace(token)
-	if tok == "" {
-		return "", fmt.Errorf("%s is empty", source)
-	}
-	if strings.ContainsAny(tok, "\n\r") {
-		return "", fmt.Errorf("%s must not contain newline characters", source)
-	}
-	return tok, nil
-}
-
-func readAuthTokenFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("reading auth token file %q: %w", path, err)
-	}
-	tok, err := cleanAuthToken(fmt.Sprintf("auth token file %q", path), string(data))
-	if err != nil {
-		return "", err
-	}
-	return tok, nil
-}
-
+// Load parses args and returns the resolved Config. Returns an error
+// (rather than calling os.Exit) so callers can present errors however
+// they like.
 func Load(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("dflockd", flag.ContinueOnError)
+
 	host := fs.String("host", "127.0.0.1", "Bind address")
 	port := fs.Int("port", 6388, "Bind port")
 	defaultLeaseTTL := fs.Int("default-lease-ttl", 33, "Default lock lease duration (seconds)")
@@ -217,15 +72,14 @@ func Load(args []string) (*Config, error) {
 	maxConnections := fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
 	maxConnectionsPerIP := fs.Int("max-connections-per-ip", 0, "Maximum concurrent TCP connections per remote IP (0 = unlimited)")
 	maxWaiters := fs.Int("max-waiters", 0, "Maximum waiters per lock/semaphore key (0 = unlimited)")
-	maxSubscriptions := fs.Int("max-subscriptions", 0, "Maximum watch+listen registrations per connection (0 = unlimited)")
 	readTimeout := fs.Int("read-timeout", 23, "Client read timeout (seconds)")
 	writeTimeout := fs.Int("write-timeout", 5, "Client write timeout (seconds)")
 	shutdownTimeout := fs.Int("shutdown-timeout", 30, "Graceful shutdown drain timeout (seconds, 0 = wait forever)")
 	autoRelease := fs.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	tlsCert := fs.String("tls-cert", "", "Path to TLS certificate PEM file")
 	tlsKey := fs.String("tls-key", "", "Path to TLS private key PEM file")
-	authToken := fs.String("auth-token", "", "Shared secret token for client authentication (visible in process list; prefer --auth-token-file)")
-	authTokenFile := fs.String("auth-token-file", "", "Path to file containing the auth token (one line, trailing whitespace stripped)")
+	authToken := fs.String("auth-token", "", "Shared secret token (visible in process list; prefer --auth-token-file)")
+	authTokenFile := fs.String("auth-token-file", "", "Path to file containing the auth token (one line)")
 	httpPort := fs.Int("http-port", 0, "HTTP API listen port (0 = disabled)")
 	httpHost := fs.String("http-host", "", "HTTP API bind address (defaults to --host)")
 	httpIdle := fs.Int("http-session-idle-timeout", 20, "HTTP session idle timeout (seconds)")
@@ -234,201 +88,144 @@ func Load(args []string) (*Config, error) {
 	httpMaxConnsPerIP := fs.Int("http-max-connections-per-ip", 0, "Max concurrent HTTP transport connections per remote IP (0 = unlimited)")
 	httpRateLimitPerIP := fs.Int("http-rate-limit-per-ip", 0, "HTTP requests per second per remote IP (0 = unlimited)")
 	httpRateLimitBurst := fs.Int("http-rate-limit-burst", 0, "HTTP per-IP rate-limit burst size (0 = same as rate)")
-	httpSSEPing := fs.Int("http-sse-ping-interval", 15, "Internal ping interval for SSE streams (seconds)")
 	httpCORSOrigins := fs.String("http-cors-allowed-origins", "", "Comma-separated allowed CORS origins for the HTTP API (empty = disabled)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	version := fs.Bool("version", false, "Print version and exit")
+
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 
-	// Track which flags were explicitly set on the command line so they
-	// take precedence over environment variables.  Precedence order:
-	//   CLI flag (explicit) > environment variable > flag default
-	setFlags := make(map[string]bool)
-	fs.Visit(func(f *flag.Flag) {
-		setFlags[f.Name] = true
-	})
-	resolveInt := func(flagName, envKey string, flagVal int) (int, error) {
-		if setFlags[flagName] {
-			return flagVal, nil
-		}
-		return envOrInt(envKey, flagVal)
-	}
-	resolveString := func(flagName, envKey string, flagVal string) string {
-		if setFlags[flagName] {
-			return flagVal
-		}
-		return envOrString(envKey, flagVal)
-	}
-	resolveBool := func(flagName, envKey string, flagVal bool) (bool, error) {
-		if setFlags[flagName] {
-			return flagVal, nil
-		}
-		return envOrBool(envKey, flagVal)
-	}
-	resolveDuration := func(flagName, envKey string, flagVal int) (time.Duration, error) {
-		if setFlags[flagName] {
-			return durationFromSeconds("--"+flagName, flagVal)
-		}
-		return envOrDuration(envKey, flagVal)
-	}
-	// resolveDurationWithAliases prefers the canonical env var name, falls
-	// back to one or more deprecated aliases, and prints a one-shot
-	// deprecation warning to stderr when an alias matches. CLI flag still
-	// wins when explicitly set.
-	resolveDurationWithAliases := func(flagName string, flagVal int, keys ...string) (time.Duration, error) {
-		if setFlags[flagName] {
-			return durationFromSeconds("--"+flagName, flagVal)
-		}
-		d, matched, err := envOrDurationWithAliases(flagVal, keys...)
-		if err != nil {
-			return 0, err
-		}
-		if matched != "" && matched != keys[0] {
-			fmt.Fprintf(os.Stderr,
-				"dflockd: env var %s is deprecated; please use %s instead\n",
-				matched, keys[0])
-		}
-		return d, nil
-	}
+	r := newResolver(fs)
 
-	authTok, err := loadAuthToken(*authToken, setFlags["auth-token"], *authTokenFile, setFlags["auth-token-file"])
-	if err != nil {
-		return nil, err
-	}
-
-	defaultLeaseTTLDuration, err := resolveDuration("default-lease-ttl", "DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL)
-	if err != nil {
-		return nil, err
-	}
-	leaseSweepIntervalDuration, err := resolveDuration("lease-sweep-interval", "DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval)
-	if err != nil {
-		return nil, err
-	}
-	gcIntervalDuration, err := resolveDurationWithAliases("gc-interval", *gcInterval,
-		"DFLOCKD_GC_INTERVAL_S", "DFLOCKD_GC_LOOP_SLEEP")
-	if err != nil {
-		return nil, err
-	}
-	gcMaxIdleDuration, err := resolveDurationWithAliases("gc-max-idle", *gcMaxIdle,
-		"DFLOCKD_GC_MAX_IDLE_S", "DFLOCKD_GC_MAX_UNUSED_TIME")
-	if err != nil {
-		return nil, err
-	}
-	readTimeoutDuration, err := resolveDuration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout)
-	if err != nil {
-		return nil, err
-	}
-	writeTimeoutDuration, err := resolveDuration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout)
-	if err != nil {
-		return nil, err
-	}
-	shutdownTimeoutDuration, err := resolveDuration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout)
-	if err != nil {
-		return nil, err
-	}
-	httpIdleDuration, err := resolveDuration("http-session-idle-timeout", "DFLOCKD_HTTP_SESSION_IDLE_S", *httpIdle)
-	if err != nil {
-		return nil, err
-	}
-	httpSSEPingDuration, err := resolveDuration("http-sse-ping-interval", "DFLOCKD_HTTP_SSE_PING_S", *httpSSEPing)
-	if err != nil {
-		return nil, err
-	}
-
-	resolvedHTTPRate, err := resolveInt("http-rate-limit-per-ip", "DFLOCKD_HTTP_RATE_LIMIT_PER_IP", *httpRateLimitPerIP)
-	if err != nil {
-		return nil, err
-	}
-	resolvedHTTPBurst, err := resolveInt("http-rate-limit-burst", "DFLOCKD_HTTP_RATE_LIMIT_BURST", *httpRateLimitBurst)
-	if err != nil {
-		return nil, err
-	}
-	if resolvedHTTPRate > 0 && resolvedHTTPBurst == 0 {
-		resolvedHTTPBurst = resolvedHTTPRate
-	}
-
-	resolvedPort, err := resolveInt("port", "DFLOCKD_PORT", *port)
-	if err != nil {
-		return nil, err
-	}
-	resolvedMaxLocks, err := resolveInt("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks)
-	if err != nil {
-		return nil, err
-	}
-	resolvedMaxConnections, err := resolveInt("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections)
-	if err != nil {
-		return nil, err
-	}
-	resolvedMaxConnectionsPerIP, err := resolveInt("max-connections-per-ip", "DFLOCKD_MAX_CONNECTIONS_PER_IP", *maxConnectionsPerIP)
-	if err != nil {
-		return nil, err
-	}
-	resolvedMaxWaiters, err := resolveInt("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters)
-	if err != nil {
-		return nil, err
-	}
-	resolvedMaxSubscriptions, err := resolveInt("max-subscriptions", "DFLOCKD_MAX_SUBSCRIPTIONS", *maxSubscriptions)
-	if err != nil {
-		return nil, err
-	}
-	resolvedAutoRelease, err := resolveBool("auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)
-	if err != nil {
-		return nil, err
-	}
-	resolvedHTTPPort, err := resolveInt("http-port", "DFLOCKD_HTTP_PORT", *httpPort)
-	if err != nil {
-		return nil, err
-	}
-	resolvedHTTPMaxSessions, err := resolveInt("http-max-sessions", "DFLOCKD_HTTP_MAX_SESSIONS", *httpMaxSessions)
-	if err != nil {
-		return nil, err
-	}
-	resolvedHTTPMaxSessionsPerIP, err := resolveInt("http-max-sessions-per-ip", "DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", *httpMaxSessionsPerIP)
-	if err != nil {
-		return nil, err
-	}
-	resolvedHTTPMaxConnsPerIP, err := resolveInt("http-max-connections-per-ip", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP", *httpMaxConnsPerIP)
-	if err != nil {
-		return nil, err
-	}
-	resolvedDebug, err := resolveBool("debug", "DFLOCKD_DEBUG", *debug)
+	authTok, err := r.loadAuthToken(*authToken, *authTokenFile)
 	if err != nil {
 		return nil, err
 	}
 
 	cfg := &Config{
-		Host:                    resolveString("host", "DFLOCKD_HOST", *host),
-		Port:                    resolvedPort,
-		DefaultLeaseTTL:         defaultLeaseTTLDuration,
-		LeaseSweepInterval:      leaseSweepIntervalDuration,
-		GCInterval:              gcIntervalDuration,
-		GCMaxIdleTime:           gcMaxIdleDuration,
-		MaxLocks:                resolvedMaxLocks,
-		MaxConnections:          resolvedMaxConnections,
-		MaxConnectionsPerIP:     resolvedMaxConnectionsPerIP,
-		MaxWaiters:              resolvedMaxWaiters,
-		MaxSubscriptions:        resolvedMaxSubscriptions,
-		ReadTimeout:             readTimeoutDuration,
-		WriteTimeout:            writeTimeoutDuration,
-		ShutdownTimeout:         shutdownTimeoutDuration,
-		AutoReleaseOnDisconnect: resolvedAutoRelease,
-		TLSCert:                 resolveString("tls-cert", "DFLOCKD_TLS_CERT", *tlsCert),
-		TLSKey:                  resolveString("tls-key", "DFLOCKD_TLS_KEY", *tlsKey),
-		AuthToken:               authTok,
-		HTTPPort:                resolvedHTTPPort,
-		HTTPHost:                resolveString("http-host", "DFLOCKD_HTTP_HOST", *httpHost),
-		HTTPSessionIdleTimeout:  httpIdleDuration,
-		HTTPMaxSessions:         resolvedHTTPMaxSessions,
-		HTTPMaxSessionsPerIP:    resolvedHTTPMaxSessionsPerIP,
-		HTTPMaxConnectionsPerIP: resolvedHTTPMaxConnsPerIP,
-		HTTPRateLimitPerIP:      resolvedHTTPRate,
-		HTTPRateLimitBurst:      resolvedHTTPBurst,
-		HTTPSSEPingInterval:     httpSSEPingDuration,
-		HTTPCORSAllowedOrigins:  splitCSV(resolveString("http-cors-allowed-origins", "DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", *httpCORSOrigins)),
-		Debug:                   resolvedDebug,
-		Version:                 *version,
+		Host:                   r.str("host", "DFLOCKD_HOST", *host),
+		TLSCert:                r.str("tls-cert", "DFLOCKD_TLS_CERT", *tlsCert),
+		TLSKey:                 r.str("tls-key", "DFLOCKD_TLS_KEY", *tlsKey),
+		HTTPHost:               r.str("http-host", "DFLOCKD_HTTP_HOST", *httpHost),
+		AuthToken:              authTok,
+		HTTPCORSAllowedOrigins: splitCSV(r.str("http-cors-allowed-origins", "DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", *httpCORSOrigins)),
+		Version:                *version,
+	}
+	for _, fn := range []func(*Config) error{
+		func(c *Config) error {
+			var err error
+			c.Port, err = r.intVal("port", "DFLOCKD_PORT", *port)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.MaxLocks, err = r.intVal("max-locks", "DFLOCKD_MAX_LOCKS", *maxLocks)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.MaxConnections, err = r.intVal("max-connections", "DFLOCKD_MAX_CONNECTIONS", *maxConnections)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.MaxConnectionsPerIP, err = r.intVal("max-connections-per-ip", "DFLOCKD_MAX_CONNECTIONS_PER_IP", *maxConnectionsPerIP)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.MaxWaiters, err = r.intVal("max-waiters", "DFLOCKD_MAX_WAITERS", *maxWaiters)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.AutoReleaseOnDisconnect, err = r.boolVal("auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", *autoRelease)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPPort, err = r.intVal("http-port", "DFLOCKD_HTTP_PORT", *httpPort)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPMaxSessions, err = r.intVal("http-max-sessions", "DFLOCKD_HTTP_MAX_SESSIONS", *httpMaxSessions)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPMaxSessionsPerIP, err = r.intVal("http-max-sessions-per-ip", "DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", *httpMaxSessionsPerIP)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPMaxConnectionsPerIP, err = r.intVal("http-max-connections-per-ip", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP", *httpMaxConnsPerIP)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPRateLimitPerIP, err = r.intVal("http-rate-limit-per-ip", "DFLOCKD_HTTP_RATE_LIMIT_PER_IP", *httpRateLimitPerIP)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPRateLimitBurst, err = r.intVal("http-rate-limit-burst", "DFLOCKD_HTTP_RATE_LIMIT_BURST", *httpRateLimitBurst)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.Debug, err = r.boolVal("debug", "DFLOCKD_DEBUG", *debug)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.DefaultLeaseTTL, err = r.duration("default-lease-ttl", "DFLOCKD_DEFAULT_LEASE_TTL_S", *defaultLeaseTTL)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.LeaseSweepInterval, err = r.duration("lease-sweep-interval", "DFLOCKD_LEASE_SWEEP_INTERVAL_S", *leaseSweepInterval)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.GCInterval, err = r.duration("gc-interval", "DFLOCKD_GC_INTERVAL_S", *gcInterval)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.GCMaxIdleTime, err = r.duration("gc-max-idle", "DFLOCKD_GC_MAX_IDLE_S", *gcMaxIdle)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.ReadTimeout, err = r.duration("read-timeout", "DFLOCKD_READ_TIMEOUT_S", *readTimeout)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.WriteTimeout, err = r.duration("write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", *writeTimeout)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.ShutdownTimeout, err = r.duration("shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", *shutdownTimeout)
+			return err
+		},
+		func(c *Config) error {
+			var err error
+			c.HTTPSessionIdleTimeout, err = r.duration("http-session-idle-timeout", "DFLOCKD_HTTP_SESSION_IDLE_S", *httpIdle)
+			return err
+		},
+	} {
+		if err := fn(cfg); err != nil {
+			return nil, err
+		}
+	}
+
+	if cfg.HTTPRateLimitPerIP > 0 && cfg.HTTPRateLimitBurst == 0 {
+		cfg.HTTPRateLimitBurst = cfg.HTTPRateLimitPerIP
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -437,6 +234,8 @@ func Load(args []string) (*Config, error) {
 	return cfg, nil
 }
 
+// Validate enforces invariants that aren't expressible as simple flag
+// types. Returned errors are wrapped to identify the offending flag.
 func (c *Config) Validate() error {
 	if c.MaxLocks <= 0 {
 		return fmt.Errorf("--max-locks must be > 0 (got %d)", c.MaxLocks)
@@ -454,28 +253,25 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("--read-timeout must be > 0")
 	}
 	if c.WriteTimeout < 0 {
-		return fmt.Errorf("--write-timeout must be >= 0 (got %s)", c.WriteTimeout)
+		return fmt.Errorf("--write-timeout must be >= 0")
 	}
 	if c.ShutdownTimeout < 0 {
-		return fmt.Errorf("--shutdown-timeout must be >= 0 (got %s)", c.ShutdownTimeout)
+		return fmt.Errorf("--shutdown-timeout must be >= 0")
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("--port must be 0-65535 (got %d)", c.Port)
 	}
 	if c.MaxConnections < 0 {
-		return fmt.Errorf("--max-connections must be >= 0 (got %d)", c.MaxConnections)
+		return fmt.Errorf("--max-connections must be >= 0")
 	}
 	if c.MaxConnectionsPerIP < 0 {
-		return fmt.Errorf("--max-connections-per-ip must be >= 0 (got %d)", c.MaxConnectionsPerIP)
+		return fmt.Errorf("--max-connections-per-ip must be >= 0")
 	}
 	if c.MaxWaiters < 0 {
-		return fmt.Errorf("--max-waiters must be >= 0 (got %d)", c.MaxWaiters)
-	}
-	if c.MaxSubscriptions < 0 {
-		return fmt.Errorf("--max-subscriptions must be >= 0 (got %d)", c.MaxSubscriptions)
+		return fmt.Errorf("--max-waiters must be >= 0")
 	}
 	if c.GCMaxIdleTime < 0 {
-		return fmt.Errorf("--gc-max-idle must be >= 0 (got %s)", c.GCMaxIdleTime)
+		return fmt.Errorf("--gc-max-idle must be >= 0")
 	}
 	if (c.TLSCert != "") != (c.TLSKey != "") {
 		return fmt.Errorf("both --tls-cert and --tls-key must be provided together")
@@ -510,18 +306,127 @@ func (c *Config) Validate() error {
 	if c.HTTPRateLimitPerIP > 0 && c.HTTPRateLimitBurst == 0 {
 		return fmt.Errorf("--http-rate-limit-burst must be > 0 when --http-rate-limit-per-ip is set")
 	}
-	if c.HTTPSSEPingInterval < 0 {
-		return fmt.Errorf("--http-sse-ping-interval must be >= 0")
-	}
-	// The SSE handler relies on its internal pinger to refresh the
-	// session's lastSeen before the bridge sweeper reaps it. The sweeper
-	// cutoff is 2 * HTTPSessionIdleTimeout, so a ping firing later than
-	// that races the sweeper. Require pingInterval < idleTimeout to keep
-	// 2x margin.
-	if c.HTTPSSEPingInterval > 0 && c.HTTPSessionIdleTimeout > 0 &&
-		c.HTTPSSEPingInterval >= c.HTTPSessionIdleTimeout {
-		return fmt.Errorf("--http-sse-ping-interval (%s) must be less than --http-session-idle-timeout (%s)",
-			c.HTTPSSEPingInterval, c.HTTPSessionIdleTimeout)
-	}
 	return nil
+}
+
+// resolver implements the precedence rules: explicit CLI flag wins over
+// env, env wins over flag default. Track which flags the user actually
+// set so unset flags don't shadow legitimate env values.
+type resolver struct {
+	setFlags map[string]bool
+}
+
+func newResolver(fs *flag.FlagSet) *resolver {
+	r := &resolver{setFlags: make(map[string]bool)}
+	fs.Visit(func(f *flag.Flag) { r.setFlags[f.Name] = true })
+	return r
+}
+
+func (r *resolver) str(flag, env, def string) string {
+	if r.setFlags[flag] {
+		return def
+	}
+	if v := os.Getenv(env); v != "" {
+		return v
+	}
+	return def
+}
+
+func (r *resolver) intVal(flag, env string, def int) (int, error) {
+	if r.setFlags[flag] {
+		return def, nil
+	}
+	if v := os.Getenv(env); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s must be an integer (got %q)", env, v)
+		}
+		return n, nil
+	}
+	return def, nil
+}
+
+func (r *resolver) boolVal(flag, env string, def bool) (bool, error) {
+	if r.setFlags[flag] {
+		return def, nil
+	}
+	v := os.Getenv(env)
+	if v == "" {
+		return def, nil
+	}
+	switch strings.ToLower(v) {
+	case "1", "yes", "true":
+		return true, nil
+	case "0", "no", "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be a boolean (got %q)", env, v)
+}
+
+func (r *resolver) duration(flag, env string, def int) (time.Duration, error) {
+	n, err := r.intVal(flag, env, def)
+	if err != nil {
+		return 0, err
+	}
+	return secondsToDuration(env, n)
+}
+
+// loadAuthToken resolves the auth token following the documented
+// precedence: --auth-token > --auth-token-file > DFLOCKD_AUTH_TOKEN
+// > DFLOCKD_AUTH_TOKEN_FILE.
+func (r *resolver) loadAuthToken(flagToken, flagTokenFile string) (string, error) {
+	if r.setFlags["auth-token"] && flagToken != "" {
+		return cleanAuthToken("--auth-token", flagToken)
+	}
+	if r.setFlags["auth-token-file"] && flagTokenFile != "" {
+		return readAuthTokenFile(flagTokenFile)
+	}
+	if v := os.Getenv("DFLOCKD_AUTH_TOKEN"); v != "" {
+		return cleanAuthToken("DFLOCKD_AUTH_TOKEN", v)
+	}
+	if v := os.Getenv("DFLOCKD_AUTH_TOKEN_FILE"); v != "" {
+		return readAuthTokenFile(v)
+	}
+	return "", nil
+}
+
+func cleanAuthToken(source, token string) (string, error) {
+	tok := strings.TrimSpace(token)
+	if tok == "" {
+		return "", fmt.Errorf("%s is empty", source)
+	}
+	if strings.ContainsAny(tok, "\n\r") {
+		return "", fmt.Errorf("%s must not contain newline characters", source)
+	}
+	return tok, nil
+}
+
+func readAuthTokenFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading auth token file %q: %w", path, err)
+	}
+	return cleanAuthToken(fmt.Sprintf("auth token file %q", path), string(data))
+}
+
+func secondsToDuration(label string, seconds int) (time.Duration, error) {
+	n := int64(seconds)
+	if n > maxDurationSeconds || n < -maxDurationSeconds {
+		return 0, fmt.Errorf("%s too large (max %d seconds)", label, maxDurationSeconds)
+	}
+	return time.Duration(n) * time.Second, nil
+}
+
+func splitCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
