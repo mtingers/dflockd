@@ -874,7 +874,7 @@ func TestHTTP_DeleteAbortsLongPollWait(t *testing.T) {
 	waitDone := make(chan int, 1)
 	go func() {
 		resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 60})
-		waitDone <- resp.StatusCode
+		waitDone <- statusCode(resp)
 	}()
 	time.Sleep(50 * time.Millisecond) // let the wait reach lm.Wait
 
@@ -891,7 +891,10 @@ func TestHTTP_DeleteAbortsLongPollWait(t *testing.T) {
 		t.Fatal("DELETE blocked by long-poll /wait — session ctx never cancelled")
 	}
 	select {
-	case <-waitDone:
+	case got := <-waitDone:
+		if got != http.StatusGone {
+			t.Fatalf("/wait status = %d, want 410 after session delete", got)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("/wait never returned after DELETE — handler still parked")
 	}

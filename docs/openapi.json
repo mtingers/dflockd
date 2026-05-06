@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "dflockd HTTP API",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "summary": "REST surface for dflockd's distributed FIFO lock and semaphore primitives.",
-    "description": "dflockd is a distributed FIFO lock server with leases and semaphores. This HTTP API and the native line-based TCP protocol share the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.\n\n## Sessions\n\nTwo-phase operations (`enqueue` + `wait`) need a stable identity that survives across requests. That identity is a session: a server-side token bound to a unique `connID` in the LockManager.\n\n1. `POST /v1/sessions` mints an opaque ID and allocates a connID.\n2. Carry `X-Dflockd-Session: <id>` on every lock-modifying request.\n3. `DELETE /v1/sessions/{id}` synchronously releases anything still held.\n\n## Idle sessions\n\nA background sweeper reaps any session whose `lastSeen` falls behind 2× `--http-session-idle-timeout`. In-flight handlers (e.g. a long-poll `/wait`) are immune for the duration of the request. `POST /v1/sessions/{id}/ping` refreshes `lastSeen` without acquiring any lock.\n\n## Lease renewal\n\nAcquire returns a `token` and `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the slot and grants it to the next waiter. The Go client renews at 50% of the TTL with early-only jitter.\n\n## Auth, rate limit, CORS\n\nWhen `--auth-token` is set, every endpoint except `/health` and `/ready` requires `Authorization: Bearer <token>`. `--http-rate-limit-per-ip` enforces a token-bucket per remote IP and surfaces excess as `429 rate_limited`. `--http-cors-allowed-origins` controls cross-origin behaviour.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
+    "description": "dflockd is a distributed FIFO lock server with leases and semaphores. This HTTP API and the native line-based TCP protocol share the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.\n\n## Sessions\n\nTwo-phase operations (`enqueue` + `wait`) need a stable identity that survives across requests. That identity is a session: a server-side token bound to a unique `connID` in the LockManager.\n\n1. `POST /v1/sessions` mints an opaque ID and allocates a connID.\n2. Carry `X-Dflockd-Session: <id>` on every lock-modifying request.\n3. `DELETE /v1/sessions/{id}` synchronously releases anything still held.\n\n## Idle sessions\n\nA background sweeper reaps any session whose `lastSeen` falls behind 2× `--http-session-idle-timeout`. In-flight handlers (e.g. a long-poll `/wait`) are immune for the duration of the request. `POST /v1/sessions/{id}/ping` refreshes `lastSeen` without acquiring any lock.\n\n## Lease renewal\n\nAcquire returns a `token` and `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the slot and grants it to the next waiter. The Go client renews at 50% of the TTL with early-only jitter.\n\n## Auth, rate limit, CORS\n\nWhen `--auth-token` is set, every endpoint except `/health`, `/ready`, and `/v1/openapi.json` requires `Authorization: Bearer <token>`. `--http-rate-limit-per-ip` enforces a token-bucket per remote IP and surfaces excess as `429 rate_limited`. `--http-cors-allowed-origins` controls cross-origin behaviour.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
   },
   "servers": [
     {
@@ -310,7 +310,7 @@
         "in": "path",
         "required": true,
         "description": "Lock or semaphore key. Must not be empty or contain whitespace; max 256 bytes.",
-        "schema": {"type": "string", "minLength": 1, "maxLength": 256}
+        "schema": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$"}
       },
       "SessionIdPath": {
         "name": "id",
@@ -417,49 +417,59 @@
       },
       "AcquireRequest": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["acquire_timeout_s"],
         "properties": {
-          "acquire_timeout_s": {"type": "integer", "minimum": 0, "description": "0 = non-blocking try-lock."},
-          "lease_ttl_s": {"type": "integer", "minimum": 0, "description": "Omit or 0 = use server default."}
+          "acquire_timeout_s": {"type": "integer", "minimum": 0, "maximum": 9223372036, "description": "0 = non-blocking try-lock."},
+          "lease_ttl_s": {"type": "integer", "minimum": 0, "maximum": 9223372036, "description": "Omit or 0 = use server default."}
         }
       },
       "SemAcquireRequest": {
-        "allOf": [
-          {"$ref": "#/components/schemas/AcquireRequest"},
-          {"type": "object", "required": ["limit"], "properties": {"limit": {"type": "integer", "minimum": 1}}}
-        ]
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["acquire_timeout_s", "limit"],
+        "properties": {
+          "acquire_timeout_s": {"type": "integer", "minimum": 0, "maximum": 9223372036, "description": "0 = non-blocking try-lock."},
+          "limit": {"type": "integer", "minimum": 1},
+          "lease_ttl_s": {"type": "integer", "minimum": 0, "maximum": 9223372036, "description": "Omit or 0 = use server default."}
+        }
       },
       "ReleaseRequest": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["token"],
-        "properties": {"token": {"type": "string", "description": "Token returned by acquire/wait."}}
+        "properties": {"token": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$", "description": "Token returned by acquire/wait."}}
       },
       "RenewRequest": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["token"],
         "properties": {
-          "token": {"type": "string"},
-          "lease_ttl_s": {"type": "integer", "minimum": 0}
+          "token": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$"},
+          "lease_ttl_s": {"type": "integer", "minimum": 0, "maximum": 9223372036}
         }
       },
       "EnqueueRequest": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "lease_ttl_s": {"type": "integer", "minimum": 0}
+          "lease_ttl_s": {"type": "integer", "minimum": 0, "maximum": 9223372036}
         }
       },
       "SemEnqueueRequest": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["limit"],
         "properties": {
           "limit": {"type": "integer", "minimum": 1},
-          "lease_ttl_s": {"type": "integer", "minimum": 0}
+          "lease_ttl_s": {"type": "integer", "minimum": 0, "maximum": 9223372036}
         }
       },
       "WaitRequest": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["timeout_s"],
-        "properties": {"timeout_s": {"type": "integer", "minimum": 0}}
+        "properties": {"timeout_s": {"type": "integer", "minimum": 0, "maximum": 9223372036}}
       },
       "OpResponse": {
         "type": "object",

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.0.1] - 2026-05-05
+
+### Fixed
+
+- **HTTP `/wait` returns `410 session_gone` when the session is deleted mid-flight.** v2.0.0's `renderLockErr` swallowed every `context.Canceled` / `context.DeadlineExceeded` silently — including the case where `DELETE /v1/sessions/{id}` cancelled the session-lifetime context but the HTTP client was still connected. The handler now distinguishes the two: HTTP-client-gone is still silent (no useful response to write), but session-cancelled-while-client-alive surfaces the documented `410 session_gone` contract. Regression test in `TestHTTP_DeleteAbortsLongPollWait`.
+
+### Changed
+
+- **OpenAPI request schemas now mirror the Go decoder exactly.** All seven request schemas (`AcquireRequest`, `SemAcquireRequest`, `ReleaseRequest`, `RenewRequest`, `EnqueueRequest`, `SemEnqueueRequest`, `WaitRequest`) declare `additionalProperties: false` to match `json.Decoder.DisallowUnknownFields()`. Integer second-fields (`acquire_timeout_s`, `lease_ttl_s`, `timeout_s`) gained `maximum: 9223372036` to mirror the runtime `maxProtocolSeconds = MaxInt64 / time.Second` ceiling. Token strings and the `{key}` path parameter gained `minLength: 1`, `maxLength: 256`, and `pattern: "^\\S+$"` to mirror `validateRESTKey` / `validateProtocolField`. `SemAcquireRequest` was flattened from `allOf` to inline (`additionalProperties: false` does not compose under `allOf`). Bumped `info.version` to `2.0.1`. New tests: `TestOpenAPI_RouteMethodsMatchSpec` enforces method-level parity with `Routes()`; `TestOpenAPI_RequestSchemasRejectUnknownFields` keeps future schemas honest.
+
+[v2.0.1]: https://github.com/mtingers/dflockd/releases/tag/v2.0.1
+
 ## [v2.0.0] - 2026-05-05
 
 Major reset: dflockd is now exclusively a distributed FIFO lock server. The pub/sub layer that v1.11+ shipped has been removed. The pre-refactor source tree is preserved under `old/` (gitignored, build-tagged out) for reference.

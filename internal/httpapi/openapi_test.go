@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mtingers/dflockd/internal/config"
@@ -49,6 +50,35 @@ func TestOpenAPI_RoutesMatchSpec(t *testing.T) {
 	for p := range specPaths {
 		if !codePaths[p] {
 			t.Errorf("openapi.json documents %q but no route is registered", p)
+		}
+	}
+}
+
+func TestOpenAPI_RouteMethodsMatchSpec(t *testing.T) {
+	spec := decodeSpec(t)
+	for _, route := range Routes() {
+		specMethods := methodsForSpecPath(t, spec, route.Pattern)
+		codeMethods := methodsForRoute(route)
+		for method := range codeMethods {
+			if !specMethods[method] {
+				t.Errorf("%s %s is registered but not documented in openapi.json", method, route.Pattern)
+			}
+		}
+		for method := range specMethods {
+			if !codeMethods[method] {
+				t.Errorf("%s %s is documented in openapi.json but not registered", method, route.Pattern)
+			}
+		}
+	}
+}
+
+func TestOpenAPI_RequestSchemasRejectUnknownFields(t *testing.T) {
+	spec := decodeSpec(t)
+	for _, name := range requestSchemaNames {
+		schema := schemaByName(t, spec, name)
+		got, ok := schema["additionalProperties"].(bool)
+		if !ok || got {
+			t.Errorf("schema %s must set additionalProperties=false to match DisallowUnknownFields", name)
 		}
 	}
 }
@@ -103,6 +133,59 @@ func pathsInRoutes() map[string]bool {
 		out[r.Pattern] = true
 	}
 	return out
+}
+
+func methodsForSpecPath(t *testing.T, spec map[string]any, path string) map[string]bool {
+	t.Helper()
+	paths, _ := spec["paths"].(map[string]any)
+	pathItem, _ := paths[path].(map[string]any)
+	if pathItem == nil {
+		t.Fatalf("path %q missing from openapi.json", path)
+	}
+	out := map[string]bool{}
+	for method := range pathItem {
+		if isHTTPMethod(method) {
+			out[strings.ToUpper(method)] = true
+		}
+	}
+	return out
+}
+
+func methodsForRoute(route RegisteredPath) map[string]bool {
+	out := map[string]bool{}
+	for _, method := range route.Methods {
+		out[method] = true
+	}
+	return out
+}
+
+func isHTTPMethod(method string) bool {
+	switch strings.ToLower(method) {
+	case "get", "post", "put", "patch", "delete", "options", "head", "trace":
+		return true
+	}
+	return false
+}
+
+var requestSchemaNames = []string{
+	"AcquireRequest",
+	"SemAcquireRequest",
+	"ReleaseRequest",
+	"RenewRequest",
+	"EnqueueRequest",
+	"SemEnqueueRequest",
+	"WaitRequest",
+}
+
+func schemaByName(t *testing.T, spec map[string]any, name string) map[string]any {
+	t.Helper()
+	components, _ := spec["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	schema, _ := schemas[name].(map[string]any)
+	if schema == nil {
+		t.Fatalf("schema %q missing from openapi.json", name)
+	}
+	return schema
 }
 
 // repoRelPath returns an absolute path inside the repo. The test

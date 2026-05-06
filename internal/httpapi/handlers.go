@@ -343,7 +343,7 @@ func (h *httpServer) runRenew(w http.ResponseWriter, prefixedKey, token string, 
 
 func (h *httpServer) renderAcquireOutcome(w http.ResponseWriter, r *http.Request, key, prefix, tok string, leaseTTL time.Duration, err error) {
 	if err != nil {
-		renderLockErr(w, err)
+		renderLockErr(w, r, err)
 		return
 	}
 	if tok == "" {
@@ -371,7 +371,7 @@ func (h *httpServer) renderEnqueueOutcome(w http.ResponseWriter, r *http.Request
 
 func (h *httpServer) renderWaitOutcome(w http.ResponseWriter, r *http.Request, prefixedKey, tok string, leaseSec int, err error) {
 	if err != nil {
-		renderLockErr(w, err)
+		renderLockErr(w, r, err)
 		return
 	}
 	if tok == "" {
@@ -385,13 +385,23 @@ func (h *httpServer) renderWaitOutcome(w http.ResponseWriter, r *http.Request, p
 	renderToken(w, "ok", tok, leaseSec)
 }
 
-// renderLockErr writes the appropriate response for a LockManager
-// error, swallowing context cancellation (client gone).
-func renderLockErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+// renderLockErr writes the appropriate response for a LockManager error.
+// If the HTTP client is already gone there is no useful response to
+// write; if only the session context was cancelled, surface the
+// documented session_gone contract.
+func renderLockErr(w http.ResponseWriter, r *http.Request, err error) {
+	if !isContextErr(err) {
+		writeLockErr(w, err)
 		return
 	}
-	writeLockErr(w, err)
+	if r.Context().Err() != nil {
+		return
+	}
+	writeError(w, http.StatusGone, "session_gone", "")
+}
+
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func renderTimeout(w http.ResponseWriter) {
