@@ -977,3 +977,127 @@ func TestRoutes_NotEmpty(t *testing.T) {
 		t.Errorf("Routes() returned %d", len(Routes()))
 	}
 }
+
+// TestHTTP_OpsAfterSessionDeleteReturn410 asserts every lock-modifying op
+// on a deleted session id surfaces 410 session_gone, not 500 / hang. Sister
+// to TestSession_BeginRequestAfterClose which only checks acquire.
+func TestHTTP_OpsAfterSessionDeleteReturn410(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+
+	c := startedClient(t, base)
+
+	resp := c.delete("/v1/sessions/" + c.session)
+	if resp.StatusCode != 204 {
+		t.Fatalf("delete: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	checks := []struct {
+		name string
+		do   func() *http.Response
+	}{
+		{"acquire", func() *http.Response { return c.post("/v1/locks/k", acquireRequest{AcquireTimeoutS: 1}) }},
+		{"enqueue", func() *http.Response { return c.post("/v1/locks/k/enqueue", enqueueRequest{}) }},
+		{"wait", func() *http.Response { return c.post("/v1/locks/k/wait", waitRequest{TimeoutS: 1}) }},
+		{"renew", func() *http.Response { return c.post("/v1/locks/k/renew", renewRequest{Token: "x"}) }},
+		{"release", func() *http.Response { return c.post("/v1/locks/k/release", releaseRequest{Token: "x"}) }},
+		{"sem-acquire", func() *http.Response {
+			return c.post("/v1/semaphores/k", semAcquireRequest{AcquireTimeoutS: 1, Limit: 1})
+		}},
+		{"ping", func() *http.Response { return c.post("/v1/sessions/"+c.session+"/ping", nil) }},
+	}
+	for _, tc := range checks {
+		resp := tc.do()
+		if resp.StatusCode != http.StatusGone {
+			t.Errorf("%s: status = %d, want 410", tc.name, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+}
+
+// TestHTTP_WaitNaturalTimeoutReturnsTimeoutNot410 pins the renderLockErr
+// boundary: when /wait's own timer fires (not the session ctx), the response
+// is 200 with status="timeout" — not 410 session_gone. Regression guard for
+// the v2.0.1 renderLockErr split.
+func TestHTTP_WaitNaturalTimeoutReturnsTimeoutNot410(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+
+	_, queuer, _ := setupQueuedLock(t, base, "k")
+
+	resp := queuer.post("/v1/locks/k/wait", waitRequest{TimeoutS: 1})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (timeout, not 410)", resp.StatusCode)
+	}
+	var v opResponse
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Status != "timeout" {
+		t.Errorf("status = %q, want timeout", v.Status)
+	}
+}
+
+// TestHTTP_MaxSessionsEnforced asserts the global cap surfaces 503
+// max_sessions before allowing the 2nd session to land.
+func TestHTTP_MaxSessionsEnforced(t *testing.T) {
+	base, stop := startHTTP(t, func(c *config.Config) { c.HTTPMaxSessions = 1 })
+	defer stop()
+
+	startedClient(t, base) // burns the only slot
+
+	resp := newClient(t, base).post("/v1/sessions", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var e errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Error != "max_sessions" {
+		t.Errorf("error = %q, want max_sessions", e.Error)
+	}
+}
+
+// TestHTTP_MaxSessionsPerIPEnforced exercises the per-IP cap. All
+// loopback clients share the same source IP, so the third session
+// from the same client must surface 503 max_sessions_per_ip.
+func TestHTTP_MaxSessionsPerIPEnforced(t *testing.T) {
+	base, stop := startHTTP(t, func(c *config.Config) { c.HTTPMaxSessionsPerIP = 2 })
+	defer stop()
+
+	startedClient(t, base)
+	startedClient(t, base)
+
+	resp := newClient(t, base).post("/v1/sessions", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var e errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Error != "max_sessions_per_ip" {
+		t.Errorf("error = %q, want max_sessions_per_ip", e.Error)
+	}
+}
+
+// TestHTTP_MethodNotAllowedOnPostOnlyRoute pins the mux's method-aware
+// routing: GET on a POST-only endpoint must surface 405, not 404 or
+// the wrong handler.
+func TestHTTP_MethodNotAllowedOnPostOnlyRoute(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+
+	c := startedClient(t, base)
+
+	resp := c.get("/v1/locks/k")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /v1/locks/{key}: status = %d, want 405", resp.StatusCode)
+	}
+}

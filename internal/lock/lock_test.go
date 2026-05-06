@@ -710,6 +710,63 @@ func TestWait_FastPathReturnsToken(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// LastActivity invariants — bogus tokens must not extend resource lifetime
+//
+// Regression coverage for the v1.16.1 fix: Release/Renew on a non-matching
+// token previously bumped LastActivity before validating Holders[token],
+// which let a caller spamming bogus tokens keep an idle resource alive past
+// --gc-max-idle (defeating GC up to --max-locks).
+// ---------------------------------------------------------------------------
+
+func TestRelease_BogusTokenDoesNotKeepResourceAlive(t *testing.T) {
+	lm := newTestManager(t, true)
+	lm.cfg.GCMaxIdleTime = 30 * time.Millisecond
+
+	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	if !lm.Release("k", tok) {
+		t.Fatal("real release returned false")
+	}
+
+	// Past the idle threshold; resource is still in the table with empty
+	// Holders, awaiting GC.
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		if lm.Release("k", "bogus") {
+			t.Fatal("bogus release returned true")
+		}
+	}
+
+	lm.gcOnce(time.Now())
+	if c := lm.resourceTotal.Load(); c != 0 {
+		t.Errorf("resource count after GC = %d, want 0 (bogus release bumped LastActivity?)", c)
+	}
+}
+
+func TestRenew_BogusTokenDoesNotKeepResourceAlive(t *testing.T) {
+	lm := newTestManager(t, true)
+	lm.cfg.GCMaxIdleTime = 30 * time.Millisecond
+
+	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	if !lm.Release("k", tok) {
+		t.Fatal("real release returned false")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		if _, ok := lm.Renew("k", "bogus", 30*time.Second); ok {
+			t.Fatal("bogus renew returned true")
+		}
+	}
+
+	lm.gcOnce(time.Now())
+	if c := lm.resourceTotal.Load(); c != 0 {
+		t.Errorf("resource count after GC = %d, want 0 (bogus renew bumped LastActivity?)", c)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // shardIndex distribution
 // ---------------------------------------------------------------------------
 

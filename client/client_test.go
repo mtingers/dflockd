@@ -506,3 +506,44 @@ func TestLock_ContextCancel(t *testing.T) {
 		t.Fatal("Acquire never returned")
 	}
 }
+
+// TestLock_ContextCancel_NextAcquirerSucceeds extends the cancel test:
+// after a cancelled waiter exits, releasing the holder must let a fresh
+// caller acquire the slot promptly. If cleanupOnCanceledGrant left the
+// cancelled caller's token in place, the fresh caller would block
+// behind a phantom holder until lease expiry.
+func TestLock_ContextCancel_NextAcquirerSucceeds(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+
+	holder := &client.Lock{Key: "lk", Servers: []string{addr}, LeaseTTL: 30}
+	if _, err := holder.Acquire(context.Background()); err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	cancelled := &client.Lock{Key: "lk", AcquireTimeout: 30 * time.Second, Servers: []string{addr}}
+	cCtx, cCancel := context.WithCancel(context.Background())
+	cDone := make(chan error, 1)
+	go func() {
+		_, err := cancelled.Acquire(cCtx)
+		cDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cCancel()
+
+	select {
+	case <-cDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled Acquire never returned")
+	}
+
+	if err := holder.Release(context.Background()); err != nil {
+		t.Fatalf("holder release: %v", err)
+	}
+
+	next := &client.Lock{Key: "lk", AcquireTimeout: 1 * time.Second, Servers: []string{addr}}
+	if _, err := next.Acquire(context.Background()); err != nil {
+		t.Fatalf("next acquire blocked behind phantom: %v", err)
+	}
+	next.Release(context.Background())
+}
