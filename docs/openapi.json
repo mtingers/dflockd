@@ -158,7 +158,8 @@
           "400": {"$ref": "#/components/responses/BadRequest"},
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     },
@@ -174,7 +175,8 @@
           "400": {"$ref": "#/components/responses/BadRequest"},
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     },
@@ -210,7 +212,8 @@
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "408": {"$ref": "#/components/responses/ClientCanceled"},
           "409": {"$ref": "#/components/responses/Conflict"},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     },
@@ -245,7 +248,8 @@
           "400": {"$ref": "#/components/responses/BadRequest"},
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     },
@@ -261,7 +265,8 @@
           "400": {"$ref": "#/components/responses/BadRequest"},
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"description": "Token not held", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_held"}}}},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     },
@@ -295,7 +300,8 @@
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "408": {"$ref": "#/components/responses/ClientCanceled"},
           "409": {"$ref": "#/components/responses/Conflict"},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     }
@@ -371,10 +377,11 @@
       },
       "SessionGone": {"description": "Session unknown, expired, or DELETEd", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "session_gone"}}}},
       "CapacityExhausted": {
-        "description": "Server-side cap reached",
+        "description": "Server-side capacity or fence persistence unavailable",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "examples": {
           "max_locks": {"value": {"error": "max_locks"}},
           "max_waiters": {"value": {"error": "max_waiters"}},
+          "fence_persistence": {"value": {"error": "fence_persistence"}},
           "draining": {"value": {"error": "draining"}}
         }}}
       },
@@ -476,7 +483,7 @@
         "required": ["status"],
         "properties": {
           "status": {"type": "string", "enum": ["ok", "acquired", "queued", "timeout"]},
-          "token": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$", "description": "Present on grant (status `ok` or `acquired`). 32 lowercase hex chars: the first 16 chars are a server-monotonic uint64 (big-endian) — a fencing prefix that strictly increases on every grant, including across server restarts on a non-regressing wall clock. The last 16 chars are random salt. Downstream systems can use the prefix as a fencing token: store the most recent token observed for a resource and reject any write whose token compares lexicographically less."},
+          "token": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$", "description": "Present on grant (status `ok` or `acquired`). 32 lowercase hex chars: the first 16 chars are a server-monotonic uint64 (big-endian) — a fencing prefix that strictly increases on every grant from one server instance. With `--fence-state-file`, the prefix is also strict across restarts and crashes; without it, cross-restart monotonicity depends on a non-regressing wall clock. The last 16 chars are random salt. Downstream systems can use the prefix as a fencing token: store the most recent token observed for a resource and reject any write whose token compares lexicographically less."},
           "lease_ttl_s": {"type": "integer", "description": "Present on grant; effective lease TTL."}
         }
       },

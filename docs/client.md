@@ -125,9 +125,10 @@ func FenceFromToken(token string) (uint64, error)
 
 Every grant returns a 32-hex token whose first 16 hex chars are a
 server-monotonic `uint64` (big-endian). The prefix strictly
-increases on every grant from one dflockd server, including across
-server restarts on a non-regressing wall clock, so a token also
+increases on every grant from one dflockd server, so a token also
 works as a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html).
+Across restarts this is best-effort by default (wall-clock seed),
+or strict when the server runs with `--fence-state-file`.
 `FenceFromToken` parses the prefix:
 
 ```go

@@ -320,7 +320,12 @@ func (h *httpServer) runWait(w http.ResponseWriter, r *http.Request, s *Session,
 }
 
 func (h *httpServer) runRelease(w http.ResponseWriter, prefixedKey, token string) {
-	if h.sessions.LockManager().Release(prefixedKey, token) {
+	ok, err := h.sessions.LockManager().Release(prefixedKey, token)
+	if err != nil {
+		writeLockErr(w, err)
+		return
+	}
+	if ok {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -329,7 +334,11 @@ func (h *httpServer) runRelease(w http.ResponseWriter, prefixedKey, token string
 
 func (h *httpServer) runRenew(w http.ResponseWriter, prefixedKey, token string, leaseS int) {
 	leaseTTL := h.leaseDuration(leaseS)
-	remaining, ok := h.sessions.LockManager().Renew(prefixedKey, token, leaseTTL)
+	remaining, ok, err := h.sessions.LockManager().Renew(prefixedKey, token, leaseTTL)
+	if err != nil {
+		writeLockErr(w, err)
+		return
+	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_held", "")
 		return
@@ -379,7 +388,7 @@ func (h *httpServer) renderWaitOutcome(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	if r.Context().Err() != nil {
-		_ = h.sessions.LockManager().Release(prefixedKey, tok)
+		_, _ = h.sessions.LockManager().Release(prefixedKey, tok)
 		return
 	}
 	renderToken(w, "ok", tok, leaseSec)
@@ -415,7 +424,7 @@ func renderToken(w http.ResponseWriter, status, tok string, leaseSec int) {
 // cleanupCanceledGrant releases a token whose owner disconnected
 // before we could write the response.
 func (h *httpServer) cleanupCanceledGrant(prefix, key, tok string) {
-	_ = h.sessions.LockManager().Release(prefix+key, tok)
+	_, _ = h.sessions.LockManager().Release(prefix+key, tok)
 }
 
 // cleanupCanceledEnqueue handles both the "acquired fast path" and the
@@ -423,7 +432,7 @@ func (h *httpServer) cleanupCanceledGrant(prefix, key, tok string) {
 func (h *httpServer) cleanupCanceledEnqueue(s *Session, prefix, key, status, tok string) {
 	switch status {
 	case "acquired":
-		_ = h.sessions.LockManager().Release(prefix+key, tok)
+		_, _ = h.sessions.LockManager().Release(prefix+key, tok)
 	case "queued":
 		h.dequeueAfterPromote(s, prefix, key)
 	}
@@ -435,7 +444,7 @@ func (h *httpServer) cleanupCanceledEnqueue(s *Session, prefix, key, status, tok
 func (h *httpServer) dequeueAfterPromote(s *Session, prefix, key string) {
 	cleanupTok, _, _ := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
 	if cleanupTok != "" {
-		_ = h.sessions.LockManager().Release(prefix+key, cleanupTok)
+		_, _ = h.sessions.LockManager().Release(prefix+key, cleanupTok)
 	}
 }
 

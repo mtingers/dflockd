@@ -79,7 +79,10 @@ func TestAcquire_SecondCallerWaits(t *testing.T) {
 
 	// Give the second caller time to enqueue.
 	time.Sleep(50 * time.Millisecond)
-	if !lm.Release("k", tok1) {
+	if ok, err := lm.Release("k", tok1); err != nil || !ok {
+		if err != nil {
+			t.Fatalf("release: %v", err)
+		}
 		t.Fatal("release returned false")
 	}
 
@@ -177,7 +180,10 @@ func TestAcquire_Timeout(t *testing.T) {
 func TestRenew_Extends(t *testing.T) {
 	lm := newTestManager(t, true)
 	tok, _ := lm.Acquire(context.Background(), "k", time.Second, 2*time.Second, 1, 1)
-	remaining, ok := lm.Renew("k", tok, 60*time.Second)
+	remaining, ok, err := lm.Renew("k", tok, 60*time.Second)
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
 	if !ok {
 		t.Fatal("renew returned false")
 	}
@@ -189,7 +195,10 @@ func TestRenew_Extends(t *testing.T) {
 func TestRenew_BadToken(t *testing.T) {
 	lm := newTestManager(t, true)
 	_, _ = lm.Acquire(context.Background(), "k", time.Second, 2*time.Second, 1, 1)
-	_, ok := lm.Renew("k", "bogus", 30*time.Second)
+	_, ok, err := lm.Renew("k", "bogus", 30*time.Second)
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
 	if ok {
 		t.Fatal("renew should fail on bad token")
 	}
@@ -199,7 +208,10 @@ func TestRenew_ExpiredLease(t *testing.T) {
 	lm := newTestManager(t, true)
 	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
 	lm.resetLeasesForTest("k")
-	_, ok := lm.Renew("k", tok, 30*time.Second)
+	_, ok, err := lm.Renew("k", tok, 30*time.Second)
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
 	if ok {
 		t.Fatal("renew should fail on expired lease")
 	}
@@ -731,7 +743,10 @@ func TestRelease_BogusTokenDoesNotKeepResourceAlive(t *testing.T) {
 	lm.cfg.GCMaxIdleTime = 30 * time.Millisecond
 
 	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
-	if !lm.Release("k", tok) {
+	if ok, err := lm.Release("k", tok); err != nil || !ok {
+		if err != nil {
+			t.Fatalf("release: %v", err)
+		}
 		t.Fatal("real release returned false")
 	}
 
@@ -740,7 +755,11 @@ func TestRelease_BogusTokenDoesNotKeepResourceAlive(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	for i := 0; i < 10; i++ {
-		if lm.Release("k", "bogus") {
+		ok, err := lm.Release("k", "bogus")
+		if err != nil {
+			t.Fatalf("bogus release: %v", err)
+		}
+		if ok {
 			t.Fatal("bogus release returned true")
 		}
 	}
@@ -756,14 +775,21 @@ func TestRenew_BogusTokenDoesNotKeepResourceAlive(t *testing.T) {
 	lm.cfg.GCMaxIdleTime = 30 * time.Millisecond
 
 	tok, _ := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
-	if !lm.Release("k", tok) {
+	if ok, err := lm.Release("k", tok); err != nil || !ok {
+		if err != nil {
+			t.Fatalf("release: %v", err)
+		}
 		t.Fatal("real release returned false")
 	}
 
 	time.Sleep(50 * time.Millisecond)
 
 	for i := 0; i < 10; i++ {
-		if _, ok := lm.Renew("k", "bogus", 30*time.Second); ok {
+		_, ok, err := lm.Renew("k", "bogus", 30*time.Second)
+		if err != nil {
+			t.Fatalf("bogus renew: %v", err)
+		}
+		if ok {
 			t.Fatal("bogus renew returned true")
 		}
 	}
@@ -808,7 +834,7 @@ func BenchmarkNewToken_InMemory(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = lm.newToken()
+		_, _ = lm.newToken()
 	}
 }
 
@@ -823,7 +849,7 @@ func BenchmarkNewToken_PersistedFence(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = lm.newToken()
+		_, _ = lm.newToken()
 	}
 }
 
@@ -838,7 +864,7 @@ func BenchmarkNewToken_InMemoryParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_ = lm.newToken()
+			_, _ = lm.newToken()
 		}
 	})
 }
@@ -855,7 +881,7 @@ func BenchmarkNewToken_PersistedFenceParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_ = lm.newToken()
+			_, _ = lm.newToken()
 		}
 	})
 }
@@ -892,7 +918,12 @@ func TestToken_PrefixMonotonicWithinManager(t *testing.T) {
 		go func(start int) {
 			defer wg.Done()
 			for i := start; i < n; i += workers {
-				tokens[i] = lm.newToken()
+				tok, err := lm.newToken()
+				if err != nil {
+					t.Errorf("newToken: %v", err)
+					return
+				}
+				tokens[i] = tok
 			}
 		}(w)
 	}
@@ -949,7 +980,10 @@ func TestToken_SaltDistinct(t *testing.T) {
 	const n = 1000
 	salts := make(map[string]struct{}, n)
 	for i := 0; i < n; i++ {
-		tok := lm.newToken()
+		tok, err := lm.newToken()
+		if err != nil {
+			t.Fatalf("newToken: %v", err)
+		}
 		salt := tok[16:]
 		if _, dup := salts[salt]; dup {
 			t.Fatalf("duplicate salt %s at iteration %d", salt, i)
@@ -974,8 +1008,11 @@ func TestLockManager_FenceFile_StrictRestartMonotonic(t *testing.T) {
 		t.Fatalf("first manager: %v", err)
 	}
 	var maxPrefix string
-	for i := 0; i < 5000; i++ { // > DefaultFenceRangeSize triggers no extends, but exercises the path
-		tok := lm1.newToken()
+	for i := 0; i < 5000; i++ { // exercises the persisted fast path without another range extend
+		tok, err := lm1.newToken()
+		if err != nil {
+			t.Fatalf("newToken: %v", err)
+		}
 		if tok[:16] > maxPrefix {
 			maxPrefix = tok[:16]
 		}
@@ -989,7 +1026,10 @@ func TestLockManager_FenceFile_StrictRestartMonotonic(t *testing.T) {
 		t.Fatalf("second manager: %v", err)
 	}
 	defer lm2.Close()
-	tok := lm2.newToken()
+	tok, err := lm2.newToken()
+	if err != nil {
+		t.Fatalf("newToken: %v", err)
+	}
 	if tok[:16] <= maxPrefix {
 		t.Fatalf("second-manager prefix %s not greater than first-manager max %s",
 			tok[:16], maxPrefix)

@@ -198,11 +198,14 @@ example: 0001a3f217b3c4d87f3c1f2b3e9a8d6e
 The **fence prefix** is a server-monotonic `uint64` seeded at
 startup from `time.Now().UnixNano()` and incremented atomically on
 every grant, so the prefix strictly increases across grants and
-across server restarts on a non-regressing wall clock. Lex-comparing
-two tokens **for the same key** reflects the order their grants
-were issued, which is the property a downstream resource needs to
-use the token as a fencing token: store the most recent token seen
-for a key, reject any write whose token compares less.
+across grants from one server instance. With `--fence-state-file`,
+the prefix is also strict across restarts and crashes; without it,
+cross-restart monotonicity depends on a non-regressing wall clock.
+Lex-comparing two tokens **for the same key** reflects the order
+their grants were issued, which is the property a downstream
+resource needs to use the token as a fencing token: store the most
+recent token seen for a key, reject any write whose token compares
+less.
 
 The **salt** is 8 bytes from `crypto/rand`. It preserves ~64 bits
 of unguessability so a third party who saw one token cannot trivially
@@ -221,10 +224,13 @@ Caveats:
   change). For unconditional cross-restart monotonicity even
   through crashes and clock regressions, run with
   `--fence-state-file=/path`: dflockd pre-allocates fence ranges
-  to disk (one `fsync` per ~1M grants, ~0.4% overhead). The next
-  instance reads the persisted ceiling and seeds above it, so the
-  first fence it issues is strictly greater than any fence the
-  prior incarnation could ever have issued.
+  to a checksummed two-slot journal (one `fsync` per ~1M grants,
+  ~3 ns/op extra in the token-mint path). The next instance reads
+  the persisted ceiling and seeds above it, so the first fence it
+  issues is strictly greater than any fence the prior incarnation
+  could ever have issued. Allocation failures (disk full, EIO)
+  surface as a generic protocol `error`; HTTP gets `503
+  fence_persistence`.
 - Tokens are not cryptographically signed. Treat the auth + TLS
   layer as the boundary that protects token confidentiality.
 

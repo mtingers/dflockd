@@ -94,8 +94,12 @@ func (lm *LockManager) shardFor(key string) *shard {
 // of random salt. The prefix lets a token also serve as a fencing
 // token — lex-comparing two tokens for the same key reflects the
 // order their grants were issued.
-func (lm *LockManager) newToken() string {
-	return encodeToken(lm.fenceAlloc.next(), lm.saltBytes())
+func (lm *LockManager) newToken() (string, error) {
+	fence, err := lm.fenceAlloc.next()
+	if err != nil {
+		return "", err
+	}
+	return encodeToken(fence, lm.saltBytes()), nil
 }
 
 // saltBytes draws 8 unguessable bytes for a token's random suffix.
@@ -151,14 +155,18 @@ func (lm *LockManager) getOrCreate(sh *shard, key string, limit int) (*ResourceS
 // grantNext drains the waiter queue while capacity is available. Each
 // granted waiter is removed from the queue, sent its token, and added
 // to Holders. Must be called with sh.mu held.
-func (lm *LockManager) grantNext(sh *shard, key string, st *ResourceState) {
+func (lm *LockManager) grantNext(sh *shard, key string, st *ResourceState) error {
 	now := time.Now()
 	for st.WaiterHead < len(st.Waiters) && len(st.Holders) < st.Limit {
 		w := st.Waiters[st.WaiterHead]
+		token, err := lm.newToken()
+		if err != nil {
+			st.compactWaiters()
+			return err
+		}
 		st.Waiters[st.WaiterHead] = nil
 		st.WaiterHead++
 
-		token := lm.newToken()
 		// Non-blocking send: if the receiver hasn't reached its select
 		// yet, skip this grant for them. The caller (cleanup or timeout)
 		// will dequeue them or grant an eventual slot.
@@ -179,6 +187,7 @@ func (lm *LockManager) grantNext(sh *shard, key string, st *ResourceState) {
 		sh.addOwned(w.connID, key, token)
 	}
 	st.compactWaiters()
+	return nil
 }
 
 // trySendGrant performs a non-blocking send on ch, returning false if
@@ -204,7 +213,7 @@ func (lm *LockManager) trySendGrant(ch chan<- string, token, key string, connID 
 
 // evictExpired removes any holders past their lease and grants the
 // freed slots to the next waiters. Must be called with sh.mu held.
-func (lm *LockManager) evictExpired(sh *shard, key string, st *ResourceState) {
+func (lm *LockManager) evictExpired(sh *shard, key string, st *ResourceState) error {
 	now := time.Now()
 	any := false
 	for token, h := range st.Holders {
@@ -222,8 +231,9 @@ func (lm *LockManager) evictExpired(sh *shard, key string, st *ResourceState) {
 	}
 	if any {
 		st.LastActivity = now
-		lm.grantNext(sh, key, st)
+		return lm.grantNext(sh, key, st)
 	}
+	return nil
 }
 
 // Acquire is the single-phase acquire, used by the "l" and "sl"
@@ -243,7 +253,11 @@ func (lm *LockManager) Acquire(ctx context.Context, key string, timeout, leaseTT
 	if err != nil {
 		return "", err
 	}
-	if tok, ok := lm.tryFastAcquire(sh, st, key, connID, leaseTTL); ok {
+	tok, ok, err := lm.tryFastAcquire(sh, st, key, connID, leaseTTL)
+	if err != nil {
+		return "", err
+	}
+	if ok {
 		return tok, nil
 	}
 	w, err := lm.enqueueWaiter(sh, st, connID, leaseTTL)
@@ -264,21 +278,28 @@ func (lm *LockManager) acquireLockShard(sh *shard, key string, limit int) (*Reso
 		return nil, err
 	}
 	st.LastActivity = time.Now()
-	lm.evictExpired(sh, key, st)
+	if err := lm.evictExpired(sh, key, st); err != nil {
+		sh.mu.Unlock()
+		return nil, err
+	}
 	return st, nil
 }
 
 // tryFastAcquire grants a slot directly when capacity is free and no
 // one is queued. Releases sh.mu only on the fast path.
-func (lm *LockManager) tryFastAcquire(sh *shard, st *ResourceState, key string, connID uint64, leaseTTL time.Duration) (string, bool) {
+func (lm *LockManager) tryFastAcquire(sh *shard, st *ResourceState, key string, connID uint64, leaseTTL time.Duration) (string, bool, error) {
 	if len(st.Holders) >= st.Limit || st.waiterCount() > 0 {
-		return "", false
+		return "", false, nil
 	}
-	token := lm.newToken()
+	token, err := lm.newToken()
+	if err != nil {
+		sh.mu.Unlock()
+		return "", false, err
+	}
 	st.Holders[token] = &holder{connID: connID, leaseExpires: time.Now().Add(leaseTTL)}
 	sh.addOwned(connID, key, token)
 	sh.mu.Unlock()
-	return token, true
+	return token, true, nil
 }
 
 // enqueueWaiter records a new waiter against MaxWaiters. Releases
@@ -382,7 +403,9 @@ func (lm *LockManager) commitGrantLocked(parentCtx context.Context, sh *shard, k
 		return "", ErrLeaseExpired
 	}
 	if parentCtx.Err() != nil {
-		lm.releaseGrantOnCancel(sh, st, key, token, h, parentCtx.Err())
+		if err := lm.releaseGrantOnCancel(sh, st, key, token, h, parentCtx.Err()); err != nil {
+			return "", err
+		}
 		return "", parentCtx.Err()
 	}
 	h.leaseExpires = time.Now().Add(leaseTTL)
@@ -392,11 +415,11 @@ func (lm *LockManager) commitGrantLocked(parentCtx context.Context, sh *shard, k
 
 // releaseGrantOnCancel undoes a grant whose owner cancelled before we
 // observed it. The slot is handed to the next waiter.
-func (lm *LockManager) releaseGrantOnCancel(sh *shard, st *ResourceState, key, token string, h *holder, _ error) {
+func (lm *LockManager) releaseGrantOnCancel(sh *shard, st *ResourceState, key, token string, h *holder, _ error) error {
 	sh.removeOwned(h.connID, key, token)
 	delete(st.Holders, token)
 	st.LastActivity = time.Now()
-	lm.grantNext(sh, key, st)
+	return lm.grantNext(sh, key, st)
 }
 
 // Enqueue is phase 1 of two-phase acquire (commands "e" and "se").
@@ -420,7 +443,9 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 		return "", "", 0, err
 	}
 	st.LastActivity = time.Now()
-	lm.evictExpired(sh, key, st)
+	if err := lm.evictExpired(sh, key, st); err != nil {
+		return "", "", 0, err
+	}
 	return lm.enqueueOnto(sh, st, eqKey, key, connID, leaseTTL)
 }
 
@@ -429,7 +454,10 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 func (lm *LockManager) enqueueOnto(sh *shard, st *ResourceState, eqKey connKey, key string, connID uint64, leaseTTL time.Duration) (string, string, int, error) {
 	leaseSec := int(leaseTTL / time.Second)
 	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
-		token := lm.fastEnqueueGrant(sh, st, eqKey, key, connID, leaseTTL)
+		token, err := lm.fastEnqueueGrant(sh, st, eqKey, key, connID, leaseTTL)
+		if err != nil {
+			return "", "", 0, err
+		}
 		return "acquired", token, leaseSec, nil
 	}
 	if !lm.waiterCapAvailable(st) {
@@ -441,12 +469,15 @@ func (lm *LockManager) enqueueOnto(sh *shard, st *ResourceState, eqKey connKey, 
 
 // fastEnqueueGrant is the same-tick acquire used by Enqueue's fast
 // path. Returns the freshly-minted token.
-func (lm *LockManager) fastEnqueueGrant(sh *shard, st *ResourceState, eqKey connKey, key string, connID uint64, leaseTTL time.Duration) string {
-	token := lm.newToken()
+func (lm *LockManager) fastEnqueueGrant(sh *shard, st *ResourceState, eqKey connKey, key string, connID uint64, leaseTTL time.Duration) (string, error) {
+	token, err := lm.newToken()
+	if err != nil {
+		return "", err
+	}
 	st.Holders[token] = &holder{connID: connID, leaseExpires: time.Now().Add(leaseTTL)}
 	sh.addOwned(connID, key, token)
 	sh.setEnqueued(eqKey, &enqueuedState{token: token, leaseTTL: leaseTTL})
-	return token
+	return token, nil
 }
 
 // queueEnqueueWaiter parks a waiter and records the matching
@@ -497,7 +528,10 @@ func (lm *LockManager) consumePreGrantedToken(sh *shard, eqKey connKey, key stri
 	defer sh.mu.Unlock()
 	sh.removeEnqueued(eqKey)
 	leaseSec := int(es.leaseTTL / time.Second)
-	h, ok := lm.refreshPromotedHolder(sh, key, connID, es)
+	h, ok, err := lm.refreshPromotedHolder(sh, key, connID, es)
+	if err != nil {
+		return "", 0, err
+	}
 	if !ok {
 		return "", 0, ErrLeaseExpired
 	}
@@ -509,31 +543,33 @@ func (lm *LockManager) consumePreGrantedToken(sh *shard, eqKey connKey, key stri
 // refreshPromotedHolder validates that the promoted holder still
 // exists and isn't expired. Evicts and returns ok=false otherwise.
 // Caller holds sh.mu.
-func (lm *LockManager) refreshPromotedHolder(sh *shard, key string, connID uint64, es *enqueuedState) (*holder, bool) {
+func (lm *LockManager) refreshPromotedHolder(sh *shard, key string, connID uint64, es *enqueuedState) (*holder, bool, error) {
 	st := sh.resources[key]
 	if st == nil {
 		sh.removeOwned(connID, key, es.token)
-		return nil, false
+		return nil, false, nil
 	}
 	h, ok := st.Holders[es.token]
 	if !ok {
 		sh.removeOwned(connID, key, es.token)
-		return nil, false
+		return nil, false, nil
 	}
 	if leaseHasExpired(h, time.Now()) {
-		lm.evictExpiredHolder(sh, st, key, connID, es.token)
-		return nil, false
+		if err := lm.evictExpiredHolder(sh, st, key, connID, es.token); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
 	}
-	return h, true
+	return h, true, nil
 }
 
 // evictExpiredHolder removes a holder whose lease has elapsed and
 // hands its slot to the next waiter. Caller holds sh.mu.
-func (lm *LockManager) evictExpiredHolder(sh *shard, st *ResourceState, key string, connID uint64, token string) {
+func (lm *LockManager) evictExpiredHolder(sh *shard, st *ResourceState, key string, connID uint64, token string) error {
 	sh.removeOwned(connID, key, token)
 	delete(st.Holders, token)
 	st.LastActivity = time.Now()
-	lm.grantNext(sh, key, st)
+	return lm.grantNext(sh, key, st)
 }
 
 // waitQueuedGrant is the slow path: the waiter is parked on its
@@ -566,9 +602,9 @@ func finishWaitResult(token string, leaseTTL time.Duration, err error) (string, 
 	return token, int(leaseTTL / time.Second), nil
 }
 
-// Release frees one held slot if (key, token) match. Returns false when
+// Release frees one held slot if (key, token) match. ok=false means
 // the token isn't held — the caller may have raced lease expiry.
-func (lm *LockManager) Release(key, token string) bool {
+func (lm *LockManager) Release(key, token string) (ok bool, err error) {
 	sh := lm.shardFor(key)
 
 	sh.mu.Lock()
@@ -576,12 +612,12 @@ func (lm *LockManager) Release(key, token string) bool {
 
 	st := sh.resources[key]
 	if st == nil {
-		return false
+		return false, nil
 	}
 	h, ok := st.Holders[token]
 	if !ok {
 		// Don't bump LastActivity: a bogus token must not extend life.
-		return false
+		return false, nil
 	}
 	now := time.Now()
 	st.LastActivity = now
@@ -591,26 +627,30 @@ func (lm *LockManager) Release(key, token string) bool {
 		sh.removeEnqueued(eqKey)
 	}
 	delete(st.Holders, token)
-	lm.grantNext(sh, key, st)
-	return true
+	if err := lm.grantNext(sh, key, st); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // Renew extends the lease on a held slot by leaseTTL. Returns the new
 // remaining seconds and ok=true on success.
-func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bool) {
+func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bool, error) {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
 	st, h, ok := lookupHolder(sh, key, token)
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
 	if leaseHasExpired(h, time.Now()) {
-		lm.rejectExpiredRenew(sh, st, key, token, h)
-		return 0, false
+		if err := lm.rejectExpiredRenew(sh, st, key, token, h); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
 	}
-	return extendLease(st, h, leaseTTL), true
+	return extendLease(st, h, leaseTTL), true, nil
 }
 
 // lookupHolder returns the (resource, holder) pair if both exist for
@@ -636,13 +676,13 @@ func leaseHasExpired(h *holder, now time.Time) bool {
 // rejectExpiredRenew evicts an expired holder, drops any stale
 // connEnqueued entry pointing at the same token, and grants the
 // freed slot to the next waiter. Caller holds sh.mu.
-func (lm *LockManager) rejectExpiredRenew(sh *shard, st *ResourceState, key, token string, h *holder) {
+func (lm *LockManager) rejectExpiredRenew(sh *shard, st *ResourceState, key, token string, h *holder) error {
 	lm.log.Warn("renew rejected (already expired)", "key", key, "conn", h.connID)
 	sh.removeOwned(h.connID, key, token)
 	dropMatchingEnqueued(sh, h.connID, key, token)
 	delete(st.Holders, token)
 	st.LastActivity = time.Now()
-	lm.grantNext(sh, key, st)
+	return lm.grantNext(sh, key, st)
 }
 
 // dropMatchingEnqueued removes the connEnqueued entry for (connID,
@@ -670,23 +710,28 @@ func extendLease(st *ResourceState, h *holder, leaseTTL time.Duration) int {
 // CleanupConnection clears all state for a connection that has gone
 // away. Pending waiters and enqueued state are always cleaned; held
 // slots are released only when AutoReleaseOnDisconnect is true.
-func (lm *LockManager) CleanupConnection(connID uint64) {
+func (lm *LockManager) CleanupConnection(connID uint64) error {
 	closed := make(map[chan string]struct{})
+	var out error
 	for i := range lm.shards {
-		lm.cleanupShard(&lm.shards[i], connID, closed)
+		if err := lm.cleanupShard(&lm.shards[i], connID, closed); err != nil {
+			out = errors.Join(out, err)
+		}
 	}
+	return out
 }
 
 // cleanupShard runs every per-connection cleanup step on one shard
 // under sh.mu.
-func (lm *LockManager) cleanupShard(sh *shard, connID uint64, closed map[chan string]struct{}) {
+func (lm *LockManager) cleanupShard(sh *shard, connID uint64, closed map[chan string]struct{}) error {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	cleanupEnqueuedForConn(sh, connID, closed)
 	cleanupPendingWaitersForConn(sh, connID, closed)
 	if lm.cfg.AutoReleaseOnDisconnect {
-		lm.releaseOwnedForConn(sh, connID)
+		return lm.releaseOwnedForConn(sh, connID)
 	}
+	return nil
 }
 
 // cleanupEnqueuedForConn drops the two-phase enqueued state for
@@ -733,27 +778,31 @@ func cleanupPendingWaitersForConn(sh *shard, connID uint64, closed map[chan stri
 
 // releaseOwnedForConn releases every held slot for connID and grants
 // the freed slots to the next waiters.
-func (lm *LockManager) releaseOwnedForConn(sh *shard, connID uint64) {
+func (lm *LockManager) releaseOwnedForConn(sh *shard, connID uint64) error {
 	owned := sh.connOwned[connID]
 	if owned == nil {
-		return
+		return nil
 	}
+	var out error
 	for key, tokens := range owned {
-		lm.releaseOwnedKey(sh, connID, key, tokens)
+		if err := lm.releaseOwnedKey(sh, connID, key, tokens); err != nil {
+			out = errors.Join(out, err)
+		}
 	}
 	delete(sh.connOwned, connID)
+	return out
 }
 
-func (lm *LockManager) releaseOwnedKey(sh *shard, connID uint64, key string, tokens map[string]struct{}) {
+func (lm *LockManager) releaseOwnedKey(sh *shard, connID uint64, key string, tokens map[string]struct{}) error {
 	st := sh.resources[key]
 	if st == nil {
-		return
+		return nil
 	}
 	for token := range tokens {
 		lm.releaseHolderEntry(st, key, token, connID)
 	}
 	st.LastActivity = time.Now()
-	lm.grantNext(sh, key, st)
+	return lm.grantNext(sh, key, st)
 }
 
 func (lm *LockManager) releaseHolderEntry(st *ResourceState, key, token string, connID uint64) {

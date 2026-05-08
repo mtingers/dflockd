@@ -74,7 +74,9 @@ func newConnCtx(parent context.Context, conn net.Conn) (context.Context, func())
 // teardownConn runs the deferred cleanup chain for ServeConn.
 func (s *Server) teardownConn(conn net.Conn, peer string, connID uint64, cancelConn func()) {
 	cancelConn()
-	s.lm.CleanupConnection(connID)
+	if err := s.lm.CleanupConnection(connID); err != nil {
+		s.log.Error("connection cleanup failed", "peer", peer, "conn_id", connID, "err", err)
+	}
 	s.log.Debug("client closed", "peer", peer, "conn_id", connID)
 }
 
@@ -395,14 +397,21 @@ func acquireAck(tok string, leaseTTL time.Duration) *protocol.Ack {
 }
 
 func (s *Server) handleRelease(req *protocol.Request) *protocol.Ack {
-	if s.lm.Release(requestKey(req), req.Token) {
+	ok, err := s.lm.Release(requestKey(req), req.Token)
+	if err != nil {
+		return ackForLockErr(err)
+	}
+	if ok {
 		return &protocol.Ack{Status: protocol.StatusOK}
 	}
 	return &protocol.Ack{Status: protocol.StatusError}
 }
 
 func (s *Server) handleRenew(req *protocol.Request) *protocol.Ack {
-	remaining, ok := s.lm.Renew(requestKey(req), req.Token, req.LeaseTTL)
+	remaining, ok, err := s.lm.Renew(requestKey(req), req.Token, req.LeaseTTL)
+	if err != nil {
+		return ackForLockErr(err)
+	}
 	if !ok {
 		return &protocol.Ack{Status: protocol.StatusError}
 	}

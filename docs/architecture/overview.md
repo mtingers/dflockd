@@ -53,9 +53,10 @@ every grant, so a token doubles as a [fencing token](https://martin.kleppmann.co
 By default the counter is seeded at startup from
 `time.Now().UnixNano()` (best-effort cross-restart monotonicity);
 with `--fence-state-file=/path`, fence ranges are pre-allocated
-to disk (one `fsync` per ~1M grants), giving unconditional
-cross-restart monotonicity even through crashes and clock
-regressions. The salt is drawn from a per-manager `randBuf` that
+to a checksummed two-slot journal (one `fsync` per ~1M grants),
+giving unconditional cross-restart monotonicity even through
+crashes and clock regressions. The salt is drawn from a
+per-manager `randBuf` that
 reads 4 KiB from `crypto/rand` at a time and dispenses 8 bytes
 per token, amortising the syscall.
 

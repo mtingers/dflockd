@@ -46,7 +46,7 @@ var configEnvKeys = []string{
 	"DFLOCKD_MAX_WAITERS", "DFLOCKD_READ_TIMEOUT_S",
 	"DFLOCKD_WRITE_TIMEOUT_S", "DFLOCKD_SHUTDOWN_TIMEOUT_S",
 	"DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "DFLOCKD_TLS_CERT", "DFLOCKD_TLS_KEY",
-	"DFLOCKD_AUTH_TOKEN", "DFLOCKD_AUTH_TOKEN_FILE",
+	"DFLOCKD_AUTH_TOKEN", "DFLOCKD_AUTH_TOKEN_FILE", "DFLOCKD_FENCE_STATE_FILE",
 	"DFLOCKD_HTTP_PORT", "DFLOCKD_HTTP_HOST",
 	"DFLOCKD_HTTP_SESSION_IDLE_S", "DFLOCKD_HTTP_MAX_SESSIONS",
 	"DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP",
@@ -106,6 +106,18 @@ func TestLoad_EnvWhenFlagOmitted(t *testing.T) {
 	}
 	if cfg.Port != 9999 {
 		t.Errorf("Port = %d, want 9999 (from env)", cfg.Port)
+	}
+}
+
+func TestLoad_FenceStateFile(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_FENCE_STATE_FILE": "/tmp/from-env"})
+	cfg, err := Load([]string{"--fence-state-file", "/tmp/from-flag"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.FenceStateFile != "/tmp/from-flag" {
+		t.Errorf("FenceStateFile = %q, want flag value", cfg.FenceStateFile)
 	}
 }
 

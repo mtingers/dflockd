@@ -77,7 +77,7 @@ The connection must stay open. By default, locks are auto-released on disconnect
 
 ## Fencing tokens
 
-Tokens are 32 lowercase hex chars: `<16-hex monotonic prefix><16-hex random salt>`. The prefix is a server-monotonic uint64 (big-endian) that strictly increases on every grant — including across server restarts on a non-regressing wall clock — so a token also serves as a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html). Compare two tokens **for the same key** lexicographically (or parse the prefix as a uint64): the larger token was issued later, so a downstream resource can store the most recent token it has seen and reject any write whose token compares less.
+Tokens are 32 lowercase hex chars: `<16-hex monotonic prefix><16-hex random salt>`. The prefix is a server-monotonic uint64 (big-endian) that strictly increases on every grant, so a token also serves as a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html). Compare two tokens **for the same key** lexicographically (or parse the prefix as a uint64): the larger token was issued later, so a downstream resource can store the most recent token it has seen and reject any write whose token compares less.
 
 ```go
 tok, _, _ := client.Acquire(c, "row:42", 5*time.Second)
@@ -86,7 +86,7 @@ fence, _ := client.FenceFromToken(tok)        // uint64 — pass to your DB / bl
 
 Fences are per-server-instance: each dflockd process is the source of truth for the keys clients route to it (CRC32 sharding). Caveats: tokens for *different* keys aren't meaningfully ordered against each other; a `Limit>1` semaphore issues a distinct fence per grant, not per resource.
 
-By default cross-restart monotonicity comes from seeding the counter with `time.Now().UnixNano()`, which holds *as long as the wall clock doesn't regress* across the restart (NTP step, VM snapshot, manual change). For strict monotonicity even across crashes and clock regressions, set `--fence-state-file=/path`: dflockd pre-allocates fence ranges to disk (one fsync per ~1M grants — measured ~0.4% overhead vs. the in-memory path), and the next instance always seeds above the highest value the prior one could ever have issued. The file is 8 bytes; default off preserves the "single binary, zero deps" promise.
+By default cross-restart monotonicity comes from seeding the counter with `time.Now().UnixNano()`, which holds *as long as the wall clock doesn't regress* across the restart (NTP step, VM snapshot, manual change). For strict monotonicity even across crashes and clock regressions, set `--fence-state-file=/path`: dflockd pre-allocates fence ranges to a checksummed two-slot journal (one fsync per ~1M grants — measured ~3 ns/op extra vs. the in-memory path, single-digit percent of token-mint cost), and the next instance always seeds above the highest value the prior one could ever have issued. The state file is tiny (up to 64 bytes), exclusive-locked while dflockd is running; default off preserves the "single binary, zero deps" promise.
 
 ## Performance
 
@@ -120,7 +120,7 @@ CLI flags take precedence over environment variables. The full table is in the [
 | `--tls-cert` / `--tls-key` | `DFLOCKD_TLS_CERT` / `_KEY` | *(unset)* | Enable TLS on both listeners |
 | `--auth-token-file` | `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | Shared-secret auth token |
 | `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release tokens on disconnect |
-| `--fence-state-file` | `DFLOCKD_FENCE_STATE_FILE` | *(unset)* | Path to fence-counter state file. Set for strict cross-restart fencing-token monotonicity (~0.4% perf cost). |
+| `--fence-state-file` | `DFLOCKD_FENCE_STATE_FILE` | *(unset)* | Path to fence-counter journal. Set for strict cross-restart fencing-token monotonicity (~3 ns/op extra). |
 
 ## Client libraries
 

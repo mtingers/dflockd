@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`--fence-state-file` for strict cross-restart fencing.** When set, dflockd pre-allocates fence ranges to a small (8-byte) state file via fsync — one fsync per ~1M grants. After a crash or clean restart, the new instance always seeds above the highest fence the prior instance could have issued, regardless of wall-clock regression. Default off preserves the "single binary, zero deps" promise. Measured overhead: 42.96 ns/op vs. 42.79 ns/op for the in-memory path (Apple M1, `BenchmarkNewToken_*`). Up to ~1M fence values are skipped per restart but monotonicity holds unconditionally.
+- **`--fence-state-file` for strict cross-restart fencing.** When set, dflockd pre-allocates fence ranges to a checksummed two-slot journal via fsync — one fsync per ~1M grants. After a crash or clean restart, the new instance always seeds above the highest fence the prior instance could have issued, regardless of wall-clock regression. The file is exclusive-locked (`flock(2)` on Unix) while dflockd is running so two instances cannot share one state path. Default off preserves the "single binary, zero deps" promise. Measured overhead vs. the in-memory path on Apple M1 (`BenchmarkNewToken_*`, three 5 s runs): ~41 → ~44 ns/op single-threaded, ~137 → ~146 ns/op parallel — a constant ~3 ns/op overhead, dominated by the CAS loop the in-memory path skips (the CAS is necessary: `atomic.Add` on a uint64 wraps silently and would issue 0). Up to ~1M fence values are skipped per restart but monotonicity holds unconditionally. Fence allocation failures surface as `503 fence_persistence` over HTTP and the generic `error` status over TCP.
 - **`LockManager.Close()`** to release the fence state file (no-op when persistence is disabled). `cmd/dflockd` calls it on graceful shutdown.
+- **`ErrFencePersistence`** sentinel for fence persistence failures. Both HTTP and TCP wire layers map it (HTTP: 503 `fence_persistence`; TCP: generic `error`).
 
 ### Changed
 

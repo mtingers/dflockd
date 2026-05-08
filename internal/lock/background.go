@@ -59,7 +59,9 @@ func (lm *LockManager) sweepResource(sh *shard, key string, st *ResourceState, n
 		return
 	}
 	st.LastActivity = now
-	lm.grantNext(sh, key, st)
+	if err := lm.grantNext(sh, key, st); err != nil {
+		lm.log.Error("grant after lease expiry failed", "key", key, "err", err)
+	}
 }
 
 // evictExpiredHolders walks st.Holders and removes any expired

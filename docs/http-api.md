@@ -133,8 +133,8 @@ hex chars, structured as:
 
 The fence prefix is a server-monotonic `uint64` seeded from
 `time.Now().UnixNano()` at startup and incremented atomically on
-every grant. It strictly increases across grants and across server
-restarts on a non-regressing wall clock, so the token doubles as a
+every grant. It strictly increases across grants from one server
+instance, so the token doubles as a
 [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html):
 a downstream resource can store the most recent token it has seen
 for a key and reject any write whose token compares lex-less.
@@ -150,7 +150,10 @@ By default the prefix is seeded from `time.Now().UnixNano()` at
 boot — strictly monotonic across restarts only while the wall
 clock does not regress. Run dflockd with `--fence-state-file=/path`
 for unconditional cross-restart monotonicity (one fsync per ~1M
-grants, ~0.4% overhead). See [server config](server.md#fence-state-file).
+grants to a checksummed two-slot journal, ~3 ns/op extra in the
+hot path). If a fence allocation fails (disk full, EIO, etc.),
+the server returns `503 fence_persistence`. See
+[server config](server.md#fence-state-file).
 
 ## Authentication
 
@@ -192,6 +195,7 @@ code mapping:
 | 503 | `max_waiters` | Per-key waiter cap reached |
 | 503 | `max_sessions` | Cluster-wide HTTP session cap reached |
 | 503 | `max_sessions_per_ip` | Per-IP session cap reached |
+| 503 | `fence_persistence` | `--fence-state-file` write failed (disk full, EIO, counter exhausted) |
 | 503 | `draining` | Server is in graceful shutdown |
 
 ## Cancellation

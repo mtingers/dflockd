@@ -62,6 +62,8 @@ func httpStatusForLockErr(err error) (int, string) {
 		return http.StatusConflict, "lease_expired"
 	case errors.Is(err, lock.ErrWaiterClosed):
 		return http.StatusGone, "session_gone"
+	case errors.Is(err, lock.ErrFencePersistence):
+		return http.StatusServiceUnavailable, "fence_persistence"
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return http.StatusRequestTimeout, "client_canceled"
 	}

@@ -2,8 +2,13 @@ package lock
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc64"
+	"io"
+	"math"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 )
@@ -13,7 +18,18 @@ import (
 // crash recovery, up to this many fence values may be skipped.
 const DefaultFenceRangeSize uint64 = 1 << 20
 
-const fenceFileSize = 8
+const (
+	legacyFenceFileSize = 8
+	fenceRecordSize     = 32
+	fenceJournalSlots   = 2
+	fenceJournalSize    = fenceRecordSize * fenceJournalSlots
+)
+
+var (
+	ErrFencePersistence = errors.New("fence persistence failed")
+	fenceRecordMagic    = [8]byte{'d', 'f', 'l', 'f', 'n', 'c', '1', '\n'}
+	fenceCRCTable       = crc64.MakeTable(crc64.ISO)
+)
 
 // fenceAllocator hands out strictly-monotonic uint64 fence values.
 // When backed by a state file, it pre-allocates ranges to disk
@@ -22,9 +38,16 @@ const fenceFileSize = 8
 type fenceAllocator struct {
 	counter   atomic.Uint64
 	ceiling   atomic.Uint64
+	closed    atomic.Bool
 	mu        sync.Mutex
 	f         *os.File
+	recordSeq uint64
 	rangeSize uint64
+}
+
+type fenceRecord struct {
+	seq     uint64
+	ceiling uint64
 }
 
 // newFenceAllocator builds an allocator. stateFile == "" disables
@@ -35,6 +58,9 @@ func newFenceAllocator(stateFile string, fallbackSeed, rangeSize uint64) (*fence
 	if stateFile == "" {
 		return newMemFenceAllocator(fallbackSeed), nil
 	}
+	if rangeSize == 0 {
+		return nil, fmt.Errorf("%w: range size must be > 0", ErrFencePersistence)
+	}
 	return newPersistentFenceAllocator(stateFile, fallbackSeed, rangeSize)
 }
 
@@ -44,7 +70,7 @@ func newFenceAllocator(stateFile string, fallbackSeed, rangeSize uint64) (*fence
 func newMemFenceAllocator(seed uint64) *fenceAllocator {
 	fa := &fenceAllocator{}
 	fa.counter.Store(seed)
-	fa.ceiling.Store(^uint64(0))
+	fa.ceiling.Store(math.MaxUint64)
 	return fa
 }
 
@@ -53,59 +79,97 @@ func newPersistentFenceAllocator(path string, fallbackSeed, rangeSize uint64) (*
 	if err != nil {
 		return nil, err
 	}
-	return primePersistentAllocator(f, recovered, rangeSize)
+	return primePersistentAllocator(path, f, recovered, rangeSize)
 }
 
 // primePersistentAllocator builds the allocator and forces an
 // initial range extend so first-call latency is paid up front
 // rather than mid-grant.
-func primePersistentAllocator(f *os.File, recovered, rangeSize uint64) (*fenceAllocator, error) {
-	fa := &fenceAllocator{f: f, rangeSize: rangeSize}
-	fa.counter.Store(recovered)
-	fa.ceiling.Store(recovered)
-	if err := fa.extendLocked(recovered); err != nil {
-		f.Close()
+func primePersistentAllocator(path string, f *os.File, recovered fenceRecord, rangeSize uint64) (*fenceAllocator, error) {
+	fa := &fenceAllocator{f: f, recordSeq: recovered.seq, rangeSize: rangeSize}
+	fa.counter.Store(recovered.ceiling)
+	fa.ceiling.Store(recovered.ceiling)
+	if err := fa.extendLocked(recovered.ceiling); err != nil {
+		_ = fa.close()
 		return nil, err
+	}
+	if err := syncParentDir(path); err != nil {
+		_ = fa.close()
+		return nil, fmt.Errorf("%w: sync fence state directory: %v", ErrFencePersistence, err)
 	}
 	return fa, nil
 }
 
-// next returns the next fence value, taking the slow path only
-// when the in-memory range is exhausted. Panics if persistence is
-// configured and the disk write fails — at that point the fence
-// guarantee is unrecoverable.
-func (fa *fenceAllocator) next() uint64 {
-	n := fa.counter.Add(1)
-	if n < fa.ceiling.Load() {
-		return n
+// next returns the next fence value. The hot path is two atomic
+// loads and a CAS; the slow path persists a new ceiling under mu.
+// The closed check lives in the slow path only — fast-path values
+// after Close are still strictly below the already-persisted
+// ceiling, so a subsequent instance seeded from disk strictly
+// exceeds them.
+func (fa *fenceAllocator) next() (uint64, error) {
+	n, err := fa.bumpCounter()
+	if err != nil {
+		return 0, err
 	}
-	return fa.nextSlow(n)
+	if n < fa.ceiling.Load() {
+		return n, nil
+	}
+	if err := fa.nextSlow(n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
-// nextSlow extends the on-disk ceiling and returns n. The double-
-// check inside the mutex lets goroutines that piled up while
-// another extended skip the disk write.
-func (fa *fenceAllocator) nextSlow(n uint64) uint64 {
+// bumpCounter is the standard CAS-loop increment, refusing the
+// uint64 wrap explicitly. Add(1) is unsafe here: a wrap from
+// MaxUint64 to 0 silently produces a fence value far below the
+// in-memory ceiling, breaking lex monotonicity.
+func (fa *fenceAllocator) bumpCounter() (uint64, error) {
+	for {
+		cur := fa.counter.Load()
+		if cur == math.MaxUint64 {
+			return 0, fmt.Errorf("%w: counter exhausted", ErrFencePersistence)
+		}
+		if fa.counter.CompareAndSwap(cur, cur+1) {
+			return cur + 1, nil
+		}
+	}
+}
+
+// nextSlow extends the on-disk ceiling. The double-check inside the
+// mutex lets goroutines that piled up while another extended skip
+// the disk write.
+func (fa *fenceAllocator) nextSlow(n uint64) error {
 	fa.mu.Lock()
 	defer fa.mu.Unlock()
+	if fa.closed.Load() {
+		return fmt.Errorf("%w: allocator is closed", ErrFencePersistence)
+	}
 	if n < fa.ceiling.Load() {
-		return n
+		return nil
 	}
-	if err := fa.extendLocked(n); err != nil {
-		panic("fence persistence failed: " + err.Error())
-	}
-	return n
+	return fa.extendLocked(n)
 }
 
 // extendLocked bumps the ceiling by rangeSize, persisting the new
 // value to disk before publishing it in memory. Caller holds mu.
 func (fa *fenceAllocator) extendLocked(target uint64) error {
-	newCeiling := target + fa.rangeSize
+	newCeiling, err := checkedCeiling(target, fa.rangeSize)
+	if err != nil {
+		return err
+	}
 	if err := fa.persistCeiling(newCeiling); err != nil {
 		return err
 	}
 	fa.ceiling.Store(newCeiling)
 	return nil
+}
+
+func checkedCeiling(target, rangeSize uint64) (uint64, error) {
+	if rangeSize == 0 || target > math.MaxUint64-rangeSize {
+		return 0, fmt.Errorf("%w: counter would overflow", ErrFencePersistence)
+	}
+	return target + rangeSize, nil
 }
 
 // persistCeiling writes the new ceiling and fsyncs. A no-op when
@@ -114,73 +178,180 @@ func (fa *fenceAllocator) persistCeiling(ceiling uint64) error {
 	if fa.f == nil {
 		return nil
 	}
-	return writeCeiling(fa.f, ceiling)
+	return fa.writeRecord(ceiling)
 }
 
-// close releases the state file. Safe to call on an in-memory
-// allocator (no-op).
+func (fa *fenceAllocator) writeRecord(ceiling uint64) error {
+	if fa.recordSeq == math.MaxUint64 {
+		return fmt.Errorf("%w: journal sequence exhausted", ErrFencePersistence)
+	}
+	rec := fenceRecord{seq: fa.recordSeq + 1, ceiling: ceiling}
+	if err := writeFenceRecord(fa.f, rec); err != nil {
+		return err
+	}
+	fa.recordSeq = rec.seq
+	return nil
+}
+
+// close releases the state file. Safe to call multiple times; safe
+// on an allocator without persistence.
 func (fa *fenceAllocator) close() error {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
 	if fa.f == nil {
 		return nil
 	}
-	return fa.f.Close()
+	f := fa.f
+	fa.f = nil
+	fa.closed.Store(true)
+	unlockErr := unlockFenceFile(f)
+	closeErr := f.Close()
+	return errors.Join(unlockErr, closeErr)
 }
 
-// openFenceFile opens (or creates) the state file and recovers the
-// stored ceiling. Returns max(persisted, fallbackSeed) so a
-// restored-from-backup file can't seed below the wall clock.
-func openFenceFile(path string, fallbackSeed uint64) (*os.File, uint64, error) {
+// openFenceFile opens (or creates) the state file, takes an
+// exclusive advisory lock, and recovers the stored ceiling. Returns
+// max(persisted, fallbackSeed) so a restored-from-backup file can't
+// seed below the wall clock.
+func openFenceFile(path string, fallbackSeed uint64) (*os.File, fenceRecord, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, 0, fmt.Errorf("open fence state %q: %w", path, err)
+		return nil, fenceRecord{}, fmt.Errorf("open fence state %q: %w", path, err)
+	}
+	if err := lockFenceFile(f); err != nil {
+		f.Close()
+		return nil, fenceRecord{}, fmt.Errorf("%w: lock fence state %q: %v", ErrFencePersistence, path, err)
 	}
 	return readRecoveredCeiling(f, fallbackSeed)
 }
 
-// readRecoveredCeiling returns the ceiling persisted in f, or
-// fallbackSeed if f is empty. Files of unexpected size are
-// rejected — fail-closed beats silently corrupting fences.
-func readRecoveredCeiling(f *os.File, fallbackSeed uint64) (*os.File, uint64, error) {
+// readRecoveredCeiling returns the highest valid journal record, a
+// legacy raw uint64 ceiling, or fallbackSeed if f is empty. Files of
+// unexpected shape are rejected fail-closed.
+func readRecoveredCeiling(f *os.File, fallbackSeed uint64) (*os.File, fenceRecord, error) {
+	rec, err := readFenceState(f, fallbackSeed)
+	if err != nil {
+		_ = unlockFenceFile(f)
+		f.Close()
+		return nil, fenceRecord{}, err
+	}
+	return f, rec, nil
+}
+
+func readFenceState(f *os.File, fallbackSeed uint64) (fenceRecord, error) {
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
-		return nil, 0, err
+		return fenceRecord{}, err
 	}
-	if info.Size() == 0 {
-		return f, fallbackSeed, nil
+	switch size := info.Size(); size {
+	case 0:
+		return fenceRecord{ceiling: fallbackSeed}, nil
+	case legacyFenceFileSize:
+		return readLegacyCeiling(f, fallbackSeed)
+	case fenceRecordSize, fenceJournalSize:
+		return readJournalCeiling(f, size, fallbackSeed)
+	default:
+		return fenceRecord{}, fmt.Errorf("%w: state file is %d bytes, expected %d, %d, or %d",
+			ErrFencePersistence, size, legacyFenceFileSize, fenceRecordSize, fenceJournalSize)
 	}
-	return readExistingCeiling(f, info.Size(), fallbackSeed)
 }
 
-func readExistingCeiling(f *os.File, size int64, fallbackSeed uint64) (*os.File, uint64, error) {
-	if size != fenceFileSize {
-		f.Close()
-		return nil, 0, fmt.Errorf("fence state file is %d bytes, expected %d", size, fenceFileSize)
-	}
-	persisted, err := readUint64(f)
-	if err != nil {
-		f.Close()
-		return nil, 0, err
-	}
-	return f, maxU64(persisted, fallbackSeed), nil
-}
-
-func readUint64(f *os.File) (uint64, error) {
-	var buf [fenceFileSize]byte
+func readLegacyCeiling(f *os.File, fallbackSeed uint64) (fenceRecord, error) {
+	var buf [legacyFenceFileSize]byte
 	if _, err := f.ReadAt(buf[:], 0); err != nil {
-		return 0, fmt.Errorf("read fence state: %w", err)
+		return fenceRecord{}, fmt.Errorf("%w: read legacy fence state: %v", ErrFencePersistence, err)
 	}
-	return binary.BigEndian.Uint64(buf[:]), nil
+	return fenceRecord{ceiling: maxU64(binary.BigEndian.Uint64(buf[:]), fallbackSeed)}, nil
 }
 
-// writeCeiling rewrites the file with ceiling and fsyncs. Aligned
-// 8-byte writes are atomic on POSIX, so no rename-tempfile dance.
-func writeCeiling(f *os.File, ceiling uint64) error {
-	var buf [fenceFileSize]byte
-	binary.BigEndian.PutUint64(buf[:], ceiling)
-	if _, err := f.WriteAt(buf[:], 0); err != nil {
-		return fmt.Errorf("write fence state: %w", err)
+func readJournalCeiling(f *os.File, size int64, fallbackSeed uint64) (fenceRecord, error) {
+	records := validFenceRecords(f, size)
+	if len(records) == 0 {
+		return fenceRecord{}, fmt.Errorf("%w: no valid fence journal records", ErrFencePersistence)
 	}
+	rec := latestFenceRecord(records)
+	rec.ceiling = maxU64(rec.ceiling, fallbackSeed)
+	return rec, nil
+}
+
+func validFenceRecords(f *os.File, size int64) []fenceRecord {
+	var out []fenceRecord
+	for slot := int64(0); slot < fenceJournalSlots && slot*fenceRecordSize < size; slot++ {
+		if rec, ok := readFenceRecord(f, slot*fenceRecordSize); ok {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+func latestFenceRecord(records []fenceRecord) fenceRecord {
+	latest := records[0]
+	for _, rec := range records[1:] {
+		if rec.seq > latest.seq {
+			latest = rec
+		}
+	}
+	return latest
+}
+
+func readFenceRecord(f *os.File, offset int64) (fenceRecord, bool) {
+	var buf [fenceRecordSize]byte
+	if _, err := f.ReadAt(buf[:], offset); err != nil {
+		return fenceRecord{}, false
+	}
+	return decodeFenceRecord(buf)
+}
+
+func decodeFenceRecord(buf [fenceRecordSize]byte) (fenceRecord, bool) {
+	if string(buf[:8]) != string(fenceRecordMagic[:]) {
+		return fenceRecord{}, false
+	}
+	got := binary.BigEndian.Uint64(buf[24:32])
+	if got != fenceChecksum(buf[:24]) {
+		return fenceRecord{}, false
+	}
+	return fenceRecord{
+		seq:     binary.BigEndian.Uint64(buf[8:16]),
+		ceiling: binary.BigEndian.Uint64(buf[16:24]),
+	}, true
+}
+
+func writeFenceRecord(f *os.File, rec fenceRecord) error {
+	buf := encodeFenceRecord(rec)
+	offset := int64((rec.seq - 1) % fenceJournalSlots * fenceRecordSize)
+	n, err := f.WriteAt(buf[:], offset)
+	if err != nil {
+		return fmt.Errorf("%w: write fence state: %v", ErrFencePersistence, err)
+	}
+	if n != len(buf) {
+		return fmt.Errorf("%w: write fence state: %v", ErrFencePersistence, io.ErrShortWrite)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("%w: sync fence state: %v", ErrFencePersistence, err)
+	}
+	return nil
+}
+
+func encodeFenceRecord(rec fenceRecord) [fenceRecordSize]byte {
+	var buf [fenceRecordSize]byte
+	copy(buf[:8], fenceRecordMagic[:])
+	binary.BigEndian.PutUint64(buf[8:16], rec.seq)
+	binary.BigEndian.PutUint64(buf[16:24], rec.ceiling)
+	binary.BigEndian.PutUint64(buf[24:32], fenceChecksum(buf[:24]))
+	return buf
+}
+
+func fenceChecksum(data []byte) uint64 {
+	return crc64.Checksum(data, fenceCRCTable)
+}
+
+func syncParentDir(path string) error {
+	dir := filepath.Dir(path)
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	return f.Sync()
 }
 

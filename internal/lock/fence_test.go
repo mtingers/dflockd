@@ -2,6 +2,8 @@ package lock
 
 import (
 	"encoding/binary"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,7 +19,7 @@ func TestFenceAllocator_InMemory_Monotonic(t *testing.T) {
 	}
 	var prev uint64
 	for i := 0; i < 1000; i++ {
-		n := fa.next()
+		n := mustNextFence(t, fa)
 		if n <= prev {
 			t.Fatalf("not monotonic: %d <= %d", n, prev)
 		}
@@ -38,7 +40,7 @@ func TestFenceAllocator_File_PersistsAhead(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	defer fa.close()
-	first := fa.next()
+	first := mustNextFence(t, fa)
 	persisted := readPersistedCeiling(t, path)
 	if persisted <= first {
 		t.Fatalf("persisted %d should be > issued %d", persisted, first)
@@ -64,7 +66,7 @@ func TestFenceAllocator_File_RecoveryNeverDuplicates(t *testing.T) {
 }
 
 // TestFenceAllocator_File_ExtendsAcrossRange forces many range
-// extensions (rangeSize=4, 100 grants → 25 extends) and confirms
+// extensions (rangeSize=4, 100 grants -> 25 extends) and confirms
 // no value is ever duplicated.
 func TestFenceAllocator_File_ExtendsAcrossRange(t *testing.T) {
 	fa, err := newFenceAllocator(filepath.Join(t.TempDir(), "fence"), 0, 4)
@@ -74,7 +76,7 @@ func TestFenceAllocator_File_ExtendsAcrossRange(t *testing.T) {
 	defer fa.close()
 	seen := make(map[uint64]struct{})
 	for i := 0; i < 100; i++ {
-		n := fa.next()
+		n := mustNextFence(t, fa)
 		if _, dup := seen[n]; dup {
 			t.Fatalf("duplicate %d at iteration %d", n, i)
 		}
@@ -90,15 +92,14 @@ func TestFenceAllocator_File_Concurrent(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	defer fa.close()
-	got := concurrentAllocate(fa, 16, 200)
+	got := concurrentAllocate(t, fa, 16, 200)
 	if len(got) != 16*200 {
 		t.Fatalf("expected %d distinct, got %d", 16*200, len(got))
 	}
 }
 
 // TestFenceAllocator_File_MalformedRejected refuses to start when
-// the state file exists but has the wrong size — better fail-closed
-// than silently treat garbage as a recovered ceiling.
+// the state file exists but has the wrong size.
 func TestFenceAllocator_File_MalformedRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fence")
 	if err := os.WriteFile(path, []byte("nope"), 0o600); err != nil {
@@ -106,6 +107,37 @@ func TestFenceAllocator_File_MalformedRejected(t *testing.T) {
 	}
 	if _, err := newFenceAllocator(path, 0, 8); err == nil {
 		t.Fatal("expected error on malformed state file")
+	}
+}
+
+// TestFenceAllocator_File_TornLatestRecordFallsBack exercises the
+// journal format: if the newest slot is torn, recovery uses the
+// previous valid slot rather than trusting corrupted bytes.
+func TestFenceAllocator_File_TornLatestRecordFallsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fence")
+	writeRecordAt(t, path, fenceRecord{seq: 1, ceiling: 100})
+	writeCorruptRecordAt(t, path, fenceRecordSize, fenceRecord{seq: 2, ceiling: 200})
+
+	fa, err := newFenceAllocator(path, 0, 8)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer fa.close()
+	n := mustNextFence(t, fa)
+	if n != 101 {
+		t.Fatalf("recovered from wrong ceiling: issued %d, want 101", n)
+	}
+}
+
+// TestFenceAllocator_File_OverflowRejected covers corrupt-but-valid
+// records near MaxUint64. Extending such a ceiling would wrap, so
+// startup fails closed.
+func TestFenceAllocator_File_OverflowRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fence")
+	writePersistedCeiling(t, path, math.MaxUint64-1)
+	_, err := newFenceAllocator(path, 0, 8)
+	if !errors.Is(err, ErrFencePersistence) {
+		t.Fatalf("got %v, want ErrFencePersistence", err)
 	}
 }
 
@@ -122,15 +154,68 @@ func TestFenceAllocator_File_FallbackSeedFloors(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	defer fa.close()
-	n := fa.next()
+	n := mustNextFence(t, fa)
 	if n <= seed {
 		t.Fatalf("issued %d should exceed fallback seed %d", n, seed)
+	}
+}
+
+func TestFenceAllocator_File_LegacyUint64Migrates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fence")
+	writeLegacyCeiling(t, path, 50)
+	fa, err := newFenceAllocator(path, 0, 8)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer fa.close()
+	if n := mustNextFence(t, fa); n != 51 {
+		t.Fatalf("issued %d, want 51", n)
+	}
+	if size := fenceFileSize(t, path); size != fenceRecordSize {
+		t.Fatalf("state file size = %d, want %d after migration", size, fenceRecordSize)
+	}
+}
+
+func TestFenceAllocator_File_ExclusiveLock(t *testing.T) {
+	if !fenceFileLocksSupported {
+		t.Skip("platform has no fence file lock implementation")
+	}
+	path := filepath.Join(t.TempDir(), "fence")
+	fa, err := newFenceAllocator(path, 0, 8)
+	if err != nil {
+		t.Fatalf("first new: %v", err)
+	}
+	defer fa.close()
+	if _, err := newFenceAllocator(path, 0, 8); err == nil {
+		t.Fatal("expected second allocator on same state file to fail")
+	}
+}
+
+func TestFenceAllocator_Close_Idempotent(t *testing.T) {
+	fa, err := newFenceAllocator(filepath.Join(t.TempDir(), "fence"), 0, 8)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := fa.close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if err := fa.close(); err != nil {
+		t.Fatalf("second close: %v", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+func mustNextFence(t *testing.T, fa *fenceAllocator) uint64 {
+	t.Helper()
+	n, err := fa.next()
+	if err != nil {
+		t.Fatalf("next: %v", err)
+	}
+	return n
+}
 
 func allocateBatch(t *testing.T, path string, count int, rangeSize uint64) map[uint64]struct{} {
 	t.Helper()
@@ -140,7 +225,7 @@ func allocateBatch(t *testing.T, path string, count int, rangeSize uint64) map[u
 	}
 	out := make(map[uint64]struct{}, count)
 	for i := 0; i < count; i++ {
-		out[fa.next()] = struct{}{}
+		out[mustNextFence(t, fa)] = struct{}{}
 	}
 	if err := fa.close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -148,16 +233,23 @@ func allocateBatch(t *testing.T, path string, count int, rangeSize uint64) map[u
 	return out
 }
 
-func concurrentAllocate(fa *fenceAllocator, workers, perWorker int) map[uint64]struct{} {
+func concurrentAllocate(t *testing.T, fa *fenceAllocator, workers, perWorker int) map[uint64]struct{} {
+	t.Helper()
 	out := make(map[uint64]struct{}, workers*perWorker)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var gotErr error
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				n := fa.next()
+				n, err := fa.next()
+				if err != nil {
+					errOnce.Do(func() { gotErr = err })
+					return
+				}
 				mu.Lock()
 				out[n] = struct{}{}
 				mu.Unlock()
@@ -165,28 +257,76 @@ func concurrentAllocate(fa *fenceAllocator, workers, perWorker int) map[uint64]s
 		}()
 	}
 	wg.Wait()
+	if gotErr != nil {
+		t.Fatalf("next: %v", gotErr)
+	}
 	return out
 }
 
 func readPersistedCeiling(t *testing.T, path string) uint64 {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open persisted: %v", err)
+	}
+	defer f.Close()
+	rec, err := readFenceState(f, 0)
 	if err != nil {
 		t.Fatalf("read persisted: %v", err)
 	}
-	if len(data) != 8 {
-		t.Fatalf("persisted file is %d bytes, expected 8", len(data))
-	}
-	return binary.BigEndian.Uint64(data)
+	return rec.ceiling
 }
 
 func writePersistedCeiling(t *testing.T, path string, value uint64) {
 	t.Helper()
+	writeRecordAt(t, path, fenceRecord{seq: 1, ceiling: value})
+}
+
+func writeRecordAt(t *testing.T, path string, rec fenceRecord) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open persisted: %v", err)
+	}
+	defer f.Close()
+	if err := writeFenceRecord(f, rec); err != nil {
+		t.Fatalf("write persisted: %v", err)
+	}
+}
+
+func writeCorruptRecordAt(t *testing.T, path string, offset int64, rec fenceRecord) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open persisted: %v", err)
+	}
+	defer f.Close()
+	buf := encodeFenceRecord(rec)
+	buf[16] ^= 0xff
+	if _, err := f.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync corrupt: %v", err)
+	}
+}
+
+func writeLegacyCeiling(t *testing.T, path string, value uint64) {
+	t.Helper()
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], value)
 	if err := os.WriteFile(path, buf[:], 0o600); err != nil {
-		t.Fatalf("write persisted: %v", err)
+		t.Fatalf("write legacy: %v", err)
 	}
+}
+
+func fenceFileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fence file: %v", err)
+	}
+	return info.Size()
 }
 
 func maxKey(m map[uint64]struct{}) uint64 {
