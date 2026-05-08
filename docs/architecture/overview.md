@@ -46,9 +46,15 @@ Per shard:
 - `connEnqueued` — map of (connID, key) → enqueued state. Backs
   the two-phase `Wait` lookup.
 
-Tokens are 16 random bytes, hex-encoded. A small per-manager
-`tokenBuf` reads 4 KiB from `crypto/rand` at a time and dispenses
-tokens 16 bytes at a time, amortising the syscall.
+Tokens are 32 lowercase hex chars: an 8-byte big-endian
+**fence prefix** drawn from a per-manager `atomic.Uint64` counter
+(seeded at startup with `time.Now().UnixNano()`), followed by 8
+random bytes. The counter strictly increases on every grant —
+including across server restarts on a non-regressing wall clock —
+so a token doubles as a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html).
+The salt is drawn from a per-manager `randBuf` that reads 4 KiB
+from `crypto/rand` at a time and dispenses 8 bytes per token,
+amortising the syscall.
 
 Two background goroutines run for the manager's lifetime:
 

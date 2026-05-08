@@ -338,11 +338,11 @@
       },
       "Release": {
         "required": true,
-        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReleaseRequest"}, "example": {"token": "7f4c1f2b3e9a"}}}
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReleaseRequest"}, "example": {"token": "0001a3f217b3c4d87f3c1f2b3e9a8d6e"}}}
       },
       "Renew": {
         "required": true,
-        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenewRequest"}, "example": {"token": "7f4c1f2b3e9a", "lease_ttl_s": 60}}}
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenewRequest"}, "example": {"token": "0001a3f217b3c4d87f3c1f2b3e9a8d6e", "lease_ttl_s": 60}}}
       },
       "Enqueue": {
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EnqueueRequest"}, "example": {"lease_ttl_s": 60}}}
@@ -381,14 +381,14 @@
       "AcquireOutcome": {
         "description": "Acquire/wait result",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpResponse"}, "examples": {
-          "granted": {"value": {"status": "ok", "token": "7f4c1f2b3e9a", "lease_ttl_s": 60}},
+          "granted": {"value": {"status": "ok", "token": "0001a3f217b3c4d87f3c1f2b3e9a8d6e", "lease_ttl_s": 60}},
           "timeout": {"value": {"status": "timeout"}}
         }}}
       },
       "EnqueueOutcome": {
         "description": "Enqueue result",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpResponse"}, "examples": {
-          "acquired": {"value": {"status": "acquired", "token": "7f4c1f2b3e9a", "lease_ttl_s": 60}},
+          "acquired": {"value": {"status": "acquired", "token": "0001a3f217b3c4d87f3c1f2b3e9a8d6e", "lease_ttl_s": 60}},
           "queued": {"value": {"status": "queued"}}
         }}}
       }
@@ -438,14 +438,14 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["token"],
-        "properties": {"token": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$", "description": "Token returned by acquire/wait."}}
+        "properties": {"token": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$", "description": "Token returned by acquire/wait."}}
       },
       "RenewRequest": {
         "type": "object",
         "additionalProperties": false,
         "required": ["token"],
         "properties": {
-          "token": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$"},
+          "token": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$"},
           "lease_ttl_s": {"type": "integer", "minimum": 0, "maximum": 9223372036}
         }
       },
@@ -476,7 +476,7 @@
         "required": ["status"],
         "properties": {
           "status": {"type": "string", "enum": ["ok", "acquired", "queued", "timeout"]},
-          "token": {"type": "string", "description": "Present on grant (status `ok` or `acquired`)."},
+          "token": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$", "description": "Present on grant (status `ok` or `acquired`). 32 lowercase hex chars: the first 16 chars are a server-monotonic uint64 (big-endian) — a fencing prefix that strictly increases on every grant, including across server restarts on a non-regressing wall clock. The last 16 chars are random salt. Downstream systems can use the prefix as a fencing token: store the most recent token observed for a resource and reject any write whose token compares lexicographically less."},
           "lease_ttl_s": {"type": "integer", "description": "Present on grant; effective lease TTL."}
         }
       },

@@ -184,6 +184,44 @@ Body of the `<json>` is the same shape as `GET /v1/stats`:
 | `error_lease_expired` | Granted slot's lease expired before we could observe it. |
 | `error_draining` | Server is in graceful shutdown. |
 
+## Token format
+
+Every grant returns a 32-char lowercase-hex token:
+
+```
+<16 hex: fence prefix (uint64, big-endian)><16 hex: random salt>
+
+example: 0001a3f217b3c4d87f3c1f2b3e9a8d6e
+         └─── fence prefix ───┘└── salt ──┘
+```
+
+The **fence prefix** is a server-monotonic `uint64` seeded at
+startup from `time.Now().UnixNano()` and incremented atomically on
+every grant, so the prefix strictly increases across grants and
+across server restarts on a non-regressing wall clock. Lex-comparing
+two tokens **for the same key** reflects the order their grants
+were issued, which is the property a downstream resource needs to
+use the token as a fencing token: store the most recent token seen
+for a key, reject any write whose token compares less.
+
+The **salt** is 8 bytes from `crypto/rand`. It preserves ~64 bits
+of unguessability so a third party who saw one token cannot trivially
+forge another for the same key.
+
+Caveats:
+
+- Fences from *different keys* aren't meaningfully comparable —
+  the global counter increments across all keys, so prefix order
+  reflects when grants happened, not anything about the resource.
+- A `Limit>1` semaphore issues a distinct fence per grant; fencing
+  orders the *grants*, not the resource. The classic single-writer
+  fencing pattern doesn't directly apply.
+- Cross-restart monotonicity assumes wall clock doesn't regress
+  across the restart. Pair dflockd with NTP and don't manually
+  rewind the clock.
+- Tokens are not cryptographically signed. Treat the auth + TLS
+  layer as the boundary that protects token confidentiality.
+
 ## Disconnect semantics
 
 Closing the TCP connection triggers `LockManager.CleanupConnection`:

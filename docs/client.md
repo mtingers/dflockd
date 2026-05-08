@@ -114,9 +114,33 @@ func SemWait(c *Conn, key string, timeout time.Duration) (token string, lease in
 
 // Auth
 func Authenticate(c *Conn, token string) error
+
+// Fencing
+func FenceFromToken(token string) (uint64, error)
 ```
 
 `Option` is currently just `WithLeaseTTL(seconds)`.
+
+### Fencing tokens
+
+Every grant returns a 32-hex token whose first 16 hex chars are a
+server-monotonic `uint64` (big-endian). The prefix strictly
+increases on every grant from one dflockd server, including across
+server restarts on a non-regressing wall clock, so a token also
+works as a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html).
+`FenceFromToken` parses the prefix:
+
+```go
+tok, _, _ := client.Acquire(conn, "row:42", 5*time.Second)
+fence, _ := client.FenceFromToken(tok)   // uint64 to pass downstream
+```
+
+Fence comparison is meaningful **per key**: a downstream resource
+stores the most recent fence it has observed for a key and rejects
+any write whose fence compares less. Fences from different keys
+aren't ordered relative to one another. A `Limit>1` semaphore
+issues a distinct fence per grant — fencing orders the grants, not
+the resource.
 
 ## Sentinel errors
 

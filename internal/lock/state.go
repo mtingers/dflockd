@@ -2,7 +2,6 @@ package lock
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"strings"
 	"sync"
 	"time"
@@ -228,28 +227,53 @@ func (sh *shard) enqueuedKeys(connID uint64) []connKey {
 	return out
 }
 
-// tokenBuf amortises crypto/rand syscalls by buffering 4096 bytes
-// (256 16-byte tokens) and dispensing 16 bytes per request.
-type tokenBuf struct {
+// randBuf amortises crypto/rand syscalls by buffering 4096 bytes and
+// dispensing arbitrary slice-sized chunks. fill is the only entry
+// point; callers ask for exactly the bytes they need.
+type randBuf struct {
 	mu  sync.Mutex
 	buf [4096]byte
 	pos int // starts at len(buf) to force initial fill
 }
 
-func newTokenBuf() tokenBuf {
-	return tokenBuf{pos: 4096}
+func newRandBuf() randBuf {
+	return randBuf{pos: 4096}
 }
 
-func (tb *tokenBuf) next() string {
-	tb.mu.Lock()
-	if tb.pos+16 > len(tb.buf) {
-		if _, err := rand.Read(tb.buf[:]); err != nil {
-			panic("crypto/rand failed: " + err.Error())
-		}
-		tb.pos = 0
+// fill copies len(dst) random bytes into dst. Requests larger than the
+// reservoir bypass it entirely.
+func (rb *randBuf) fill(dst []byte) {
+	if len(dst) > len(rb.buf) {
+		readRand(dst)
+		return
 	}
-	tok := hex.EncodeToString(tb.buf[tb.pos : tb.pos+16])
-	tb.pos += 16
-	tb.mu.Unlock()
-	return tok
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.dispense(dst)
+}
+
+// dispense copies len(dst) bytes from the reservoir, refilling first
+// if needed. Caller holds rb.mu.
+func (rb *randBuf) dispense(dst []byte) {
+	rb.refillIfNeeded(len(dst))
+	copy(dst, rb.buf[rb.pos:rb.pos+len(dst)])
+	rb.pos += len(dst)
+}
+
+// refillIfNeeded reads from crypto/rand into the reservoir when it
+// can't satisfy n more bytes. Caller holds rb.mu.
+func (rb *randBuf) refillIfNeeded(n int) {
+	if rb.pos+n <= len(rb.buf) {
+		return
+	}
+	readRand(rb.buf[:])
+	rb.pos = 0
+}
+
+// readRand fills dst from crypto/rand or panics. crypto/rand should
+// never fail in practice; treating it as fatal keeps callers tidy.
+func readRand(dst []byte) {
+	if _, err := rand.Read(dst); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
 }

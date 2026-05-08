@@ -14,6 +14,8 @@ package lock
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"sync/atomic"
@@ -41,12 +43,17 @@ type LockManager struct {
 	resourceTotal atomic.Int64 // total resources across all shards (cap enforcement)
 	cfg           *config.Config
 	log           *slog.Logger
-	tokBuf        tokenBuf
+	randBuf       randBuf
+	// fenceCounter is the source of the lex-sortable prefix encoded in
+	// every issued token. Seeded at startup with time.Now().UnixNano()
+	// so values keep advancing across server restarts on a sane clock.
+	fenceCounter atomic.Uint64
 }
 
 // NewLockManager creates a LockManager bound to the given config.
 func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
-	lm := &LockManager{cfg: cfg, log: log, tokBuf: newTokenBuf()}
+	lm := &LockManager{cfg: cfg, log: log, randBuf: newRandBuf()}
+	lm.fenceCounter.Store(uint64(time.Now().UnixNano()))
 	for i := range lm.shards {
 		lm.shards[i].init()
 	}
@@ -70,8 +77,30 @@ func (lm *LockManager) shardFor(key string) *shard {
 	return &lm.shards[shardIndex(key)]
 }
 
+// newToken returns a 32-char lowercase-hex token: a server-monotonic
+// uint64 fence prefix (big-endian, first 16 chars) followed by 8 bytes
+// of random salt. The prefix lets a token also serve as a fencing
+// token — lex-comparing two tokens for the same key reflects the
+// order their grants were issued.
 func (lm *LockManager) newToken() string {
-	return lm.tokBuf.next()
+	return encodeToken(lm.fenceCounter.Add(1), lm.saltBytes())
+}
+
+// saltBytes draws 8 unguessable bytes for a token's random suffix.
+func (lm *LockManager) saltBytes() [8]byte {
+	var salt [8]byte
+	lm.randBuf.fill(salt[:])
+	return salt
+}
+
+// encodeToken formats a (fence, salt) pair as 32 lowercase hex chars.
+func encodeToken(fence uint64, salt [8]byte) string {
+	var prefix [8]byte
+	binary.BigEndian.PutUint64(prefix[:], fence)
+	var out [32]byte
+	hex.Encode(out[:16], prefix[:])
+	hex.Encode(out[16:], salt[:])
+	return string(out[:])
 }
 
 // getOrCreate returns the existing ResourceState for key, or creates a

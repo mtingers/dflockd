@@ -138,14 +138,14 @@ $ nc localhost 6388
 l                          # command
 my-key                     # key
 10                         # acquire timeout, seconds
-ok abc123 33               # ← server reply: status, token, lease_ttl
+ok 0001a3f217b3c4d87f3c1f2b3e9a8d6e 33   # ← status, token, lease_ttl
 n                          # renew
 my-key
-abc123 60                  # token, new lease_ttl
+0001a3f217b3c4d87f3c1f2b3e9a8d6e 60      # token, new lease_ttl
 ok 60                      # ← remaining seconds after renew
 r                          # release
 my-key
-abc123
+0001a3f217b3c4d87f3c1f2b3e9a8d6e
 ok
 ```
 

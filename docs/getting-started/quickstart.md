@@ -53,12 +53,12 @@ sid=$(curl -sX POST http://localhost:6389/v1/sessions | jq -r .session_id)
 curl -sX POST http://localhost:6389/v1/locks/deploy-job \
      -H "X-Dflockd-Session: $sid" \
      -d '{"acquire_timeout_s": 10, "lease_ttl_s": 60}'
-# → {"status":"ok","token":"7f4c...","lease_ttl_s":60}
+# → {"status":"ok","token":"0001a3f217b3c4d87f3c1f2b3e9a8d6e","lease_ttl_s":60}
 
 # release
 curl -sX POST http://localhost:6389/v1/locks/deploy-job/release \
      -H "X-Dflockd-Session: $sid" \
-     -d '{"token":"7f4c..."}'
+     -d '{"token":"0001a3f217b3c4d87f3c1f2b3e9a8d6e"}'
 # → 204 No Content
 
 # end the session (releases anything still held)

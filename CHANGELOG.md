@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Lock tokens are now usable as fencing tokens.** The 32-char hex format is unchanged, but the layout is: first 16 chars are a server-monotonic uint64 (big-endian) seeded from `time.Now().UnixNano()` at startup, last 16 chars are random salt. The prefix strictly increases on every grant — including across server restarts on a non-regressing wall clock — so a downstream resource can store the most recent token it has observed for a key and reject any write whose token compares lexicographically less. Existing clients are unaffected (tokens were already opaque). New helper: `client.FenceFromToken(token) (uint64, error)`. OpenAPI tightened the lock-token pattern from `^\S+$` to `^[0-9a-f]{32}$` on `ReleaseRequest`, `RenewRequest`, and `OpResponse.token`. See README "Fencing tokens".
+
 ## [v2.0.1] - 2026-05-05
 
 ### Fixed

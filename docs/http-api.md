@@ -122,6 +122,30 @@ POST /v1/semaphores/{key}/wait       request: {"timeout_s": int}
 The same key cannot be used as both a lock and a semaphore.
 Mismatching `limit` for an existing key returns `409 limit_mismatch`.
 
+## Tokens and fencing
+
+Every grant response carries a `token` field that is 32 lowercase
+hex chars, structured as:
+
+```
+<16 hex: fence prefix (uint64, big-endian)><16 hex: random salt>
+```
+
+The fence prefix is a server-monotonic `uint64` seeded from
+`time.Now().UnixNano()` at startup and incremented atomically on
+every grant. It strictly increases across grants and across server
+restarts on a non-regressing wall clock, so the token doubles as a
+[fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html):
+a downstream resource can store the most recent token it has seen
+for a key and reject any write whose token compares lex-less.
+Comparison is meaningful **per key** — fences from different keys
+aren't ordered against one another. A `Limit>1` semaphore issues a
+distinct fence per grant, not per resource. The salt preserves ~64
+bits of unguessability.
+
+The Go client exposes `client.FenceFromToken(token) (uint64, error)`
+to extract the fence as a typed integer.
+
 ## Authentication
 
 When `--auth-token` is set, every request except `/health` and

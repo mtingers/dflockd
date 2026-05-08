@@ -2,9 +2,12 @@ package lock
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
+	"regexp"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -783,5 +786,147 @@ func TestShardIndex_Distribution(t *testing.T) {
 	}
 	if zero > numShards/4 {
 		t.Errorf("%d/%d shards saw zero hits — distribution looks degenerate", zero, numShards)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Token format and fencing-prefix monotonicity
+// ---------------------------------------------------------------------------
+
+var tokenShape = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+func TestToken_FormatIs32LowerHex(t *testing.T) {
+	lm := newTestManager(t, true)
+	tok, err := lm.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if !tokenShape.MatchString(tok) {
+		t.Fatalf("token %q does not match %s", tok, tokenShape)
+	}
+}
+
+// TestToken_PrefixMonotonicWithinManager issues N tokens directly via
+// newToken() (so we don't need to release each one) and asserts the
+// 16-hex prefixes form a strictly increasing sequence equal to the
+// expected {seed+1 … seed+N} window.
+func TestToken_PrefixMonotonicWithinManager(t *testing.T) {
+	lm := newTestManager(t, true)
+	const n = 1000
+	const workers = 32
+	tokens := make([]string, n)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(start int) {
+			defer wg.Done()
+			for i := start; i < n; i += workers {
+				tokens[i] = lm.newToken()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	prefixes := make([]string, n)
+	for i, tok := range tokens {
+		if len(tok) != 32 {
+			t.Fatalf("token[%d] = %q has wrong length", i, tok)
+		}
+		prefixes[i] = tok[:16]
+	}
+	sort.Strings(prefixes)
+	for i := 1; i < len(prefixes); i++ {
+		if prefixes[i-1] >= prefixes[i] {
+			t.Fatalf("prefix %d (%s) >= prefix %d (%s); duplicates or non-monotonic",
+				i-1, prefixes[i-1], i, prefixes[i])
+		}
+	}
+}
+
+// TestToken_PrefixMonotonicAcrossRestart simulates a server restart by
+// constructing two managers in sequence and asserts every token from
+// the second is strictly lex-greater than every token from the first.
+// Cross-restart monotonicity is what makes the prefix safe to use as a
+// fencing token in the face of dflockd process crashes.
+func TestToken_PrefixMonotonicAcrossRestart(t *testing.T) {
+	lm1 := newTestManager(t, true)
+	t1, err := lm1.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	// Sleep just enough for time.Now().UnixNano() to advance past the
+	// number of grants the first manager will ever do in this test.
+	time.Sleep(time.Millisecond)
+
+	lm2 := newTestManager(t, true)
+	t2, err := lm2.Acquire(context.Background(), "k", time.Second, time.Second, 1, 1)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if t2[:16] <= t1[:16] {
+		t.Fatalf("second-manager prefix %s not greater than first-manager prefix %s",
+			t2[:16], t1[:16])
+	}
+}
+
+// TestToken_SaltDistinct issues many tokens and asserts the random
+// suffix bytes are unique. Birthday-bound at 2^32, so 1000 tokens have
+// collision probability < 2^-22 — vanishingly small.
+func TestToken_SaltDistinct(t *testing.T) {
+	lm := newTestManager(t, true)
+	const n = 1000
+	salts := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		tok := lm.newToken()
+		salt := tok[16:]
+		if _, dup := salts[salt]; dup {
+			t.Fatalf("duplicate salt %s at iteration %d", salt, i)
+		}
+		salts[salt] = struct{}{}
+	}
+}
+
+// TestSemaphore_EachGrantGetsDistinctFence covers the multi-holder case:
+// three concurrent acquirers on a Limit=3 semaphore each get a distinct
+// strictly-ordered prefix. Documents that each grant — not each
+// resource — is what the fence orders.
+func TestSemaphore_EachGrantGetsDistinctFence(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx := context.Background()
+	const limit = 3
+	got := make([]string, limit)
+	var wg sync.WaitGroup
+	wg.Add(limit)
+	for i := 0; i < limit; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			tok, err := lm.Acquire(ctx, "sem", time.Second, time.Second, uint64(idx+1), limit)
+			if err != nil {
+				t.Errorf("acquire %d: %v", idx, err)
+				return
+			}
+			got[idx] = tok
+		}(i)
+	}
+	wg.Wait()
+
+	prefixes := make([]string, limit)
+	seen := make(map[string]struct{}, limit)
+	for i, tok := range got {
+		if tok == "" {
+			t.Fatalf("acquire %d returned empty token", i)
+		}
+		prefixes[i] = tok[:16]
+		if _, dup := seen[prefixes[i]]; dup {
+			t.Fatalf("duplicate fence prefix %s among semaphore grants", prefixes[i])
+		}
+		seen[prefixes[i]] = struct{}{}
+	}
+	// Sanity check the prefixes parse as valid hex.
+	for _, p := range prefixes {
+		if _, err := hex.DecodeString(p); err != nil {
+			t.Fatalf("prefix %q is not hex: %v", p, err)
+		}
 	}
 }

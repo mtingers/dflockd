@@ -547,3 +547,75 @@ func TestLock_ContextCancel_NextAcquirerSucceeds(t *testing.T) {
 	}
 	next.Release(context.Background())
 }
+
+func TestFenceFromToken_Decodes(t *testing.T) {
+	cases := []struct {
+		token string
+		want  uint64
+	}{
+		{"00000000000000017f3c1f2b3e9a8d6e", 1},
+		{"0001a3f217b3c4d8aaaaaaaaaaaaaaaa", 0x0001a3f217b3c4d8},
+		{"ffffffffffffffff0000000000000000", ^uint64(0)},
+	}
+	for _, tc := range cases {
+		got, err := client.FenceFromToken(tc.token)
+		if err != nil {
+			t.Errorf("FenceFromToken(%q): %v", tc.token, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("FenceFromToken(%q) = %#x, want %#x", tc.token, got, tc.want)
+		}
+	}
+}
+
+func TestFenceFromToken_RejectsBadInput(t *testing.T) {
+	for _, tok := range []string{"", "tooshort", strings.Repeat("g", 32), strings.Repeat("0", 31)} {
+		if _, err := client.FenceFromToken(tok); err == nil {
+			t.Errorf("FenceFromToken(%q) returned nil error", tok)
+		}
+	}
+}
+
+func TestFenceFromToken_TwoLiveAcquiresAreOrdered(t *testing.T) {
+	addr, stop := startServer(t)
+	defer stop()
+
+	c1, err := client.Dial(addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c1.Close()
+	t1, _, err := client.Acquire(c1, "fence-key", time.Second)
+	if err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	if err := client.Release(c1, "fence-key", t1); err != nil {
+		t.Fatalf("release 1: %v", err)
+	}
+
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c2.Close()
+	t2, _, err := client.Acquire(c2, "fence-key", time.Second)
+	if err != nil {
+		t.Fatalf("acquire 2: %v", err)
+	}
+	if err := client.Release(c2, "fence-key", t2); err != nil {
+		t.Fatalf("release 2: %v", err)
+	}
+
+	f1, err := client.FenceFromToken(t1)
+	if err != nil {
+		t.Fatalf("fence 1: %v", err)
+	}
+	f2, err := client.FenceFromToken(t2)
+	if err != nil {
+		t.Fatalf("fence 2: %v", err)
+	}
+	if f2 <= f1 {
+		t.Fatalf("expected fence f2 > f1, got f1=%d f2=%d", f1, f2)
+	}
+}

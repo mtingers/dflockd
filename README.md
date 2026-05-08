@@ -75,6 +75,17 @@ ok
 
 The connection must stay open. By default, locks are auto-released on disconnect. See the [protocol reference](https://mtingers.github.io/dflockd/architecture/protocol/) for every command.
 
+## Fencing tokens
+
+Tokens are 32 lowercase hex chars: `<16-hex monotonic prefix><16-hex random salt>`. The prefix is a server-monotonic uint64 (big-endian) that strictly increases on every grant — including across server restarts on a non-regressing wall clock — so a token also serves as a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html). Compare two tokens **for the same key** lexicographically (or parse the prefix as a uint64): the larger token was issued later, so a downstream resource can store the most recent token it has seen and reject any write whose token compares less.
+
+```go
+tok, _, _ := client.Acquire(c, "row:42", 5*time.Second)
+fence, _ := client.FenceFromToken(tok)        // uint64 — pass to your DB / blob store
+```
+
+Fences are per-server-instance: each dflockd process is the source of truth for the keys clients route to it (CRC32 sharding). Caveats: tokens for *different* keys aren't meaningfully ordered against each other; a `Limit>1` semaphore issues a distinct fence per grant, not per resource; and cross-restart monotonicity assumes the wall clock doesn't regress between processes.
+
 ## Performance
 
 One acquire + release per operation over a persistent TCP connection. Median of three runs on v1.16.0; Apple M1 (MacBook Air, 8 GB RAM) with server and clients on localhost. Unique keys, no contention.

@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -239,6 +240,40 @@ func validateSemaphoreLimit(limit int) error {
 		return fmt.Errorf("dflockd: semaphore limit must be > 0 (got %d)", limit)
 	}
 	return nil
+}
+
+// FenceFromToken returns the 64-bit monotonic prefix encoded in the
+// first 16 hex chars of a server-issued token. The prefix strictly
+// increases on every grant from a single dflockd server (including
+// across restarts on a non-regressing wall clock), making it safe to
+// use as a fencing token: a downstream resource can store the most
+// recent fence it has observed for a given key and reject any write
+// whose fence compares less. Comparison is per-key — fences from
+// different keys aren't meaningfully ordered relative to one another.
+func FenceFromToken(token string) (uint64, error) {
+	prefix, err := decodeFencePrefix(token)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(prefix[:]), nil
+}
+
+// decodeFencePrefix validates the token's length and decodes the
+// first 16 hex chars into 8 raw bytes.
+func decodeFencePrefix(token string) ([8]byte, error) {
+	var prefix [8]byte
+	if len(token) != 32 {
+		return prefix, fmt.Errorf("dflockd: token must be 32 hex chars, got %d", len(token))
+	}
+	_, err := hex.Decode(prefix[:], []byte(token[:16]))
+	return prefix, wrapHexErr(err)
+}
+
+func wrapHexErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("dflockd: token prefix is not hex: %w", err)
 }
 
 // secondsCeil converts a Duration to whole seconds, rounding up so a
