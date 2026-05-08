@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -772,6 +773,38 @@ func TestHTTP_DeleteSessionReleasesHeldLocks(t *testing.T) {
 	// the slot was freed, not waiting for lease expiry).
 	v := startedClient(t, base).acquireLock("k", acquireRequest{AcquireTimeoutS: 1})
 	requireTokenStatus(t, v, "ok")
+}
+
+func TestHTTP_DeleteSessionReportsCleanupError(t *testing.T) {
+	cfg := defaultTestConfig()
+	log := discardLogger()
+	srv := testTCPServer(t, cfg, log)
+	ctx := context.Background()
+	hs, _ := buildHTTPServer(ctx, srv, cfg, log)
+	defer hs.limiter.Stop()
+	defer hs.sessions.Shutdown()
+	hs.sessions.cleanupConn = func(uint64) error {
+		return lock.ErrFencePersistence
+	}
+	s, err := hs.sessions.Create("127.0.0.1")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/sessions/"+s.ID, nil)
+	hs.handleDeleteSession(rec, req, s.ID)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("delete status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Error != "fence_persistence" {
+		t.Fatalf("error = %q, want fence_persistence", body.Error)
+	}
 }
 
 // TestSession_BeginRequestAfterClose asserts the closed-flag check

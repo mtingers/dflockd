@@ -105,7 +105,7 @@ func tlsConfig(cert tls.Certificate) *tls.Config {
 // http.Server together. Returns the server plus a once-only
 // session-shutdown trigger.
 func buildHTTPServer(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger) (*httpServer, func()) {
-	sessions := NewSessionStore(ctx, srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, cfg.HTTPMaxSessionsPerIP)
+	sessions := NewSessionStore(ctx, srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, cfg.HTTPMaxSessionsPerIP, log)
 	hs := &httpServer{
 		sessions: sessions,
 		cfg:      cfg,

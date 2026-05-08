@@ -243,15 +243,16 @@ func readFenceState(f *os.File, fallbackSeed uint64) (fenceRecord, error) {
 	if err != nil {
 		return fenceRecord{}, err
 	}
-	switch size := info.Size(); size {
-	case 0:
+	size := info.Size()
+	switch {
+	case size == 0:
 		return fenceRecord{ceiling: fallbackSeed}, nil
-	case legacyFenceFileSize:
+	case size == legacyFenceFileSize:
 		return readLegacyCeiling(f, fallbackSeed)
-	case fenceRecordSize, fenceJournalSize:
+	case journalSizeRecoverable(size):
 		return readJournalCeiling(f, size, fallbackSeed)
 	default:
-		return fenceRecord{}, fmt.Errorf("%w: state file is %d bytes, expected %d, %d, or %d",
+		return fenceRecord{}, fmt.Errorf("%w: state file is %d bytes, expected %d or %d-%d",
 			ErrFencePersistence, size, legacyFenceFileSize, fenceRecordSize, fenceJournalSize)
 	}
 }
@@ -264,8 +265,15 @@ func readLegacyCeiling(f *os.File, fallbackSeed uint64) (fenceRecord, error) {
 	return fenceRecord{ceiling: maxU64(binary.BigEndian.Uint64(buf[:]), fallbackSeed)}, nil
 }
 
+func journalSizeRecoverable(size int64) bool {
+	return size >= fenceRecordSize && size <= fenceJournalSize
+}
+
 func readJournalCeiling(f *os.File, size int64, fallbackSeed uint64) (fenceRecord, error) {
-	records := validFenceRecords(f, size)
+	records, err := validFenceRecords(f, size)
+	if err != nil {
+		return fenceRecord{}, err
+	}
 	if len(records) == 0 {
 		return fenceRecord{}, fmt.Errorf("%w: no valid fence journal records", ErrFencePersistence)
 	}
@@ -274,14 +282,18 @@ func readJournalCeiling(f *os.File, size int64, fallbackSeed uint64) (fenceRecor
 	return rec, nil
 }
 
-func validFenceRecords(f *os.File, size int64) []fenceRecord {
+func validFenceRecords(f *os.File, size int64) ([]fenceRecord, error) {
 	var out []fenceRecord
 	for slot := int64(0); slot < fenceJournalSlots && slot*fenceRecordSize < size; slot++ {
-		if rec, ok := readFenceRecord(f, slot*fenceRecordSize); ok {
+		rec, ok, err := readFenceRecord(f, slot*fenceRecordSize)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			out = append(out, rec)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func latestFenceRecord(records []fenceRecord) fenceRecord {
@@ -294,12 +306,21 @@ func latestFenceRecord(records []fenceRecord) fenceRecord {
 	return latest
 }
 
-func readFenceRecord(f *os.File, offset int64) (fenceRecord, bool) {
+type fenceRecordReader interface {
+	ReadAt([]byte, int64) (int, error)
+}
+
+func readFenceRecord(f fenceRecordReader, offset int64) (fenceRecord, bool, error) {
 	var buf [fenceRecordSize]byte
-	if _, err := f.ReadAt(buf[:], offset); err != nil {
-		return fenceRecord{}, false
+	n, err := f.ReadAt(buf[:], offset)
+	if err != nil {
+		if errors.Is(err, io.EOF) && n < len(buf) {
+			return fenceRecord{}, false, nil
+		}
+		return fenceRecord{}, false, fmt.Errorf("%w: read fence journal: %v", ErrFencePersistence, err)
 	}
-	return decodeFenceRecord(buf)
+	rec, ok := decodeFenceRecord(buf)
+	return rec, ok, nil
 }
 
 func decodeFenceRecord(buf [fenceRecordSize]byte) (fenceRecord, bool) {

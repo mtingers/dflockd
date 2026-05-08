@@ -129,6 +129,35 @@ func TestFenceAllocator_File_TornLatestRecordFallsBack(t *testing.T) {
 	}
 }
 
+func TestFenceAllocator_File_PartialLatestRecordFallsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fence")
+	writeRecordAt(t, path, fenceRecord{seq: 1, ceiling: 100})
+	writePartialRecordAt(t, path, fenceRecordSize, fenceRecord{seq: 2, ceiling: 200}, 9)
+
+	fa, err := newFenceAllocator(path, 0, 8)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer fa.close()
+	n := mustNextFence(t, fa)
+	if n != 101 {
+		t.Fatalf("recovered from wrong ceiling: issued %d, want 101", n)
+	}
+}
+
+func TestFenceAllocator_RecordReadIOErrorFailsClosed(t *testing.T) {
+	boom := errors.New("boom")
+	_, ok, err := readFenceRecord(readAtFunc(func([]byte, int64) (int, error) {
+		return 0, boom
+	}), 0)
+	if ok {
+		t.Fatal("record should not be valid")
+	}
+	if !errors.Is(err, ErrFencePersistence) {
+		t.Fatalf("got %v, want ErrFencePersistence", err)
+	}
+}
+
 // TestFenceAllocator_File_OverflowRejected covers corrupt-but-valid
 // records near MaxUint64. Extending such a ceiling would wrap, so
 // startup fails closed.
@@ -309,6 +338,28 @@ func writeCorruptRecordAt(t *testing.T, path string, offset int64, rec fenceReco
 	if err := f.Sync(); err != nil {
 		t.Fatalf("sync corrupt: %v", err)
 	}
+}
+
+func writePartialRecordAt(t *testing.T, path string, offset int64, rec fenceRecord, n int) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open persisted: %v", err)
+	}
+	defer f.Close()
+	buf := encodeFenceRecord(rec)
+	if _, err := f.WriteAt(buf[:n], offset); err != nil {
+		t.Fatalf("write partial: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync partial: %v", err)
+	}
+}
+
+type readAtFunc func([]byte, int64) (int, error)
+
+func (fn readAtFunc) ReadAt(p []byte, off int64) (int, error) {
+	return fn(p, off)
 }
 
 func writeLegacyCeiling(t *testing.T, path string, value uint64) {

@@ -96,7 +96,8 @@
           "204": {"description": "Closed"},
           "400": {"$ref": "#/components/responses/BadRequest"},
           "401": {"$ref": "#/components/responses/Unauthorized"},
-          "410": {"$ref": "#/components/responses/SessionGone"}
+          "410": {"$ref": "#/components/responses/SessionGone"},
+          "503": {"$ref": "#/components/responses/CapacityExhausted"}
         }
       }
     },

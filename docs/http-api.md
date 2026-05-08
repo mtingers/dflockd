@@ -24,7 +24,7 @@ LockManager.
 
 ```
 POST   /v1/sessions               → 200 {"session_id":"...","idle_timeout_s":20}
-DELETE /v1/sessions/{id}          → 204 (releases anything held)
+DELETE /v1/sessions/{id}          → 204 (releases anything held; 503 if cleanup cannot advance fences)
 POST   /v1/sessions/{id}/ping     → 204 (refreshes idle timer)
 ```
 
@@ -35,7 +35,8 @@ Carry the session ID on every lock-modifying request via
 Sessions die in three ways:
 
 1. **Explicit `DELETE`.** Synchronous; held tokens are released
-   before the response returns.
+   before the response returns. If cleanup cannot allocate a fence for
+   the next waiter, the response is `503 fence_persistence`.
 2. **Idle timeout.** A background sweeper reaps any session whose
    `lastSeen` falls behind 2× `--http-session-idle-timeout`.
    In-flight handlers are immune for the duration of the request.

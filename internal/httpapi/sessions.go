@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,8 @@ type SessionStore struct {
 	cancel context.CancelFunc
 
 	sweeperDone chan struct{}
+	cleanupConn func(uint64) error
+	log         *slog.Logger
 }
 
 // Errors returned to handlers.
@@ -126,8 +129,11 @@ var (
 )
 
 // NewSessionStore creates a store and starts its idle sweeper.
-func NewSessionStore(parent context.Context, srv *server.Server, idleTimeout time.Duration, max, maxPerIP int) *SessionStore {
+func NewSessionStore(parent context.Context, srv *server.Server, idleTimeout time.Duration, max, maxPerIP int, log *slog.Logger) *SessionStore {
 	ctx, cancel := context.WithCancel(parent)
+	if log == nil {
+		log = slog.Default()
+	}
 	st := &SessionStore{
 		srv:         srv,
 		idleTimeout: idleTimeout,
@@ -138,6 +144,8 @@ func NewSessionStore(parent context.Context, srv *server.Server, idleTimeout tim
 		ctx:         ctx,
 		cancel:      cancel,
 		sweeperDone: make(chan struct{}),
+		cleanupConn: srv.LockManager().CleanupConnection,
+		log:         log,
 	}
 	go st.sweeperLoop()
 	return st
@@ -157,8 +165,7 @@ func (st *SessionStore) Shutdown() {
 	st.mu.Unlock()
 
 	for _, s := range sessions {
-		s.sealAndDrain()
-		st.srv.LockManager().CleanupConnection(s.ConnID)
+		st.closeAndLogCleanup(s)
 	}
 	<-st.sweeperDone
 }
@@ -269,8 +276,7 @@ func (st *SessionStore) Delete(id string) error {
 		return ErrSessionGone
 	}
 	s.sealAndDrain()
-	st.srv.LockManager().CleanupConnection(s.ConnID)
-	return nil
+	return st.cleanupSession(s)
 }
 
 // Count returns the number of active sessions.
@@ -338,9 +344,30 @@ func (st *SessionStore) sweepOnce(now time.Time) {
 	}
 	doomed := st.collectIdleSessions(now.Add(-2 * st.idleTimeout))
 	for _, s := range doomed {
-		s.sealAndDrain()
-		st.srv.LockManager().CleanupConnection(s.ConnID)
+		st.closeAndLogCleanup(s)
 	}
+}
+
+func (st *SessionStore) closeAndLogCleanup(s *Session) {
+	if err := st.closeSession(s); err != nil {
+		st.logCleanupErr(s, err)
+	}
+}
+
+func (st *SessionStore) closeSession(s *Session) error {
+	s.sealAndDrain()
+	return st.cleanupSession(s)
+}
+
+func (st *SessionStore) cleanupSession(s *Session) error {
+	if st.cleanupConn == nil {
+		return nil
+	}
+	return st.cleanupConn(s.ConnID)
+}
+
+func (st *SessionStore) logCleanupErr(s *Session, err error) {
+	st.log.Error("session cleanup failed", "session_id", s.ID, "conn_id", s.ConnID, "err", err)
 }
 
 // collectIdleSessions removes every reapable session from the map

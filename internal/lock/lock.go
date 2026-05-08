@@ -236,6 +236,15 @@ func (lm *LockManager) evictExpired(sh *shard, key string, st *ResourceState) er
 	return nil
 }
 
+// grantQueuedIfCapacity retries waiter promotion when a prior grantNext
+// failed after capacity had already been freed. Caller holds sh.mu.
+func (lm *LockManager) grantQueuedIfCapacity(sh *shard, key string, st *ResourceState) error {
+	if len(st.Holders) >= st.Limit || st.waiterCount() == 0 {
+		return nil
+	}
+	return lm.grantNext(sh, key, st)
+}
+
 // Acquire is the single-phase acquire, used by the "l" and "sl"
 // protocol commands. Returns the granted token on success, or one of:
 //
@@ -279,6 +288,10 @@ func (lm *LockManager) acquireLockShard(sh *shard, key string, limit int) (*Reso
 	}
 	st.LastActivity = time.Now()
 	if err := lm.evictExpired(sh, key, st); err != nil {
+		sh.mu.Unlock()
+		return nil, err
+	}
+	if err := lm.grantQueuedIfCapacity(sh, key, st); err != nil {
 		sh.mu.Unlock()
 		return nil, err
 	}
@@ -446,6 +459,9 @@ func (lm *LockManager) Enqueue(key string, leaseTTL time.Duration, connID uint64
 	if err := lm.evictExpired(sh, key, st); err != nil {
 		return "", "", 0, err
 	}
+	if err := lm.grantQueuedIfCapacity(sh, key, st); err != nil {
+		return "", "", 0, err
+	}
 	return lm.enqueueOnto(sh, st, eqKey, key, connID, leaseTTL)
 }
 
@@ -503,9 +519,30 @@ func (lm *LockManager) Wait(ctx context.Context, key string, timeout time.Durati
 	if es.token != "" {
 		return lm.consumePreGrantedToken(sh, eqKey, key, connID, es)
 	}
+	if err := lm.grantQueuedWaiterIfCapacity(sh, key, es); err != nil && es.token == "" {
+		sh.mu.Unlock()
+		return "", 0, err
+	}
+	if es.token != "" {
+		return lm.consumePreGrantedToken(sh, eqKey, key, connID, es)
+	}
 	leaseTTL, w := es.leaseTTL, es.waiter
 	sh.mu.Unlock()
 	return lm.waitQueuedGrant(ctx, sh, eqKey, key, w, leaseTTL, timeout)
+}
+
+// grantQueuedWaiterIfCapacity gives Wait itself a chance to recover a
+// free-capacity/queued-waiter state left by a prior persistence error.
+// Caller holds sh.mu.
+func (lm *LockManager) grantQueuedWaiterIfCapacity(sh *shard, key string, es *enqueuedState) error {
+	if es.waiter == nil {
+		return nil
+	}
+	st := sh.resources[key]
+	if st == nil {
+		return nil
+	}
+	return lm.grantQueuedIfCapacity(sh, key, st)
 }
 
 // loadEnqueuedStateLocked locks sh.mu and returns the enqueued state

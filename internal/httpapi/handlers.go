@@ -123,7 +123,11 @@ func writeCreateSessionErr(w http.ResponseWriter, err error) {
 
 func (h *httpServer) handleDeleteSession(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.sessions.Delete(id); err != nil {
-		writeError(w, http.StatusGone, "session_gone", "")
+		if errors.Is(err, ErrSessionGone) {
+			writeError(w, http.StatusGone, "session_gone", "")
+			return
+		}
+		writeLockErr(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

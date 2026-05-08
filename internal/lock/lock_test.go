@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"regexp"
 	"sort"
 	"sync"
@@ -99,6 +100,59 @@ func TestAcquire_SecondCallerWaits(t *testing.T) {
 	}
 }
 
+func TestAcquire_RetriesPromotionAfterReleaseGrantError(t *testing.T) {
+	lm := newTestManager(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tok1, err := lm.Acquire(ctx, "k", time.Second, 5*time.Second, 1, 1)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	gotCh := make(chan acquireResult, 1)
+	go func() {
+		tok, err := lm.Acquire(ctx, "k", 5*time.Second, 5*time.Second, 2, 1)
+		gotCh <- acquireResult{token: tok, err: err}
+	}()
+	waitForWaiters(t, lm, "k", 1)
+
+	lm.fenceAlloc.counter.Store(math.MaxUint64)
+	ok, err := lm.Release("k", tok1)
+	if !ok {
+		t.Fatal("release returned false")
+	}
+	if !errors.Is(err, ErrFencePersistence) {
+		t.Fatalf("release error = %v, want ErrFencePersistence", err)
+	}
+
+	lm.fenceAlloc.counter.Store(uint64(time.Now().UnixNano()))
+	lm.fenceAlloc.ceiling.Store(math.MaxUint64)
+	tok3, err := lm.Acquire(ctx, "k", 20*time.Millisecond, 5*time.Second, 3, 1)
+	if err != nil {
+		t.Fatalf("trigger acquire: %v", err)
+	}
+	if tok3 != "" {
+		t.Fatalf("trigger acquire jumped the queue with token %q", tok3)
+	}
+
+	select {
+	case got := <-gotCh:
+		if got.err != nil {
+			t.Fatalf("queued acquire: %v", got.err)
+		}
+		if got.token == "" {
+			t.Fatal("queued acquire got empty token")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued acquire was not promoted after allocator recovered")
+	}
+}
+
+type acquireResult struct {
+	token string
+	err   error
+}
+
 func TestAcquire_FIFOOrdering(t *testing.T) {
 	lm := newTestManager(t, true)
 	ctx := context.Background()
@@ -153,6 +207,29 @@ func (lm *LockManager) resetLeasesForTest(key string) {
 			h.leaseExpires = past
 		}
 	}
+}
+
+func waitForWaiters(t *testing.T, lm *LockManager, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if waiterCountForTest(lm, key) == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("waiter count for %q did not reach %d; got %d", key, want, waiterCountForTest(lm, key))
+}
+
+func waiterCountForTest(lm *LockManager, key string) int {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil {
+		return 0
+	}
+	return st.waiterCount()
 }
 
 // ---------------------------------------------------------------------------
