@@ -31,11 +31,33 @@ deadline. The default is large enough for human typing during ad-hoc
 | `--gc-max-idle` | `DFLOCKD_GC_MAX_IDLE_S` | `60` | Idle seconds before a no-holder, no-waiter resource is GCed |
 | `--max-locks` | `DFLOCKD_MAX_LOCKS` | `1024` | Cluster-wide cap on unique active keys |
 | `--max-waiters` | `DFLOCKD_MAX_WAITERS` | `0` | Per-key waiter cap (0 = unlimited) |
+| `--fence-state-file` | `DFLOCKD_FENCE_STATE_FILE` | *(unset)* | Path to the fence-counter state file (8-byte uint64). Empty = best-effort wall-clock seeding. Set for strict cross-restart fencing — see [protocol → token format](architecture/protocol.md#token-format). |
 
 `--max-locks` is the global cap on resource state. Once it's hit,
 new keys return `error_max_locks` even on the fast path. Idle
 resources (no holders, no waiters) are GCed after `--gc-max-idle`,
 so the cap is a steady-state limit, not a high-water mark.
+
+### Fence state file
+
+Without `--fence-state-file`, the fencing prefix in every issued
+token starts from `time.Now().UnixNano()` at boot — strictly
+monotonic across restarts only as long as the wall clock doesn't
+regress.
+
+With `--fence-state-file=/path`, dflockd pre-allocates fence
+ranges to disk: each ~1M grants triggers one `fsync(2)` of an
+8-byte file. After a crash, the next instance reads the persisted
+ceiling (which is always ≥ any fence ever issued) and seeds above
+it. Up to ~1M fence values are skipped per restart, but
+monotonicity is preserved unconditionally.
+
+Measured overhead vs. the in-memory path is ~0.4% (Apple M1,
+single-threaded, `BenchmarkNewToken_*` in `internal/lock/`). The
+file is created if missing, must be 8 bytes if present, and
+resides in a directory the dflockd user can write. On clean
+shutdown the file is closed (FD released); the durable state is
+already on disk at that point.
 
 ## TLS and authentication
 

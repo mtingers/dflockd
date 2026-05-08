@@ -216,9 +216,15 @@ Caveats:
 - A `Limit>1` semaphore issues a distinct fence per grant; fencing
   orders the *grants*, not the resource. The classic single-writer
   fencing pattern doesn't directly apply.
-- Cross-restart monotonicity assumes wall clock doesn't regress
-  across the restart. Pair dflockd with NTP and don't manually
-  rewind the clock.
+- Cross-restart monotonicity by default depends on the wall clock
+  not regressing across the restart (NTP step, VM snapshot, manual
+  change). For unconditional cross-restart monotonicity even
+  through crashes and clock regressions, run with
+  `--fence-state-file=/path`: dflockd pre-allocates fence ranges
+  to disk (one `fsync` per ~1M grants, ~0.4% overhead). The next
+  instance reads the persisted ceiling and seeds above it, so the
+  first fence it issues is strictly greater than any fence the
+  prior incarnation could ever have issued.
 - Tokens are not cryptographically signed. Treat the auth + TLS
   layer as the boundary that protects token confidentiality.
 

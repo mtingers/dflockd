@@ -35,6 +35,7 @@ type Config struct {
 	GCMaxIdleTime      time.Duration
 	MaxLocks           int
 	MaxWaiters         int
+	FenceStateFile     string
 
 	// HTTP API (HTTPPort=0 disables).
 	HTTPPort                int
@@ -107,6 +108,7 @@ type flagPtrs struct {
 	host, tlsCert, tlsKey                           *string
 	authToken, authTokenFile                        *string
 	httpHost, httpCORSOrigins                       *string
+	fenceStateFile                                  *string
 	port, maxLocks                                  *int
 	maxConnections, maxConnectionsPerIP, maxWaiters *int
 	defaultLeaseTTL, leaseSweepInterval             *int
@@ -138,6 +140,7 @@ func defineStringFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.authTokenFile = fs.String("auth-token-file", "", "Path to file containing the auth token (one line)")
 	f.httpHost = fs.String("http-host", "", "HTTP API bind address (defaults to --host)")
 	f.httpCORSOrigins = fs.String("http-cors-allowed-origins", "", "Comma-separated allowed CORS origins for the HTTP API (empty = disabled)")
+	f.fenceStateFile = fs.String("fence-state-file", "", "Path to the fence-counter state file. Set to enable strict cross-restart fencing-token monotonicity (one fsync per ~1M grants). Empty = best-effort wall-clock seeding.")
 }
 
 func defineIntFlags(fs *flag.FlagSet, f *flagPtrs) {
@@ -195,6 +198,7 @@ func stringResolvers(f *flagPtrs) []stringResolver {
 		{"tls-cert", "DFLOCKD_TLS_CERT", f.tlsCert, func(c *Config, v string) { c.TLSCert = v }},
 		{"tls-key", "DFLOCKD_TLS_KEY", f.tlsKey, func(c *Config, v string) { c.TLSKey = v }},
 		{"http-host", "DFLOCKD_HTTP_HOST", f.httpHost, func(c *Config, v string) { c.HTTPHost = v }},
+		{"fence-state-file", "DFLOCKD_FENCE_STATE_FILE", f.fenceStateFile, func(c *Config, v string) { c.FenceStateFile = v }},
 	}
 }
 

@@ -40,7 +40,12 @@ func newTCPTestRuntime(t *testing.T, cfg *config.Config) *tcpTestRuntime {
 	configureTCPListener(cfg, listener)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx, cancel := context.WithCancel(context.Background())
-	srv := New(lock.NewLockManager(cfg, log), cfg, log)
+	lm, err := lock.NewLockManager(cfg, log)
+	if err != nil {
+		t.Fatalf("NewLockManager: %v", err)
+	}
+	t.Cleanup(func() { lm.Close() })
+	srv := New(lm, cfg, log)
 	return &tcpTestRuntime{listener: listener, ctx: ctx, cancel: cancel, done: make(chan struct{}), addr: listener.Addr().String(), srv: srv}
 }
 

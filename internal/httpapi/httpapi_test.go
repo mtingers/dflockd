@@ -46,7 +46,7 @@ func newHTTPTestRuntime(t *testing.T, mods ...func(*config.Config)) *httpTestRun
 	tcpL, httpL := testHTTPListeners(t, cfg)
 	log := discardLogger()
 	ctx, cancel := context.WithCancel(context.Background())
-	return &httpTestRuntime{cfg: cfg, log: log, srv: testTCPServer(cfg, log), tcpL: tcpL, httpL: httpL, ctx: ctx, cancel: cancel, tcpDone: make(chan struct{}), httpDone: make(chan struct{}), base: httpBase(cfg)}
+	return &httpTestRuntime{cfg: cfg, log: log, srv: testTCPServer(t, cfg, log), tcpL: tcpL, httpL: httpL, ctx: ctx, cancel: cancel, tcpDone: make(chan struct{}), httpDone: make(chan struct{}), base: httpBase(cfg)}
 }
 
 func testHTTPConfig(mods ...func(*config.Config)) *config.Config {
@@ -79,8 +79,14 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func testTCPServer(cfg *config.Config, log *slog.Logger) *server.Server {
-	return server.New(lock.NewLockManager(cfg, log), cfg, log)
+func testTCPServer(t *testing.T, cfg *config.Config, log *slog.Logger) *server.Server {
+	t.Helper()
+	lm, err := lock.NewLockManager(cfg, log)
+	if err != nil {
+		t.Fatalf("NewLockManager: %v", err)
+	}
+	t.Cleanup(func() { lm.Close() })
+	return server.New(lm, cfg, log)
 }
 
 func httpBase(cfg *config.Config) string {

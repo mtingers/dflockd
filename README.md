@@ -84,7 +84,9 @@ tok, _, _ := client.Acquire(c, "row:42", 5*time.Second)
 fence, _ := client.FenceFromToken(tok)        // uint64 — pass to your DB / blob store
 ```
 
-Fences are per-server-instance: each dflockd process is the source of truth for the keys clients route to it (CRC32 sharding). Caveats: tokens for *different* keys aren't meaningfully ordered against each other; a `Limit>1` semaphore issues a distinct fence per grant, not per resource; and cross-restart monotonicity assumes the wall clock doesn't regress between processes.
+Fences are per-server-instance: each dflockd process is the source of truth for the keys clients route to it (CRC32 sharding). Caveats: tokens for *different* keys aren't meaningfully ordered against each other; a `Limit>1` semaphore issues a distinct fence per grant, not per resource.
+
+By default cross-restart monotonicity comes from seeding the counter with `time.Now().UnixNano()`, which holds *as long as the wall clock doesn't regress* across the restart (NTP step, VM snapshot, manual change). For strict monotonicity even across crashes and clock regressions, set `--fence-state-file=/path`: dflockd pre-allocates fence ranges to disk (one fsync per ~1M grants — measured ~0.4% overhead vs. the in-memory path), and the next instance always seeds above the highest value the prior one could ever have issued. The file is 8 bytes; default off preserves the "single binary, zero deps" promise.
 
 ## Performance
 
@@ -118,6 +120,7 @@ CLI flags take precedence over environment variables. The full table is in the [
 | `--tls-cert` / `--tls-key` | `DFLOCKD_TLS_CERT` / `_KEY` | *(unset)* | Enable TLS on both listeners |
 | `--auth-token-file` | `DFLOCKD_AUTH_TOKEN_FILE` | *(unset)* | Shared-secret auth token |
 | `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release tokens on disconnect |
+| `--fence-state-file` | `DFLOCKD_FENCE_STATE_FILE` | *(unset)* | Path to fence-counter state file. Set for strict cross-restart fencing-token monotonicity (~0.4% perf cost). |
 
 ## Client libraries
 

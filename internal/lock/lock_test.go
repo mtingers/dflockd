@@ -17,7 +17,12 @@ import (
 
 func newTestManager(t *testing.T, autoRelease bool) *LockManager {
 	t.Helper()
-	return NewLockManager(testManagerConfig(autoRelease), discardLockLogger())
+	lm, err := NewLockManager(testManagerConfig(autoRelease), discardLockLogger())
+	if err != nil {
+		t.Fatalf("NewLockManager: %v", err)
+	}
+	t.Cleanup(func() { lm.Close() })
+	return lm
 }
 
 func testManagerConfig(autoRelease bool) *config.Config {
@@ -790,6 +795,72 @@ func TestShardIndex_Distribution(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+func BenchmarkNewToken_InMemory(b *testing.B) {
+	cfg := testManagerConfig(true)
+	lm, err := NewLockManager(cfg, discardLockLogger())
+	if err != nil {
+		b.Fatalf("NewLockManager: %v", err)
+	}
+	defer lm.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = lm.newToken()
+	}
+}
+
+func BenchmarkNewToken_PersistedFence(b *testing.B) {
+	cfg := testManagerConfig(true)
+	cfg.FenceStateFile = b.TempDir() + "/fence"
+	lm, err := NewLockManager(cfg, discardLockLogger())
+	if err != nil {
+		b.Fatalf("NewLockManager: %v", err)
+	}
+	defer lm.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = lm.newToken()
+	}
+}
+
+func BenchmarkNewToken_InMemoryParallel(b *testing.B) {
+	cfg := testManagerConfig(true)
+	lm, err := NewLockManager(cfg, discardLockLogger())
+	if err != nil {
+		b.Fatalf("NewLockManager: %v", err)
+	}
+	defer lm.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = lm.newToken()
+		}
+	})
+}
+
+func BenchmarkNewToken_PersistedFenceParallel(b *testing.B) {
+	cfg := testManagerConfig(true)
+	cfg.FenceStateFile = b.TempDir() + "/fence"
+	lm, err := NewLockManager(cfg, discardLockLogger())
+	if err != nil {
+		b.Fatalf("NewLockManager: %v", err)
+	}
+	defer lm.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = lm.newToken()
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Token format and fencing-prefix monotonicity
 // ---------------------------------------------------------------------------
 
@@ -884,6 +955,44 @@ func TestToken_SaltDistinct(t *testing.T) {
 			t.Fatalf("duplicate salt %s at iteration %d", salt, i)
 		}
 		salts[salt] = struct{}{}
+	}
+}
+
+// TestLockManager_FenceFile_StrictRestartMonotonic exercises the
+// end-to-end strict-fencing path: with --fence-state-file set, a
+// second LockManager built on the same file always issues tokens
+// whose fence prefix exceeds anything the first one issued, even
+// when the first issued many tokens (i.e., the prior ceiling was
+// extended past the initial seed).
+func TestLockManager_FenceFile_StrictRestartMonotonic(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testManagerConfig(true)
+	cfg.FenceStateFile = dir + "/fence"
+
+	lm1, err := NewLockManager(cfg, discardLockLogger())
+	if err != nil {
+		t.Fatalf("first manager: %v", err)
+	}
+	var maxPrefix string
+	for i := 0; i < 5000; i++ { // > DefaultFenceRangeSize triggers no extends, but exercises the path
+		tok := lm1.newToken()
+		if tok[:16] > maxPrefix {
+			maxPrefix = tok[:16]
+		}
+	}
+	if err := lm1.Close(); err != nil {
+		t.Fatalf("close lm1: %v", err)
+	}
+
+	lm2, err := NewLockManager(cfg, discardLockLogger())
+	if err != nil {
+		t.Fatalf("second manager: %v", err)
+	}
+	defer lm2.Close()
+	tok := lm2.newToken()
+	if tok[:16] <= maxPrefix {
+		t.Fatalf("second-manager prefix %s not greater than first-manager max %s",
+			tok[:16], maxPrefix)
 	}
 }
 

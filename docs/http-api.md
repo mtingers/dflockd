@@ -146,6 +146,12 @@ bits of unguessability.
 The Go client exposes `client.FenceFromToken(token) (uint64, error)`
 to extract the fence as a typed integer.
 
+By default the prefix is seeded from `time.Now().UnixNano()` at
+boot — strictly monotonic across restarts only while the wall
+clock does not regress. Run dflockd with `--fence-state-file=/path`
+for unconditional cross-restart monotonicity (one fsync per ~1M
+grants, ~0.4% overhead). See [server config](server.md#fence-state-file).
+
 ## Authentication
 
 When `--auth-token` is set, every request except `/health` and

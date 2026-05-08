@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--fence-state-file` for strict cross-restart fencing.** When set, dflockd pre-allocates fence ranges to a small (8-byte) state file via fsync — one fsync per ~1M grants. After a crash or clean restart, the new instance always seeds above the highest fence the prior instance could have issued, regardless of wall-clock regression. Default off preserves the "single binary, zero deps" promise. Measured overhead: 42.96 ns/op vs. 42.79 ns/op for the in-memory path (Apple M1, `BenchmarkNewToken_*`). Up to ~1M fence values are skipped per restart but monotonicity holds unconditionally.
+- **`LockManager.Close()`** to release the fence state file (no-op when persistence is disabled). `cmd/dflockd` calls it on graceful shutdown.
+
 ### Changed
 
-- **Lock tokens are now usable as fencing tokens.** The 32-char hex format is unchanged, but the layout is: first 16 chars are a server-monotonic uint64 (big-endian) seeded from `time.Now().UnixNano()` at startup, last 16 chars are random salt. The prefix strictly increases on every grant — including across server restarts on a non-regressing wall clock — so a downstream resource can store the most recent token it has observed for a key and reject any write whose token compares lexicographically less. Existing clients are unaffected (tokens were already opaque). New helper: `client.FenceFromToken(token) (uint64, error)`. OpenAPI tightened the lock-token pattern from `^\S+$` to `^[0-9a-f]{32}$` on `ReleaseRequest`, `RenewRequest`, and `OpResponse.token`. See README "Fencing tokens".
+- **Lock tokens are now usable as fencing tokens.** The 32-char hex format is unchanged, but the layout is: first 16 chars are a server-monotonic uint64 (big-endian), last 16 chars are random salt. The prefix strictly increases on every grant. Without `--fence-state-file`, the counter seeds from `time.Now().UnixNano()` at startup (cross-restart monotonicity is best-effort, dependent on wall-clock not regressing). With it, monotonicity is strict (see Added). Existing clients are unaffected (tokens were already opaque). New helper: `client.FenceFromToken(token) (uint64, error)`. OpenAPI tightened the lock-token pattern from `^\S+$` to `^[0-9a-f]{32}$` on `ReleaseRequest`, `RenewRequest`, and `OpResponse.token`. See README "Fencing tokens".
+- **`lock.NewLockManager` now returns `(*LockManager, error)`.** Persistent fence state opens a file at startup; failure to open or perform the initial fsync is a startup error rather than a silent fallback.
 
 ## [v2.0.1] - 2026-05-05
 

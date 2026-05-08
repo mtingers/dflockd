@@ -44,7 +44,13 @@ func mustLoadConfig() *config.Config {
 // and returns the process exit code.
 func run(cfg *config.Config) int {
 	log := newLogger(cfg.Debug)
-	srv := server.New(lock.NewLockManager(cfg, log), cfg, log)
+	lm, err := lock.NewLockManager(cfg, log)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lock manager init failed: %v\n", err)
+		return 1
+	}
+	defer lm.Close()
+	srv := server.New(lm, cfg, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	return runAll(ctx, srv, cfg, log, cancel)

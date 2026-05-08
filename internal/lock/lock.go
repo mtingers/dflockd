@@ -44,20 +44,32 @@ type LockManager struct {
 	cfg           *config.Config
 	log           *slog.Logger
 	randBuf       randBuf
-	// fenceCounter is the source of the lex-sortable prefix encoded in
-	// every issued token. Seeded at startup with time.Now().UnixNano()
-	// so values keep advancing across server restarts on a sane clock.
-	fenceCounter atomic.Uint64
+	// fenceAlloc is the source of the lex-sortable prefix encoded in
+	// every issued token. With cfg.FenceStateFile set, ranges are
+	// pre-allocated to disk so cross-restart monotonicity holds even
+	// across crashes and clock regressions.
+	fenceAlloc *fenceAllocator
 }
 
 // NewLockManager creates a LockManager bound to the given config.
-func NewLockManager(cfg *config.Config, log *slog.Logger) *LockManager {
-	lm := &LockManager{cfg: cfg, log: log, randBuf: newRandBuf()}
-	lm.fenceCounter.Store(uint64(time.Now().UnixNano()))
+// Returns an error only if persistence is enabled and the state
+// file cannot be opened or initial range cannot be persisted.
+func NewLockManager(cfg *config.Config, log *slog.Logger) (*LockManager, error) {
+	fa, err := newFenceAllocator(cfg.FenceStateFile, uint64(time.Now().UnixNano()), DefaultFenceRangeSize)
+	if err != nil {
+		return nil, err
+	}
+	lm := &LockManager{cfg: cfg, log: log, randBuf: newRandBuf(), fenceAlloc: fa}
 	for i := range lm.shards {
 		lm.shards[i].init()
 	}
-	return lm
+	return lm, nil
+}
+
+// Close releases the fence state file when persistence is enabled.
+// Safe to call multiple times; safe on a manager without persistence.
+func (lm *LockManager) Close() error {
+	return lm.fenceAlloc.close()
 }
 
 // shardIndex hashes key with FNV-1a (32-bit) and reduces to a shard
@@ -83,7 +95,7 @@ func (lm *LockManager) shardFor(key string) *shard {
 // token — lex-comparing two tokens for the same key reflects the
 // order their grants were issued.
 func (lm *LockManager) newToken() string {
-	return encodeToken(lm.fenceCounter.Add(1), lm.saltBytes())
+	return encodeToken(lm.fenceAlloc.next(), lm.saltBytes())
 }
 
 // saltBytes draws 8 unguessable bytes for a token's random suffix.
