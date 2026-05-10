@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -199,6 +200,10 @@ func (fa *fenceAllocator) close() error {
 	fa.mu.Lock()
 	defer fa.mu.Unlock()
 	if fa.f == nil {
+		// Either already closed, or a memory-only allocator — in the
+		// latter case `closed` is intentionally left false because the
+		// only reader (nextSlow) is unreachable when ceiling is pinned
+		// at MaxUint64.
 		return nil
 	}
 	f := fa.f
@@ -324,7 +329,7 @@ func readFenceRecord(f fenceRecordReader, offset int64) (fenceRecord, bool, erro
 }
 
 func decodeFenceRecord(buf [fenceRecordSize]byte) (fenceRecord, bool) {
-	if string(buf[:8]) != string(fenceRecordMagic[:]) {
+	if !bytes.Equal(buf[:8], fenceRecordMagic[:]) {
 		return fenceRecord{}, false
 	}
 	got := binary.BigEndian.Uint64(buf[24:32])

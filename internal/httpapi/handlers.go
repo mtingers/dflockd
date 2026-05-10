@@ -364,7 +364,7 @@ func (h *httpServer) renderAcquireOutcome(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if r.Context().Err() != nil {
-		h.cleanupCanceledGrant(prefix, key, tok)
+		h.bestEffortRelease(prefix+key, tok)
 		return
 	}
 	renderToken(w, "ok", tok, int(leaseTTL.Seconds()))
@@ -392,7 +392,7 @@ func (h *httpServer) renderWaitOutcome(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	if r.Context().Err() != nil {
-		_, _ = h.sessions.LockManager().Release(prefixedKey, tok)
+		h.bestEffortRelease(prefixedKey, tok)
 		return
 	}
 	renderToken(w, "ok", tok, leaseSec)
@@ -425,18 +425,12 @@ func renderToken(w http.ResponseWriter, status, tok string, leaseSec int) {
 	writeJSON(w, http.StatusOK, opResponse{Status: status, Token: tok, LeaseTTLS: leaseSec})
 }
 
-// cleanupCanceledGrant releases a token whose owner disconnected
-// before we could write the response.
-func (h *httpServer) cleanupCanceledGrant(prefix, key, tok string) {
-	_, _ = h.sessions.LockManager().Release(prefix+key, tok)
-}
-
 // cleanupCanceledEnqueue handles both the "acquired fast path" and the
 // "queued + then promoted" cleanup variants.
 func (h *httpServer) cleanupCanceledEnqueue(s *Session, prefix, key, status, tok string) {
 	switch status {
 	case "acquired":
-		_, _ = h.sessions.LockManager().Release(prefix+key, tok)
+		h.bestEffortRelease(prefix+key, tok)
 	case "queued":
 		h.dequeueAfterPromote(s, prefix, key)
 	}
@@ -446,9 +440,22 @@ func (h *httpServer) cleanupCanceledEnqueue(s *Session, prefix, key, status, tok
 // promoted between Enqueue and now, Wait returns the granted token;
 // release it instead of stranding the slot.
 func (h *httpServer) dequeueAfterPromote(s *Session, prefix, key string) {
-	cleanupTok, _, _ := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
+	cleanupTok, _, err := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
+	if err != nil {
+		h.log.Warn("dequeue-after-promote wait failed", "key", prefix+key, "err", err)
+		return
+	}
 	if cleanupTok != "" {
-		_, _ = h.sessions.LockManager().Release(prefix+key, cleanupTok)
+		h.bestEffortRelease(prefix+key, cleanupTok)
+	}
+}
+
+// bestEffortRelease releases a token on a cleanup path that has no
+// response left to write. A failure here (e.g. fence persistence) is
+// logged so operators see it; the lease-expiry sweep reclaims the slot.
+func (h *httpServer) bestEffortRelease(prefixedKey, tok string) {
+	if _, err := h.sessions.LockManager().Release(prefixedKey, tok); err != nil {
+		h.log.Warn("best-effort release failed", "key", prefixedKey, "err", err)
 	}
 }
 
