@@ -268,3 +268,59 @@ func TestLoad_CORS(t *testing.T) {
 		}
 	}
 }
+
+func TestUnboundedLimitWarnings(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     *Config
+		wantAny bool
+		wantNot []string // substrings that must NOT appear
+	}{
+		{
+			name:    "loopback host stays quiet even with everything unbounded",
+			cfg:     &Config{Host: "127.0.0.1"},
+			wantAny: false,
+		},
+		{
+			name:    "loopback host with HTTP on loopback stays quiet",
+			cfg:     &Config{Host: "localhost", HTTPPort: 6389, HTTPHost: "::1"},
+			wantAny: false,
+		},
+		{
+			name:    "non-loopback host warns about TCP limits",
+			cfg:     &Config{Host: "0.0.0.0"},
+			wantAny: true,
+			wantNot: []string{"http"},
+		},
+		{
+			name:    "non-loopback host with HTTP warns about HTTP limits too",
+			cfg:     &Config{Host: "10.0.0.1", HTTPPort: 6389},
+			wantAny: true,
+		},
+		{
+			name: "fully-bounded non-loopback config stays quiet",
+			cfg: &Config{
+				Host: "0.0.0.0", MaxConnections: 100, MaxConnectionsPerIP: 10, MaxWaiters: 50,
+				HTTPPort: 6389, HTTPMaxSessions: 100, HTTPMaxConnectionsPerIP: 10, HTTPRateLimitPerIP: 100,
+			},
+			wantAny: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := c.cfg.UnboundedLimitWarnings()
+			if c.wantAny && len(got) == 0 {
+				t.Fatalf("got no warnings, want at least one")
+			}
+			if !c.wantAny && len(got) != 0 {
+				t.Fatalf("got warnings %v, want none", got)
+			}
+			joined := strings.ToLower(strings.Join(got, " "))
+			for _, sub := range c.wantNot {
+				if strings.Contains(joined, sub) {
+					t.Errorf("warnings %v unexpectedly mention %q", got, sub)
+				}
+			}
+		})
+	}
+}

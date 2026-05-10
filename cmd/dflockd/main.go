@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,6 +45,10 @@ func mustLoadConfig() *config.Config {
 // and returns the process exit code.
 func run(cfg *config.Config) int {
 	log := newLogger(cfg.Debug)
+	if unbounded := cfg.UnboundedLimitWarnings(); len(unbounded) > 0 {
+		log.Warn("running without one or more resource limits set; not recommended when reachable by untrusted clients",
+			"unset", strings.Join(unbounded, " "))
+	}
 	lm, err := lock.NewLockManager(cfg, log)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lock manager init failed: %v\n", err)

@@ -121,8 +121,10 @@ func TestAcquire_RetriesPromotionAfterReleaseGrantError(t *testing.T) {
 	if !ok {
 		t.Fatal("release returned false")
 	}
-	if !errors.Is(err, ErrFencePersistence) {
-		t.Fatalf("release error = %v, want ErrFencePersistence", err)
+	// Release succeeds even though promoting the queued waiter failed
+	// (that's logged, not returned); the waiter is recovered below.
+	if err != nil {
+		t.Fatalf("release error = %v, want nil", err)
 	}
 
 	lm.fenceAlloc.counter.Store(uint64(time.Now().UnixNano()))

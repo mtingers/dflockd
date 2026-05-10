@@ -144,7 +144,10 @@ When `--http-port` is set:
   with HTTP 503 during graceful shutdown; otherwise
   `{"status":"ok"}`.
 - `GET /metrics` — Prometheus exposition. Includes per-route
-  request counts/durations and lock-manager gauges.
+  request counts/durations and lock-manager gauges. Unlike `/health`
+  and `/ready`, this endpoint is **not** exempt from `--auth-token` or
+  `--http-rate-limit-per-ip`, so a scraper needs the bearer token (when
+  configured) and must stay under the rate limit.
 - `GET /v1/openapi.json` — unauthenticated. Serves the embedded
   OpenAPI 3.1 spec for codegen tools.
 

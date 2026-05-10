@@ -152,11 +152,93 @@ func waitStopped(t *testing.T, name string, done <-chan struct{}) {
 // runHTTPOnListener mirrors Run but takes a pre-listening listener so
 // tests can pick a random port.
 func runHTTPOnListener(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger, listener net.Listener) error {
-	hs, startShutdown := buildHTTPServer(ctx, srv, cfg, log)
+	hs, shutdown := buildHTTPServer(ctx, srv, cfg, log)
 	defer hs.limiter.Stop()
 	srv.SetExtraConnCounter(func() int64 { return int64(hs.sessions.Count()) })
 	defer srv.SetExtraConnCounter(nil)
-	return hs.serveUntilDone(ctx, listener, startShutdown, 2*time.Second)
+	return hs.serveUntilDone(ctx, listener, shutdown, 2*time.Second)
+}
+
+func TestHTTP_ShutdownWaitsForSessionCleanup(t *testing.T) {
+	cfg := defaultTestConfig()
+	httpL := mustListenLocal(t)
+	cfg.HTTPPort = httpL.Addr().(*net.TCPAddr).Port
+	cfg.HTTPHost = "127.0.0.1"
+	log := discardLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hs, shutdown := buildHTTPServer(ctx, testTCPServer(t, cfg, log), cfg, log)
+	defer hs.limiter.Stop()
+
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	defer closeIfOpen(releaseCleanup)
+	hs.sessions.cleanupConn = func(uint64) error {
+		close(cleanupStarted)
+		<-releaseCleanup
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- hs.serveUntilDone(ctx, httpL, shutdown, 0) }()
+	waitHTTPReady(t, httpBase(cfg))
+	startedClient(t, httpBase(cfg))
+
+	cancel()
+	waitClosed(t, cleanupStarted, "session cleanup did not start")
+	assertNotStopped(t, done, "http server returned before session cleanup finished")
+	close(releaseCleanup)
+	waitHTTPDone(t, done)
+}
+
+func waitHTTPReady(t *testing.T, base string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if healthReady(base) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("http server did not become ready")
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+func assertNotStopped(t *testing.T, done <-chan error, msg string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("%s: %v", msg, err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func waitHTTPDone(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("http server returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("http server did not stop after session cleanup finished")
+	}
+}
+
+func closeIfOpen(ch chan struct{}) {
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
 }
 
 func defaultTestConfig() *config.Config {
@@ -1139,4 +1221,39 @@ func TestHTTP_MethodNotAllowedOnPostOnlyRoute(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET /v1/locks/{key}: status = %d, want 405", resp.StatusCode)
 	}
+}
+
+// TestHTTP_MetricsMethodCardinalityBounded checks that arbitrary HTTP
+// method tokens against an unmatched path don't become distinct
+// /metrics labels — they're bucketed as "OTHER" so the per-route
+// metrics map stays bounded.
+func TestHTTP_MetricsMethodCardinalityBounded(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+	c := newClient(t, base)
+
+	weird := []string{"WIBBLE1", "WIBBLE2", "QUUX9"}
+	for _, m := range weird {
+		c.do(c.request(m, "/no/such/route", nil)).Body.Close()
+	}
+
+	body := readBody(t, c.get("/metrics"))
+	for _, m := range weird {
+		if strings.Contains(body, m) {
+			t.Errorf("/metrics leaked unbounded method label %q:\n%s", m, body)
+		}
+	}
+	if !strings.Contains(body, `method="OTHER"`) {
+		t.Errorf("/metrics missing bucketed OTHER label:\n%s", body)
+	}
+}
+
+func readBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
 }

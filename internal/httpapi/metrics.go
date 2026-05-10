@@ -85,8 +85,26 @@ func (h *httpServer) withMetrics(mux *http.ServeMux, next http.Handler) http.Han
 		if status == 0 {
 			status = http.StatusOK
 		}
-		h.metrics.observe(r.Method, pattern, status, time.Since(start))
+		h.metrics.observe(normalizeMethod(r.Method), pattern, status, time.Since(start))
 	})
+}
+
+// knownMethods are the HTTP verbs we're willing to use as a metric
+// label. r.Method is whatever token the client put on the request line
+// — on an unmatched route an arbitrary verb flows straight to observe,
+// so without this clamp a client spraying distinct method strings could
+// grow metricsRegistry.requests without bound.
+var knownMethods = map[string]struct{}{
+	http.MethodGet: {}, http.MethodHead: {}, http.MethodPost: {},
+	http.MethodPut: {}, http.MethodPatch: {}, http.MethodDelete: {},
+	http.MethodConnect: {}, http.MethodOptions: {}, http.MethodTrace: {},
+}
+
+func normalizeMethod(m string) string {
+	if _, ok := knownMethods[m]; ok {
+		return m
+	}
+	return "OTHER"
 }
 
 // routePattern returns the path pattern that handled r, or

@@ -207,6 +207,11 @@ func (lm *LockManager) trySendGrant(ch chan<- string, token, key string, connID 
 	case ch <- token:
 		return true
 	default:
+		// Also meant to be unreachable: a queued waiter is dequeued the
+		// instant a grant is sent to it, so its channel is always empty
+		// here. Log loudly if that invariant ever breaks.
+		lm.log.Error("grant send skipped: waiter channel unexpectedly full",
+			"key", key, "conn_id", connID)
 		return false
 	}
 }
@@ -641,6 +646,12 @@ func finishWaitResult(token string, leaseTTL time.Duration, err error) (string, 
 
 // Release frees one held slot if (key, token) match. ok=false means
 // the token isn't held — the caller may have raced lease expiry.
+//
+// The error return exists for symmetry with Acquire/Enqueue but is
+// always nil today: the release itself never fails, and a failure
+// promoting the next waiter (only reachable with --fence-state-file set
+// and the disk failing) is logged, not surfaced — the freed slot has
+// its own recovery paths (the next op on the key, or the lease sweep).
 func (lm *LockManager) Release(key, token string) (ok bool, err error) {
 	sh := lm.shardFor(key)
 
@@ -665,13 +676,14 @@ func (lm *LockManager) Release(key, token string) (ok bool, err error) {
 	}
 	delete(st.Holders, token)
 	if err := lm.grantNext(sh, key, st); err != nil {
-		return true, err
+		lm.log.Error("release: granting next waiter failed", "key", key, "err", err)
 	}
 	return true, nil
 }
 
 // Renew extends the lease on a held slot by leaseTTL. Returns the new
-// remaining seconds and ok=true on success.
+// remaining seconds and ok=true on success. The error return is always
+// nil today (kept for symmetry with the other operations).
 func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bool, error) {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
@@ -682,9 +694,7 @@ func (lm *LockManager) Renew(key, token string, leaseTTL time.Duration) (int, bo
 		return 0, false, nil
 	}
 	if leaseHasExpired(h, time.Now()) {
-		if err := lm.rejectExpiredRenew(sh, st, key, token, h); err != nil {
-			return 0, false, err
-		}
+		lm.rejectExpiredRenew(sh, st, key, token, h)
 		return 0, false, nil
 	}
 	return extendLease(st, h, leaseTTL), true, nil
@@ -712,14 +722,17 @@ func leaseHasExpired(h *holder, now time.Time) bool {
 
 // rejectExpiredRenew evicts an expired holder, drops any stale
 // connEnqueued entry pointing at the same token, and grants the
-// freed slot to the next waiter. Caller holds sh.mu.
-func (lm *LockManager) rejectExpiredRenew(sh *shard, st *ResourceState, key, token string, h *holder) error {
+// freed slot to the next waiter. A grant failure is logged, not
+// returned: the renew was already going to fail. Caller holds sh.mu.
+func (lm *LockManager) rejectExpiredRenew(sh *shard, st *ResourceState, key, token string, h *holder) {
 	lm.log.Warn("renew rejected (already expired)", "key", key, "conn", h.connID)
 	sh.removeOwned(h.connID, key, token)
 	dropMatchingEnqueued(sh, h.connID, key, token)
 	delete(st.Holders, token)
 	st.LastActivity = time.Now()
-	return lm.grantNext(sh, key, st)
+	if err := lm.grantNext(sh, key, st); err != nil {
+		lm.log.Error("renew: granting next waiter after eviction failed", "key", key, "err", err)
+	}
 }
 
 // dropMatchingEnqueued removes the connEnqueued entry for (connID,

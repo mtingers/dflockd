@@ -55,9 +55,17 @@ type fenceRecord struct {
 // persistence and seeds from fallbackSeed; otherwise the file is
 // opened (or created) and the recovered ceiling is used, floored
 // by fallbackSeed for defence-in-depth against stale backups.
+//
+// Persistence is refused on platforms without exclusive file locking
+// (Windows and other non-Unix targets): without the lock, two
+// instances pointed at the same state file would silently corrupt the
+// journal — failing fast at startup is safer than that.
 func newFenceAllocator(stateFile string, fallbackSeed, rangeSize uint64) (*fenceAllocator, error) {
 	if stateFile == "" {
 		return newMemFenceAllocator(fallbackSeed), nil
+	}
+	if !fenceFileLocksSupported {
+		return nil, fmt.Errorf("%w: exclusive file locking is not supported on this platform; --fence-state-file requires a Unix-like OS", ErrFencePersistence)
 	}
 	if rangeSize == 0 {
 		return nil, fmt.Errorf("%w: range size must be > 0", ErrFencePersistence)

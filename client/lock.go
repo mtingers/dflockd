@@ -664,7 +664,11 @@ func (r *renewableResource) releaseHeldToken(ctx context.Context, key string, fn
 
 // Lock owns a single distributed lock.
 type Lock struct {
-	Key            string
+	Key string
+	// AcquireTimeout bounds how long Acquire/Wait blocks. The zero
+	// value means 10s, NOT a non-blocking poll; the wire is
+	// second-granular, so sub-second values round up to 1s. For a
+	// true zero-timeout attempt use the low-level client.Acquire.
 	AcquireTimeout time.Duration
 	LeaseTTL       int
 	Servers        []string
@@ -746,8 +750,12 @@ var lockOps = resourceOps{
 
 // Semaphore is the multi-slot equivalent of Lock.
 type Semaphore struct {
-	Key            string
-	Limit          int
+	Key   string
+	Limit int
+	// AcquireTimeout bounds how long Acquire/Wait blocks. The zero
+	// value means 10s, NOT a non-blocking poll; sub-second values
+	// round up to 1s. For a true zero-timeout attempt use the
+	// low-level client.SemAcquire.
 	AcquireTimeout time.Duration
 	LeaseTTL       int
 	Servers        []string

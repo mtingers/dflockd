@@ -13,6 +13,7 @@ import (
 
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/protocol"
 )
 
 // startServer launches a server on a random local port and returns
@@ -460,5 +461,39 @@ func TestServer_DrainsOnShutdown(t *testing.T) {
 		return
 	} else if !strings.Contains(line, "drain") && !strings.Contains(line, "ok") {
 		t.Logf("post-shutdown response: %q", line)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Panic isolation
+// ---------------------------------------------------------------------------
+
+// TestServer_RecoversHandlerPanic verifies that a panic inside a
+// command handler is recovered: the offending request gets a generic
+// error and the rest of the server keeps serving.
+func TestServer_RecoversHandlerPanic(t *testing.T) {
+	orig := commandTable[protocol.CmdPing]
+	commandTable[protocol.CmdPing] = func(*Server, context.Context, *protocol.Request, uint64) *protocol.Ack {
+		panic("induced handler panic")
+	}
+	defer func() { commandTable[protocol.CmdPing] = orig }()
+
+	addr, stop := startServer(t)
+	defer stop()
+
+	conn, r := dial(t, addr)
+	defer conn.Close()
+	if got := reqResp(t, conn, r, "ping", "_", ""); got != "error" {
+		t.Fatalf("ping into a panicking handler: got %q, want error", got)
+	}
+
+	// Server must still be serving — on this conn and a fresh one.
+	if got := reqResp(t, conn, r, "l", "k", "5"); !strings.HasPrefix(got, "ok ") {
+		t.Fatalf("acquire on same conn after recovered panic: %q", got)
+	}
+	conn2, r2 := dial(t, addr)
+	defer conn2.Close()
+	if got := reqResp(t, conn2, r2, "l", "k2", "5"); !strings.HasPrefix(got, "ok ") {
+		t.Fatalf("acquire on fresh conn after recovered panic: %q", got)
 	}
 }

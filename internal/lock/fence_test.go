@@ -220,6 +220,15 @@ func TestFenceAllocator_File_ExclusiveLock(t *testing.T) {
 	}
 }
 
+func TestFenceAllocator_File_RefusedWithoutLockSupport(t *testing.T) {
+	if fenceFileLocksSupported {
+		t.Skip("platform supports fence file locking; nothing to refuse")
+	}
+	if _, err := newFenceAllocator(filepath.Join(t.TempDir(), "fence"), 0, 8); !errors.Is(err, ErrFencePersistence) {
+		t.Fatalf("got %v, want ErrFencePersistence on a platform without file locking", err)
+	}
+}
+
 func TestFenceAllocator_Close_Idempotent(t *testing.T) {
 	fa, err := newFenceAllocator(filepath.Join(t.TempDir(), "fence"), 0, 8)
 	if err != nil {

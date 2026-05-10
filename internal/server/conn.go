@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"time"
@@ -184,9 +185,25 @@ func (s *Server) dispatchAndWrite(connCtx context.Context, req *protocol.Request
 
 func (s *Server) dispatchWithPeerWatch(connCtx context.Context, req *protocol.Request, cs *connSession, conn net.Conn, connID uint64, cancelConn func()) *protocol.Ack {
 	stopWatch := s.maybeWatchPeerClose(req, cs.reader, conn, cancelConn)
-	ack := s.handleRequest(connCtx, req, connID)
-	stopIfWatching(stopWatch)
-	return ack
+	defer stopIfWatching(stopWatch)
+	return s.handleRequestRecovered(connCtx, req, connID)
+}
+
+// handleRequestRecovered runs handleRequest under a panic guard so one
+// malformed request can't crash the process and drop every other
+// connection (net/http does the same for the REST API). A recovered
+// panic is logged with the offending command + stack and surfaces to
+// the client as a generic error.
+func (s *Server) handleRequestRecovered(ctx context.Context, req *protocol.Request, connID uint64) (ack *protocol.Ack) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("recovered panic in request handler",
+				"conn_id", connID, "cmd", req.Cmd, "key", req.Key,
+				"recovered", r, "stack", string(debug.Stack()))
+			ack = &protocol.Ack{Status: protocol.StatusError}
+		}
+	}()
+	return s.handleRequest(ctx, req, connID)
 }
 
 func stopIfWatching(stopWatch func()) {

@@ -55,12 +55,12 @@ func Run(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.
 	if err != nil {
 		return err
 	}
-	hs, startShutdown := buildHTTPServer(ctx, srv, cfg, log)
+	hs, shutdown := buildHTTPServer(ctx, srv, cfg, log)
 	defer hs.limiter.Stop()
 	srv.SetExtraConnCounter(func() int64 { return int64(hs.sessions.Count()) })
 	defer srv.SetExtraConnCounter(nil)
 	log.Info("http listening", "addr", listener.Addr())
-	return hs.serveUntilDone(ctx, listener, startShutdown, cfg.ShutdownTimeout)
+	return hs.serveUntilDone(ctx, listener, shutdown, cfg.ShutdownTimeout)
 }
 
 // buildHTTPListener resolves the bind address and wraps the listener
@@ -103,8 +103,8 @@ func tlsConfig(cert tls.Certificate) *tls.Config {
 
 // buildHTTPServer wires the SessionStore, middleware chain, and
 // http.Server together. Returns the server plus a once-only
-// session-shutdown trigger.
-func buildHTTPServer(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger) (*httpServer, func()) {
+// session-shutdown coordinator.
+func buildHTTPServer(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger) (*httpServer, *sessionShutdown) {
 	sessions := NewSessionStore(ctx, srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, cfg.HTTPMaxSessionsPerIP, log)
 	hs := &httpServer{
 		sessions: sessions,
@@ -114,9 +114,9 @@ func buildHTTPServer(ctx context.Context, srv *server.Server, cfg *config.Config
 		limiter:  newHTTPRateLimiter(cfg.HTTPRateLimitPerIP, cfg.HTTPRateLimitBurst),
 	}
 	hs.srv = newStdHTTPServer(hs, cfg)
-	startShutdown := newOnceShutdown(sessions)
-	hs.srv.RegisterOnShutdown(startShutdown)
-	return hs, startShutdown
+	shutdown := newSessionShutdown(sessions)
+	hs.srv.RegisterOnShutdown(shutdown.Start)
+	return hs, shutdown
 }
 
 // newStdHTTPServer constructs the *http.Server with our middleware
@@ -133,29 +133,52 @@ func newStdHTTPServer(hs *httpServer, cfg *config.Config) *http.Server {
 	}
 }
 
-// newOnceShutdown returns a function that triggers session shutdown
-// at most once.
-func newOnceShutdown(sessions *SessionStore) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() { go sessions.Shutdown() })
+// sessionShutdown starts SessionStore shutdown at most once and lets
+// the server wait until all session cleanup has finished. Start is
+// asynchronous so it can be registered with http.Server.Shutdown before
+// active handlers have returned.
+type sessionShutdown struct {
+	sessions *SessionStore
+	once     sync.Once
+	done     chan struct{}
+}
+
+func newSessionShutdown(sessions *SessionStore) *sessionShutdown {
+	return &sessionShutdown{sessions: sessions, done: make(chan struct{})}
+}
+
+func (sd *sessionShutdown) Start() {
+	sd.once.Do(func() {
+		go func() {
+			sd.sessions.Shutdown()
+			close(sd.done)
+		}()
+	})
+}
+
+func (sd *sessionShutdown) Wait(ctx context.Context) error {
+	select {
+	case <-sd.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 // serveUntilDone runs the http.Server.Serve loop and blocks until ctx
 // is cancelled or Serve returns. On context cancellation it triggers
 // graceful shutdown bounded by shutdownTimeout.
-func (hs *httpServer) serveUntilDone(ctx context.Context, listener net.Listener, startShutdown func(), shutdownTimeout time.Duration) error {
+func (hs *httpServer) serveUntilDone(ctx context.Context, listener net.Listener, shutdown *sessionShutdown, shutdownTimeout time.Duration) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- runServe(hs.srv, listener) }()
 	select {
 	case <-ctx.Done():
 		hs.draining.Store(true)
-		hs.gracefulShutdown(startShutdown, shutdownTimeout)
+		hs.gracefulShutdown(shutdown, shutdownTimeout)
 		<-serveErr
 		return nil
 	case err := <-serveErr:
-		startShutdown()
+		hs.stopSessions(shutdown, shutdownTimeout)
 		return err
 	}
 }
@@ -168,14 +191,37 @@ func runServe(srv *http.Server, listener net.Listener) error {
 	return nil
 }
 
-func (hs *httpServer) gracefulShutdown(startShutdown func(), timeout time.Duration) {
-	startShutdown()
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+func (hs *httpServer) gracefulShutdown(shutdown *sessionShutdown, timeout time.Duration) {
+	shutdown.Start()
+	shutdownCtx, cancel := shutdownContext(timeout)
 	defer cancel()
-	_ = hs.srv.Shutdown(shutdownCtx)
+	if err := hs.srv.Shutdown(shutdownCtx); err != nil {
+		hs.log.Warn("http shutdown timeout reached, force-closing connections", "err", err)
+		_ = hs.srv.Close()
+	}
+	hs.waitForSessionShutdown(shutdown, shutdownCtx)
+}
+
+func (hs *httpServer) stopSessions(shutdown *sessionShutdown, timeout time.Duration) {
+	shutdown.Start()
+	shutdownCtx, cancel := shutdownContext(timeout)
+	defer cancel()
+	hs.waitForSessionShutdown(shutdown, shutdownCtx)
+}
+
+func shutdownContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func (hs *httpServer) waitForSessionShutdown(shutdown *sessionShutdown, ctx context.Context) {
+	if err := shutdown.Wait(ctx); err != nil {
+		hs.log.Warn("http session shutdown timeout reached; waiting after force-close", "err", err)
+		_ = hs.srv.Close()
+		_ = shutdown.Wait(context.Background())
+	}
 }
 
 // jsonRouteErrors wraps mux to ensure every 404/405 produces a JSON

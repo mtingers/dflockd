@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -503,6 +504,72 @@ func validateHTTPRateBurstWhenRate(c *Config) error {
 		return fmt.Errorf("--http-rate-limit-burst must be > 0 when --http-rate-limit-per-ip is set")
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Operational posture warnings
+// ---------------------------------------------------------------------------
+
+// UnboundedLimitWarnings returns the names of resource-protection limits
+// that are left unbounded, so cmd/dflockd can warn at startup. It stays
+// quiet when the server is bound only to loopback (the permissive
+// defaults are fine for local development).
+func (c *Config) UnboundedLimitWarnings() []string {
+	if c.boundToLoopback() {
+		return nil
+	}
+	var w []string
+	if c.MaxConnections == 0 {
+		w = append(w, "--max-connections")
+	}
+	if c.MaxConnectionsPerIP == 0 {
+		w = append(w, "--max-connections-per-ip")
+	}
+	if c.MaxWaiters == 0 {
+		w = append(w, "--max-waiters")
+	}
+	if c.HTTPPort != 0 {
+		w = appendHTTPLimitWarnings(w, c)
+	}
+	return w
+}
+
+func appendHTTPLimitWarnings(w []string, c *Config) []string {
+	if c.HTTPMaxSessions == 0 {
+		w = append(w, "--http-max-sessions")
+	}
+	if c.HTTPMaxConnectionsPerIP == 0 {
+		w = append(w, "--http-max-connections-per-ip")
+	}
+	if c.HTTPRateLimitPerIP == 0 {
+		w = append(w, "--http-rate-limit-per-ip")
+	}
+	return w
+}
+
+// boundToLoopback reports whether every bind address is loopback. Only
+// the literal forms are recognised; a hostname or "0.0.0.0" is treated
+// as potentially reachable.
+func (c *Config) boundToLoopback() bool {
+	if !isLoopbackHost(c.Host) {
+		return false
+	}
+	return c.HTTPPort == 0 || isLoopbackHost(httpBindHost(c))
+}
+
+func httpBindHost(c *Config) string {
+	if c.HTTPHost != "" {
+		return c.HTTPHost
+	}
+	return c.Host
+}
+
+func isLoopbackHost(h string) bool {
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ---------------------------------------------------------------------------

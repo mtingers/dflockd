@@ -518,9 +518,9 @@ func appendLine(buf []byte) []byte {
 // readLine reads one newline-terminated line from r, enforcing max as the
 // payload cap. The returned string has trailing CR stripped.
 //
-// Hot-path note: most lines fit in MaxLineBytes; we use a stack-allocated
-// backing array in that case so the common request triple causes zero
-// heap allocation.
+// Hot-path note: lines that fit in MaxLineBytes are accumulated in a
+// stack-allocated backing array, so the only per-line heap allocation is
+// the final string conversion — the byte buffer itself never escapes.
 func readLine(r *bufio.Reader, timeout time.Duration, conn net.Conn, max int) (string, error) {
 	if err := setReadDeadline(conn, timeout); err != nil {
 		return "", err
