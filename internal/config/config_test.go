@@ -274,6 +274,7 @@ func TestUnboundedLimitWarnings(t *testing.T) {
 		name    string
 		cfg     *Config
 		wantAny bool
+		want    []string
 		wantNot []string // substrings that must NOT appear
 	}{
 		{
@@ -290,18 +291,29 @@ func TestUnboundedLimitWarnings(t *testing.T) {
 			name:    "non-loopback host warns about TCP limits",
 			cfg:     &Config{Host: "0.0.0.0"},
 			wantAny: true,
+			want:    []string{"--max-connections", "--max-connections-per-ip", "--max-waiters"},
 			wantNot: []string{"http"},
 		},
 		{
 			name:    "non-loopback host with HTTP warns about HTTP limits too",
 			cfg:     &Config{Host: "10.0.0.1", HTTPPort: 6389},
 			wantAny: true,
+			want: []string{
+				"--max-connections",
+				"--max-connections-per-ip",
+				"--max-waiters",
+				"--http-max-sessions",
+				"--http-max-sessions-per-ip",
+				"--http-max-connections-per-ip",
+				"--http-rate-limit-per-ip",
+			},
 		},
 		{
 			name: "fully-bounded non-loopback config stays quiet",
 			cfg: &Config{
 				Host: "0.0.0.0", MaxConnections: 100, MaxConnectionsPerIP: 10, MaxWaiters: 50,
-				HTTPPort: 6389, HTTPMaxSessions: 100, HTTPMaxConnectionsPerIP: 10, HTTPRateLimitPerIP: 100,
+				HTTPPort: 6389, HTTPMaxSessions: 100, HTTPMaxSessionsPerIP: 10,
+				HTTPMaxConnectionsPerIP: 10, HTTPRateLimitPerIP: 100,
 			},
 			wantAny: false,
 		},
@@ -316,6 +328,11 @@ func TestUnboundedLimitWarnings(t *testing.T) {
 				t.Fatalf("got warnings %v, want none", got)
 			}
 			joined := strings.ToLower(strings.Join(got, " "))
+			for _, want := range c.want {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warnings %v missing %q", got, want)
+				}
+			}
 			for _, sub := range c.wantNot {
 				if strings.Contains(joined, sub) {
 					t.Errorf("warnings %v unexpectedly mention %q", got, sub)

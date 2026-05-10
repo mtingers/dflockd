@@ -538,6 +538,9 @@ func appendHTTPLimitWarnings(w []string, c *Config) []string {
 	if c.HTTPMaxSessions == 0 {
 		w = append(w, "--http-max-sessions")
 	}
+	if c.HTTPMaxSessionsPerIP == 0 {
+		w = append(w, "--http-max-sessions-per-ip")
+	}
 	if c.HTTPMaxConnectionsPerIP == 0 {
 		w = append(w, "--http-max-connections-per-ip")
 	}

@@ -92,7 +92,7 @@ Auth is a single shared secret compared in constant time:
 
 - TCP: the first command on a new connection must be `auth\n_\n<token>\n`. Anything else gets `error_auth`.
 - HTTP: every request must carry `Authorization: Bearer <token>`,
-  except `/health` and `/ready`.
+  except `/health`, `/ready`, and `/v1/openapi.json`.
 
 Auth-token resolution order:
 
@@ -125,6 +125,10 @@ The session sweeper reaps any session whose `lastSeen` falls behind
 2× `--http-session-idle-timeout`. In-flight requests (held via
 `BeginRequest`) are immune to reaping for the duration of the
 request, so a long-poll `/wait` won't be killed mid-flight.
+
+When either listener is bound beyond loopback, startup logs a warning
+for unbounded DoS-relevant limits, including HTTP session, per-IP
+session, transport connection, and rate limits.
 
 ## Diagnostics
 
