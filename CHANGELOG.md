@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **High-availability cluster mode (alpha).** dflockd can now run as an N-node Raft-replicated cluster with persistent Raft log + FSM snapshots on disk. Opt-in: set `--raft-dir`, `--node-id`, `--raft-addr`, and `--cluster-peers`; clients connect to any member and follow the `error_not_leader <host:port>` redirect (the Go client surfaces `*client.NotLeaderError` for that). With no cluster flags the server is byte-for-byte the v2.1.x single-node binary and `go.sum` remains empty — Raft is hand-rolled in `internal/raft/` (~3,500 lines + ~1,500 lines of tests). Scope: leader election with PreVote, log replication with the same-term commit rule, durable HardState + WAL + atomic-rename snapshot files (each `flock(2)`-protected), the FSM apply pipeline, snapshot install on far-behind followers, single-server membership changes (Raft §4.3 — `AddVoter` / `RemoveServer`). The TCP API is the v1 cluster surface; `--http-port` is rejected when cluster mode is on (HTTP cluster routing is a follow-on). See `PLAN.md` for the design + the §7 production-readiness checklist.
+- **`internal/lock` FSM apply path.** New `ApplyAcquire` / `ApplyEnqueue` / `ApplyRelease` / `ApplyRenew` / `ApplyEvict` / `ApplyCleanupConn` / `ApplyGC` methods are pure functions of (current state, args) — they take an explicit `now time.Time` and a per-token salt, and bump a `fsmFenceCounter` recorded in the snapshot. The existing direct methods are unchanged; the new methods drive every node from the replicated log. `Snapshot(io.Writer)` / `Restore(io.Reader)` round-trip is byte-deterministic (sorted iteration), and `WatchGrants(ref)` / `RouteGrants(grants)` route promotion grants to local blocked handlers.
+- **`internal/cluster`.** Glue package that assembles `internal/raft` + `internal/lock` + storage + transport. `cluster.Node` exposes typed `ProposeAcquire/Enqueue/Release/Renew/Evict/CleanupConn/GC` + `Barrier` and integration helpers (`IsLeader`, `LeaderClientAddr`, `AddVoter`, `RemoveServer`, `Status`).
+- **`error_not_leader` wire status** with an optional trailing leader address; the Go client converts it to `*NotLeaderError{Leader string}` via `client.IsNotLeader(err, &nle)`.
+
+### Changed
+
+- `lock.NewLockManager` and `internal/server.Server` gain non-breaking additions: `SetCluster(c)` enables the cluster-mode handler path; mutating commands on a follower return `error_not_leader [<addr>]`; the per-conn cleanup proposes `CleanupConn` through the cluster; the lock manager's lease-expiry / GC loops are suppressed in cluster mode (Raft-driven Evict / GC commands are the deterministic source).
+
+### Known limitations (cluster mode, v1)
+
+- The HTTP API is rejected at startup when `--raft-dir` is set; wiring the HTTP handlers through the cluster's propose path is a follow-on.
+- A client blocked in `acquire` / `wait` when the leader fails loses its queue position (the holder entry it never observed expires via lease; FIFO is preserved for already-granted tokens). Stable client refs that re-attach across failover are documented in `PLAN.md` §4.7 as a follow-on.
+- TLS / cluster-shared-secret on the Raft transport are not yet wired (the framing layer is in place); cluster traffic must currently run on a trusted network.
+- Dynamic-join with snapshot transfer to a node started without prior state is not yet implemented; the supported flows are static bootstrap (all members listed in `--cluster-peers`) and `AddVoter` against a node that already has its members map in place.
+
 ## [v2.1.1] - 2026-05-11
 
 ### Security
