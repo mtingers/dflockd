@@ -33,6 +33,17 @@ type Server struct {
 	// cluster routes mutating commands through a Raft cluster when set;
 	// nil leaves the legacy single-node path in charge.
 	cluster atomic.Pointer[Cluster]
+	// connIDEpoch is a per-process random value OR'd into the high bits
+	// of the FSM-visible connection id in cluster mode, so a restarted
+	// node's fresh low connIDs can't collide with a dead leader's
+	// orphaned ones (which would make CleanupConn release the wrong
+	// client's locks). Set lazily on SetCluster; 0 in single-node mode.
+	connIDEpoch atomic.Uint64
+	// pendingGrants holds, per connection id, the grant listener
+	// registered by a two-phase Enqueue so the matching Wait (or the
+	// disconnect cleanup) can consume/cancel it — closing the lost-
+	// wakeup window between the Enqueue's commit and the client's Wait.
+	pendingGrants sync.Map // uint64 connID → *pendingGrant
 }
 
 // connCounter wraps a count function so we can store it through

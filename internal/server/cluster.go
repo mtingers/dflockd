@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -38,7 +39,33 @@ func (s *Server) SetCluster(c Cluster) {
 		s.cluster.Store(nil)
 		return
 	}
+	if s.connIDEpoch.Load() == 0 {
+		s.connIDEpoch.Store(randomConnIDEpoch())
+	}
 	s.cluster.Store(&c)
+}
+
+// randomConnIDEpoch returns a non-zero value to OR into the high 32 bits
+// of cluster-mode connection ids. Pure collision-avoidance across
+// process restarts — crypto strength isn't required, but crypto/rand is
+// already on hand and cheap.
+func randomConnIDEpoch() uint64 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return uint64(time.Now().UnixNano()&0xFFFFFFFF) << 32
+	}
+	e := uint64(binary.BigEndian.Uint32(b[:]))
+	if e == 0 {
+		e = 1
+	}
+	return e << 32
+}
+
+// clusterConnID maps a per-process connection counter value to the
+// globally-unique id the FSM sees (epoch in the high bits, the 32-bit
+// counter in the low bits).
+func (s *Server) clusterConnID(raw uint64) uint64 {
+	return s.connIDEpoch.Load() | uint64(uint32(raw))
 }
 
 // clusterOrNil returns the installed Cluster, or nil if running in
@@ -62,10 +89,43 @@ func notLeaderAck(c Cluster) *protocol.Ack {
 // the legacy ones; the table in conn.go switches on s.clusterOrNil().
 // ---------------------------------------------------------------------------
 
-// clusterRef stamps a globally-unique-per-conn requester id for the
-// FSM. Stable within a connection so per-conn cleanup works.
+// clusterRef stamps the requester id the FSM routes grants by. It's the
+// decimal form of clusterConnID, so it's globally unique (across process
+// restarts) and stable within a connection.
 func (s *Server) clusterRef(connID uint64) string {
-	return fmt.Sprintf("%d", connID)
+	return fmt.Sprintf("%d", s.clusterConnID(connID))
+}
+
+// pendingGrant is a grant listener registered by a queued two-phase
+// Enqueue, held until the matching Wait consumes it (or the conn dies).
+type pendingGrant struct {
+	ch     <-chan lock.Grant
+	cancel func()
+}
+
+func (s *Server) stashPendingGrant(connID uint64, ch <-chan lock.Grant, cancel func()) {
+	// Overwrite any prior entry without cancelling it: a fresh
+	// WatchGrants on the same ref already replaced the registry slot, so
+	// the old channel is simply unreferenced. (A connection with two
+	// concurrent queued enqueues is already loosely-handled — one grant
+	// fits in the buffer-1 channel — and this doesn't make it worse.)
+	s.pendingGrants.Store(connID, &pendingGrant{ch: ch, cancel: cancel})
+}
+
+func (s *Server) takePendingGrant(connID uint64) (*pendingGrant, bool) {
+	v, ok := s.pendingGrants.LoadAndDelete(connID)
+	if !ok {
+		return nil, false
+	}
+	return v.(*pendingGrant), true
+}
+
+// dropPendingGrant cancels and discards any pending grant listener for
+// connID (used on disconnect).
+func (s *Server) dropPendingGrant(connID uint64) {
+	if pg, ok := s.takePendingGrant(connID); ok {
+		pg.cancel()
+	}
 }
 
 // clusterSalt generates a fresh 8-byte salt for one token.
@@ -85,18 +145,18 @@ func (s *Server) clusterAcquire(ctx context.Context, c Cluster, req *protocol.Re
 	if err != nil {
 		return &protocol.Ack{Status: protocol.StatusError}
 	}
-	ref := s.clusterRef(connID)
-	return s.clusterDoAcquire(ctx, c, req, ref, connID, salt)
+	cid := s.clusterConnID(connID)
+	return s.clusterDoAcquire(ctx, c, req, fmt.Sprintf("%d", cid), cid, salt)
 }
 
-func (s *Server) clusterDoAcquire(ctx context.Context, c Cluster, req *protocol.Request, ref string, connID uint64, salt [8]byte) *protocol.Ack {
+func (s *Server) clusterDoAcquire(ctx context.Context, c Cluster, req *protocol.Request, ref string, cid uint64, salt [8]byte) *protocol.Ack {
 	// Register the listener BEFORE proposing so a synchronous-grant
 	// promotion (e.g. an Evict that frees the slot just before our
 	// Acquire commits) doesn't slip past us.
 	grants, cancel := s.lm.WatchGrants(ref)
 	defer cancel()
 	leaseTTL := req.LeaseTTL
-	result, err := c.ProposeAcquire(ctx, requestKey(req), requestLimit(req), ref, connID, leaseTTL, salt)
+	result, err := c.ProposeAcquire(ctx, requestKey(req), requestLimit(req), ref, cid, leaseTTL, salt)
 	if err != nil {
 		return clusterProposeErrAck(err, c)
 	}
@@ -137,10 +197,22 @@ func (s *Server) clusterEnqueue(ctx context.Context, c Cluster, req *protocol.Re
 	if err != nil {
 		return &protocol.Ack{Status: protocol.StatusError}
 	}
-	ref := s.clusterRef(connID)
-	result, err := c.ProposeEnqueue(ctx, requestKey(req), requestLimit(req), ref, connID, req.LeaseTTL, salt)
+	cid := s.clusterConnID(connID)
+	ref := fmt.Sprintf("%d", cid)
+	// Register the grant listener before proposing and hold it on the
+	// connection: a promotion can land between this Enqueue's commit and
+	// the client's Wait, and without a live listener that grant is lost
+	// (the holder then leaks until its lease expires).
+	ch, cancel := s.lm.WatchGrants(ref)
+	result, err := c.ProposeEnqueue(ctx, requestKey(req), requestLimit(req), ref, cid, req.LeaseTTL, salt)
 	if err != nil {
+		cancel()
 		return clusterProposeErrAck(err, c)
+	}
+	if result.Status == lock.StatusQueued {
+		s.stashPendingGrant(connID, ch, cancel)
+	} else {
+		cancel() // acquired fast-path, or an error status — nothing will Wait
 	}
 	return enqueueAckFromResult(result)
 }
@@ -160,8 +232,14 @@ func (s *Server) clusterWait(ctx context.Context, c Cluster, req *protocol.Reque
 	if !c.IsLeader() {
 		return notLeaderAck(c)
 	}
-	ref := s.clusterRef(connID)
-	grants, cancel := s.lm.WatchGrants(ref)
+	// Prefer the listener the matching Enqueue stashed (so a promotion
+	// between the Enqueue and this Wait was already captured); otherwise
+	// register one now.
+	if pg, ok := s.takePendingGrant(connID); ok {
+		defer pg.cancel()
+		return s.clusterWaitForGrant(ctx, pg.ch, req.AcquireTimeout)
+	}
+	grants, cancel := s.lm.WatchGrants(s.clusterRef(connID))
 	defer cancel()
 	return s.clusterWaitForGrant(ctx, grants, req.AcquireTimeout)
 }

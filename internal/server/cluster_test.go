@@ -35,7 +35,6 @@ type fakeCluster struct {
 }
 
 type promotion struct {
-	ref      string
 	token    string
 	leaseSec int
 	delay    time.Duration
@@ -58,24 +57,30 @@ func (f *fakeCluster) ProposeAcquire(ctx context.Context, key string, limit int,
 		return lock.ApplyResult{}, f.proposeErr
 	}
 	if f.promotion != nil {
-		f.schedulePromotion()
+		f.schedulePromotion(ref)
 	}
 	return f.acquireResult, nil
 }
 
-func (f *fakeCluster) schedulePromotion() {
+// schedulePromotion routes a follow-on grant for `ref` (the ref the
+// server actually registered its listener under) after the configured
+// delay.
+func (f *fakeCluster) schedulePromotion(ref string) {
 	p := f.promotion
 	go func() {
 		if p.delay > 0 {
 			time.Sleep(p.delay)
 		}
-		f.lm.RouteGrants([]lock.Grant{{Ref: p.ref, Token: p.token, LeaseSec: p.leaseSec}})
+		f.lm.RouteGrants([]lock.Grant{{Ref: ref, Token: p.token, LeaseSec: p.leaseSec}})
 	}()
 }
 
 func (f *fakeCluster) ProposeEnqueue(ctx context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error) {
 	if f.proposeErr != nil {
 		return lock.ApplyResult{}, f.proposeErr
+	}
+	if f.promotion != nil {
+		f.schedulePromotion(ref)
 	}
 	return f.enqueueResult, nil
 }
@@ -173,14 +178,36 @@ func TestClusterAcquireQueuedWaitsForGrant(t *testing.T) {
 		leader:        true,
 		acquireResult: lock.ApplyResult{Status: lock.StatusQueued},
 		lm:            lm,
-		promotion: &promotion{
-			ref: "1", token: "tk-after", leaseSec: 25, delay: 20 * time.Millisecond,
-		},
+		promotion:     &promotion{token: "tk-after", leaseSec: 25, delay: 20 * time.Millisecond},
 	}
 	s.SetCluster(fc)
 	ack := s.handleAcquire(context.Background(), reqAcquire("k", 30*time.Second, 2*time.Second), 1)
 	if ack.Status != protocol.StatusOK || ack.Token != "tk-after" || ack.LeaseTTL != 25 {
 		t.Fatalf("queued+promotion ack = %+v", ack)
+	}
+}
+
+// A two-phase Enqueue that comes back queued must register a grant
+// listener that survives until the matching Wait — a promotion landing
+// in between must not be lost.
+func TestClusterEnqueueThenWaitGetsPromotion(t *testing.T) {
+	s, lm := newTestServer(t)
+	fc := &fakeCluster{
+		leader:        true,
+		enqueueResult: lock.ApplyResult{Status: lock.StatusQueued},
+		lm:            lm,
+		promotion:     &promotion{token: "tk-promoted", leaseSec: 40, delay: 15 * time.Millisecond},
+	}
+	s.SetCluster(fc)
+	const connID = 7
+	if ack := s.handleEnqueue(&protocol.Request{Cmd: protocol.CmdEnqueue, Key: "k", LeaseTTL: 40 * time.Second}, connID); ack.Status != protocol.StatusQueued {
+		t.Fatalf("enqueue ack = %+v, want queued", ack)
+	}
+	// The promotion fires ~15ms after the enqueue (before Wait below).
+	time.Sleep(30 * time.Millisecond)
+	ack := s.handleWait(context.Background(), &protocol.Request{Cmd: protocol.CmdWait, Key: "k", AcquireTimeout: time.Second}, connID)
+	if ack.Status != protocol.StatusOK || ack.Token != "tk-promoted" || ack.LeaseTTL != 40 {
+		t.Fatalf("wait after enqueue+promotion ack = %+v", ack)
 	}
 }
 

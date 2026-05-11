@@ -89,12 +89,13 @@ func (s *Server) teardownConn(conn net.Conn, peer string, connID uint64, cancelC
 }
 
 func (s *Server) teardownConnClustered(c Cluster, peer string, connID uint64) {
+	s.dropPendingGrant(connID) // a queued-but-never-waited Enqueue's listener
 	if !c.IsLeader() {
 		return // can't propose; lease expiry is the backstop
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
 	defer cancel()
-	if _, err := c.ProposeCleanupConn(ctx, s.clusterRef(connID), connID); err != nil {
+	if _, err := c.ProposeCleanupConn(ctx, s.clusterRef(connID), s.clusterConnID(connID)); err != nil {
 		s.log.Warn("cluster cleanup propose failed", "peer", peer, "conn_id", connID, "err", err)
 	}
 }
