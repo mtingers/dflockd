@@ -42,7 +42,17 @@ func (h *httpServer) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpServer) handleStats(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, h.currentStats())
+	stats := h.currentStats()
+	if cj := h.sessions.Server().ClusterStatusJSON(); cj != nil {
+		// Splice a "cluster" object alongside the lock stats (single-node
+		// output is unchanged), matching the TCP `stats` command.
+		writeJSON(w, http.StatusOK, struct {
+			*lock.Stats
+			Cluster json.RawMessage `json:"cluster"`
+		}{stats, cj})
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 // handleOpenAPI serves the embedded OpenAPI 3.1 contract. Unauthenticated
@@ -284,7 +294,7 @@ func (h *httpServer) serveRelease(w http.ResponseWriter, r *http.Request, prefix
 		return
 	}
 	defer done()
-	h.runRelease(w, prefixedKey, req.Token)
+	h.runRelease(w, r, prefixedKey, req.Token)
 }
 
 func (h *httpServer) serveRenew(w http.ResponseWriter, r *http.Request, prefixedKey string) {
@@ -293,7 +303,7 @@ func (h *httpServer) serveRenew(w http.ResponseWriter, r *http.Request, prefixed
 		return
 	}
 	defer done()
-	h.runRenew(w, prefixedKey, req.Token, req.LeaseTTLS)
+	h.runRenew(w, r, prefixedKey, req.Token, req.LeaseTTLS)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +311,10 @@ func (h *httpServer) serveRenew(w http.ResponseWriter, r *http.Request, prefixed
 // ---------------------------------------------------------------------------
 
 func (h *httpServer) runAcquire(w http.ResponseWriter, r *http.Request, s *Session, key, prefix string, limit, timeoutS, leaseS int) {
+	if h.sessions.Server().IsClusterMode() {
+		h.runAcquireCluster(w, r, s, key, prefix, limit, timeoutS, leaseS)
+		return
+	}
 	leaseTTL := h.leaseDuration(leaseS)
 	ctx, cancel := s.RequestContext(r.Context())
 	defer cancel()
@@ -310,12 +324,20 @@ func (h *httpServer) runAcquire(w http.ResponseWriter, r *http.Request, s *Sessi
 }
 
 func (h *httpServer) runEnqueue(w http.ResponseWriter, r *http.Request, s *Session, key, prefix string, limit, leaseS int) {
+	if h.sessions.Server().IsClusterMode() {
+		h.runEnqueueCluster(w, r, s, key, prefix, limit, leaseS)
+		return
+	}
 	leaseTTL := h.leaseDuration(leaseS)
 	status, tok, leaseSec, err := h.sessions.LockManager().Enqueue(prefix+key, leaseTTL, s.ConnID, limit)
 	h.renderEnqueueOutcome(w, r, s, key, prefix, status, tok, leaseSec, err)
 }
 
 func (h *httpServer) runWait(w http.ResponseWriter, r *http.Request, s *Session, prefixedKey string, timeoutS int) {
+	if h.sessions.Server().IsClusterMode() {
+		h.runWaitCluster(w, r, s, prefixedKey, timeoutS)
+		return
+	}
 	ctx, cancel := s.RequestContext(r.Context())
 	defer cancel()
 	tok, leaseSec, err := h.sessions.LockManager().Wait(
@@ -323,7 +345,11 @@ func (h *httpServer) runWait(w http.ResponseWriter, r *http.Request, s *Session,
 	h.renderWaitOutcome(w, r, prefixedKey, tok, leaseSec, err)
 }
 
-func (h *httpServer) runRelease(w http.ResponseWriter, prefixedKey, token string) {
+func (h *httpServer) runRelease(w http.ResponseWriter, r *http.Request, prefixedKey, token string) {
+	if h.sessions.Server().IsClusterMode() {
+		h.runReleaseCluster(w, r, prefixedKey, token)
+		return
+	}
 	ok, err := h.sessions.LockManager().Release(prefixedKey, token)
 	if err != nil {
 		writeLockErr(w, err)
@@ -336,7 +362,11 @@ func (h *httpServer) runRelease(w http.ResponseWriter, prefixedKey, token string
 	writeError(w, http.StatusNotFound, "not_held", "")
 }
 
-func (h *httpServer) runRenew(w http.ResponseWriter, prefixedKey, token string, leaseS int) {
+func (h *httpServer) runRenew(w http.ResponseWriter, r *http.Request, prefixedKey, token string, leaseS int) {
+	if h.sessions.Server().IsClusterMode() {
+		h.runRenewCluster(w, r, prefixedKey, token, leaseS)
+		return
+	}
 	leaseTTL := h.leaseDuration(leaseS)
 	remaining, ok, err := h.sessions.LockManager().Renew(prefixedKey, token, leaseTTL)
 	if err != nil {

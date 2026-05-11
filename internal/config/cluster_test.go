@@ -93,7 +93,6 @@ func TestClusterFieldValidation(t *testing.T) {
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n2=h:1@c:1"}, "must include this node"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1,n1=h:2@c:2"}, "duplicate node id"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--fence-state-file", "/fence"}, "--fence-state-file is incompatible"},
-		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--http-port", "6389"}, "--http-port is not yet supported in cluster mode"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--raft-tls-cert", "/c.pem"}, "must be set together"},
 		{[]string{"--raft-tls-cert", "/c.pem", "--raft-tls-key", "/k.pem", "--raft-tls-ca", "/ca.pem"}, "requires cluster mode"},
 	}
@@ -117,5 +116,14 @@ func TestClusterFieldValidation(t *testing.T) {
 	}
 	if !c.RaftTLSEnabled() || c.RaftTLSCA != "/ca.pem" {
 		t.Fatalf("RaftTLS* not wired: %+v", c)
+	}
+
+	// --http-port + cluster mode is now allowed (the HTTP API routes
+	// through the cluster).
+	if _, err := Load([]string{
+		"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001",
+		"--cluster-peers", "n1=h:1@c:1", "--http-port", "6389", "--port", "6388",
+	}); err != nil {
+		t.Fatalf("--http-port + cluster should be allowed now: %v", err)
 	}
 }

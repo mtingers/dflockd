@@ -144,7 +144,9 @@ func NewSessionStore(parent context.Context, srv *server.Server, idleTimeout tim
 		ctx:         ctx,
 		cancel:      cancel,
 		sweeperDone: make(chan struct{}),
-		cleanupConn: srv.LockManager().CleanupConnection,
+		// CleanupConnID routes through the cluster when one is configured
+		// (proposes a CleanupConn), else does the local LockManager cleanup.
+		cleanupConn: srv.CleanupConnID,
 		log:         log,
 	}
 	go st.sweeperLoop()
@@ -298,6 +300,10 @@ func (st *SessionStore) IdleTimeout() time.Duration {
 func (st *SessionStore) LockManager() *lock.LockManager {
 	return st.srv.LockManager()
 }
+
+// Server returns the underlying dflockd server (used by the lock
+// handlers to route through the cluster when one is configured).
+func (st *SessionStore) Server() *server.Server { return st.srv }
 
 // ConnCount returns active TCP-side connections only.
 func (st *SessionStore) ConnCount() int64 {
