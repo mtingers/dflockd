@@ -72,13 +72,31 @@ func newConnCtx(parent context.Context, conn net.Conn) (context.Context, func())
 	return ctx, func() { cancel(); conn.Close() }
 }
 
-// teardownConn runs the deferred cleanup chain for ServeConn.
+// teardownConn runs the deferred cleanup chain for ServeConn. In
+// cluster mode it proposes a CleanupConn command so every replica
+// drops this connection's holders/waiters; in single-node mode it
+// goes through the lock manager directly. (If we're not the leader
+// the propose returns an error — that's fine, the legacy path can't
+// do anything either, and lease expiry will reclaim the holders.)
 func (s *Server) teardownConn(conn net.Conn, peer string, connID uint64, cancelConn func()) {
 	cancelConn()
-	if err := s.lm.CleanupConnection(connID); err != nil {
+	if c := s.clusterOrNil(); c != nil {
+		s.teardownConnClustered(c, peer, connID)
+	} else if err := s.lm.CleanupConnection(connID); err != nil {
 		s.log.Error("connection cleanup failed", "peer", peer, "conn_id", connID, "err", err)
 	}
 	s.log.Debug("client closed", "peer", peer, "conn_id", connID)
+}
+
+func (s *Server) teardownConnClustered(c Cluster, peer string, connID uint64) {
+	if !c.IsLeader() {
+		return // can't propose; lease expiry is the backstop
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
+	defer cancel()
+	if _, err := c.ProposeCleanupConn(ctx, s.clusterRef(connID), connID); err != nil {
+		s.log.Warn("cluster cleanup propose failed", "peer", peer, "conn_id", connID, "err", err)
+	}
 }
 
 // preflightAuth runs the optional auth handshake. Returns false if
@@ -395,6 +413,9 @@ func stripIdleInfoKeys(items []lock.IdleInfo) {
 }
 
 func (s *Server) handleAcquire(ctx context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
+	if c := s.clusterOrNil(); c != nil {
+		return s.clusterAcquire(ctx, c, req, connID)
+	}
 	tok, err := s.acquireToken(ctx, req, connID)
 	if err != nil {
 		return ackForLockErr(err)
@@ -414,6 +435,11 @@ func acquireAck(tok string, leaseTTL time.Duration) *protocol.Ack {
 }
 
 func (s *Server) handleRelease(req *protocol.Request) *protocol.Ack {
+	if c := s.clusterOrNil(); c != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
+		defer cancel()
+		return s.clusterRelease(ctx, c, req)
+	}
 	ok, err := s.lm.Release(requestKey(req), req.Token)
 	if err != nil {
 		return ackForLockErr(err)
@@ -425,6 +451,11 @@ func (s *Server) handleRelease(req *protocol.Request) *protocol.Ack {
 }
 
 func (s *Server) handleRenew(req *protocol.Request) *protocol.Ack {
+	if c := s.clusterOrNil(); c != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
+		defer cancel()
+		return s.clusterRenew(ctx, c, req)
+	}
 	remaining, ok, err := s.lm.Renew(requestKey(req), req.Token, req.LeaseTTL)
 	if err != nil {
 		return ackForLockErr(err)
@@ -436,6 +467,11 @@ func (s *Server) handleRenew(req *protocol.Request) *protocol.Ack {
 }
 
 func (s *Server) handleEnqueue(req *protocol.Request, connID uint64) *protocol.Ack {
+	if c := s.clusterOrNil(); c != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
+		defer cancel()
+		return s.clusterEnqueue(ctx, c, req, connID)
+	}
 	status, tok, lease, err := s.enqueue(req, connID)
 	if err != nil {
 		return ackForLockErr(err)
@@ -448,6 +484,9 @@ func (s *Server) enqueue(req *protocol.Request, connID uint64) (string, string, 
 }
 
 func (s *Server) handleWait(ctx context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
+	if c := s.clusterOrNil(); c != nil {
+		return s.clusterWait(ctx, c, req, connID)
+	}
 	tok, lease, err := s.lm.Wait(ctx, requestKey(req), req.AcquireTimeout, connID)
 	if err != nil {
 		return ackForLockErr(err)

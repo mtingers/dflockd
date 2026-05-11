@@ -30,6 +30,9 @@ type Server struct {
 	connCount  atomic.Int64
 	conns      sync.Map // net.Conn → struct{}
 	extraConns atomic.Pointer[connCounter]
+	// cluster routes mutating commands through a Raft cluster when set;
+	// nil leaves the legacy single-node path in charge.
+	cluster atomic.Pointer[Cluster]
 }
 
 // connCounter wraps a count function so we can store it through
@@ -191,8 +194,14 @@ func (s *Server) runServe(listener net.Listener, st *serveState) error {
 }
 
 // startBackgroundLoops spawns the lock-manager sweeper goroutines.
-// They exit when serveCtx is cancelled.
+// They exit when serveCtx is cancelled. In cluster mode they're
+// suppressed: the only deterministic source of lease eviction and idle
+// GC must be Raft-replicated commands, and those are driven by the
+// cluster's leader-only loops (Phase 8b — currently stubbed).
 func (s *Server) startBackgroundLoops(serveCtx context.Context, wg *sync.WaitGroup) {
+	if s.clusterOrNil() != nil {
+		return
+	}
 	wg.Add(2)
 	go func() { defer wg.Done(); s.lm.LeaseExpiryLoop(serveCtx) }()
 	go func() { defer wg.Done(); s.lm.GCLoop(serveCtx) }()

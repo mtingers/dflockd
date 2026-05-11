@@ -68,6 +68,11 @@ const (
 	StatusErrorAlreadyEnqueued = "error_already_enqueued"
 	StatusErrorLeaseExpired    = "error_lease_expired"
 	StatusErrorDraining        = "error_draining"
+	// StatusErrorNotLeader is returned by a cluster-mode follower for
+	// any mutating command. The trailing whitespace-separated token, if
+	// non-empty, is the leader's client-facing host:port; the client
+	// retries against it (or round-robins members if empty).
+	StatusErrorNotLeader = "error_not_leader"
 )
 
 // Pre-encoded response bytes for the common (no-payload) statuses. Avoids
@@ -425,10 +430,23 @@ func buildWait(cmd, key, timeout string) (*Request, error) {
 // FormatResponse encodes ack into the wire format. Returns a fresh byte
 // slice the caller may write directly.
 func FormatResponse(ack *Ack, defaultLeaseTTLSec int) []byte {
+	if ack.Status == StatusErrorNotLeader {
+		return formatNotLeader(ack.Extra)
+	}
 	if responseMayCarryPayload(ack.Status) {
 		return formatGrantOrPlain(ack, defaultLeaseTTLSec)
 	}
 	return formatPlainStatus(ack.Status)
+}
+
+// formatNotLeader emits "error_not_leader [<addr>]\n". An empty addr is
+// allowed — the client falls back to round-robin against the configured
+// members until one becomes leader.
+func formatNotLeader(addr string) []byte {
+	if addr == "" {
+		return []byte(StatusErrorNotLeader + "\n")
+	}
+	return []byte(StatusErrorNotLeader + " " + addr + "\n")
 }
 
 func responseMayCarryPayload(status string) bool {
