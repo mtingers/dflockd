@@ -130,7 +130,9 @@ const maxResponseBytes = 65536
 
 // sendRecv writes one 3-line frame (cmd, key, arg) and reads exactly
 // one response line. Holding c.mu means concurrent callers cannot
-// interleave their bytes on the wire.
+// interleave their bytes on the wire. A server-side "error_not_leader"
+// response is converted into a *NotLeaderError so every caller can
+// react uniformly (typically: reconnect to the named leader and retry).
 func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -145,7 +147,14 @@ func (c *Conn) sendRecv(cmd, key, arg string) (string, error) {
 	if _, err := c.conn.Write(buf); err != nil {
 		return "", err
 	}
-	return c.readLine()
+	resp, err := c.readLine()
+	if err != nil {
+		return "", err
+	}
+	if nle := notLeaderFromResp(resp); nle != nil {
+		return "", nle
+	}
+	return resp, nil
 }
 
 // readLine reads a single newline-terminated line, capped at
