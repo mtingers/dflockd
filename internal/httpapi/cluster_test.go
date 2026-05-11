@@ -114,6 +114,37 @@ func TestHTTPCluster_FollowerReturns503NotLeader(t *testing.T) {
 	}
 }
 
+func TestHTTPCluster_EnqueueAcquiredFastPath(t *testing.T) {
+	fc := &httpFakeCluster{leader: true, enqueueResult: lock.ApplyResult{Status: lock.StatusAcquired, Token: "et", LeaseSec: 33}}
+	hs := newClusterHTTPTest(t, fc)
+	s, _ := hs.sessions.Create("127.0.0.1")
+	rec := httptest.NewRecorder()
+	hs.runEnqueueCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/enqueue", nil), s, "k", lock.LockPrefix, 1, 33)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enqueue status = %d, want 200", rec.Code)
+	}
+	var op opResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &op)
+	if op.Status != "acquired" || op.Token != "et" || op.LeaseTTLS != 33 {
+		t.Fatalf("op = %+v", op)
+	}
+
+	// Queued enqueue → "queued", and a follower enqueue → 503.
+	fc.enqueueResult = lock.ApplyResult{Status: lock.StatusQueued}
+	rec = httptest.NewRecorder()
+	hs.runEnqueueCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/enqueue", nil), s, "k2", lock.LockPrefix, 1, 33)
+	_ = json.Unmarshal(rec.Body.Bytes(), &op)
+	if op.Status != "queued" {
+		t.Fatalf("queued enqueue op = %+v", op)
+	}
+	fc.setLeader(false)
+	rec = httptest.NewRecorder()
+	hs.runEnqueueCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/enqueue", nil), s, "k", lock.LockPrefix, 1, 33)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("follower enqueue status = %d, want 503", rec.Code)
+	}
+}
+
 func TestHTTPCluster_QueuedAcquireTimesOut(t *testing.T) {
 	fc := &httpFakeCluster{leader: true, acquireResult: lock.ApplyResult{Status: lock.StatusQueued}}
 	hs := newClusterHTTPTest(t, fc)
