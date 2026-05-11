@@ -93,6 +93,7 @@ type Node struct {
 	rpcReplyc   chan rpcReply
 	proposec    chan *proposal
 	confchangec chan *confChange
+	transferc   chan chan error // leadership-transfer requests
 	statusc     chan chan NodeStatus
 	applyc      chan applyReq    // run loop → apply goroutine
 	snapSavec   chan snapSaveReq // apply goroutine → run loop
@@ -218,6 +219,7 @@ func newNode(cfg Config, fsm FSM, rl *raftLog, transport Transport, config Confi
 		rpcReplyc:   make(chan rpcReply, 64),
 		proposec:    make(chan *proposal),
 		confchangec: make(chan *confChange),
+		transferc:   make(chan chan error),
 		statusc:     make(chan chan NodeStatus),
 		applyc:      make(chan applyReq, cfg.ApplyChanDepth),
 		snapSavec:   make(chan snapSaveReq, 1),
@@ -347,6 +349,8 @@ func (n *Node) run() {
 			n.onPropose(p)
 		case cc := <-n.confchangec:
 			n.onConfChange(cc)
+		case done := <-n.transferc:
+			n.onTransferLeadership(done)
 		case s := <-n.snapSavec:
 			n.onSnapshotSave(s)
 		case replyc := <-n.statusc:

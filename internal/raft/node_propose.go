@@ -103,6 +103,69 @@ func (n *Node) submitConfChange(ctx context.Context, cc *confChange) (*Future, e
 	}
 }
 
+// TransferLeadership asks this node (which must be the leader) to hand
+// leadership to its most-caught-up follower by sending it a TimeoutNow,
+// so the successor is elected within one round trip instead of waiting
+// out an election timeout — useful for a graceful rolling restart.
+// Returns ErrNotLeader if not leader, or an error if no follower is
+// caught up enough. It does not block for the successor to win.
+func (n *Node) TransferLeadership(ctx context.Context) error {
+	done := make(chan error, 1)
+	select {
+	case n.transferc <- done:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.donec:
+		return ErrStopped
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.donec:
+		return ErrStopped
+	}
+}
+
+// onTransferLeadership picks the best successor and fires a TimeoutNow at
+// it (run-loop handler).
+func (n *Node) onTransferLeadership(done chan error) {
+	if n.role != roleLeader {
+		done <- ErrNotLeader
+		return
+	}
+	target := n.bestTransferTarget()
+	if target == "" {
+		done <- fmt.Errorf("raft: no follower is caught up enough to transfer leadership to")
+		return
+	}
+	n.logger.Info("transferring leadership", "to", target, "term", n.term)
+	n.sendRPC(target, &TimeoutNowReq{Term: n.term, LeaderID: n.cfg.ID})
+	done <- nil
+}
+
+// bestTransferTarget returns the voter (other than us) with the highest
+// matchIndex, provided it's at least our committed index — anything less
+// couldn't satisfy the election restriction (Raft §5.4.1). "" if none.
+func (n *Node) bestTransferTarget() NodeID {
+	var best NodeID
+	var bestMatch Index
+	for id := range n.config.Voters {
+		if id == n.cfg.ID {
+			continue
+		}
+		p := n.progress[id]
+		if p == nil || p.matchIndex < n.log.committed {
+			continue
+		}
+		if best == "" || p.matchIndex > bestMatch {
+			best, bestMatch = id, p.matchIndex
+		}
+	}
+	return best
+}
+
 // onConfChange handles a membership-change request. Leader-only; on a
 // follower it surfaces ErrNotLeader to the future. The new
 // Configuration takes effect on append (Raft §4.3) — not on commit —

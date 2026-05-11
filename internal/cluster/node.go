@@ -28,6 +28,10 @@ const (
 	// gcEverySweeps: propose a KindGC every N sweep ticks (idle-resource
 	// pruning is far less urgent than reclaiming expired leases).
 	gcEverySweeps = 30
+	// leadershipTransferTimeout bounds the TransferLeadership call made on
+	// a graceful Close (it returns near-instantly in the happy path; the
+	// timeout just keeps Close from hanging if the run loop is wedged).
+	leadershipTransferTimeout = 3 * time.Second
 )
 
 // Member is one cluster member's pair of addresses: the Raft transport
@@ -111,9 +115,12 @@ func (n *Node) Start() {
 	go n.sweepLoop()
 }
 
-// Close stops the sweep loop (so no more proposes are in flight), then
-// stops the raft node and waits for its goroutines to exit. Idempotent.
+// Close gracefully hands off leadership if this node is the leader (so a
+// successor is elected within a round trip rather than after an election
+// timeout), stops the sweep loop, then stops the raft node and waits for
+// its goroutines to exit. Idempotent.
 func (n *Node) Close() error {
+	n.transferLeadershipBestEffort()
 	select {
 	case <-n.sweepStop:
 	default:
@@ -121,6 +128,17 @@ func (n *Node) Close() error {
 	}
 	n.sweepWG.Wait()
 	return n.raft.Close()
+}
+
+func (n *Node) transferLeadershipBestEffort() {
+	if !n.IsLeader() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), leadershipTransferTimeout)
+	defer cancel()
+	if err := n.raft.TransferLeadership(ctx); err != nil {
+		n.log.Debug("graceful leadership transfer skipped", "err", err)
+	}
 }
 
 // IsLeader reports whether this node currently believes it is the

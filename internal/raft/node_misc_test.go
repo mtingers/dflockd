@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -77,6 +78,54 @@ func TestTimeoutNowTriggersElection(t *testing.T) {
 		return struct{}{}, tc.nodes[target].Status().Term > startTerm
 	}); !ok {
 		t.Fatalf("TimeoutNow did not advance %s's term beyond %d", target, startTerm)
+	}
+}
+
+func TestTransferLeadershipHandsOffToFollower(t *testing.T) {
+	tc := newTestCluster(t, "n1", "n2", "n3")
+	defer tc.stopAll()
+	leader1 := tc.waitLeader()
+	// One committed entry so the followers' matchIndex is up — otherwise
+	// "caught up enough" depends on the leader's no-op having replicated.
+	f, err := tc.nodes[leader1].Propose(context.Background(), []byte("x"))
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	if _, err := mustWait(t, f, 2*time.Second); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	// TimeoutNow gives the target a head start, so it normally wins the
+	// next term — but on a heavily-loaded machine the original leader's
+	// own (very short, test-config) election timer can occasionally beat
+	// it and win back. Retry the transfer against whoever is leader until
+	// it actually moves; only a persistent failure to move is a bug.
+	newLeader, ok := pollUntil(t, 5*time.Second, func() (NodeID, bool) {
+		cur := tc.waitLeader()
+		if cur != leader1 {
+			return cur, true
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = tc.nodes[cur].TransferLeadership(ctx)
+		cancel()
+		return pollUntil(t, 300*time.Millisecond, func() (NodeID, bool) {
+			l, stable := tc.findStableLeader(tc.ids)
+			return l, stable && l != leader1
+		})
+	})
+	if !ok || newLeader == leader1 {
+		t.Fatalf("leadership never moved off %s (now %q, ok=%v)", leader1, newLeader, ok)
+	}
+}
+
+func TestTransferLeadershipOnFollowerErrs(t *testing.T) {
+	tc := newTestCluster(t, "n1", "n2", "n3")
+	defer tc.stopAll()
+	leader := tc.waitLeader()
+	follower := otherIDs(tc.ids, leader)[0]
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tc.nodes[follower].TransferLeadership(ctx); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("TransferLeadership on follower = %v, want ErrNotLeader", err)
 	}
 }
 
