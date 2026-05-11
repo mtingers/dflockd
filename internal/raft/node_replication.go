@@ -193,8 +193,28 @@ func (n *Node) applyAppendEntries(req *AppendEntriesReq) *AppendEntriesResp {
 		n.logger.Error("append from leader failed", "err", err)
 		return &AppendEntriesResp{Term: n.term, Success: false}
 	}
+	n.adoptConfigEntriesFromAppend(req.Entries)
 	n.advanceFollowerCommit(req.LeaderCommit, through)
 	return &AppendEntriesResp{Term: n.term, Success: true, MatchIndex: through}
+}
+
+// adoptConfigEntriesFromAppend scans the just-installed entries for an
+// EntryConfig and adopts it locally. The last one wins (a batch is
+// already in log order). This is the follower side of "configurations
+// take effect on append."
+func (n *Node) adoptConfigEntriesFromAppend(entries []Entry) {
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Type != EntryConfig {
+			continue
+		}
+		cfg, err := decodeConfig(entries[i].Data)
+		if err != nil {
+			n.logger.Error("decode config entry", "index", entries[i].Index, "err", err)
+			return
+		}
+		n.adoptConfig(cfg, entries[i].Index)
+		return
+	}
 }
 
 func (n *Node) advanceFollowerCommit(leaderCommit, lastNew Index) {

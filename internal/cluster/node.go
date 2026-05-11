@@ -191,3 +191,32 @@ func (n *Node) Barrier(ctx context.Context) error {
 	_, err := n.Propose(ctx, Command{Kind: KindBarrier})
 	return err
 }
+
+// AddVoter proposes adding a new voting member with the given Raft
+// transport address. The change is durable and takes effect on append
+// (the new node starts being counted toward quorum immediately). It is
+// the caller's responsibility to start the new node and to make sure
+// the leader's transport can reach it.
+func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAddr string) error {
+	n.cfg.Members[id] = Member{RaftAddr: raftAddr, ClientAddr: clientAddr}
+	fut, err := n.raft.AddVoter(ctx, id, raftAddr)
+	if err != nil {
+		return err
+	}
+	_, err = fut.Wait(ctx)
+	return err
+}
+
+// RemoveServer proposes removing a voter from the cluster. A leader
+// removing itself steps down once the entry commits.
+func (n *Node) RemoveServer(ctx context.Context, id raft.NodeID) error {
+	fut, err := n.raft.RemoveServer(ctx, id)
+	if err != nil {
+		return err
+	}
+	if _, err = fut.Wait(ctx); err != nil {
+		return err
+	}
+	delete(n.cfg.Members, id)
+	return nil
+}

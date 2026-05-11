@@ -88,16 +88,27 @@ type Node struct {
 	rpcWG sync.WaitGroup
 
 	// channels into the run loop
-	tickc     chan struct{}
-	recvc     chan rpcRequest
-	rpcReplyc chan rpcReply
-	proposec  chan *proposal
-	statusc   chan chan NodeStatus
-	applyc    chan applyReq    // run loop → apply goroutine
-	snapSavec chan snapSaveReq // apply goroutine → run loop
-	stopc     chan struct{}
-	donec     chan struct{}
-	applyDone chan struct{} // closed when the apply goroutine exits
+	tickc       chan struct{}
+	recvc       chan rpcRequest
+	rpcReplyc   chan rpcReply
+	proposec    chan *proposal
+	confchangec chan *confChange
+	statusc     chan chan NodeStatus
+	applyc      chan applyReq    // run loop → apply goroutine
+	snapSavec   chan snapSaveReq // apply goroutine → run loop
+	stopc       chan struct{}
+	donec       chan struct{}
+	applyDone   chan struct{} // closed when the apply goroutine exits
+}
+
+// confChange is one membership change submitted to the run loop. It is
+// turned into an EntryConfig by onConfChange and the future is resolved
+// when the entry commits (or with ErrLeadershipLost on stepdown).
+type confChange struct {
+	add    bool // true = AddVoter; false = RemoveServer
+	id     NodeID
+	addr   string
+	future *Future
 }
 
 // snapSaveReq asks the run loop to persist a snapshot that the apply
@@ -200,18 +211,19 @@ func newNode(cfg Config, fsm FSM, rl *raftLog, transport Transport, config Confi
 	return &Node{
 		cfg: cfg, log: rl, transport: transport, fsm: fsm, logger: logger.With("node", cfg.ID),
 		role: roleFollower, config: config.Clone(),
-		proposals: map[Index]*proposal{},
-		rng:       rand.New(rand.NewSource(int64(crc([]byte(cfg.ID))) ^ time.Now().UnixNano())),
-		tickc:     make(chan struct{}, 1),
-		recvc:     make(chan rpcRequest),
-		rpcReplyc: make(chan rpcReply, 64),
-		proposec:  make(chan *proposal),
-		statusc:   make(chan chan NodeStatus),
-		applyc:    make(chan applyReq, cfg.ApplyChanDepth),
-		snapSavec: make(chan snapSaveReq, 1),
-		stopc:     make(chan struct{}),
-		donec:     make(chan struct{}),
-		applyDone: make(chan struct{}),
+		proposals:   map[Index]*proposal{},
+		rng:         rand.New(rand.NewSource(int64(crc([]byte(cfg.ID))) ^ time.Now().UnixNano())),
+		tickc:       make(chan struct{}, 1),
+		recvc:       make(chan rpcRequest),
+		rpcReplyc:   make(chan rpcReply, 64),
+		proposec:    make(chan *proposal),
+		confchangec: make(chan *confChange),
+		statusc:     make(chan chan NodeStatus),
+		applyc:      make(chan applyReq, cfg.ApplyChanDepth),
+		snapSavec:   make(chan snapSaveReq, 1),
+		stopc:       make(chan struct{}),
+		donec:       make(chan struct{}),
+		applyDone:   make(chan struct{}),
 	}
 }
 
@@ -333,6 +345,8 @@ func (n *Node) run() {
 			n.onRPCReply(rep)
 		case p := <-n.proposec:
 			n.onPropose(p)
+		case cc := <-n.confchangec:
+			n.onConfChange(cc)
 		case s := <-n.snapSavec:
 			n.onSnapshotSave(s)
 		case replyc := <-n.statusc:
