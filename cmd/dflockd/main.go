@@ -79,7 +79,17 @@ func startCluster(cfg *config.Config, lm *lock.LockManager, srv *server.Server, 
 	if err != nil {
 		return nil, fmt.Errorf("open raft storage at %s: %w", cfg.RaftDir, err)
 	}
-	transport, err := raft.NewTCPTransport(raft.NodeID(cfg.NodeID), cfg.RaftAddr, log)
+	tlsCfg, err := raft.NewMutualTLSConfig(cfg.RaftTLSCert, cfg.RaftTLSKey, cfg.RaftTLSCA)
+	if err != nil {
+		_ = storage.Close()
+		return nil, err
+	}
+	if tlsCfg != nil {
+		log.Info("raft transport: mutual TLS enabled")
+	} else {
+		log.Warn("raft transport: plaintext (set --raft-tls-cert/--raft-tls-key/--raft-tls-ca to enable mutual TLS)")
+	}
+	transport, err := raft.NewTCPTransport(raft.NodeID(cfg.NodeID), cfg.RaftAddr, log, raft.WithTLS(tlsCfg))
 	if err != nil {
 		_ = storage.Close()
 		return nil, fmt.Errorf("open raft transport on %s: %w", cfg.RaftAddr, err)

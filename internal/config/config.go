@@ -57,6 +57,13 @@ type Config struct {
 	RaftAddr         string        // this node's Raft transport bind ("host:port")
 	AdvertiseAddr    string        // this node's client-facing host:port (returned to redirected clients)
 	ClusterBootstrap bool          // bootstrap a new cluster vs. join an existing one
+	// Mutual TLS on the Raft transport. All three set → every inter-node
+	// connection is mTLS (each node presents RaftTLSCert and verifies the
+	// peer against RaftTLSCA). All empty → plaintext (trusted network).
+	// Mixed → a startup error.
+	RaftTLSCert string
+	RaftTLSKey  string
+	RaftTLSCA   string
 
 	// Diagnostics.
 	Debug   bool
@@ -128,6 +135,7 @@ type flagPtrs struct {
 	fenceStateFile                                  *string
 	raftDir, nodeID, clusterPeers                   *string
 	raftAddr, advertiseAddr                         *string
+	raftTLSCert, raftTLSKey, raftTLSCA              *string
 	port, maxLocks                                  *int
 	maxConnections, maxConnectionsPerIP, maxWaiters *int
 	defaultLeaseTTL, leaseSweepInterval             *int
@@ -165,6 +173,9 @@ func defineStringFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.clusterPeers = fs.String("cluster-peers", "", "Comma-separated list of cluster members: id=raftHost:raftPort@clientHost:clientPort. Required in cluster mode; must include this node.")
 	f.raftAddr = fs.String("raft-addr", "", "This node's Raft transport bind address (host:port). Required in cluster mode.")
 	f.advertiseAddr = fs.String("advertise-addr", "", "This node's client-facing host:port returned to clients via error_not_leader. Defaults to --host:--port.")
+	f.raftTLSCert = fs.String("raft-tls-cert", "", "PEM cert for mutual TLS on the Raft transport. Set with --raft-tls-key and --raft-tls-ca to encrypt+authenticate all inter-node traffic.")
+	f.raftTLSKey = fs.String("raft-tls-key", "", "PEM private key for --raft-tls-cert.")
+	f.raftTLSCA = fs.String("raft-tls-ca", "", "PEM CA bundle used to verify Raft peers' certificates (enables mutual TLS when set with --raft-tls-cert/--raft-tls-key).")
 }
 
 func defineIntFlags(fs *flag.FlagSet, f *flagPtrs) {
@@ -271,6 +282,9 @@ func stringResolvers(f *flagPtrs) []stringResolver {
 		{"node-id", "DFLOCKD_NODE_ID", f.nodeID, func(c *Config, v string) { c.NodeID = v }},
 		{"raft-addr", "DFLOCKD_RAFT_ADDR", f.raftAddr, func(c *Config, v string) { c.RaftAddr = v }},
 		{"advertise-addr", "DFLOCKD_ADVERTISE_ADDR", f.advertiseAddr, func(c *Config, v string) { c.AdvertiseAddr = v }},
+		{"raft-tls-cert", "DFLOCKD_RAFT_TLS_CERT", f.raftTLSCert, func(c *Config, v string) { c.RaftTLSCert = v }},
+		{"raft-tls-key", "DFLOCKD_RAFT_TLS_KEY", f.raftTLSKey, func(c *Config, v string) { c.RaftTLSKey = v }},
+		{"raft-tls-ca", "DFLOCKD_RAFT_TLS_CA", f.raftTLSCA, func(c *Config, v string) { c.RaftTLSCA = v }},
 	}
 }
 
@@ -418,6 +432,7 @@ var validators = []func(*Config) error{
 	validateClusterFields,
 	validateClusterVsFenceFile,
 	validateClusterVsHTTPPort,
+	validateRaftTLS,
 }
 
 // validateClusterFields enforces that cluster fields are coherent: if
@@ -482,6 +497,31 @@ func validateClusterVsHTTPPort(c *Config) error {
 	}
 	return nil
 }
+
+// validateRaftTLS enforces the all-three-or-none rule on the Raft mTLS
+// flags and ties them to cluster mode.
+func validateRaftTLS(c *Config) error {
+	set := 0
+	for _, v := range []string{c.RaftTLSCert, c.RaftTLSKey, c.RaftTLSCA} {
+		if v != "" {
+			set++
+		}
+	}
+	if set == 0 {
+		return nil
+	}
+	if set != 3 {
+		return fmt.Errorf("--raft-tls-cert, --raft-tls-key and --raft-tls-ca must be set together (or all left empty)")
+	}
+	if !c.IsCluster() {
+		return fmt.Errorf("--raft-tls-* requires cluster mode (--raft-dir)")
+	}
+	return nil
+}
+
+// RaftTLSEnabled reports whether mutual TLS is configured for the Raft
+// transport.
+func (c *Config) RaftTLSEnabled() bool { return c.RaftTLSCert != "" }
 
 // IsCluster reports whether cluster mode is enabled. We use --raft-dir
 // as the canonical "are we clustered?" switch: it is the only required

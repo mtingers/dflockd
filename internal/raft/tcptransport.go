@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,7 @@ type rpcHandler = func(from NodeID, req Message) Message
 type TCPTransport struct {
 	id           NodeID
 	listener     net.Listener
+	tlsCfg       *tls.Config                // non-nil → mutual TLS on every conn
 	handler      atomic.Pointer[rpcHandler] // set via SetHandler; read off accept goroutines
 	addrs        sync.Map                   // NodeID → string
 	outbound     sync.Map                   // NodeID → *outboundConn
@@ -42,18 +44,35 @@ var _ Transport = (*TCPTransport)(nil)
 // errTransportClosed is returned by Send once Close has been called.
 var errTransportClosed = errors.New("raft: transport closed")
 
+// TCPOption configures a TCPTransport at construction time.
+type TCPOption func(*tcpOptions)
+
+type tcpOptions struct{ tlsCfg *tls.Config }
+
+// WithTLS makes every inter-node connection use cfg (mutual TLS — see
+// NewMutualTLSConfig). A nil cfg is a no-op (plaintext).
+func WithTLS(cfg *tls.Config) TCPOption { return func(o *tcpOptions) { o.tlsCfg = cfg } }
+
 // NewTCPTransport listens on listenAddr ("host:port"; "0" gets a free
 // port) and returns a Transport bound to id. Call SetHandler before
-// expecting inbound RPCs to deliver.
-func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger) (*TCPTransport, error) {
+// expecting inbound RPCs to deliver. Pass WithTLS(cfg) to wrap every
+// connection in mutual TLS.
+func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger, opts ...TCPOption) (*TCPTransport, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	var o tcpOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("raft: tcp listen %s: %w", listenAddr, err)
 	}
-	t := &TCPTransport{id: id, listener: lis, log: logger.With("transport", id)}
+	if o.tlsCfg != nil {
+		lis = tls.NewListener(lis, o.tlsCfg)
+	}
+	t := &TCPTransport{id: id, listener: lis, tlsCfg: o.tlsCfg, log: logger.With("transport", id)}
 	t.wg.Add(1)
 	go t.acceptLoop()
 	return t, nil
@@ -218,11 +237,15 @@ func (t *TCPTransport) writeResponse(conn net.Conn, reqID uint64, resp Message) 
 }
 
 // tuneConn enables TCP keepalive so a peer whose host disappeared
-// (no RST/FIN) is detected without waiting out connIdleTimeout.
+// (no RST/FIN) is detected without waiting out connIdleTimeout. It
+// unwraps a *tls.Conn to reach the underlying socket.
 func tuneConn(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(tcpKeepAlivePeriod)
+	switch v := c.(type) {
+	case *net.TCPConn:
+		_ = v.SetKeepAlive(true)
+		_ = v.SetKeepAlivePeriod(tcpKeepAlivePeriod)
+	case *tls.Conn:
+		tuneConn(v.NetConn())
 	}
 }
 
@@ -271,7 +294,7 @@ func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
 	if !ok {
 		return nil, fmt.Errorf("raft: no address for peer %q", to)
 	}
-	conn, err := net.DialTimeout("tcp", addrAny.(string), 3*time.Second)
+	conn, err := t.dial(addrAny.(string))
 	if err != nil {
 		t.lastDialFail.Store(to, time.Now())
 		return nil, fmt.Errorf("raft: dial %s: %w", to, err)
@@ -288,6 +311,16 @@ func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
 	t.wg.Add(1)
 	go func() { defer t.wg.Done(); oc.runReader() }()
 	return oc, nil
+}
+
+// dial opens a TCP connection (TLS-wrapped when configured). The 3 s
+// budget covers connect + the TLS handshake as a whole.
+func (t *TCPTransport) dial(addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 3 * time.Second}
+	if t.tlsCfg != nil {
+		return tls.DialWithDialer(d, "tcp", addr, t.tlsCfg)
+	}
+	return d.Dial("tcp", addr)
 }
 
 func (t *TCPTransport) clientHandshake(conn net.Conn, want NodeID) error {

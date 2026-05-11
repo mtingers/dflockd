@@ -94,6 +94,8 @@ func TestClusterFieldValidation(t *testing.T) {
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1,n1=h:2@c:2"}, "duplicate node id"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--fence-state-file", "/fence"}, "--fence-state-file is incompatible"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--http-port", "6389"}, "--http-port is not yet supported in cluster mode"},
+		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--raft-tls-cert", "/c.pem"}, "must be set together"},
+		{[]string{"--raft-tls-cert", "/c.pem", "--raft-tls-key", "/k.pem", "--raft-tls-ca", "/ca.pem"}, "requires cluster mode"},
 	}
 	for _, bad := range bads {
 		t.Run(strings.Join(bad.args, " "), func(t *testing.T) {
@@ -102,5 +104,18 @@ func TestClusterFieldValidation(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", bad.want, err)
 			}
 		})
+	}
+
+	// All three TLS flags + cluster mode validate, and RaftTLSEnabled flips.
+	c, err := Load([]string{
+		"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001",
+		"--cluster-peers", "n1=h:1@c:1",
+		"--raft-tls-cert", "/c.pem", "--raft-tls-key", "/k.pem", "--raft-tls-ca", "/ca.pem",
+	})
+	if err != nil {
+		t.Fatalf("full TLS cluster cfg should load: %v", err)
+	}
+	if !c.RaftTLSEnabled() || c.RaftTLSCA != "/ca.pem" {
+		t.Fatalf("RaftTLS* not wired: %+v", c)
 	}
 }

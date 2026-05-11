@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mtingers/dflockd/internal/testutil"
 )
 
 // Stand up two real TCP transports on loopback, wire them as the
@@ -240,6 +242,65 @@ func TestReadFrameClearsStaleDeadline(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("readFrame after deadline cleared: %v", err)
+	}
+}
+
+func TestTCPTransportMutualTLS(t *testing.T) {
+	cfg := testutil.MutualTLS(t) // shared by both ends
+	trA, err := NewTCPTransport("a", "127.0.0.1:0", nil, WithTLS(cfg))
+	if err != nil {
+		t.Fatalf("NewTCPTransport a: %v", err)
+	}
+	trB, err := NewTCPTransport("b", "127.0.0.1:0", nil, WithTLS(cfg))
+	if err != nil {
+		t.Fatalf("NewTCPTransport b: %v", err)
+	}
+	defer trA.Close()
+	defer trB.Close()
+	trA.AddPeer("b", trB.ListenAddr())
+	trB.SetHandler(func(from NodeID, req Message) Message {
+		return &RequestVoteResp{Term: req.messageTerm(), VoteGranted: true}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := trA.Send(ctx, "b", &RequestVoteReq{Term: 9, CandidateID: "a"})
+	if err != nil {
+		t.Fatalf("Send over mTLS: %v", err)
+	}
+	if rv, ok := resp.(*RequestVoteResp); !ok || rv.Term != 9 {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestTCPTransportTLSRejectsUntrustedPeer(t *testing.T) {
+	trA, err := NewTCPTransport("a", "127.0.0.1:0", nil, WithTLS(testutil.MutualTLS(t)))
+	if err != nil {
+		t.Fatalf("NewTCPTransport a: %v", err)
+	}
+	trB, err := NewTCPTransport("b", "127.0.0.1:0", nil, WithTLS(testutil.MutualTLS(t))) // a different cert/pool
+	if err != nil {
+		t.Fatalf("NewTCPTransport b: %v", err)
+	}
+	defer trA.Close()
+	defer trB.Close()
+	trB.SetHandler(func(NodeID, Message) Message { return &RequestVoteResp{} })
+	trA.AddPeer("b", trB.ListenAddr())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := trA.Send(ctx, "b", &RequestVoteReq{Term: 1}); err == nil {
+		t.Fatalf("Send to a peer with an untrusted cert should fail the TLS handshake")
+	}
+}
+
+func TestNewMutualTLSConfig(t *testing.T) {
+	if cfg, err := NewMutualTLSConfig("", "", ""); err != nil || cfg != nil {
+		t.Fatalf("empty paths: cfg=%v err=%v, want nil,nil", cfg, err)
+	}
+	if _, err := NewMutualTLSConfig("a.pem", "", ""); err == nil {
+		t.Fatalf("partial config should error")
+	}
+	if _, err := NewMutualTLSConfig("/no/such/cert", "/no/such/key", "/no/such/ca"); err == nil {
+		t.Fatalf("missing files should error")
 	}
 }
 
