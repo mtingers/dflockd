@@ -242,14 +242,22 @@ Then, continuing toward "prod ready":
 - **Graceful leadership transfer** — `raft.Node.TransferLeadership` (+
   `cluster.Node.Close` on the leader): a rolling restart of the leader
   re-elects within a round trip instead of after an election timeout.
-- **Cluster observability** — `stats` now carries a `"cluster"` object
-  (role, term, leader, commit/last-log/snapshot indices, voters).
+- **Cluster observability** — `stats` (TCP and `GET /v1/stats`) carries
+  a `"cluster"` object (role, term, leader, commit/last-log/snapshot
+  indices, voters); `GET /metrics` exposes `dflockd_raft_*` gauges.
+- **The HTTP API works in cluster mode** — `--http-port` + `--raft-dir`
+  is no longer rejected. Mutating endpoints propose through Raft; a
+  follower returns `503 {"error":"not_leader"}` + an `X-Dflockd-Leader`
+  header; read-only endpoints serve on any node. Single-node behaviour
+  is byte-identical.
 
 Deliberately *not* changed (noted, low priority): `persistHardState`
-failure logs + demotes rather than self-`Close`ing; `clusterProposeErrAck`
-still maps every non-context propose error to `error_not_leader` (the
-shutdown window where that's slightly misleading is narrow because
-`SetCluster(nil)` runs first on teardown).
+failure logs + demotes rather than self-`Close`ing; the TCP path's
+`clusterProposeErrAck` still maps every non-context propose error to
+`error_not_leader` (the shutdown window where that's slightly misleading
+is narrow because `SetCluster(nil)` runs first on teardown; the HTTP
+path treats `raft.ErrStopped`/`ErrLeadershipLost` as not-leader → 503,
+which is the right "retry elsewhere" signal).
 
 ## Bottom line
 
@@ -262,22 +270,18 @@ non-cluster single-node binary is byte-identical to v2.1.x.
 
 Recommended next work, in priority order:
 
-1. **HTTP API cluster routing** — propose mutating handlers through
-   the cluster (so `--http-port` + cluster mode is no longer rejected
-   at startup); this also unblocks `/metrics`.
-2. **Prometheus cluster metrics** (`dflockd_raft_role`,
-   `_term`, `_commit_index`, `_applied_index`, `_leader_changes_total`,
-   `_proposals_total`, `_apply_duration_seconds`) on `/metrics` — the
-   same data is already in `stats`.
-3. **Runtime reconfiguration surface** — expose `AddVoter`/`RemoveServer`
-   over a (TLS'd) admin command/endpoint so operators don't need a Go
-   program to grow/shrink a running cluster.
-4. **Multi-node soak harness** under `cmd/cluster-soak` with the
+1. **Runtime reconfiguration surface** — expose `AddVoter`/`RemoveServer`
+   over a (TLS'd / authed) admin command or HTTP endpoint so operators
+   don't need a Go program to grow/shrink a running cluster.
+2. **Counter-style cluster metrics** — `dflockd_raft_leader_changes_total`,
+   `_proposals_total`, `_apply_duration_seconds` (the gauge-style state
+   metrics — role, term, commit index, etc. — are already on `/metrics`).
+3. **Multi-node soak harness** under `cmd/cluster-soak` with the
    fault-injection knobs PLAN.md §6 lists (and a long-running variant
    of `tools/cluster-smoke`).
-5. **Stable-client-ref re-attach** for FIFO across leader failover
+4. **Stable-client-ref re-attach** for FIFO across leader failover
    (PLAN.md §4.7 follow-on).
-6. **Dynamic join with InstallSnapshot transfer** to a node started
+5. **Dynamic join with InstallSnapshot transfer** to a node started
    without prior state (PLAN.md §12 follow-on).
-7. **Linearizable read barrier** (`ReadIndex` API) as an exposed public
+6. **Linearizable read barrier** (`ReadIndex` API) as an exposed public
    API (the internal `Barrier` is already wired).

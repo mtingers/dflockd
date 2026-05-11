@@ -14,8 +14,8 @@ it, and recovering from common failures. See
 | `--cluster-peers <list>` | Every member of the cluster as `id=raftHost:raftPort@clientHost:clientPort,...`. Must include this node. |
 | `--advertise-addr <host:port>` (optional) | This node's client-facing address. Defaults to `--host:--port`. Clients connect here when redirected. |
 
-`--http-port` is currently rejected when `--raft-dir` is set — see
-the [v1 caveats below](#v1-caveats).
+`--http-port` works in cluster mode — see [HTTP API in cluster
+mode](#http-api-in-cluster-mode) below.
 
 ### Securing the Raft transport (mutual TLS)
 
@@ -115,24 +115,39 @@ commits.
 
 ## Health / observability
 
-- The TCP `stats` command returns the local node's lock state, and in
-  cluster mode an extra `"cluster"` object: this node's id, role
+- The TCP `stats` command (and `GET /v1/stats` when `--http-port` is
+  enabled) return the local node's lock state, and in cluster mode an
+  extra `"cluster"` object: this node's id, role
   (`leader`/`follower`/`candidate`/`pre-candidate`), term, leader id +
   client address, commit index, last-log index, snapshot index, and the
   voter set. Poll any node — a follower's view is consistent enough for
   monitoring.
+- `GET /metrics` (HTTP enabled) exposes `dflockd_raft_state`,
+  `dflockd_raft_is_leader`, `dflockd_raft_term`,
+  `dflockd_raft_commit_index`, `dflockd_raft_last_log_index`,
+  `dflockd_raft_snapshot_index`, and `dflockd_raft_voters` alongside the
+  usual `dflockd_*` gauges.
 - A follower also reveals the leader via the `error_not_leader <addr>`
-  redirect on any mutating command.
+  TCP redirect (or the `503 {"error":"not_leader"}` HTTP response with
+  an `X-Dflockd-Leader` header) on any mutating command.
 - Log output (`level=INFO`) shows role changes, elections, leadership
-  transfers, and snapshot events. A Prometheus surface for cluster
-  metrics is a follow-on.
+  transfers, and snapshot events.
+
+## HTTP API in cluster mode
+
+The HTTP API works in cluster mode: mutating endpoints
+(`acquire`/`enqueue`/`wait`/`release`/`renew`, session delete) are
+proposed through Raft. On a **follower** they return
+`503 {"error":"not_leader","detail":...}` with the leader's *raft client
+address* in an `X-Dflockd-Leader` header — note that's the leader's TCP
+port, not its HTTP port (the cluster config doesn't carry HTTP
+addresses), so an HTTP client should retry against another node it knows
+rather than blindly following the header. Read-only endpoints
+(`/health`, `/ready`, `/v1/stats`, `/metrics`, `/openapi.json`) work on
+any node.
 
 ## v1 caveats
 
-- **`--http-port` is rejected with cluster mode.** The HTTP API
-  currently calls the LockManager directly; routing it through the
-  cluster's propose path is a follow-on. Use the TCP API in cluster
-  mode.
 - **FIFO across leader failover** — a client blocked in `acquire` /
   `wait` when the leader fails loses its queue position; the holder
   entry (if any was minted) expires via its lease. Already-granted
