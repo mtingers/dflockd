@@ -28,16 +28,30 @@ func StripKeyPrefix(key string) string {
 }
 
 // holder is one currently-held slot in a ResourceState.
+//
+// Ref is the cluster-mode requester identifier. Single-node callers leave
+// it empty; the existing connID-based routing remains the source of
+// truth for them. Both fields coexist so that cluster failover (where
+// connID is meaningless across nodes) can route by Ref while the
+// single-node fast paths continue to key off connID.
 type holder struct {
 	connID       uint64
 	leaseExpires time.Time
+	ref          string
 }
 
 // waiter is a queued grant request waiting for capacity.
+//
+// Ref / Salt are populated only by the FSM apply path so a leadership
+// change can preserve which client a queued slot belongs to and so
+// promotion can mint a token deterministically; single-node callers
+// continue to use ch + connID for routing.
 type waiter struct {
 	ch       chan string
 	connID   uint64
 	leaseTTL time.Duration
+	ref      string
+	salt     [8]byte
 }
 
 // connKey identifies one connection's two-phase state for one key.

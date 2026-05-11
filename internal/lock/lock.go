@@ -49,6 +49,17 @@ type LockManager struct {
 	// pre-allocated to disk so cross-restart monotonicity holds even
 	// across crashes and clock regressions.
 	fenceAlloc *fenceAllocator
+	// fsmFenceCounter is the deterministic, snapshot-able fence prefix
+	// source used by the FSM Apply path (cluster mode). The single-node
+	// Acquire/Enqueue methods continue to use fenceAlloc; this counter
+	// is bumped exclusively by ApplyX, which the Raft apply goroutine
+	// invokes serially, so it needs no atomic. Snapshot() captures it;
+	// Restore() seeds it.
+	fsmFenceCounter uint64
+	// listeners maps an FSM-path requester reference to its local grant
+	// channel. ApplyX never touches it; routing of grants is the
+	// caller's job (see RouteGrants).
+	listeners listenerRegistry
 }
 
 // NewLockManager creates a LockManager bound to the given config.
