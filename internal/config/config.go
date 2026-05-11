@@ -417,6 +417,7 @@ var validators = []func(*Config) error{
 	validateHTTPRateBurstWhenRate,
 	validateClusterFields,
 	validateClusterVsFenceFile,
+	validateClusterVsHTTPPort,
 }
 
 // validateClusterFields enforces that cluster fields are coherent: if
@@ -466,6 +467,18 @@ func validateClusterPeerUniqueness(peers []ClusterPeer) error {
 func validateClusterVsFenceFile(c *Config) error {
 	if c.IsCluster() && c.FenceStateFile != "" {
 		return fmt.Errorf("--fence-state-file is incompatible with cluster mode; Raft persistence supersedes it")
+	}
+	return nil
+}
+
+// validateClusterVsHTTPPort rejects the combination of cluster mode +
+// --http-port for v1. The HTTP API currently bypasses the cluster's
+// FSM (it calls LockManager directly) and would mutate state that
+// isn't replicated — wiring it through the cluster's propose path is a
+// follow-on. Until then, cluster operators use the TCP API.
+func validateClusterVsHTTPPort(c *Config) error {
+	if c.IsCluster() && c.HTTPPort != 0 {
+		return fmt.Errorf("--http-port is not yet supported in cluster mode; use the TCP API or run a non-cluster gateway")
 	}
 	return nil
 }
