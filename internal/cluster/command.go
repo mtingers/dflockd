@@ -20,30 +20,28 @@ const (
 	KindEvict
 	KindCleanupConn
 	KindGC
-	KindBarrier // no-op for ReadIndex-style fences; produces no FSM mutation
+	KindBarrier      // no-op for ReadIndex-style fences; produces no FSM mutation
+	KindEvictExpired // sweep all holders past their lease deadline (leader-driven)
+	// Append new kinds here only — values are stable on the wire.
 )
 
+var kindNames = [...]string{
+	KindAcquire:      "acquire",
+	KindEnqueue:      "enqueue",
+	KindRelease:      "release",
+	KindRenew:        "renew",
+	KindEvict:        "evict",
+	KindCleanupConn:  "cleanup_conn",
+	KindGC:           "gc",
+	KindBarrier:      "barrier",
+	KindEvictExpired: "evict_expired",
+}
+
 func (k Kind) String() string {
-	switch k {
-	case KindAcquire:
-		return "acquire"
-	case KindEnqueue:
-		return "enqueue"
-	case KindRelease:
-		return "release"
-	case KindRenew:
-		return "renew"
-	case KindEvict:
-		return "evict"
-	case KindCleanupConn:
-		return "cleanup_conn"
-	case KindGC:
-		return "gc"
-	case KindBarrier:
-		return "barrier"
-	default:
-		return fmt.Sprintf("kind(%d)", uint8(k))
+	if int(k) < len(kindNames) && kindNames[k] != "" {
+		return kindNames[k]
 	}
+	return fmt.Sprintf("kind(%d)", uint8(k))
 }
 
 // Command is one application-level operation submitted to the cluster.

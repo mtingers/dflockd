@@ -278,6 +278,41 @@ func sortedKeys[V any](m map[string]V) []string {
 	return out
 }
 
+// ApplyEvictExpired drops every holder whose lease deadline is before
+// `now`, across all shards, and promotes waiters into the freed slots.
+// The leader's sweep loop proposes it periodically so a holder whose
+// client crashed (no graceful release/cleanup) is reclaimed even if
+// nobody else ever touches the key. Deterministic: leaseExpires was
+// stamped from the acquiring command's time, and `now` is the same on
+// every replica.
+func (lm *LockManager) ApplyEvictExpired(now time.Time) (ApplyResult, []Grant, error) {
+	var grants []Grant
+	for i := range lm.shards {
+		g, err := lm.evictExpiredShard(&lm.shards[i], now)
+		if err != nil {
+			return ApplyResult{}, grants, err
+		}
+		grants = append(grants, g...)
+	}
+	return ApplyResult{Status: StatusOK}, grants, nil
+}
+
+func (lm *LockManager) evictExpiredShard(sh *shard, now time.Time) ([]Grant, error) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	var grants []Grant
+	// Sorted key order: evictExpiredAt mints fences via grantNextAt, so
+	// the per-key processing order must match across replicas.
+	for _, key := range sortedKeys(sh.resources) {
+		g, err := lm.evictExpiredAt(sh, key, sh.resources[key], now)
+		if err != nil {
+			return grants, err
+		}
+		grants = append(grants, g...)
+	}
+	return grants, nil
+}
+
 // ApplyGC drops resources that have been idle longer than the
 // configured threshold across all shards. The leader's GC loop proposes
 // it periodically.

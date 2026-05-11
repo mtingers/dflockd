@@ -20,12 +20,17 @@ type testCluster struct {
 	nodes map[raft.NodeID]*Node
 	lms   map[raft.NodeID]*lock.LockManager
 	trs   map[raft.NodeID]*raft.MemTransport
+	sweep time.Duration // 0 → node default
 }
 
 func newCluster(t *testing.T, ids ...raft.NodeID) *testCluster {
+	return newClusterWithSweep(t, 0, ids...)
+}
+
+func newClusterWithSweep(t *testing.T, sweep time.Duration, ids ...raft.NodeID) *testCluster {
 	t.Helper()
 	tc := &testCluster{
-		t: t, net: raft.NewMemNetwork(), ids: ids,
+		t: t, net: raft.NewMemNetwork(), ids: ids, sweep: sweep,
 		nodes: map[raft.NodeID]*Node{},
 		lms:   map[raft.NodeID]*lock.LockManager{},
 		trs:   map[raft.NodeID]*raft.MemTransport{},
@@ -43,7 +48,7 @@ func newCluster(t *testing.T, ids ...raft.NodeID) *testCluster {
 func (tc *testCluster) startNode(id raft.NodeID, members map[raft.NodeID]Member) {
 	tc.t.Helper()
 	rcfg := fastRaftConfig(id)
-	cfg := Config{Raft: rcfg, Members: members, AdvertiseAddr: members[id].ClientAddr}
+	cfg := Config{Raft: rcfg, Members: members, AdvertiseAddr: members[id].ClientAddr, SweepInterval: tc.sweep}
 	lm := newClusterLM(tc.t)
 	tr := tc.net.Transport(id)
 	st := raft.NewMemStorage()
@@ -346,6 +351,32 @@ func TestBarrierAppliesAsNoOp(t *testing.T) {
 	defer cancel()
 	if err := tc.nodes[leader].Barrier(ctx); err != nil {
 		t.Fatalf("Barrier: %v", err)
+	}
+}
+
+// The leader-driven sweep loop must reclaim a holder whose lease has
+// expired, with no further client activity on that key.
+func TestSweepLoopEvictsExpiredHolder(t *testing.T) {
+	tc := newClusterWithSweep(t, 10*time.Millisecond, "n1", "n2", "n3")
+	defer tc.stopAll()
+	leader := tc.waitLeader()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// A 1ms lease: expired almost immediately; only the sweep loop can
+	// reclaim it (nothing else touches "lock:ephemeral").
+	if r, err := tc.nodes[leader].ProposeAcquire(ctx, "lock:ephemeral", 1, "A", 1, time.Millisecond, saltOf(1)); err != nil || r.Status != lock.StatusOK {
+		t.Fatalf("ProposeAcquire = %+v, %v", r, err)
+	}
+	if got := holderTokens(tc.lms[leader], "ephemeral"); len(got) != 1 {
+		t.Fatalf("right after acquire: %d holders, want 1", len(got))
+	}
+	// Within a few sweep ticks the leader proposes KindEvictExpired and
+	// the holder vanishes on every replica.
+	for _, id := range tc.ids {
+		id := id
+		if !pollUntil(t, time.Second, func() bool { return len(holderTokens(tc.lms[id], "ephemeral")) == 0 }) {
+			t.Fatalf("node %s: expired holder not reclaimed by the sweep loop", id)
+		}
 	}
 }
 

@@ -278,6 +278,34 @@ func TestRestoreReplacesAllPriorState(t *testing.T) {
 	}
 }
 
+func TestApplyEvictExpired(t *testing.T) {
+	lm := newApplyTestLM(t)
+	// liveK: holder with a 1h lease taken at t=100; staleK: holder with a
+	// 10s lease taken at t=100 (so it's expired by t=200) and a queued
+	// waiter behind it.
+	rLive, _, _ := lm.ApplyAcquire(at(100), "lock:liveK", 1, "live", 1, time.Hour, saltOf(1))
+	rStale, _, _ := lm.ApplyAcquire(at(100), "lock:staleK", 1, "stale", 2, 10*time.Second, saltOf(2))
+	if r, _, _ := lm.ApplyAcquire(at(101), "lock:staleK", 1, "wait", 3, 30*time.Second, saltOf(3)); r.Status != StatusQueued {
+		t.Fatalf("waiter on staleK = %+v, want queued", r)
+	}
+
+	_, grants, err := lm.ApplyEvictExpired(at(200)) // 100s in: staleK's 10s lease is long gone
+	if err != nil {
+		t.Fatalf("ApplyEvictExpired: %v", err)
+	}
+
+	if got := lm.DebugHolderTokens("lock:liveK"); len(got) != 1 || got[0] != rLive.Token {
+		t.Fatalf("liveK holders = %v, want [%s] (lease not expired)", got, rLive.Token)
+	}
+	staleHolders := lm.DebugHolderTokens("lock:staleK")
+	if len(staleHolders) != 1 || staleHolders[0] == rStale.Token {
+		t.Fatalf("staleK holders = %v: expired holder should be evicted and the waiter promoted", staleHolders)
+	}
+	if len(grants) != 1 || grants[0].Ref != "wait" || grants[0].Token != staleHolders[0] {
+		t.Fatalf("promotion grant = %+v, want one grant for ref \"wait\" with the new token", grants)
+	}
+}
+
 // --- Grant routing via the listener registry ---
 
 func TestRouteGrantsDeliversToRegisteredListener(t *testing.T) {

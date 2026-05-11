@@ -2,8 +2,10 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
@@ -16,7 +18,17 @@ type Config struct {
 	Raft          raft.Config
 	Members       map[raft.NodeID]Member // every member's addresses, keyed by node id
 	AdvertiseAddr string                 // this node's client-facing host:port (returned to redirected clients)
+	// SweepInterval is how often the leader proposes a lease-expiry sweep
+	// (and, less often, an idle-resource GC). Zero → defaultSweepInterval.
+	SweepInterval time.Duration
 }
+
+const (
+	defaultSweepInterval = time.Second
+	// gcEverySweeps: propose a KindGC every N sweep ticks (idle-resource
+	// pruning is far less urgent than reclaiming expired leases).
+	gcEverySweeps = 30
+)
 
 // Member is one cluster member's pair of addresses: the Raft transport
 // address (peer-to-peer consensus traffic) and the client-facing
@@ -54,6 +66,11 @@ type Node struct {
 	lm        *lock.LockManager
 	fsm       *fsm
 	log       *slog.Logger
+
+	membersMu sync.Mutex // guards cfg.Members (mutated by AddVoter/RemoveServer, read by LeaderClientAddr)
+
+	sweepStop chan struct{}
+	sweepWG   sync.WaitGroup
 }
 
 // NewNode wires the raft node + FSM. It does not start any work until
@@ -70,7 +87,10 @@ func NewNode(cfg Config, lm *lock.LockManager, storage raft.Storage, transport r
 	if err != nil {
 		return nil, fmt.Errorf("cluster: build raft node: %w", err)
 	}
-	return &Node{cfg: cfg, raft: rn, storage: storage, transport: transport, lm: lm, fsm: f, log: logger.With("node", cfg.Raft.ID)}, nil
+	return &Node{
+		cfg: cfg, raft: rn, storage: storage, transport: transport, lm: lm, fsm: f,
+		log: logger.With("node", cfg.Raft.ID), sweepStop: make(chan struct{}),
+	}, nil
 }
 
 // raftConfigFor builds the raft.Configuration the cluster.Config maps to.
@@ -83,11 +103,25 @@ func raftConfigFor(cfg Config) raft.Configuration {
 	return raft.Configuration{Voters: voters}
 }
 
-// Start launches the underlying raft node.
-func (n *Node) Start() { n.raft.Start() }
+// Start launches the underlying raft node and the leader-driven sweep
+// loop (lease expiry + idle GC).
+func (n *Node) Start() {
+	n.raft.Start()
+	n.sweepWG.Add(1)
+	go n.sweepLoop()
+}
 
-// Close stops the raft node and waits for its goroutines to exit.
-func (n *Node) Close() error { return n.raft.Close() }
+// Close stops the sweep loop (so no more proposes are in flight), then
+// stops the raft node and waits for its goroutines to exit. Idempotent.
+func (n *Node) Close() error {
+	select {
+	case <-n.sweepStop:
+	default:
+		close(n.sweepStop)
+	}
+	n.sweepWG.Wait()
+	return n.raft.Close()
+}
 
 // IsLeader reports whether this node currently believes it is the
 // cluster leader.
@@ -113,7 +147,9 @@ func (n *Node) LeaderClientAddr() (string, bool) {
 	if id == "" {
 		return "", false
 	}
+	n.membersMu.Lock()
 	m, ok := n.cfg.Members[id]
+	n.membersMu.Unlock()
 	if !ok {
 		return "", false
 	}
@@ -185,6 +221,69 @@ func (n *Node) ProposeGC(ctx context.Context) (lock.ApplyResult, error) {
 	return n.Propose(ctx, Command{Kind: KindGC})
 }
 
+// ProposeEvictExpired asks the cluster to drop every holder past its
+// lease deadline (and promote waiters into the freed slots).
+func (n *Node) ProposeEvictExpired(ctx context.Context) (lock.ApplyResult, error) {
+	return n.Propose(ctx, Command{Kind: KindEvictExpired})
+}
+
+// ---------------------------------------------------------------------------
+// leader-driven background sweep
+// ---------------------------------------------------------------------------
+
+// sweepLoop runs on every node but only acts while this node is the
+// leader: it proposes a lease-expiry sweep every tick and an idle GC
+// every gcEverySweeps ticks. A non-leader tick is a no-op (the real
+// leader's loop does the work); a leadership change between the IsLeader
+// check and the propose just yields ErrNotLeader, which we ignore.
+func (n *Node) sweepLoop() {
+	defer n.sweepWG.Done()
+	interval := n.cfg.SweepInterval
+	if interval <= 0 {
+		interval = defaultSweepInterval
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for tick := 0; ; tick++ {
+		select {
+		case <-n.sweepStop:
+			return
+		case <-t.C:
+			if !n.IsLeader() {
+				continue
+			}
+			n.runOneSweep(interval, tick%gcEverySweeps == 0)
+		}
+	}
+}
+
+func (n *Node) runOneSweep(budget time.Duration, alsoGC bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	if _, err := n.ProposeEvictExpired(ctx); err != nil {
+		n.logSweepErr("evict-expired", err)
+		return
+	}
+	if alsoGC {
+		if _, err := n.ProposeGC(ctx); err != nil {
+			n.logSweepErr("gc", err)
+		}
+	}
+}
+
+func (n *Node) logSweepErr(what string, err error) {
+	switch {
+	case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost):
+		// expected around leadership changes
+	case errors.Is(err, raft.ErrStopped), errors.Is(err, context.Canceled):
+		// shutting down
+	case errors.Is(err, context.DeadlineExceeded):
+		// a degraded cluster (no quorum) — the next tick retries; no spam
+	default:
+		n.log.Debug("cluster sweep proposal failed", "op", what, "err", err)
+	}
+}
+
 // Barrier proposes a no-op and waits for it to apply — a cheap
 // linearizable read barrier for the leader's own queries.
 func (n *Node) Barrier(ctx context.Context) error {
@@ -198,7 +297,7 @@ func (n *Node) Barrier(ctx context.Context) error {
 // the caller's responsibility to start the new node and to make sure
 // the leader's transport can reach it.
 func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAddr string) error {
-	n.cfg.Members[id] = Member{RaftAddr: raftAddr, ClientAddr: clientAddr}
+	n.setMember(id, Member{RaftAddr: raftAddr, ClientAddr: clientAddr})
 	fut, err := n.raft.AddVoter(ctx, id, raftAddr)
 	if err != nil {
 		return err
@@ -217,6 +316,18 @@ func (n *Node) RemoveServer(ctx context.Context, id raft.NodeID) error {
 	if _, err = fut.Wait(ctx); err != nil {
 		return err
 	}
-	delete(n.cfg.Members, id)
+	n.deleteMember(id)
 	return nil
+}
+
+func (n *Node) setMember(id raft.NodeID, m Member) {
+	n.membersMu.Lock()
+	n.cfg.Members[id] = m
+	n.membersMu.Unlock()
+}
+
+func (n *Node) deleteMember(id raft.NodeID) {
+	n.membersMu.Lock()
+	delete(n.cfg.Members, id)
+	n.membersMu.Unlock()
 }

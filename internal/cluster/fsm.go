@@ -37,28 +37,27 @@ func (f *fsm) Apply(e raft.Entry) any {
 	return f.dispatch(cmd)
 }
 
+// fsmHandlers maps a command kind to its apply function. Using a table
+// (rather than a switch) keeps dispatch's cyclomatic complexity flat as
+// kinds are added.
+var fsmHandlers = map[Kind]func(*fsm, time.Time, Command) any{
+	KindAcquire:      (*fsm).applyAcquire,
+	KindEnqueue:      (*fsm).applyEnqueue,
+	KindRelease:      (*fsm).applyRelease,
+	KindRenew:        (*fsm).applyRenew,
+	KindEvict:        (*fsm).applyEvict,
+	KindCleanupConn:  (*fsm).applyCleanupConn,
+	KindGC:           func(f *fsm, now time.Time, _ Command) any { return f.lm.ApplyGC(now) },
+	KindEvictExpired: (*fsm).applyEvictExpired,
+	KindBarrier:      func(_ *fsm, _ time.Time, _ Command) any { return lock.ApplyResult{Status: lock.StatusOK} },
+}
+
 func (f *fsm) dispatch(cmd Command) any {
-	now := time.Unix(0, cmd.NowNanos)
-	switch cmd.Kind {
-	case KindAcquire:
-		return f.applyAcquire(now, cmd)
-	case KindEnqueue:
-		return f.applyEnqueue(now, cmd)
-	case KindRelease:
-		return f.applyRelease(now, cmd)
-	case KindRenew:
-		return f.applyRenew(now, cmd)
-	case KindEvict:
-		return f.applyEvict(now, cmd)
-	case KindCleanupConn:
-		return f.applyCleanupConn(now, cmd)
-	case KindGC:
-		return f.lm.ApplyGC(now)
-	case KindBarrier:
-		return lock.ApplyResult{Status: lock.StatusOK}
-	default:
+	h, ok := fsmHandlers[cmd.Kind]
+	if !ok {
 		return applyErrResult(errUnknownKind)
 	}
+	return h(f, time.Unix(0, cmd.NowNanos), cmd)
 }
 
 func (f *fsm) applyAcquire(now time.Time, cmd Command) any {
@@ -101,6 +100,12 @@ func (f *fsm) applyEvict(now time.Time, cmd Command) any {
 
 func (f *fsm) applyCleanupConn(now time.Time, cmd Command) any {
 	result, grants, err := f.lm.ApplyCleanupConn(now, cmd.Ref, cmd.ConnID)
+	f.lm.RouteGrants(grants)
+	return resultOr(result, err)
+}
+
+func (f *fsm) applyEvictExpired(now time.Time, _ Command) any {
+	result, grants, err := f.lm.ApplyEvictExpired(now)
 	f.lm.RouteGrants(grants)
 	return resultOr(result, err)
 }

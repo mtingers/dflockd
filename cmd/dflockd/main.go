@@ -109,7 +109,11 @@ func buildClusterNode(cfg *config.Config, lm *lock.LockManager, storage raft.Sto
 	members := membersFromConfig(cfg)
 	rcfg := raft.DefaultConfig()
 	rcfg.ID = raft.NodeID(cfg.NodeID)
-	ccfg := cluster.Config{Raft: rcfg, Members: members, AdvertiseAddr: cfg.EffectiveAdvertiseAddr()}
+	ccfg := cluster.Config{
+		Raft: rcfg, Members: members,
+		AdvertiseAddr: cfg.EffectiveAdvertiseAddr(),
+		SweepInterval: cfg.LeaseSweepInterval,
+	}
 	return cluster.NewNode(ccfg, lm, storage, transport, log)
 }
 
