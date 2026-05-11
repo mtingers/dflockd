@@ -21,6 +21,13 @@ import (
 const walRecordHeaderBytes = 12 // u32 len + u64 crc
 const walFilePerm = 0o600
 
+// maxWALFileBytes bounds the WAL we'll read into memory on open. The
+// inter-snapshot log is small by design (capped by SnapshotThresholdEntries
+// × entry size); this rejects a corrupt/runaway file before it OOMs us.
+const maxWALFileBytes = maxTCPFrameBytes // 64 MiB
+
+var errWALClosed = errors.New("raft: wal file is closed")
+
 type walFile struct {
 	path string
 	f    *os.File // append handle, positioned at EOF
@@ -30,16 +37,37 @@ type walFile struct {
 // slice of entries, truncates any torn tail, and leaves the file ready
 // for appends.
 func openWAL(path string) (*walFile, []Entry, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, nil, fmt.Errorf("read wal %s: %w", path, err)
+	raw, err := readWALFile(path)
+	if err != nil {
+		return nil, nil, err
 	}
 	entries, good := parseWALRecords(raw)
 	w := &walFile{path: path}
 	if err := w.openAppendTruncated(int64(good)); err != nil {
 		return nil, nil, err
 	}
+	if err := fsyncDir(path); err != nil { // make the dirent durable (file may be brand new)
+		return nil, nil, err
+	}
 	return w, entries, nil
+}
+
+func readWALFile(path string) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat wal %s: %w", path, err)
+	}
+	if fi.Size() > maxWALFileBytes {
+		return nil, fmt.Errorf("raft: wal %s is %d bytes (max %d) — refusing to load", path, fi.Size(), maxWALFileBytes)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read wal %s: %w", path, err)
+	}
+	return raw, nil
 }
 
 // parseWALRecords decodes as many whole, CRC-valid records as it can and
@@ -108,12 +136,24 @@ func truncateAndSeekEnd(f *os.File, size int64) error {
 	return nil
 }
 
-// appendEntries writes es as records and fsyncs.
+// appendEntries writes es as records and fsyncs. A partial write (e.g.
+// ENOSPC) is rolled back so the next append can't bury the torn bytes
+// mid-file (which parseWALRecords would treat as the tail and silently
+// drop everything after it).
 func (w *walFile) appendEntries(es []Entry) error {
 	if len(es) == 0 {
 		return nil
 	}
+	if w.f == nil {
+		return errWALClosed
+	}
+	off, err := w.f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("wal %s: tell: %w", w.path, err)
+	}
 	if _, err := w.f.Write(encodeWALRecords(nil, es)); err != nil {
+		_ = w.f.Truncate(off)
+		_, _ = w.f.Seek(off, io.SeekStart)
 		return fmt.Errorf("append wal %s: %w", w.path, err)
 	}
 	return fsyncFile(w.f)
@@ -135,15 +175,23 @@ func encodeWALRecord(dst []byte, e Entry) []byte {
 
 // rewrite atomically replaces the WAL contents with exactly es, then
 // reopens the append handle. Used by suffix-truncate and compaction.
+//
+// The old handle is kept until writeFileAtomic succeeds, so a failure
+// there (ENOSPC, EIO) leaves w.f valid and pointing at the unchanged
+// file. If the reopen after a successful rename fails, w.f is left nil
+// — the on-disk WAL is correct (recovery will pick it up), and
+// appendEntries returns errWALClosed rather than panicking on a nil
+// dereference.
 func (w *walFile) rewrite(es []Entry) error {
-	if err := w.f.Close(); err != nil {
-		return fmt.Errorf("close wal before rewrite: %w", err)
-	}
-	w.f = nil
 	body := encodeWALRecords(nil, es)
 	if err := writeFileAtomic(w.path, body, walFilePerm); err != nil {
-		return err
+		return err // w.f still valid (old file unchanged)
 	}
+	// The rename replaced the inode our handle pointed at; reopen.
+	if err := w.f.Close(); err != nil {
+		return fmt.Errorf("close wal before reopen: %w", err)
+	}
+	w.f = nil
 	return w.openAppendTruncated(int64(len(body)))
 }
 

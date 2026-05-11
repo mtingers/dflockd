@@ -85,7 +85,10 @@ func decodeConfig(b []byte) (Configuration, error) {
 }
 
 func decodeConfigVoters(b []byte, n int) (Configuration, error) {
-	c := Configuration{Voters: make(map[NodeID]string, n)}
+	if n < 0 || n > len(b) { // every voter is ≥4 bytes (two empty string16s)
+		return Configuration{}, fmt.Errorf("raft: config voter count %d implausible for %d bytes", n, len(b))
+	}
+	c := Configuration{Voters: make(map[NodeID]string)} // no capacity hint: n is attacker-influenced
 	for i := 0; i < n; i++ {
 		id, rest, err := takeString16(b)
 		if err != nil {

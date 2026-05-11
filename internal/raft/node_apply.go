@@ -127,13 +127,21 @@ func (n *Node) dispatchPendingApply() {
 
 func (n *Node) shipApplyBatch(entries []Entry) {
 	req := applyReq{entries: entries, proposals: n.takeMatchingProposals(entries), configAtBatch: n.config.Clone()}
-	select {
-	case n.applyc <- req:
-		n.applyDispatched = entries[len(entries)-1].Index
-	case <-n.stopc:
-		// Shutdown in flight — fail the proposals we just claimed.
-		for _, p := range req.proposals {
-			p.future.resolve(nil, ErrStopped)
+	for {
+		select {
+		case n.applyc <- req:
+			n.applyDispatched = entries[len(entries)-1].Index
+			return
+		case s := <-n.snapSavec:
+			// Keep draining so the apply goroutine can't wedge on a full
+			// snapSavec while we're wedged here on a full applyc.
+			n.onSnapshotSave(s)
+		case <-n.stopc:
+			// Shutdown in flight — fail the proposals we just claimed.
+			for _, p := range req.proposals {
+				p.future.resolve(nil, ErrStopped)
+			}
+			return
 		}
 	}
 }

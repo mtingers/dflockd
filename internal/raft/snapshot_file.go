@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -22,6 +23,10 @@ const (
 	snapshotFilePerm   = 0o600
 	snapshotNamePrefix = "snap-"
 	snapshotHeaderMin  = 8 + 8 + 8 + 4 // magic + idx + term + configLen
+	// maxSnapshotFileBytes bounds a snapshot file we'll read into memory.
+	// dflockd's FSM is small; a snapshot must also fit in one InstallSnapshot
+	// frame, so this is ≤ the wire frame cap.
+	maxSnapshotFileBytes = maxTCPFrameBytes // 64 MiB
 )
 
 var snapshotMagic = [8]byte{'d', 'f', 'l', 'r', 's', 'n', 'p', '1'}
@@ -133,7 +138,10 @@ func (s snapshotStore) listNames() ([]string, error) {
 }
 
 // loadLatest returns the highest-index valid snapshot's meta + fsm bytes.
-// ok is false if there is none.
+// ok is false if there is no snapshot at all. A snapshot that exists but
+// is corrupt/oversized is a hard error — silently treating it as "no
+// snapshot" would, after a log compaction, reset the node to empty state
+// at term 0 (total data loss).
 func (s snapshotStore) loadLatest() (SnapshotMeta, []byte, bool, error) {
 	names, err := s.listNames()
 	if err != nil {
@@ -142,29 +150,51 @@ func (s snapshotStore) loadLatest() (SnapshotMeta, []byte, bool, error) {
 	return s.pickBest(names)
 }
 
+// pickBest tries snapshot files in descending-index order and returns
+// the first that reads + decodes. If that one is corrupt/oversized, it
+// errors (rather than falling back to an older snapshot — the entries
+// between them are not retained anywhere). Files that race a concurrent
+// delete (ENOENT) or don't parse a valid name are skipped.
 func (s snapshotStore) pickBest(names []string) (SnapshotMeta, []byte, bool, error) {
-	var bestMeta SnapshotMeta
-	var bestFSM []byte
-	found := false
-	for _, n := range names {
-		meta, fsm, ok := s.tryLoad(n)
-		if ok && (!found || meta.LastIncludedIndex > bestMeta.LastIncludedIndex) {
-			bestMeta, bestFSM, found = meta, fsm, true
+	for _, n := range sortSnapshotNamesDesc(names) {
+		raw, err := readSnapshotFile(filepath.Join(s.dir, n))
+		if os.IsNotExist(err) {
+			continue
 		}
+		if err != nil {
+			return SnapshotMeta{}, nil, false, err
+		}
+		meta, fsm, err := decodeSnapshotFile(raw)
+		if err != nil {
+			return SnapshotMeta{}, nil, false, fmt.Errorf("raft: snapshot %s is corrupt: %w", n, err)
+		}
+		return meta, fsm, true, nil
 	}
-	return bestMeta, bestFSM, found, nil
+	return SnapshotMeta{}, nil, false, nil
 }
 
-func (s snapshotStore) tryLoad(name string) (SnapshotMeta, []byte, bool) {
-	raw, err := os.ReadFile(filepath.Join(s.dir, name))
+// sortSnapshotNamesDesc returns names sorted by their encoded index,
+// highest first; names that don't parse sort last.
+func sortSnapshotNamesDesc(names []string) []string {
+	out := append([]string(nil), names...)
+	idx := func(n string) Index { i, _, _ := parseSnapshotName(n); return i }
+	sort.Slice(out, func(a, b int) bool { return idx(out[a]) > idx(out[b]) })
+	return out
+}
+
+func readSnapshotFile(path string) ([]byte, error) {
+	fi, err := os.Stat(path)
 	if err != nil {
-		return SnapshotMeta{}, nil, false
+		return nil, err // caller distinguishes ENOENT
 	}
-	meta, fsm, err := decodeSnapshotFile(raw)
+	if fi.Size() > maxSnapshotFileBytes {
+		return nil, fmt.Errorf("raft: snapshot %s is %d bytes (max %d)", path, fi.Size(), maxSnapshotFileBytes)
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return SnapshotMeta{}, nil, false
+		return nil, fmt.Errorf("read snapshot %s: %w", path, err)
 	}
-	return meta, fsm, true
+	return raw, nil
 }
 
 // parseSnapshotName is the inverse of snapshotName (used by tests).

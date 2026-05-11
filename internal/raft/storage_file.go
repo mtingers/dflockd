@@ -47,6 +47,7 @@ func OpenFileStorage(dir string) (*FileStorage, error) {
 	if err := os.MkdirAll(dir, storageDirPerm); err != nil {
 		return nil, fmt.Errorf("raft: mkdir %s: %w", dir, err)
 	}
+	_ = fsyncDir(dir) // best effort: make the new dir's own dirent durable
 	lf, err := acquireDirLock(dir)
 	if err != nil {
 		return nil, err
@@ -182,15 +183,29 @@ func (s *FileStorage) TruncateSuffix(from Index) error {
 }
 
 func (s *FileStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
-	fsm, err := io.ReadAll(data)
+	fsm, err := readSnapshotData(data)
 	if err != nil {
-		return fmt.Errorf("raft: read snapshot data: %w", err)
+		return err
 	}
 	if err := s.snaps.save(meta, fsm); err != nil {
 		return err
 	}
 	s.memLog.applySnapshot(meta)
 	return s.wal.rewrite(s.memLog.entries)
+}
+
+// readSnapshotData reads the FSM bytes, refusing anything larger than
+// maxSnapshotFileBytes (a corrupt InstallSnapshot payload, or an FSM
+// that has outgrown what we can persist/transfer).
+func readSnapshotData(r io.Reader) ([]byte, error) {
+	fsm, err := io.ReadAll(io.LimitReader(r, maxSnapshotFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("raft: read snapshot data: %w", err)
+	}
+	if len(fsm) > maxSnapshotFileBytes {
+		return nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotFileBytes)
+	}
+	return fsm, nil
 }
 
 func (s *FileStorage) SnapshotMeta() (SnapshotMeta, bool) {

@@ -359,6 +359,33 @@ func TestFileStorageRejectsCorruptHardState(t *testing.T) {
 	}
 }
 
+// A snapshot file that exists but is corrupt must fail the open loudly —
+// silently treating it as "no snapshot" would, after a log compaction,
+// reset the node to empty state at term 0.
+func TestFileStorageRejectsCorruptSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	appendN(t, s, 1, 1, 5)
+	mustSaveSnap(t, s, SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 1}, []byte("state"))
+	s.Close()
+
+	names, err := snapshotStore{dir: filepath.Join(dir, snapshotsSubdir)}.listNames()
+	if err != nil || len(names) != 1 {
+		t.Fatalf("listNames = %v, %v", names, err)
+	}
+	snapPath := filepath.Join(dir, snapshotsSubdir, names[0])
+	raw, _ := os.ReadFile(snapPath)
+	raw[len(raw)/2] ^= 0xFF // corrupt the middle; the trailing CRC will mismatch
+	if err := os.WriteFile(snapPath, raw, 0o600); err != nil {
+		t.Fatalf("rewrite corrupt snapshot: %v", err)
+	}
+
+	if s2, err := OpenFileStorage(dir); err == nil {
+		s2.Close()
+		t.Fatalf("OpenFileStorage with a corrupt snapshot should fail, got nil")
+	}
+}
+
 func TestSnapshotNameRoundTrip(t *testing.T) {
 	meta := SnapshotMeta{LastIncludedIndex: 12345, LastIncludedTerm: 67}
 	name := snapshotName(meta)

@@ -39,6 +39,10 @@ func openHardStateFile(path string) (*hardStateFile, HardState, error) {
 		f.Close()
 		return nil, HardState{}, err
 	}
+	if err := fsyncDir(path); err != nil { // make the dirent durable (file may be brand new)
+		f.Close()
+		return nil, HardState{}, err
+	}
 	return loadHardStateSlots(f, path)
 }
 

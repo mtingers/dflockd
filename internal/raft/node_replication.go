@@ -258,6 +258,13 @@ func (n *Node) handleInstallSnapshot(from NodeID, req *InstallSnapshotReq) *Inst
 		return &InstallSnapshotResp{Term: n.term}
 	}
 	n.becomeFollower(req.Term, req.LeaderID)
+	if req.Meta.LastIncludedIndex <= n.log.committed {
+		// Stale or duplicate: we already have everything this snapshot
+		// covers. Installing it would regress our snapshot point (and
+		// could leave committed > lastIndex). LastIndex 0 = "no update";
+		// the leader reconciles via the next AppendEntries.
+		return &InstallSnapshotResp{Term: n.term}
+	}
 	last, err := n.log.installSnapshot(req.Meta, req.Data)
 	if err != nil {
 		n.logger.Error("install snapshot failed", "err", err)
