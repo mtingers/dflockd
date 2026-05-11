@@ -72,7 +72,7 @@ func (c Command) Encode() ([]byte, error) {
 	return json.Marshal(c)
 }
 
-// Decode parses the JSON bytes back into a Command.
+// Decode parses the JSON bytes back into a Command and validates it.
 func Decode(data []byte) (Command, error) {
 	var c Command
 	if err := json.Unmarshal(data, &c); err != nil {
@@ -81,7 +81,46 @@ func Decode(data []byte) (Command, error) {
 	if c.Kind == KindUnknown {
 		return Command{}, errors.New("cluster: decoded KindUnknown")
 	}
+	if err := c.Validate(); err != nil {
+		return Command{}, err
+	}
 	return c, nil
+}
+
+const (
+	// Defensive bounds on a decoded command. The protocol layer already
+	// enforces tighter limits on anything that becomes a Command in normal
+	// operation; these guard against a hand-crafted / corrupt log entry
+	// producing weird FSM state (or a value that can't be re-encoded into
+	// a snapshot's fixed-width fields).
+	maxCommandKeyBytes = 512  // a protocol key (≤256) plus its "lock:"/"sem:" prefix, with headroom
+	maxCommandRefBytes = 4096 // node-id-prefixed connection ref
+	maxCommandLimit    = 1 << 20
+)
+
+// Validate rejects a structurally-impossible command. It is purely a
+// function of the command's fields, so every replica reaches the same
+// verdict.
+func (c Command) Validate() error {
+	if c.LeaseTTLNanos < 0 {
+		return fmt.Errorf("cluster: negative lease TTL %d", c.LeaseTTLNanos)
+	}
+	if len(c.Key) > maxCommandKeyBytes {
+		return fmt.Errorf("cluster: key too long (%d bytes)", len(c.Key))
+	}
+	if len(c.Ref) > maxCommandRefBytes {
+		return fmt.Errorf("cluster: ref too long (%d bytes)", len(c.Ref))
+	}
+	if c.Limit < 0 || c.Limit > maxCommandLimit {
+		return fmt.Errorf("cluster: implausible limit %d", c.Limit)
+	}
+	switch c.Kind {
+	case KindAcquire, KindEnqueue, KindRelease, KindRenew, KindEvict:
+		if c.Key == "" {
+			return fmt.Errorf("cluster: %s command with empty key", c.Kind)
+		}
+	}
+	return nil
 }
 
 // EncodeSalt / DecodeSalt: tokens carry an 8-byte salt; we ship it as

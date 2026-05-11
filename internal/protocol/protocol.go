@@ -27,6 +27,12 @@ import (
 // MaxLineBytes caps the cmd, key, and most arg lines.
 const MaxLineBytes = 256
 
+// MaxSemaphoreLimit caps a semaphore's slot count. It's far larger than
+// any sane use and exists mainly so the value fits in the fixed-width
+// fields of the cluster snapshot encoding (a uint32) without truncating,
+// which would diverge a snapshot-restored replica from a log-replayed one.
+const MaxSemaphoreLimit = 1 << 20
+
 // MaxAuthTokenBytes caps the auth token line. Tokens may legitimately be
 // large, so we accept up to 64 KiB while keeping the tight cap on the
 // rest of the protocol surface.
@@ -779,6 +785,9 @@ func parseLimitInt(s string) (int, error) {
 func validateLimit(n int) (int, error) {
 	if n <= 0 {
 		return 0, protocolErr(ErrCodeInvalidLimit, "limit must be > 0")
+	}
+	if n > MaxSemaphoreLimit {
+		return 0, protocolErr(ErrCodeInvalidLimit, "limit too large")
 	}
 	return n, nil
 }

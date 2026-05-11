@@ -18,6 +18,7 @@ package lock
 
 import (
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -78,7 +79,7 @@ func (lm *LockManager) applyAcquireLocked(sh *shard, key string, limit int, ref 
 		if err != nil {
 			return nil, ApplyResult{}, pre, err
 		}
-		lm.recordHolder(sh, st, key, ref, connID, token, now.Add(leaseTTL))
+		lm.recordHolder(sh, st, key, ref, connID, token, now, leaseTTL)
 		return st, ApplyResult{Status: StatusOK, Token: token, LeaseSec: secondsOf(leaseTTL)}, pre, nil
 	}
 	if !lm.waiterCapAvailable(st) {
@@ -115,7 +116,7 @@ func (lm *LockManager) applyEnqueueOnto(sh *shard, st *ResourceState, eqKey conn
 		if err != nil {
 			return ApplyResult{}, pre, err
 		}
-		lm.recordHolder(sh, st, key, ref, connID, token, now.Add(leaseTTL))
+		lm.recordHolder(sh, st, key, ref, connID, token, now, leaseTTL)
 		sh.setEnqueued(eqKey, &enqueuedState{token: token, leaseTTL: leaseTTL})
 		return ApplyResult{Status: StatusAcquired, Token: token, LeaseSec: secondsOf(leaseTTL)}, pre, nil
 	}
@@ -242,13 +243,17 @@ func (lm *LockManager) cleanupPendingWaitersForRef(sh *shard, ref string, connID
 
 func (lm *LockManager) releaseOwnedForRef(sh *shard, ref string, connID uint64, now time.Time) ([]Grant, error) {
 	_ = ref // routed via connID in v1; reserved for stable-ref cleanup
+	owned := sh.connOwned[connID]
 	var grants []Grant
-	for key, tokens := range sh.connOwned[connID] {
+	// Iterate keys in sorted order: grantNextAt mints fence numbers
+	// (fsmFenceCounter++), so the order in which keys are processed must
+	// be identical on every replica — Go map iteration order is not.
+	for _, key := range sortedKeys(owned) {
 		st := sh.resources[key]
 		if st == nil {
 			continue
 		}
-		for token := range tokens {
+		for token := range owned[key] {
 			if h, ok := st.Holders[token]; ok {
 				lm.dropHolder(sh, st, key, token, h, now)
 			}
@@ -261,6 +266,16 @@ func (lm *LockManager) releaseOwnedForRef(sh *shard, ref string, connID uint64, 
 	}
 	delete(sh.connOwned, connID)
 	return grants, nil
+}
+
+// sortedKeys returns m's keys in ascending order (m may be nil).
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ApplyGC drops resources that have been idle longer than the
@@ -377,11 +392,11 @@ func (lm *LockManager) dropHolder(sh *shard, st *ResourceState, key, token strin
 	st.LastActivity = now
 }
 
-// recordHolder installs (token, holder) in st and updates the per-conn
-// owned index.
-func (lm *LockManager) recordHolder(sh *shard, st *ResourceState, key, ref string, connID uint64, token string, leaseExpires time.Time) {
-	st.Holders[token] = &holder{connID: connID, leaseExpires: leaseExpires, ref: ref}
-	st.LastActivity = leaseExpires // close enough — caller will overwrite if needed
+// recordHolder installs (token, holder) in st with a lease of leaseTTL
+// from now, and updates the per-conn owned index.
+func (lm *LockManager) recordHolder(sh *shard, st *ResourceState, key, ref string, connID uint64, token string, now time.Time, leaseTTL time.Duration) {
+	st.Holders[token] = &holder{connID: connID, leaseExpires: now.Add(leaseTTL), ref: ref}
+	st.LastActivity = now
 	sh.addOwned(connID, key, token)
 }
 

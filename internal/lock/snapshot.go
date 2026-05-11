@@ -15,9 +15,14 @@ import (
 // indices from the holder / waiter / enqueued data.
 
 const (
-	snapshotMagic  = "dfllksn1"
-	snapshotVer    = byte(1)
-	snapshotMaxKey = 256 // matches protocol.MaxLineBytes
+	snapshotMagic = "dfllksn1"
+	snapshotVer   = byte(1)
+	// snapshotMaxStr16 is the largest string the u16-length-prefixed
+	// encoding can represent. Keys are bounded far below this by the
+	// protocol (a key gets a "lock:"/"sem:" prefix, so up to ~261 bytes);
+	// tokens are 32 bytes; refs are short. The cap exists only so a
+	// pathological value can't silently truncate via uint16(len(s)).
+	snapshotMaxStr16 = 1<<16 - 1
 )
 
 var sbe = binary.BigEndian
@@ -441,8 +446,8 @@ func writeU64(w io.Writer, v uint64) error {
 func writeI64(w io.Writer, v int64) error { return writeU64(w, uint64(v)) }
 
 func writeString16(w io.Writer, s string) error {
-	if len(s) > snapshotMaxKey {
-		return fmt.Errorf("snapshot: string too long (%d > %d)", len(s), snapshotMaxKey)
+	if len(s) > snapshotMaxStr16 {
+		return fmt.Errorf("snapshot: string too long (%d > %d)", len(s), snapshotMaxStr16)
 	}
 	var b [2]byte
 	sbe.PutUint16(b[:], uint16(len(s)))

@@ -311,3 +311,59 @@ func TestRouteGrantsToUnregisteredRefIsBenign(t *testing.T) {
 	_, grants, _ := lm.ApplyRelease(at(102), "lock:k", r.Token)
 	lm.RouteGrants(grants) // must not panic; holder for B still exists in FSM
 }
+
+// twoKeysInSameShard returns two distinct keys that hash to one shard,
+// so connOwned[connID] for that shard ends up holding both — which is
+// the precondition for ApplyCleanupConn's per-key fence minting to be
+// order-sensitive.
+func twoKeysInSameShard(lm *LockManager) (string, string) {
+	var inShard [numShards][]string
+	for i := 0; ; i++ {
+		k := "lock:k" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+		s := shardIndex(k)
+		inShard[s] = append(inShard[s], k)
+		if len(inShard[s]) == 2 {
+			a, b := inShard[s][0], inShard[s][1]
+			if a > b {
+				a, b = b, a // a is the lexicographically-smaller key
+			}
+			return a, b
+		}
+	}
+}
+
+// ApplyCleanupConn mints fence numbers per owned key; replicas must
+// process the keys in the same (sorted) order, not Go map order, or the
+// promoted holders get different tokens and the FSM diverges.
+func TestApplyCleanupConnMintsFencesInSortedKeyOrder(t *testing.T) {
+	lm := newApplyTestLM(t)
+	keyLo, keyHi := twoKeysInSameShard(lm)
+	// conn 5 holds both keys; conn 6 is queued behind it on each.
+	for _, k := range []string{keyLo, keyHi} {
+		if _, _, err := lm.ApplyAcquire(at(100), k, 1, "r5", 5, 30*time.Second, saltOf(5)); err != nil {
+			t.Fatalf("acquire %s by conn5: %v", k, err)
+		}
+		if r, _, err := lm.ApplyAcquire(at(101), k, 1, "r6", 6, 30*time.Second, saltOf(6)); err != nil || r.Status != StatusQueued {
+			t.Fatalf("acquire %s by conn6 = %+v, %v (want queued)", k, r, err)
+		}
+	}
+	if _, _, err := lm.ApplyCleanupConn(at(102), "r5", 5); err != nil {
+		t.Fatalf("ApplyCleanupConn: %v", err)
+	}
+	loTok := singleHolderToken(t, lm, keyLo)
+	hiTok := singleHolderToken(t, lm, keyHi)
+	// The fence prefix is big-endian hex, so a strictly-lower fence sorts
+	// lexicographically smaller. keyLo was processed first => lower fence.
+	if loTok >= hiTok {
+		t.Fatalf("fences not in sorted-key order: token(%s)=%s >= token(%s)=%s", keyLo, loTok, keyHi, hiTok)
+	}
+}
+
+func singleHolderToken(t *testing.T, lm *LockManager, key string) string {
+	t.Helper()
+	toks := lm.DebugHolderTokens(key)
+	if len(toks) != 1 {
+		t.Fatalf("key %s: holder tokens = %v, want exactly 1", key, toks)
+	}
+	return toks[0]
+}
