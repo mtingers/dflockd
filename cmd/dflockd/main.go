@@ -13,9 +13,11 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/mtingers/dflockd/internal/cluster"
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/httpapi"
 	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/raft"
 	"github.com/mtingers/dflockd/internal/server"
 )
 
@@ -58,7 +60,79 @@ func run(cfg *config.Config) int {
 	srv := server.New(lm, cfg, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if cfg.IsCluster() {
+		closer, err := startCluster(cfg, lm, srv, log)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cluster init failed: %v\n", err)
+			return 1
+		}
+		defer closer()
+	}
 	return runAll(ctx, srv, cfg, log, cancel)
+}
+
+// startCluster opens persistent Raft state, the inter-node transport,
+// and a cluster.Node bound to this lock manager and server. Returns a
+// closer that tears everything down in reverse.
+func startCluster(cfg *config.Config, lm *lock.LockManager, srv *server.Server, log *slog.Logger) (func(), error) {
+	storage, err := raft.OpenFileStorage(cfg.RaftDir)
+	if err != nil {
+		return nil, fmt.Errorf("open raft storage at %s: %w", cfg.RaftDir, err)
+	}
+	transport, err := raft.NewTCPTransport(raft.NodeID(cfg.NodeID), cfg.RaftAddr, log)
+	if err != nil {
+		_ = storage.Close()
+		return nil, fmt.Errorf("open raft transport on %s: %w", cfg.RaftAddr, err)
+	}
+	registerPeers(transport, cfg)
+	node, err := buildClusterNode(cfg, lm, storage, transport, log)
+	if err != nil {
+		_ = transport.Close()
+		_ = storage.Close()
+		return nil, err
+	}
+	node.Start()
+	srv.SetCluster(node)
+	return clusterCloser(srv, node, transport, storage, log), nil
+}
+
+func registerPeers(transport *raft.TCPTransport, cfg *config.Config) {
+	for _, p := range cfg.ClusterPeers {
+		if p.NodeID == cfg.NodeID {
+			continue
+		}
+		transport.AddPeer(raft.NodeID(p.NodeID), p.RaftAddr)
+	}
+}
+
+func buildClusterNode(cfg *config.Config, lm *lock.LockManager, storage raft.Storage, transport raft.Transport, log *slog.Logger) (*cluster.Node, error) {
+	members := membersFromConfig(cfg)
+	rcfg := raft.DefaultConfig()
+	rcfg.ID = raft.NodeID(cfg.NodeID)
+	ccfg := cluster.Config{Raft: rcfg, Members: members, AdvertiseAddr: cfg.EffectiveAdvertiseAddr()}
+	return cluster.NewNode(ccfg, lm, storage, transport, log)
+}
+
+func membersFromConfig(cfg *config.Config) map[raft.NodeID]cluster.Member {
+	out := make(map[raft.NodeID]cluster.Member, len(cfg.ClusterPeers))
+	for _, p := range cfg.ClusterPeers {
+		out[raft.NodeID(p.NodeID)] = cluster.Member{RaftAddr: p.RaftAddr, ClientAddr: p.ClientAddr}
+	}
+	return out
+}
+
+// clusterCloser tears down the cluster in reverse order: unwire the
+// server first (so no new proposes flow), close the node (joins its
+// goroutines), the transport, then the storage.
+func clusterCloser(srv *server.Server, node *cluster.Node, transport *raft.TCPTransport, storage raft.Storage, log *slog.Logger) func() {
+	return func() {
+		srv.SetCluster(nil)
+		if err := node.Close(); err != nil {
+			log.Warn("cluster node close", "err", err)
+		}
+		_ = transport.Close()
+		_ = storage.Close()
+	}
 }
 
 func newLogger(debug bool) *slog.Logger {

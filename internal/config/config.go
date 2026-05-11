@@ -49,9 +49,25 @@ type Config struct {
 	HTTPRateLimitBurst      int
 	HTTPCORSAllowedOrigins  []string
 
+	// Cluster (Raft HA). Empty RaftDir leaves cluster mode off; everything
+	// else is dormant in that case and the single-node behaviour holds.
+	RaftDir          string
+	NodeID           string
+	ClusterPeers     []ClusterPeer // every member (including this node)
+	RaftAddr         string        // this node's Raft transport bind ("host:port")
+	AdvertiseAddr    string        // this node's client-facing host:port (returned to redirected clients)
+	ClusterBootstrap bool          // bootstrap a new cluster vs. join an existing one
+
 	// Diagnostics.
 	Debug   bool
 	Version bool
+}
+
+// ClusterPeer is one member of the cluster.
+type ClusterPeer struct {
+	NodeID     string // stable raft node id
+	RaftAddr   string // raft transport address ("host:port")
+	ClientAddr string // client-facing address ("host:port")
 }
 
 // maxDurationSeconds caps the seconds-as-int conversions. time.Duration
@@ -110,6 +126,8 @@ type flagPtrs struct {
 	authToken, authTokenFile                        *string
 	httpHost, httpCORSOrigins                       *string
 	fenceStateFile                                  *string
+	raftDir, nodeID, clusterPeers                   *string
+	raftAddr, advertiseAddr                         *string
 	port, maxLocks                                  *int
 	maxConnections, maxConnectionsPerIP, maxWaiters *int
 	defaultLeaseTTL, leaseSweepInterval             *int
@@ -119,7 +137,7 @@ type flagPtrs struct {
 	httpMaxSessions, httpMaxSessionsPerIP           *int
 	httpMaxConnsPerIP                               *int
 	httpRateLimitPerIP, httpRateLimitBurst          *int
-	autoRelease, debug, version                     *bool
+	autoRelease, debug, version, clusterBootstrap   *bool
 }
 
 // newFlagSet defines every flag and returns the FlagSet plus the
@@ -142,6 +160,11 @@ func defineStringFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.httpHost = fs.String("http-host", "", "HTTP API bind address (defaults to --host)")
 	f.httpCORSOrigins = fs.String("http-cors-allowed-origins", "", "Comma-separated allowed CORS origins for the HTTP API (empty = disabled)")
 	f.fenceStateFile = fs.String("fence-state-file", "", "Path to the fence-counter state file. Set to enable strict cross-restart fencing-token monotonicity (one fsync per ~1M grants). Empty = best-effort wall-clock seeding.")
+	f.raftDir = fs.String("raft-dir", "", "Directory for Raft persistent state (log, snapshots, hardstate). Empty = cluster mode disabled.")
+	f.nodeID = fs.String("node-id", "", "This node's stable cluster identifier (required in cluster mode).")
+	f.clusterPeers = fs.String("cluster-peers", "", "Comma-separated list of cluster members: id=raftHost:raftPort@clientHost:clientPort. Required in cluster mode; must include this node.")
+	f.raftAddr = fs.String("raft-addr", "", "This node's Raft transport bind address (host:port). Required in cluster mode.")
+	f.advertiseAddr = fs.String("advertise-addr", "", "This node's client-facing host:port returned to clients via error_not_leader. Defaults to --host:--port.")
 }
 
 func defineIntFlags(fs *flag.FlagSet, f *flagPtrs) {
@@ -170,6 +193,7 @@ func defineBoolFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.autoRelease = fs.Bool("auto-release-on-disconnect", true, "Release locks when a client disconnects")
 	f.debug = fs.Bool("debug", false, "Enable debug logging")
 	f.version = fs.Bool("version", false, "Print version and exit")
+	f.clusterBootstrap = fs.Bool("cluster-bootstrap", false, "Bootstrap a fresh single-node cluster on this --raft-dir. The cluster grows via membership changes from there.")
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +214,50 @@ func resolveStrings(r *resolver, f *flagPtrs, c *Config) error {
 	}
 	c.HTTPCORSAllowedOrigins = splitCSV(r.str(
 		"http-cors-allowed-origins", "DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", *f.httpCORSOrigins))
+	peers, err := parseClusterPeers(r.str("cluster-peers", "DFLOCKD_CLUSTER_PEERS", *f.clusterPeers))
+	if err != nil {
+		return err
+	}
+	c.ClusterPeers = peers
 	return nil
+}
+
+// parseClusterPeers parses the cluster-peers spec
+// "id=raftHost:raftPort@clientHost:clientPort,...". Empty input -> nil.
+func parseClusterPeers(spec string) ([]ClusterPeer, error) {
+	if spec == "" {
+		return nil, nil
+	}
+	parts := strings.Split(spec, ",")
+	out := make([]ClusterPeer, 0, len(parts))
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		cp, err := parseOnePeer(p)
+		if err != nil {
+			return nil, fmt.Errorf("--cluster-peers[%d] %q: %w", i, p, err)
+		}
+		out = append(out, cp)
+	}
+	return out, nil
+}
+
+func parseOnePeer(s string) (ClusterPeer, error) {
+	idAndRest, ok := strings.CutPrefix(s, "")
+	if !ok {
+		return ClusterPeer{}, fmt.Errorf("empty peer spec")
+	}
+	id, addrs, ok := strings.Cut(idAndRest, "=")
+	if !ok || id == "" || addrs == "" {
+		return ClusterPeer{}, fmt.Errorf("missing '=' between id and address")
+	}
+	raft, client, ok := strings.Cut(addrs, "@")
+	if !ok || raft == "" || client == "" {
+		return ClusterPeer{}, fmt.Errorf("missing '@' between raft-addr and client-addr")
+	}
+	return ClusterPeer{NodeID: id, RaftAddr: raft, ClientAddr: client}, nil
 }
 
 func stringResolvers(f *flagPtrs) []stringResolver {
@@ -200,6 +267,10 @@ func stringResolvers(f *flagPtrs) []stringResolver {
 		{"tls-key", "DFLOCKD_TLS_KEY", f.tlsKey, func(c *Config, v string) { c.TLSKey = v }},
 		{"http-host", "DFLOCKD_HTTP_HOST", f.httpHost, func(c *Config, v string) { c.HTTPHost = v }},
 		{"fence-state-file", "DFLOCKD_FENCE_STATE_FILE", f.fenceStateFile, func(c *Config, v string) { c.FenceStateFile = v }},
+		{"raft-dir", "DFLOCKD_RAFT_DIR", f.raftDir, func(c *Config, v string) { c.RaftDir = v }},
+		{"node-id", "DFLOCKD_NODE_ID", f.nodeID, func(c *Config, v string) { c.NodeID = v }},
+		{"raft-addr", "DFLOCKD_RAFT_ADDR", f.raftAddr, func(c *Config, v string) { c.RaftAddr = v }},
+		{"advertise-addr", "DFLOCKD_ADVERTISE_ADDR", f.advertiseAddr, func(c *Config, v string) { c.AdvertiseAddr = v }},
 	}
 }
 
@@ -259,6 +330,7 @@ func boolResolvers(f *flagPtrs) []boolResolver {
 	return []boolResolver{
 		{"auto-release-on-disconnect", "DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", f.autoRelease, func(c *Config, v bool) { c.AutoReleaseOnDisconnect = v }},
 		{"debug", "DFLOCKD_DEBUG", f.debug, func(c *Config, v bool) { c.Debug = v }},
+		{"cluster-bootstrap", "DFLOCKD_CLUSTER_BOOTSTRAP", f.clusterBootstrap, func(c *Config, v bool) { c.ClusterBootstrap = v }},
 	}
 }
 
@@ -343,6 +415,73 @@ var validators = []func(*Config) error{
 	validateHTTPRateLimitPerIP,
 	validateHTTPRateLimitBurst,
 	validateHTTPRateBurstWhenRate,
+	validateClusterFields,
+	validateClusterVsFenceFile,
+}
+
+// validateClusterFields enforces that cluster fields are coherent: if
+// any of them is set, all required ones must be set.
+func validateClusterFields(c *Config) error {
+	if !c.IsCluster() {
+		return nil
+	}
+	if c.NodeID == "" {
+		return fmt.Errorf("--node-id is required in cluster mode")
+	}
+	if c.RaftAddr == "" {
+		return fmt.Errorf("--raft-addr is required in cluster mode")
+	}
+	if len(c.ClusterPeers) == 0 {
+		return fmt.Errorf("--cluster-peers must list at least this node")
+	}
+	if !peersIncludeNode(c.ClusterPeers, c.NodeID) {
+		return fmt.Errorf("--cluster-peers must include this node's --node-id (%q)", c.NodeID)
+	}
+	return validateClusterPeerUniqueness(c.ClusterPeers)
+}
+
+func peersIncludeNode(peers []ClusterPeer, id string) bool {
+	for _, p := range peers {
+		if p.NodeID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func validateClusterPeerUniqueness(peers []ClusterPeer) error {
+	seen := map[string]bool{}
+	for _, p := range peers {
+		if seen[p.NodeID] {
+			return fmt.Errorf("--cluster-peers: duplicate node id %q", p.NodeID)
+		}
+		seen[p.NodeID] = true
+	}
+	return nil
+}
+
+// validateClusterVsFenceFile rejects the combination of --fence-state-file
+// with cluster mode (Raft persistence supersedes it; running both would
+// duplicate fences inconsistently across nodes).
+func validateClusterVsFenceFile(c *Config) error {
+	if c.IsCluster() && c.FenceStateFile != "" {
+		return fmt.Errorf("--fence-state-file is incompatible with cluster mode; Raft persistence supersedes it")
+	}
+	return nil
+}
+
+// IsCluster reports whether cluster mode is enabled. We use --raft-dir
+// as the canonical "are we clustered?" switch: it is the only required
+// flag whose presence has no useful single-node interpretation.
+func (c *Config) IsCluster() bool { return c.RaftDir != "" }
+
+// EffectiveAdvertiseAddr returns the address a redirected client should
+// retry against. Falls back to host:port when --advertise-addr is unset.
+func (c *Config) EffectiveAdvertiseAddr() string {
+	if c.AdvertiseAddr != "" {
+		return c.AdvertiseAddr
+	}
+	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
 func validateMaxLocks(c *Config) error {

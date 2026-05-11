@@ -14,8 +14,17 @@ import (
 // caller tune timers / thresholds; everything else is dflockd-specific.
 type Config struct {
 	Raft          raft.Config
-	Members       map[raft.NodeID]string // node id -> raft transport address
+	Members       map[raft.NodeID]Member // every member's addresses, keyed by node id
 	AdvertiseAddr string                 // this node's client-facing host:port (returned to redirected clients)
+}
+
+// Member is one cluster member's pair of addresses: the Raft transport
+// address (peer-to-peer consensus traffic) and the client-facing
+// address (returned by LeaderClientAddr so a redirected client knows
+// where to retry).
+type Member struct {
+	RaftAddr   string
+	ClientAddr string
 }
 
 // Validate runs the embedded Raft validation and a few cluster-level
@@ -65,10 +74,11 @@ func NewNode(cfg Config, lm *lock.LockManager, storage raft.Storage, transport r
 }
 
 // raftConfigFor builds the raft.Configuration the cluster.Config maps to.
+// raft.Configuration carries the per-member Raft transport address.
 func raftConfigFor(cfg Config) raft.Configuration {
 	voters := make(map[raft.NodeID]string, len(cfg.Members))
-	for id, addr := range cfg.Members {
-		voters[id] = addr
+	for id, m := range cfg.Members {
+		voters[id] = m.RaftAddr
 	}
 	return raft.Configuration{Voters: voters}
 }
@@ -95,19 +105,19 @@ func (n *Node) Status() raft.NodeStatus { return n.raft.Status() }
 // server can register grant listeners on it directly.
 func (n *Node) LockManager() *lock.LockManager { return n.lm }
 
-// LeaderClientAddr returns the advertise address of the current leader
-// (suitable for an error_not_leader redirect). ok=false if there's no
-// known leader, or if the leader's address isn't in Members.
+// LeaderClientAddr returns the client-facing address of the current
+// leader (suitable for an error_not_leader redirect). ok=false if
+// there's no known leader, or if the leader's address isn't in Members.
 func (n *Node) LeaderClientAddr() (string, bool) {
 	id := n.LeaderID()
 	if id == "" {
 		return "", false
 	}
-	addr, ok := n.cfg.Members[id]
+	m, ok := n.cfg.Members[id]
 	if !ok {
 		return "", false
 	}
-	return addr, true
+	return m.ClientAddr, true
 }
 
 // ---------------------------------------------------------------------------

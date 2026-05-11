@@ -96,7 +96,7 @@ func TestUnwrapApplyResultEdgeCases(t *testing.T) {
 func TestConfigValidate(t *testing.T) {
 	cfg := Config{
 		Raft:    fastRaftConfig("n1"),
-		Members: map[raft.NodeID]string{"n1": "h:1"},
+		Members: map[raft.NodeID]Member{"n1": {RaftAddr: "h:1", ClientAddr: "c:1"}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid config: %v", err)
@@ -109,7 +109,7 @@ func TestConfigValidate(t *testing.T) {
 	}
 	// This node not in Members.
 	bad = cfg
-	bad.Members = map[raft.NodeID]string{"other": "h:1"}
+	bad.Members = map[raft.NodeID]Member{"other": {RaftAddr: "h:1"}}
 	if err := bad.Validate(); err == nil {
 		t.Fatalf("missing self in Members should error")
 	}

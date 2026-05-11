@@ -30,9 +30,9 @@ func newCluster(t *testing.T, ids ...raft.NodeID) *testCluster {
 		lms:   map[raft.NodeID]*lock.LockManager{},
 		trs:   map[raft.NodeID]*raft.MemTransport{},
 	}
-	members := map[raft.NodeID]string{}
+	members := map[raft.NodeID]Member{}
 	for _, id := range ids {
-		members[id] = "client-" + string(id) + ":0"
+		members[id] = Member{RaftAddr: "raft-" + string(id), ClientAddr: "client-" + string(id) + ":0"}
 	}
 	for _, id := range ids {
 		tc.startNode(id, members)
@@ -40,10 +40,10 @@ func newCluster(t *testing.T, ids ...raft.NodeID) *testCluster {
 	return tc
 }
 
-func (tc *testCluster) startNode(id raft.NodeID, members map[raft.NodeID]string) {
+func (tc *testCluster) startNode(id raft.NodeID, members map[raft.NodeID]Member) {
 	tc.t.Helper()
 	rcfg := fastRaftConfig(id)
-	cfg := Config{Raft: rcfg, Members: members, AdvertiseAddr: members[id]}
+	cfg := Config{Raft: rcfg, Members: members, AdvertiseAddr: members[id].ClientAddr}
 	lm := newClusterLM(tc.t)
 	tr := tc.net.Transport(id)
 	st := raft.NewMemStorage()
