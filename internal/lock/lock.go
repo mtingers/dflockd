@@ -83,6 +83,24 @@ func (lm *LockManager) Close() error {
 	return lm.fenceAlloc.close()
 }
 
+// DebugHolderTokens returns the set of holder tokens for key (which the
+// caller must pass with the internal lock:/sem: prefix). Used by E2E
+// tests to verify FSM state matches across replicas.
+func (lm *LockManager) DebugHolderTokens(key string) []string {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil {
+		return nil
+	}
+	out := make([]string, 0, len(st.Holders))
+	for tok := range st.Holders {
+		out = append(out, tok)
+	}
+	return out
+}
+
 // shardIndex hashes key with FNV-1a (32-bit) and reduces to a shard
 // index. Hand-rolled to avoid hash/fnv's per-call allocation.
 func shardIndex(key string) int {

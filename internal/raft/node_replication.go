@@ -10,20 +10,23 @@ package raft
 // Leader → follower
 // ---------------------------------------------------------------------------
 
-// broadcastHeartbeat sends an AppendEntries to every follower. (Currently
-// always heartbeat-only; entry shipping is a later phase.)
+// broadcastHeartbeat sends an AppendEntries to every follower. The
+// "heartbeat" name is historical: an AppendEntries with no pending
+// entries is the heartbeat; one with pending entries also doubles as
+// catch-up. Every periodic broadcast carries whatever entries the
+// follower hasn't acked yet, so a rejoining follower converges within
+// one heartbeat tick rather than waiting for a fresh Propose.
 func (n *Node) broadcastHeartbeat() {
 	for _, id := range n.peerIDs() {
-		n.sendAppendEntries(id, true)
+		n.sendAppendEntries(id)
 	}
 }
 
-// sendAppendEntries sends an AppendEntries to `to`. If heartbeatOnly (or
-// the follower is fully caught up) it carries no entries; otherwise it
-// carries entries from the follower's nextIndex, capped by config.
-// If the follower's nextIndex is at or before our log start, an
-// InstallSnapshot is sent instead.
-func (n *Node) sendAppendEntries(to NodeID, heartbeatOnly bool) {
+// sendAppendEntries sends an AppendEntries to `to`. It always carries
+// the entries from the follower's nextIndex (capped by config) — empty
+// when the follower is already caught up. If the follower's nextIndex
+// is at or before our log start, an InstallSnapshot is sent instead.
+func (n *Node) sendAppendEntries(to NodeID) {
 	p := n.progress[to]
 	if p == nil {
 		return
@@ -32,7 +35,7 @@ func (n *Node) sendAppendEntries(to NodeID, heartbeatOnly bool) {
 		n.sendInstallSnapshot(to)
 		return
 	}
-	req := n.buildAppendEntries(p, heartbeatOnly)
+	req := n.buildAppendEntries(p)
 	if req == nil {
 		n.sendInstallSnapshot(to)
 		return
@@ -40,17 +43,15 @@ func (n *Node) sendAppendEntries(to NodeID, heartbeatOnly bool) {
 	n.sendRPC(to, req)
 }
 
-func (n *Node) buildAppendEntries(p *peerProgress, heartbeatOnly bool) *AppendEntriesReq {
+func (n *Node) buildAppendEntries(p *peerProgress) *AppendEntriesReq {
 	prev := p.nextIndex - 1
 	prevTerm, err := n.log.term(prev)
 	if err != nil {
 		return nil // prev compacted away -> caller falls back to a snapshot
 	}
-	var entries []Entry
-	if !heartbeatOnly {
-		if entries, err = n.log.entriesFrom(p.nextIndex, n.cfg.MaxAppendEntries); err != nil {
-			return nil
-		}
+	entries, err := n.log.entriesFrom(p.nextIndex, n.cfg.MaxAppendEntries)
+	if err != nil {
+		return nil
 	}
 	return &AppendEntriesReq{Term: n.term, LeaderID: n.cfg.ID, PrevLogIndex: prev, PrevLogTerm: prevTerm, Entries: entries, LeaderCommit: n.log.committed}
 }
@@ -88,7 +89,7 @@ func (n *Node) onAppendConflict(from NodeID, p *peerProgress, resp *AppendEntrie
 	if p.nextIndex < 1 {
 		p.nextIndex = 1
 	}
-	n.sendAppendEntries(from, false) // retry promptly from the new point
+	n.sendAppendEntries(from) // retry promptly from the new point
 }
 
 // backoffNextIndex picks the follower's new nextIndex from its conflict

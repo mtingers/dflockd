@@ -73,7 +73,7 @@ func (n *Node) advanceSelfProgress(idx Index) {
 // becomeLeader.
 func (n *Node) broadcastAppendEntries() {
 	for _, id := range n.peerIDs() {
-		n.sendAppendEntries(id, false)
+		n.sendAppendEntries(id)
 	}
 }
 
