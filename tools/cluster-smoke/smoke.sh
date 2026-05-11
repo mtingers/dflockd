@@ -13,6 +13,8 @@
 #   5. Acquire + Release on the new leader.
 #
 # Run from the repo root: bash tools/cluster-smoke/smoke.sh
+# Set DFLOCKD_SMOKE_TLS=1 to run the same scenario with mutual TLS on
+# the Raft transport (needs `openssl`).
 set -uo pipefail
 
 BIN=/tmp/dflockd-smoke
@@ -41,11 +43,30 @@ PEERS="a=127.0.0.1:$A_RAFT@127.0.0.1:$A_CLIENT,b=127.0.0.1:$B_RAFT@127.0.0.1:$B_
 
 mkdir -p "$DIR/a" "$DIR/b" "$DIR/c" "$LOGS"
 
+# Optional: DFLOCKD_SMOKE_TLS=1 exercises the mutual-TLS Raft transport.
+# All three nodes share one self-signed cert (it's also the CA) — fine
+# for loopback, where every node is "127.0.0.1".
+TLS_ARGS=()
+if [[ "${DFLOCKD_SMOKE_TLS:-}" == "1" ]]; then
+  echo "==> generating shared cert for mutual TLS"
+  CERT="$DIR/cert.pem" KEY="$DIR/key.pem"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout "$KEY" -out "$CERT" -nodes -days 1 \
+    -subj "/CN=dflockd-smoke" \
+    -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+    -addext "extendedKeyUsage=serverAuth,clientAuth" \
+    >/dev/null 2>&1 || { echo "openssl cert gen failed"; exit 1; }
+  TLS_ARGS=(--raft-tls-cert "$CERT" --raft-tls-key "$KEY" --raft-tls-ca "$CERT")
+fi
+
 start_node() {
   local id=$1 raft=$2 client=$3
+  # ${arr[@]+"${arr[@]}"} expands to nothing when arr is empty — and is
+  # safe under `set -u` on the bash 3.2 that ships with macOS.
   "$BIN" --raft-dir "$DIR/$id" --node-id "$id" \
     --raft-addr "127.0.0.1:$raft" --advertise-addr "127.0.0.1:$client" \
     --port "$client" --host 127.0.0.1 --cluster-peers "$PEERS" --default-lease-ttl 60 \
+    ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} \
     >"$LOGS/$id.log" 2>&1 &
   echo $!
 }
