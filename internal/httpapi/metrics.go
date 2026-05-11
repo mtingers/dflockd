@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -153,7 +154,56 @@ func (h *httpServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeGauge(&b, "dflockd_lock_waiters", "Current lock waiters.", float64(lockWaiters))
 	writeGauge(&b, "dflockd_semaphore_holders", "Currently held semaphore slots.", float64(semHolders))
 	writeGauge(&b, "dflockd_semaphore_waiters", "Current semaphore waiters.", float64(semWaiters))
+	writeClusterMetrics(&b, h.sessions.Server().ClusterStatusJSON())
 	_, _ = w.Write([]byte(b.String()))
+}
+
+// clusterMetricView mirrors the JSON object the cluster's StatusJSON
+// emits (see internal/cluster/node.go) — just enough for the gauges.
+type clusterMetricView struct {
+	Role          string   `json:"role"`
+	Term          uint64   `json:"term"`
+	CommitIndex   uint64   `json:"commit_index"`
+	LastLogIndex  uint64   `json:"last_log_index"`
+	SnapshotIndex uint64   `json:"snapshot_index"`
+	Voters        []string `json:"voters"`
+}
+
+var raftStates = []string{"leader", "follower", "candidate", "pre-candidate"}
+
+// writeClusterMetrics emits dflockd_raft_* gauges when clusterJSON is
+// non-nil (i.e. this node is part of a cluster). In single-node mode it
+// writes nothing.
+func writeClusterMetrics(b *strings.Builder, clusterJSON []byte) {
+	if clusterJSON == nil {
+		return
+	}
+	var v clusterMetricView
+	if err := json.Unmarshal(clusterJSON, &v); err != nil {
+		return // shouldn't happen; skip rather than corrupt the exposition
+	}
+	b.WriteString("# HELP dflockd_raft_state This node's Raft role (1 for the current state, 0 otherwise).\n")
+	b.WriteString("# TYPE dflockd_raft_state gauge\n")
+	for _, s := range raftStates {
+		val := 0
+		if s == v.Role {
+			val = 1
+		}
+		fmt.Fprintf(b, "dflockd_raft_state{state=%q} %d\n", s, val)
+	}
+	writeGauge(b, "dflockd_raft_is_leader", "1 if this node is the Raft leader, 0 otherwise.", boolFloat(v.Role == "leader"))
+	writeGauge(b, "dflockd_raft_term", "Current Raft term.", float64(v.Term))
+	writeGauge(b, "dflockd_raft_commit_index", "Highest committed Raft log index.", float64(v.CommitIndex))
+	writeGauge(b, "dflockd_raft_last_log_index", "Index of the last entry in the Raft log.", float64(v.LastLogIndex))
+	writeGauge(b, "dflockd_raft_snapshot_index", "Index of the latest persisted snapshot (0 if none).", float64(v.SnapshotIndex))
+	writeGauge(b, "dflockd_raft_voters", "Number of voting members in the current configuration.", float64(len(v.Voters)))
+}
+
+func boolFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // writePrometheus dumps per-route counters under m.mu held briefly,

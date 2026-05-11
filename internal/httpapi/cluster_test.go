@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -188,6 +189,26 @@ func TestHTTPCluster_StatsHasClusterBlock(t *testing.T) {
 	}
 	if _, ok := m["cluster"]; !ok {
 		t.Fatalf("stats missing cluster block: %s", rec.Body)
+	}
+}
+
+func TestHTTPCluster_MetricsHasRaftGauges(t *testing.T) {
+	fc := &httpFakeCluster{leader: true}
+	hs := newClusterHTTPTest(t, fc)
+	rec := httptest.NewRecorder()
+	hs.handleMetrics(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`dflockd_raft_state{state="leader"} 1`,
+		`dflockd_raft_state{state="follower"} 0`,
+		"dflockd_raft_is_leader 1",
+		"dflockd_raft_term 3",
+		"dflockd_raft_commit_index",
+		"dflockd_raft_voters",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q\n%s", want, body)
+		}
 	}
 }
 
