@@ -112,7 +112,7 @@ func (n *Node) submitConfChange(ctx context.Context, cc *confChange) (*Future, e
 func (n *Node) TransferLeadership(ctx context.Context) error {
 	done := make(chan error, 1)
 	select {
-	case n.transferc <- done:
+	case n.controlc <- func() { n.onTransferLeadership(done) }:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-n.donec:

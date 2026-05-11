@@ -93,13 +93,14 @@ type Node struct {
 	rpcReplyc   chan rpcReply
 	proposec    chan *proposal
 	confchangec chan *confChange
-	transferc   chan chan error // leadership-transfer requests
-	statusc     chan chan NodeStatus
-	applyc      chan applyReq    // run loop → apply goroutine
-	snapSavec   chan snapSaveReq // apply goroutine → run loop
-	stopc       chan struct{}
-	donec       chan struct{}
-	applyDone   chan struct{} // closed when the apply goroutine exits
+	// controlc carries low-frequency "do this on the run loop" closures —
+	// Status, TransferLeadership — so the run loop's select stays small.
+	controlc  chan func()
+	applyc    chan applyReq    // run loop → apply goroutine
+	snapSavec chan snapSaveReq // apply goroutine → run loop
+	stopc     chan struct{}
+	donec     chan struct{}
+	applyDone chan struct{} // closed when the apply goroutine exits
 }
 
 // confChange is one membership change submitted to the run loop. It is
@@ -219,8 +220,7 @@ func newNode(cfg Config, fsm FSM, rl *raftLog, transport Transport, config Confi
 		rpcReplyc:   make(chan rpcReply, 64),
 		proposec:    make(chan *proposal),
 		confchangec: make(chan *confChange),
-		transferc:   make(chan chan error),
-		statusc:     make(chan chan NodeStatus),
+		controlc:    make(chan func()),
 		applyc:      make(chan applyReq, cfg.ApplyChanDepth),
 		snapSavec:   make(chan snapSaveReq, 1),
 		stopc:       make(chan struct{}),
@@ -349,12 +349,10 @@ func (n *Node) run() {
 			n.onPropose(p)
 		case cc := <-n.confchangec:
 			n.onConfChange(cc)
-		case done := <-n.transferc:
-			n.onTransferLeadership(done)
+		case fn := <-n.controlc:
+			fn()
 		case s := <-n.snapSavec:
 			n.onSnapshotSave(s)
-		case replyc := <-n.statusc:
-			replyc <- n.snapshotStatus()
 		}
 	}
 }
@@ -378,7 +376,7 @@ func (n *Node) shutdownRunLoop() {
 func (n *Node) Status() NodeStatus {
 	replyc := make(chan NodeStatus, 1)
 	select {
-	case n.statusc <- replyc:
+	case n.controlc <- func() { replyc <- n.snapshotStatus() }:
 	case <-n.donec:
 		return NodeStatus{ID: n.cfg.ID}
 	}
