@@ -76,6 +76,9 @@ func checkSnapshotEnvelope(raw []byte) error {
 
 func decodeSnapshotConfig(raw []byte) (Configuration, int, error) {
 	cfgLen := int(be.Uint32(raw[24:28]))
+	if cfgLen < 0 || cfgLen > len(raw) { // also guards 32-bit int overflow in off below
+		return Configuration{}, 0, fmt.Errorf("raft: snapshot config length out of range")
+	}
 	off := 28 + cfgLen
 	if off+8 > len(raw)-8 {
 		return Configuration{}, 0, fmt.Errorf("raft: snapshot config length out of range")
@@ -86,8 +89,11 @@ func decodeSnapshotConfig(raw []byte) (Configuration, int, error) {
 
 func decodeSnapshotFSM(raw []byte, meta SnapshotMeta, off int) (SnapshotMeta, []byte, error) {
 	fsmLen := int(be.Uint64(raw[off : off+8]))
+	if fsmLen < 0 || fsmLen > len(raw) { // also guards int overflow in end below
+		return SnapshotMeta{}, nil, fmt.Errorf("raft: snapshot fsm length out of range")
+	}
 	start, end := off+8, off+8+fsmLen
-	if fsmLen < 0 || end > len(raw)-8 {
+	if end > len(raw)-8 {
 		return SnapshotMeta{}, nil, fmt.Errorf("raft: snapshot fsm length out of range")
 	}
 	return meta, append([]byte(nil), raw[start:end]...), nil

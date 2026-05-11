@@ -42,9 +42,13 @@ derived `--host:--port`).
 ## What's replicated
 
 - **Lock state**: every `Acquire` / `Enqueue` / `Release` / `Renew` /
-  `Evict` / `CleanupConn` / `GC` is a Raft log entry. The leader's
-  lease-expiry sweep proposes `Evict` commands; the leader's GC loop
-  proposes `GC`. Followers don't run those loops.
+  `Evict` / `CleanupConn` / `GC` / `EvictExpired` is a Raft log entry.
+  A leader-only sweep loop (ticking at `--lease-sweep-interval`, default
+  1 s) proposes an `EvictExpired` command — which drops every holder
+  past its lease deadline and promotes waiters into the freed slots —
+  and a `GC` command every 30 ticks. Followers don't run that loop; a
+  leadership change between the tick and the propose just yields
+  `ErrNotLeader` and is retried on the next tick.
 - **Fencing tokens** carry through replication. The token's lex-sortable
   prefix is a `FenceCounter` kept in FSM state (snapshotted), bumped on
   every grant during apply; tokens are deterministic on every node.

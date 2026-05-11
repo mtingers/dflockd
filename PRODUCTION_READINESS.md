@@ -186,7 +186,56 @@ df00568 feat(cluster,config,cmd): wire cluster mode into the binary
 9eab13b feat(raft): plan + storage + node core + propose/apply/snapshots
 ```
 
-(Plus the Phase-14 docs / changelog commit and this Phase-15 review.)
+(Plus the Phase-14 docs / changelog commit, the Phase-15 review, and a
+post-review hardening pass — see below.)
+
+## Post-review hardening (production-readiness sweep)
+
+A focused code review after Phase 15 found and fixed a set of issues
+that the existing tests/smoke missed (mostly because everything runs on
+loopback in <5 s). Each has a test and a CHANGELOG entry.
+
+- **Transport (was a blocker):** the handshake's read deadline was never
+  cleared, so every Raft TCP connection died and was redialed ~5 s after
+  it was established — invisible on loopback, but on a real network it
+  meant constant connection churn, spurious RPC failures, and (with
+  aggressive timers) spurious elections. Now: clear the deadline,
+  60 s idle deadline on the steady-state read loops, 10 s write
+  deadline, TCP keepalive, per-peer dial backoff, `t.closed` checks on
+  the `Send`/dial paths, `handler` as an `atomic.Pointer`.
+- **Cluster lease/GC (was a blocker):** the leader-driven sweep loop
+  that proposes `EvictExpired` + `GC` through Raft was missing — so a
+  crashed client's lock leaked forever and idle resources accumulated.
+  Now implemented (`cluster.Node.sweepLoop`, started on `Start`, stopped
+  on `Close`; ticks at `--lease-sweep-interval`).
+- **FSM determinism (was a blocker):** `ApplyCleanupConn` minted fence
+  tokens in Go map-iteration order across a connection's owned keys —
+  replicas could diverge. Now sorted-key order.
+- **`internal/raft/storage` durability:** dirent fsync after creating
+  the WAL/HardState files; a corrupt snapshot halts the open instead of
+  silently meaning "no snapshot" (which would reset the node to term 0
+  after a compaction); 64 MiB read caps on the WAL and snapshot files;
+  partial-write rollback in `wal.appendEntries`; `wal.rewrite` keeps the
+  old handle until the atomic write succeeds; `handleInstallSnapshot`
+  ignores a snapshot at-or-below `committed`; decode-time bounds on the
+  config voter count and the snapshot length fields.
+- **Server/cluster glue:** cluster connection ids are now globally
+  unique (random per-process epoch ‖ counter), so a failover survivor's
+  fresh ids can't collide with the dead leader's orphans; the two-phase
+  enqueue→wait listener is registered at enqueue-commit time (no
+  lost-wakeup window); semaphore `limit` is bounded; a decoded
+  `cluster.Command` is validated before it touches the FSM.
+- **Concurrency:** `cluster.Node`'s members map is mutex-guarded
+  (was a `concurrent map read/write` crash waiting to happen on a
+  membership change during redirects); `node.shipApplyBatch` drains
+  `snapSavec` while blocked on `applyc` (removes a rare deadlock).
+
+Deliberately *not* changed (noted, low priority): `persistHardState`
+failure logs + demotes rather than self-`Close`ing; `clusterProposeErrAck`
+still maps every non-context propose error to `error_not_leader` (the
+shutdown window where that's slightly misleading is narrow because
+`SetCluster(nil)` runs first on teardown); TLS on the Raft transport is
+still a follow-on, not a bug.
 
 ## Bottom line
 
@@ -199,17 +248,18 @@ non-cluster single-node binary is byte-identical to v2.1.x.
 
 Recommended next work, in priority order:
 
-1. **HTTP API cluster routing** — propose mutating handlers through
+1. **TLS + cluster shared secret on the Raft transport** — the framing
+   layer is already in place; this is config + a handshake field. The
+   biggest remaining gap before "untrusted network" use.
+2. **HTTP API cluster routing** — propose mutating handlers through
    the cluster (so `--http-port` + cluster mode is no longer rejected
    at startup).
-2. **TLS + cluster shared secret on the Raft transport** — the
-   framing layer is already in place; this is config + a handshake
-   field.
 3. **Prometheus cluster metrics** (`dflockd_raft_role`,
    `_term`, `_commit_index`, `_applied_index`, `_leader_changes_total`,
    `_proposals_total`, `_apply_duration_seconds`) on `/metrics`.
 4. **Multi-node soak harness** under `cmd/cluster-soak` with the
-   fault-injection knobs PLAN.md §6 lists.
+   fault-injection knobs PLAN.md §6 lists (and a long-running variant
+   of `tools/cluster-smoke`).
 5. **Stable-client-ref re-attach** for FIFO across leader failover
    (PLAN.md §4.7 follow-on).
 6. **Dynamic join with InstallSnapshot transfer** to a node started
