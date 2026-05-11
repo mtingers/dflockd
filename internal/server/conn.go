@@ -382,7 +382,18 @@ func (s *Server) handleStats() *protocol.Ack {
 func (s *Server) statsJSON() (string, bool) {
 	st := s.lm.Stats(s.TotalConnCount())
 	stripStatsKeys(st)
-	data, err := json.Marshal(st)
+	var data []byte
+	var err error
+	if c := s.clusterOrNil(); c != nil {
+		// Splice a "cluster" object alongside the lock stats (the lock
+		// fields stay at the top level — single-node output is unchanged).
+		data, err = json.Marshal(struct {
+			*lock.Stats
+			Cluster json.RawMessage `json:"cluster"`
+		}{st, c.StatusJSON()})
+	} else {
+		data, err = json.Marshal(st)
+	}
 	return string(data), err == nil
 }
 

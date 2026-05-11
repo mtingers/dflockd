@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -195,6 +196,22 @@ func TestCommandValidate(t *testing.T) {
 		if err := c.Validate(); err != nil {
 			t.Fatalf("case %d: Validate() = %v, want nil for %+v", i, err, c)
 		}
+	}
+}
+
+func TestStatusJSON(t *testing.T) {
+	tc := newCluster(t, "n1")
+	defer tc.stopAll()
+	tc.waitLeader()
+	var v clusterStatusView
+	if err := json.Unmarshal(tc.nodes["n1"].StatusJSON(), &v); err != nil {
+		t.Fatalf("StatusJSON not valid JSON: %v", err)
+	}
+	if v.NodeID != "n1" || v.Role != "leader" || v.Term == 0 || v.LeaderID != "n1" {
+		t.Fatalf("StatusJSON view = %+v", v)
+	}
+	if len(v.Voters) != 1 || v.Voters[0] != "n1" {
+		t.Fatalf("voters = %v", v.Voters)
 	}
 }
 

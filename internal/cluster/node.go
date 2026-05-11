@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -152,6 +153,51 @@ func (n *Node) LeaderID() raft.NodeID { return n.raft.LeaderID() }
 // Status exposes a snapshot of the raft node's state to callers
 // (typically the HTTP admin endpoint).
 func (n *Node) Status() raft.NodeStatus { return n.raft.Status() }
+
+// clusterStatusView is the JSON-friendly shape returned by StatusJSON.
+type clusterStatusView struct {
+	NodeID        string   `json:"node_id"`
+	Role          string   `json:"role"`
+	Term          uint64   `json:"term"`
+	LeaderID      string   `json:"leader_id"`
+	LeaderAddr    string   `json:"leader_addr,omitempty"`
+	CommitIndex   uint64   `json:"commit_index"`
+	LastLogIndex  uint64   `json:"last_log_index"`
+	SnapshotIndex uint64   `json:"snapshot_index"`
+	Voters        []string `json:"voters"`
+}
+
+// StatusJSON returns this node's Raft status as a JSON object — surfaced
+// in the server's `stats` response.
+func (n *Node) StatusJSON() json.RawMessage {
+	st := n.raft.Status()
+	v := clusterStatusView{
+		NodeID:        string(st.ID),
+		Role:          st.Role,
+		Term:          uint64(st.Term),
+		LeaderID:      string(st.LeaderID),
+		CommitIndex:   uint64(st.CommitIndex),
+		LastLogIndex:  uint64(st.LastLogIndex),
+		SnapshotIndex: uint64(st.LastSnapshotIndex),
+		Voters:        nodeIDsToStrings(st.Voters),
+	}
+	if addr, ok := n.LeaderClientAddr(); ok {
+		v.LeaderAddr = addr
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`{"error":"marshal cluster status"}`)
+	}
+	return b
+}
+
+func nodeIDsToStrings(ids []raft.NodeID) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = string(id)
+	}
+	return out
+}
 
 // LockManager returns the FSM-backing LockManager — useful so the
 // server can register grant listeners on it directly.

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -12,7 +14,6 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
-	"log/slog"
 )
 
 // fakeCluster is a controllable Cluster used to drive the cluster-mode
@@ -50,6 +51,10 @@ func (f *fakeCluster) LeaderClientAddr() (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.leaderAddr, f.leaderAddr != ""
+}
+
+func (f *fakeCluster) StatusJSON() json.RawMessage {
+	return json.RawMessage(`{"node_id":"fake","role":"leader","term":7}`)
 }
 
 func (f *fakeCluster) ProposeAcquire(ctx context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error) {
@@ -316,6 +321,34 @@ func TestFormatNotLeaderEmitsExtra(t *testing.T) {
 	out = protocol.FormatResponse(&protocol.Ack{Status: protocol.StatusErrorNotLeader}, 0)
 	if string(out) != "error_not_leader\n" {
 		t.Fatalf("empty-addr frame = %q", out)
+	}
+}
+
+func TestStatsIncludesClusterBlockWhenClustered(t *testing.T) {
+	s, _ := newTestServer(t)
+	// Single-node: no "cluster" key.
+	js, ok := s.statsJSON()
+	if !ok {
+		t.Fatalf("statsJSON failed")
+	}
+	if strings.Contains(js, `"cluster"`) {
+		t.Fatalf("single-node stats unexpectedly has a cluster block: %s", js)
+	}
+	// Clustered: a "cluster" object appears, lock fields still present.
+	s.SetCluster(&fakeCluster{leader: true})
+	js, ok = s.statsJSON()
+	if !ok {
+		t.Fatalf("statsJSON (clustered) failed")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(js), &m); err != nil {
+		t.Fatalf("stats JSON unmarshal: %v\n%s", err, js)
+	}
+	if _, has := m["cluster"]; !has {
+		t.Fatalf("clustered stats missing the cluster block: %s", js)
+	}
+	if !strings.Contains(string(m["cluster"]), `"role":"leader"`) {
+		t.Fatalf("cluster block = %s", m["cluster"])
 	}
 }
 

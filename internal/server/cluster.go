@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -23,6 +24,10 @@ import (
 type Cluster interface {
 	IsLeader() bool
 	LeaderClientAddr() (string, bool)
+	// StatusJSON returns this node's Raft status as a JSON object
+	// (role, term, leader, commit/last-log indices, voters …) — spliced
+	// into the `stats` response so operators can see cluster health.
+	StatusJSON() json.RawMessage
 	ProposeAcquire(ctx context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error)
 	ProposeEnqueue(ctx context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error)
 	ProposeRelease(ctx context.Context, key, token string) (lock.ApplyResult, error)
