@@ -152,7 +152,7 @@ func TestKindString(t *testing.T) {
 	cases := map[Kind]string{
 		KindAcquire: "acquire", KindEnqueue: "enqueue", KindRelease: "release",
 		KindRenew: "renew", KindEvict: "evict", KindCleanupConn: "cleanup_conn",
-		KindGC: "gc", KindBarrier: "barrier",
+		KindGC: "gc", KindBarrier: "barrier", KindEvictExpired: "evict_expired",
 	}
 	for k, want := range cases {
 		if got := k.String(); got != want {
@@ -162,4 +162,52 @@ func TestKindString(t *testing.T) {
 	if got := Kind(99).String(); got != "kind(99)" {
 		t.Fatalf("unknown kind = %q", got)
 	}
+}
+
+func TestCommandValidate(t *testing.T) {
+	long := make([]byte, maxCommandKeyBytes+1)
+	for i := range long {
+		long[i] = 'x'
+	}
+	bad := []Command{
+		{Kind: KindAcquire, Key: "k", LeaseTTLNanos: -1},
+		{Kind: KindAcquire, Key: string(long)},
+		{Kind: KindAcquire, Key: "k", Ref: string(make([]byte, maxCommandRefBytes+1))},
+		{Kind: KindAcquire, Key: "k", Limit: maxCommandLimit + 1},
+		{Kind: KindAcquire, Key: "k", Limit: -1},
+		{Kind: KindAcquire, Key: ""},
+		{Kind: KindRelease, Key: ""},
+		{Kind: KindRenew, Key: ""},
+	}
+	for i, c := range bad {
+		if err := c.Validate(); err == nil {
+			t.Fatalf("case %d: Validate() = nil, want error for %+v", i, c)
+		}
+	}
+	good := []Command{
+		{Kind: KindAcquire, Key: "lock:k", Limit: 1, LeaseTTLNanos: int64(time.Second)},
+		{Kind: KindGC},      // no key required
+		{Kind: KindBarrier}, // no key required
+		{Kind: KindEvictExpired},
+		{Kind: KindCleanupConn, Ref: "n1-7", ConnID: 7},
+	}
+	for i, c := range good {
+		if err := c.Validate(); err != nil {
+			t.Fatalf("case %d: Validate() = %v, want nil for %+v", i, err, c)
+		}
+	}
+}
+
+func TestLogSweepErr(t *testing.T) {
+	tc := newCluster(t, "n1")
+	defer tc.stopAll()
+	n := tc.nodes["n1"]
+	// Just exercise the classification branches — the function only logs,
+	// so "doesn't panic" is the contract.
+	n.logSweepErr("x", raft.ErrNotLeader)
+	n.logSweepErr("x", raft.ErrLeadershipLost)
+	n.logSweepErr("x", raft.ErrStopped)
+	n.logSweepErr("x", context.Canceled)
+	n.logSweepErr("x", context.DeadlineExceeded)
+	n.logSweepErr("x", errors.New("something else"))
 }

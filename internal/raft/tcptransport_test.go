@@ -243,6 +243,29 @@ func TestReadFrameClearsStaleDeadline(t *testing.T) {
 	}
 }
 
+func TestTCPTransportDialBackoff(t *testing.T) {
+	tr, err := NewTCPTransport("a", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTCPTransport: %v", err)
+	}
+	defer tr.Close()
+	tr.AddPeer("dead", "127.0.0.1:1") // refuses connections
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := tr.Send(ctx, "dead", &RequestVoteReq{Term: 1}); err == nil {
+		t.Fatalf("Send to a dead peer should fail")
+	}
+	// An immediate retry should be short-circuited by the dial cool-down,
+	// not attempt another (slow) dial.
+	start := time.Now()
+	if _, err := tr.Send(context.Background(), "dead", &RequestVoteReq{Term: 1}); err == nil {
+		t.Fatalf("retry to a dead peer should fail")
+	}
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Fatalf("retry took %s — dial cool-down didn't short-circuit", d)
+	}
+}
+
 func TestTCPTransportSendAfterCloseFails(t *testing.T) {
 	trA, _ := NewTCPTransport("a", "127.0.0.1:0", nil)
 	trB, _ := NewTCPTransport("b", "127.0.0.1:0", nil)

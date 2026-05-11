@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -290,6 +291,16 @@ func TestParseRequest_BadLimit(t *testing.T) {
 	_, err := parseRequest("sl", "k", "5 0", time.Second)
 	if err == nil {
 		t.Fatal("expected error for limit=0")
+	}
+}
+
+func TestParseRequest_LimitTooLarge(t *testing.T) {
+	big := strconv.Itoa(MaxSemaphoreLimit + 1)
+	if _, err := parseRequest("sl", "k", "5 "+big, time.Second); err == nil {
+		t.Fatalf("expected error for limit=%s", big)
+	}
+	if _, err := parseRequest("sl", "k", "5 "+strconv.Itoa(MaxSemaphoreLimit), time.Second); err != nil {
+		t.Fatalf("limit at the cap should be accepted: %v", err)
 	}
 }
 
