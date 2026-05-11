@@ -128,6 +128,7 @@ func newStdHTTPServer(hs *httpServer, cfg *config.Config) *http.Server {
 	return &http.Server{
 		Handler:           hs.withCORS(hs.withMetrics(mux, hs.withRateLimit(hs.withAuth(jsonRouteErrors(mux))))),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.ReadTimeout,
 		IdleTimeout:       120 * time.Second,
 		ConnState:         connLimiter.ConnState,
 	}

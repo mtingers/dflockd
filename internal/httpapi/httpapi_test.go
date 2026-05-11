@@ -241,6 +241,16 @@ func closeIfOpen(ch chan struct{}) {
 	}
 }
 
+func TestHTTPServer_UsesConfiguredReadTimeout(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.ReadTimeout = 7 * time.Second
+
+	srv := newStdHTTPServer(&httpServer{cfg: cfg}, cfg)
+	if srv.ReadTimeout != cfg.ReadTimeout {
+		t.Fatalf("ReadTimeout = %v, want %v", srv.ReadTimeout, cfg.ReadTimeout)
+	}
+}
+
 func defaultTestConfig() *config.Config {
 	cfg := defaultHTTPConfigValue
 	return &cfg

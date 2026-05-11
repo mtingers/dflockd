@@ -575,7 +575,7 @@ func TestFenceFromToken_Decodes(t *testing.T) {
 }
 
 func TestFenceFromToken_RejectsBadInput(t *testing.T) {
-	for _, tok := range []string{"", "tooshort", strings.Repeat("g", 32), strings.Repeat("0", 31)} {
+	for _, tok := range []string{"", "tooshort", strings.Repeat("g", 32), "0000000000000001" + strings.Repeat("g", 16), strings.Repeat("0", 31)} {
 		if _, err := client.FenceFromToken(tok); err == nil {
 			t.Errorf("FenceFromToken(%q) returned nil error", tok)
 		}

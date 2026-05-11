@@ -258,14 +258,16 @@ func FenceFromToken(token string) (uint64, error) {
 	return binary.BigEndian.Uint64(prefix[:]), nil
 }
 
-// decodeFencePrefix validates the token's length and decodes the
-// first 16 hex chars into 8 raw bytes.
+// decodeFencePrefix validates the token's length and full hex shape,
+// then returns the first 8 raw bytes.
 func decodeFencePrefix(token string) ([8]byte, error) {
 	var prefix [8]byte
 	if len(token) != 32 {
 		return prefix, fmt.Errorf("dflockd: token must be 32 hex chars, got %d", len(token))
 	}
-	_, err := hex.Decode(prefix[:], []byte(token[:16]))
+	var raw [16]byte
+	_, err := hex.Decode(raw[:], []byte(token))
+	copy(prefix[:], raw[:8])
 	return prefix, wrapHexErr(err)
 }
 
@@ -273,7 +275,7 @@ func wrapHexErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("dflockd: token prefix is not hex: %w", err)
+	return fmt.Errorf("dflockd: token is not hex: %w", err)
 }
 
 // secondsCeil converts a Duration to whole seconds, rounding up so a
