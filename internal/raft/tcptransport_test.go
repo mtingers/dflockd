@@ -2,6 +2,8 @@ package raft
 
 import (
 	"context"
+	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -214,6 +216,75 @@ func TestTCPTransportCloseIsIdempotent(t *testing.T) {
 	if err := tr.Close(); err != nil {
 		t.Fatalf("Close 2: %v", err)
 	}
+}
+
+// readFrame must clear a deadline left over from a prior call (the
+// handshake sets a 5s read deadline); a steady-state read with
+// deadline<=0 must not inherit it. Regression test for the bug where
+// every conn died ~5s after it was established.
+func TestReadFrameClearsStaleDeadline(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	// Pretend the handshake left an absolute deadline that's already past.
+	_ = c1.SetReadDeadline(time.Now().Add(-time.Second))
+	done := make(chan error, 1)
+	go func() { _, err := readFrame(c1, 0); done <- err }()
+	select {
+	case err := <-done:
+		t.Fatalf("readFrame returned early — stale deadline not cleared: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := writeFrame(c2, []byte("hi")); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("readFrame after deadline cleared: %v", err)
+	}
+}
+
+func TestTCPTransportSendAfterCloseFails(t *testing.T) {
+	trA, _ := NewTCPTransport("a", "127.0.0.1:0", nil)
+	trB, _ := NewTCPTransport("b", "127.0.0.1:0", nil)
+	defer trB.Close()
+	trA.AddPeer("b", trB.ListenAddr())
+	if err := trA.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_, err := trA.Send(context.Background(), "b", &RequestVoteReq{Term: 1})
+	if !errors.Is(err, errTransportClosed) {
+		t.Fatalf("Send after Close = %v, want errTransportClosed", err)
+	}
+}
+
+// A connection must keep working well past the handshake read deadline —
+// the steady-state read loop refreshes the deadline on every read.
+func TestTCPTransportConnSurvivesPastHandshakeDeadline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("sleeps past handshakeTimeout")
+	}
+	trA, _ := NewTCPTransport("a", "127.0.0.1:0", nil)
+	trB, _ := NewTCPTransport("b", "127.0.0.1:0", nil)
+	defer trA.Close()
+	defer trB.Close()
+	trA.AddPeer("b", trB.ListenAddr())
+	trB.SetHandler(func(from NodeID, req Message) Message {
+		return &RequestVoteResp{Term: req.messageTerm(), VoteGranted: true}
+	})
+	send := func(term Term) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := trA.Send(ctx, "b", &RequestVoteReq{Term: term, CandidateID: "a"})
+		if err != nil {
+			t.Fatalf("Send(term=%d): %v", term, err)
+		}
+		if rv, ok := resp.(*RequestVoteResp); !ok || rv.Term != term {
+			t.Fatalf("Send(term=%d) resp = %+v", term, resp)
+		}
+	}
+	send(1) // establishes the conn (handshake sets a 5s read deadline)
+	time.Sleep(handshakeTimeout + time.Second)
+	send(2) // must still work — same conn, deadline was refreshed
 }
 
 func TestTCPTransportConcurrentSends(t *testing.T) {

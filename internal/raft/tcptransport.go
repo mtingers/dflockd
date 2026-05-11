@@ -21,20 +21,26 @@ import (
 //
 // TLS / cluster-secret auth on the handshake are intentionally NOT
 // wired in v1 (see PLAN.md §3); they are additive over this layer.
+type rpcHandler = func(from NodeID, req Message) Message
+
 type TCPTransport struct {
-	id       NodeID
-	listener net.Listener
-	handler  func(from NodeID, req Message) Message
-	addrs    sync.Map   // NodeID → string
-	outbound sync.Map   // NodeID → *outboundConn
-	accepted sync.Map   // net.Conn → struct{} (open accepted conns)
-	dialMu   sync.Mutex // serialises dial-on-demand per peer
-	log      *slog.Logger
-	wg       sync.WaitGroup
-	closed   atomic.Bool
+	id           NodeID
+	listener     net.Listener
+	handler      atomic.Pointer[rpcHandler] // set via SetHandler; read off accept goroutines
+	addrs        sync.Map                   // NodeID → string
+	outbound     sync.Map                   // NodeID → *outboundConn
+	accepted     sync.Map                   // net.Conn → struct{} (open accepted conns)
+	lastDialFail sync.Map                   // NodeID → time.Time (dial-failure cool-down)
+	dialMu       sync.Mutex                 // serialises dial-on-demand
+	log          *slog.Logger
+	wg           sync.WaitGroup
+	closed       atomic.Bool
 }
 
 var _ Transport = (*TCPTransport)(nil)
+
+// errTransportClosed is returned by Send once Close has been called.
+var errTransportClosed = errors.New("raft: transport closed")
 
 // NewTCPTransport listens on listenAddr ("host:port"; "0" gets a free
 // port) and returns a Transport bound to id. Call SetHandler before
@@ -59,12 +65,15 @@ func (t *TCPTransport) LocalID() NodeID { return t.id }
 // caller bound to ":0" and needs the assigned port).
 func (t *TCPTransport) ListenAddr() string { return t.listener.Addr().String() }
 
-func (t *TCPTransport) SetHandler(h func(from NodeID, req Message) Message) { t.handler = h }
+func (t *TCPTransport) SetHandler(h func(from NodeID, req Message) Message) {
+	t.handler.Store(&h)
+}
 
 func (t *TCPTransport) AddPeer(id NodeID, addr string) { t.addrs.Store(id, addr) }
 
 func (t *TCPTransport) RemovePeer(id NodeID) {
 	t.addrs.Delete(id)
+	t.lastDialFail.Delete(id)
 	t.dropOutbound(id)
 }
 
@@ -89,6 +98,9 @@ func (t *TCPTransport) Close() error {
 
 // Send delivers req to `to` and blocks for the reply or ctx.Done.
 func (t *TCPTransport) Send(ctx context.Context, to NodeID, req Message) (Message, error) {
+	if t.closed.Load() {
+		return nil, errTransportClosed
+	}
 	oc, err := t.getOrDialOutbound(to)
 	if err != nil {
 		return nil, err
@@ -111,6 +123,10 @@ func (t *TCPTransport) acceptLoop() {
 			t.log.Debug("accept error", "err", err)
 			continue
 		}
+		if t.closed.Load() {
+			_ = conn.Close() // accepted in the Close() race window
+			return
+		}
 		t.wg.Add(1)
 		go t.serveAccepted(conn)
 	}
@@ -118,8 +134,12 @@ func (t *TCPTransport) acceptLoop() {
 
 func (t *TCPTransport) serveAccepted(conn net.Conn) {
 	defer t.wg.Done()
+	tuneConn(conn)
 	t.accepted.Store(conn, struct{}{})
 	defer func() { t.accepted.Delete(conn); _ = conn.Close() }()
+	if t.closed.Load() {
+		return // Close() may have already finished its accepted.Range
+	}
 	from, err := t.serverHandshake(conn)
 	if err != nil {
 		t.log.Debug("inbound handshake failed", "err", err)
@@ -129,7 +149,7 @@ func (t *TCPTransport) serveAccepted(conn net.Conn) {
 }
 
 func (t *TCPTransport) serverHandshake(conn net.Conn) (NodeID, error) {
-	body, err := readFrame(conn, 5*time.Second)
+	body, err := readFrame(conn, handshakeTimeout)
 	if err != nil {
 		return "", fmt.Errorf("read hello: %w", err)
 	}
@@ -137,17 +157,18 @@ func (t *TCPTransport) serverHandshake(conn net.Conn) (NodeID, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := writeFrame(conn, encodeHello(t.id)); err != nil {
+	if err := writeFrameTo(conn, encodeHello(t.id), handshakeTimeout); err != nil {
 		return "", fmt.Errorf("write hello reply: %w", err)
 	}
 	return from, nil
 }
 
 // serveRequests reads request frames in a loop, dispatches to the
-// handler, and writes responses back on the same connection.
+// handler, and writes responses back on the same connection. A
+// connIdleTimeout on each read recycles a peer that has gone silent.
 func (t *TCPTransport) serveRequests(conn net.Conn, from NodeID) {
 	for {
-		body, err := readFrame(conn, 0)
+		body, err := readFrame(conn, connIdleTimeout)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) && !t.closed.Load() {
 				t.log.Debug("inbound read error", "from", from, "err", err)
@@ -155,7 +176,7 @@ func (t *TCPTransport) serveRequests(conn net.Conn, from NodeID) {
 			return
 		}
 		if err := t.handleOneInbound(conn, from, body); err != nil {
-			t.log.Debug("inbound write error", "from", from, "err", err)
+			t.log.Debug("inbound dispatch error", "from", from, "err", err)
 			return
 		}
 	}
@@ -163,23 +184,29 @@ func (t *TCPTransport) serveRequests(conn net.Conn, from NodeID) {
 
 func (t *TCPTransport) handleOneInbound(conn net.Conn, from NodeID, body []byte) error {
 	kind, reqID, msg, err := decodeRPC(body)
-	if err != nil || kind != frameRequest {
-		return fmt.Errorf("inbound frame: %w (kind=%d)", err, kind)
+	if err != nil {
+		return fmt.Errorf("inbound frame decode: %w", err)
+	}
+	if kind != frameRequest {
+		return fmt.Errorf("inbound frame: unexpected kind %d", kind)
 	}
 	resp := t.callHandler(from, msg)
 	if resp == nil {
-		// Handler declined; close the conn to surface the failure to the
-		// sender so its Send ctx fires rather than blocking forever.
+		// No handler installed yet, or the handler declined (e.g. node
+		// shutting down). Close the conn so the sender's Send ctx fires
+		// promptly rather than blocking for its full timeout; the peer
+		// redials when it next needs us.
 		return errors.New("handler returned nil")
 	}
 	return t.writeResponse(conn, reqID, resp)
 }
 
 func (t *TCPTransport) callHandler(from NodeID, msg Message) Message {
-	if t.handler == nil {
+	hp := t.handler.Load()
+	if hp == nil {
 		return nil
 	}
-	return t.handler(from, msg)
+	return (*hp)(from, msg)
 }
 
 func (t *TCPTransport) writeResponse(conn net.Conn, reqID uint64, resp Message) error {
@@ -187,7 +214,16 @@ func (t *TCPTransport) writeResponse(conn net.Conn, reqID uint64, resp Message) 
 	if err != nil {
 		return err
 	}
-	return writeFrame(conn, body)
+	return writeFrameTo(conn, body, writeTimeout)
+}
+
+// tuneConn enables TCP keepalive so a peer whose host disappeared
+// (no RST/FIN) is detected without waiting out connIdleTimeout.
+func tuneConn(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(tcpKeepAlivePeriod)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +245,25 @@ func (t *TCPTransport) getOrDialOutbound(to NodeID) (*outboundConn, error) {
 			return conn, nil
 		}
 	}
+	if t.closed.Load() {
+		return nil, errTransportClosed
+	}
+	if err := t.dialCoolingDown(to); err != nil {
+		return nil, err
+	}
 	return t.dialFresh(to)
+}
+
+// dialCoolingDown returns the cached dial error if `to` failed to dial
+// within the last dialBackoff (heartbeats fire continuously, so without
+// this every heartbeat would re-dial a downed peer).
+func (t *TCPTransport) dialCoolingDown(to NodeID) error {
+	if v, ok := t.lastDialFail.Load(to); ok {
+		if since := time.Since(v.(time.Time)); since < dialBackoff {
+			return fmt.Errorf("raft: peer %q dial cooling down (%s ago)", to, since.Round(time.Millisecond))
+		}
+	}
+	return nil
 }
 
 func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
@@ -219,12 +273,16 @@ func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
 	}
 	conn, err := net.DialTimeout("tcp", addrAny.(string), 3*time.Second)
 	if err != nil {
+		t.lastDialFail.Store(to, time.Now())
 		return nil, fmt.Errorf("raft: dial %s: %w", to, err)
 	}
+	tuneConn(conn)
 	if err := t.clientHandshake(conn, to); err != nil {
 		conn.Close()
+		t.lastDialFail.Store(to, time.Now())
 		return nil, err
 	}
+	t.lastDialFail.Delete(to)
 	oc := newOutboundConn(conn, t)
 	t.outbound.Store(to, oc)
 	t.wg.Add(1)
@@ -233,10 +291,10 @@ func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
 }
 
 func (t *TCPTransport) clientHandshake(conn net.Conn, want NodeID) error {
-	if err := writeFrame(conn, encodeHello(t.id)); err != nil {
+	if err := writeFrameTo(conn, encodeHello(t.id), handshakeTimeout); err != nil {
 		return fmt.Errorf("write hello: %w", err)
 	}
-	body, err := readFrame(conn, 5*time.Second)
+	body, err := readFrame(conn, handshakeTimeout)
 	if err != nil {
 		return fmt.Errorf("read hello reply: %w", err)
 	}
@@ -318,7 +376,7 @@ func (oc *outboundConn) send(ctx context.Context, req Message) (Message, error) 
 func (oc *outboundConn) writeFrameLocked(body []byte) error {
 	oc.writeMu.Lock()
 	defer oc.writeMu.Unlock()
-	return writeFrame(oc.conn, body)
+	return writeFrameTo(oc.conn, body, writeTimeout)
 }
 
 func (oc *outboundConn) awaitReply(ctx context.Context, reply chan rpcReplyResult) (Message, error) {
@@ -331,10 +389,12 @@ func (oc *outboundConn) awaitReply(ctx context.Context, reply chan rpcReplyResul
 }
 
 // runReader drains response frames, demuxing by reqID to the matching
-// pending channel. Exits on connection error / close.
+// pending channel. The connIdleTimeout per read means a dead/partitioned
+// peer's goroutine exits (and the conn is recycled) within it rather
+// than blocking forever. Exits on connection error / close.
 func (oc *outboundConn) runReader() {
 	for {
-		body, err := readFrame(oc.conn, 0)
+		body, err := readFrame(oc.conn, connIdleTimeout)
 		if err != nil {
 			oc.close()
 			return

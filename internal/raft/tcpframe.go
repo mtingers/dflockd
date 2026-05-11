@@ -33,6 +33,28 @@ const (
 )
 
 const (
+	// handshakeTimeout bounds the initial hello exchange on a fresh conn.
+	handshakeTimeout = 5 * time.Second
+	// connIdleTimeout recycles a connection that has produced no frame
+	// for this long. Heartbeats keep busy conns well under it; a dead or
+	// partitioned peer's reader goroutine unblocks within it (and the
+	// conn is redialed on the next Send). Idle-by-design conns (e.g. a
+	// follower's outbound conn to the leader, which it only uses when it
+	// campaigns) are simply recycled — harmless.
+	connIdleTimeout = 60 * time.Second
+	// writeTimeout bounds a single frame write so a slow-reading peer
+	// can't wedge a sender (and everyone queued behind it on writeMu).
+	writeTimeout = 10 * time.Second
+	// dialBackoff is the minimum spacing between dial attempts to a peer
+	// that just failed to dial — avoids a tight redial loop (heartbeats
+	// fire continuously) against a downed peer.
+	dialBackoff = 250 * time.Millisecond
+	// tcpKeepAlivePeriod enables OS-level keepalive so a peer whose host
+	// vanished (no RST/FIN) is detected even sooner than connIdleTimeout.
+	tcpKeepAlivePeriod = 15 * time.Second
+)
+
+const (
 	tagRequestVoteReq      uint8 = 1
 	tagRequestVoteResp     uint8 = 2
 	tagAppendEntriesReq    uint8 = 3
@@ -89,6 +111,15 @@ func newMessageOf(tag uint8) (Message, bool) {
 	return nil, false
 }
 
+// writeFrameTo writes one frame to a net.Conn under a write deadline so
+// a stalled peer can't block the writer indefinitely.
+func writeFrameTo(c net.Conn, body []byte, deadline time.Duration) error {
+	if deadline > 0 {
+		_ = c.SetWriteDeadline(time.Now().Add(deadline))
+	}
+	return writeFrame(c, body)
+}
+
 // writeFrame builds and writes one frame, fronted by its total length.
 func writeFrame(w io.Writer, body []byte) error {
 	if len(body) > maxTCPFrameBytes {
@@ -105,12 +136,17 @@ func writeFrame(w io.Writer, body []byte) error {
 	return nil
 }
 
-// readFrame reads exactly one frame from r. setDeadline applies a read
-// deadline if the underlying value is a net.Conn (otherwise no-op).
+// readFrame reads exactly one frame from r. If r is a net.Conn, a
+// positive deadline becomes a (relative) read deadline; a non-positive
+// deadline clears any deadline left over from a prior call (e.g. the
+// handshake) — otherwise an absolute deadline set once would make every
+// later read on the conn fail at that wall-clock time.
 func readFrame(r io.Reader, deadline time.Duration) ([]byte, error) {
-	if deadline > 0 {
-		if c, ok := r.(net.Conn); ok {
+	if c, ok := r.(net.Conn); ok {
+		if deadline > 0 {
 			_ = c.SetReadDeadline(time.Now().Add(deadline))
+		} else {
+			_ = c.SetReadDeadline(time.Time{})
 		}
 	}
 	var hdr [4]byte
