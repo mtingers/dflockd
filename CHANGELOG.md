@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.1.1] - 2026-05-11
+
 ### Security
 
 - **Build toolchain bumped to go1.26.3** for the standard-library fixes in [GO-2026-4971](https://pkg.go.dev/vuln/GO-2026-4971) (Windows-only panic in `net.Dial`/`net.Listen` on an address containing a NUL byte) and [GO-2026-4918](https://pkg.go.dev/vuln/GO-2026-4918) (HTTP/2 transport infinite loop on a malformed `SETTINGS_MAX_FRAME_SIZE`). Neither is a meaningful exposure for the dflockd server — the affected call paths are `client.Dial`, the HTTP listener bind, and `cmd/bench`'s HTTP client — but it clears the `govulncheck` gate.
+
+[v2.1.1]: https://github.com/mtingers/dflockd/releases/tag/v2.1.1
 
 ## [v2.1.0] - 2026-05-10
 
