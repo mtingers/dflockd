@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`internal/lock` FSM apply path.** New `ApplyAcquire` / `ApplyEnqueue` / `ApplyRelease` / `ApplyRenew` / `ApplyEvict` / `ApplyCleanupConn` / `ApplyGC` methods are pure functions of (current state, args) — they take an explicit `now time.Time` and a per-token salt, and bump a `fsmFenceCounter` recorded in the snapshot. The existing direct methods are unchanged; the new methods drive every node from the replicated log. `Snapshot(io.Writer)` / `Restore(io.Reader)` round-trip is byte-deterministic (sorted iteration), and `WatchGrants(ref)` / `RouteGrants(grants)` route promotion grants to local blocked handlers.
 - **`internal/cluster`.** Glue package that assembles `internal/raft` + `internal/lock` + storage + transport. `cluster.Node` exposes typed `ProposeAcquire/Enqueue/Release/Renew/Evict/CleanupConn/GC` + `Barrier` and integration helpers (`IsLeader`, `LeaderClientAddr`, `AddVoter`, `RemoveServer`, `Status`).
 - **`error_not_leader` wire status** with an optional trailing leader address; the Go client converts it to `*NotLeaderError{Leader string}` via `client.IsNotLeader(err, &nle)`.
+- **Mutual TLS on the Raft transport** — `--raft-tls-cert` / `--raft-tls-key` / `--raft-tls-ca` (all-or-none). When set, every inter-node connection is mutual TLS (TLS 1.3, `RequireAndVerifyClientCert`); without it the transport is plaintext (the startup log warns). `raft.NewMutualTLSConfig` + `raft.NewTCPTransport(..., raft.WithTLS(cfg))`.
+- **Graceful leadership transfer.** `raft.Node.TransferLeadership(ctx)` (and `cluster.Node.Close()` on the leader) hands leadership to the most-caught-up follower via `TimeoutNow`, so a rolling restart of the leader re-elects within a round trip instead of waiting out an election timeout.
+- **Cluster status in `stats`.** In cluster mode the `stats` TCP command's JSON gains a `"cluster"` object (node id, role, term, leader id + client address, commit / last-log / snapshot indices, voters). Single-node output is unchanged.
 
 ### Changed
 
@@ -33,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The HTTP API is rejected at startup when `--raft-dir` is set; wiring the HTTP handlers through the cluster's propose path is a follow-on.
 - A client blocked in `acquire` / `wait` when the leader fails loses its queue position (the holder entry it never observed expires via lease; FIFO is preserved for already-granted tokens). Stable client refs that re-attach across failover are documented in `PLAN.md` §4.7 as a follow-on.
-- TLS / cluster-shared-secret on the Raft transport are not yet wired (the framing layer is in place); cluster traffic must currently run on a trusted network.
+- `AddVoter` / `RemoveServer` exist on `cluster.Node` but aren't exposed via the TCP protocol or an admin API yet — runtime reconfiguration needs a small Go program; fixed-size clusters (static `--cluster-peers`) need none.
 - Dynamic-join with snapshot transfer to a node started without prior state is not yet implemented; the supported flows are static bootstrap (all members listed in `--cluster-peers`) and `AddVoter` against a node that already has its members map in place.
+- No Prometheus surface for cluster metrics yet (the `stats` command and the startup log cover the same ground); the HTTP API — including `/metrics` — is still rejected in cluster mode.
 
 ## [v2.1.1] - 2026-05-11
 

@@ -79,15 +79,15 @@ in v1, with a pointer to the follow-on.
   `internal/raft/storage_test.go:TestFileStorageTornTailDiscarded` +
   `TestFileStoragePersistsAcrossReopen` and
   `internal/raft/node_propose_test.go:TestEntriesPersistAcrossRestart`.
-- 🟡 Leadership transfer — `TimeoutNow` is wired (handler triggers an
-  immediate campaign on receipt). The leader-side **send** of
-  TimeoutNow is a one-line method that isn't surfaced as a public API
-  yet; `internal/raft/membership_test.go` covers the receive path.
-  Follow-on.
+- ✅ Leadership transfer — `raft.Node.TransferLeadership(ctx)` picks the
+  most-caught-up follower and sends it `TimeoutNow`; `cluster.Node.Close`
+  calls it on a graceful shutdown of the leader, so a rolling restart
+  re-elects within a round trip. `internal/raft/node_misc_test.go`
+  covers both the handoff and the not-leader case.
 - ⏳ `ReadIndex`-style linearizable reads: not exposed as a public API
   in v1. dflockd's read path is `stats`, which is best-effort applied
-  state on the leader. `Barrier(ctx)` exists on `cluster.Node` and can
-  be the building block.
+  state. `Barrier(ctx)` exists on `cluster.Node` and can be the
+  building block.
 
 ## Security & resource bounds
 
@@ -102,10 +102,13 @@ in v1, with a pointer to the follow-on.
   goroutine, and `Close` joins them; same for the TCP transport
   (`rpcWG` in raft.Node + `wg` in MemTransport + accepted-conn tracking
   in TCPTransport).
-- ⏳ **TLS** on the Raft transport and **cluster shared secret** on the
-  handshake — the codec / handshake layer is in place; the actual TLS
-  hookup and a `--cluster-secret-file` flag are follow-on. Documented
-  in CHANGELOG "Known limitations" and operations/cluster.md.
+- ✅ **Mutual TLS** on the Raft transport — `--raft-tls-cert/-key/-ca`
+  (all-or-none). When set, every inter-node connection is mTLS (TLS 1.3,
+  `RequireAndVerifyClientCert`), so a node without a CA-signed cert
+  can't join or inject messages. Plaintext is still the default (the
+  startup log warns); a node on a trusted network needs no config.
+  `internal/raft/tcptransport_test.go` covers the happy path + an
+  untrusted-cert rejection.
 
 ## Correctness under concurrency
 
@@ -230,12 +233,23 @@ loopback in <5 s). Each has a test and a CHANGELOG entry.
   membership change during redirects); `node.shipApplyBatch` drains
   `snapSavec` while blocked on `applyc` (removes a rare deadlock).
 
+Then, continuing toward "prod ready":
+
+- **Mutual TLS on the Raft transport** — `--raft-tls-cert/-key/-ca`;
+  every inter-node connection is mTLS (TLS 1.3, client-cert required)
+  when configured. Closes the "consensus over an unauthenticated
+  plaintext channel" gap.
+- **Graceful leadership transfer** — `raft.Node.TransferLeadership` (+
+  `cluster.Node.Close` on the leader): a rolling restart of the leader
+  re-elects within a round trip instead of after an election timeout.
+- **Cluster observability** — `stats` now carries a `"cluster"` object
+  (role, term, leader, commit/last-log/snapshot indices, voters).
+
 Deliberately *not* changed (noted, low priority): `persistHardState`
 failure logs + demotes rather than self-`Close`ing; `clusterProposeErrAck`
 still maps every non-context propose error to `error_not_leader` (the
 shutdown window where that's slightly misleading is narrow because
-`SetCluster(nil)` runs first on teardown); TLS on the Raft transport is
-still a follow-on, not a bug.
+`SetCluster(nil)` runs first on teardown).
 
 ## Bottom line
 
@@ -248,15 +262,16 @@ non-cluster single-node binary is byte-identical to v2.1.x.
 
 Recommended next work, in priority order:
 
-1. **TLS + cluster shared secret on the Raft transport** — the framing
-   layer is already in place; this is config + a handshake field. The
-   biggest remaining gap before "untrusted network" use.
-2. **HTTP API cluster routing** — propose mutating handlers through
+1. **HTTP API cluster routing** — propose mutating handlers through
    the cluster (so `--http-port` + cluster mode is no longer rejected
-   at startup).
-3. **Prometheus cluster metrics** (`dflockd_raft_role`,
+   at startup); this also unblocks `/metrics`.
+2. **Prometheus cluster metrics** (`dflockd_raft_role`,
    `_term`, `_commit_index`, `_applied_index`, `_leader_changes_total`,
-   `_proposals_total`, `_apply_duration_seconds`) on `/metrics`.
+   `_proposals_total`, `_apply_duration_seconds`) on `/metrics` — the
+   same data is already in `stats`.
+3. **Runtime reconfiguration surface** — expose `AddVoter`/`RemoveServer`
+   over a (TLS'd) admin command/endpoint so operators don't need a Go
+   program to grow/shrink a running cluster.
 4. **Multi-node soak harness** under `cmd/cluster-soak` with the
    fault-injection knobs PLAN.md §6 lists (and a long-running variant
    of `tools/cluster-smoke`).
@@ -264,5 +279,5 @@ Recommended next work, in priority order:
    (PLAN.md §4.7 follow-on).
 6. **Dynamic join with InstallSnapshot transfer** to a node started
    without prior state (PLAN.md §12 follow-on).
-7. **Linearizable read barrier** (`ReadIndex` API) and **leadership
-   transfer** sender side as exposed public APIs.
+7. **Linearizable read barrier** (`ReadIndex` API) as an exposed public
+   API (the internal `Barrier` is already wired).

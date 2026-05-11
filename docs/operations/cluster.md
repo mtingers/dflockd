@@ -17,6 +17,24 @@ it, and recovering from common failures. See
 `--http-port` is currently rejected when `--raft-dir` is set — see
 the [v1 caveats below](#v1-caveats).
 
+### Securing the Raft transport (mutual TLS)
+
+Inter-node consensus traffic is plaintext by default. To encrypt and
+authenticate it, give every node a certificate signed by a shared CA
+and pass:
+
+| Flag | Description |
+|---|---|
+| `--raft-tls-cert <pem>` | This node's certificate. |
+| `--raft-tls-key <pem>` | Its private key. |
+| `--raft-tls-ca <pem>` | The CA bundle used to verify peers. |
+
+All three must be set together (or all omitted). When set, every
+connection between nodes is mutual TLS (TLS 1.3, `RequireAndVerifyClientCert`)
+— a node without a CA-signed cert cannot join or inject messages. The
+startup log says `raft transport: mutual TLS enabled` (or warns when
+it's plaintext).
+
 ## Bringing up a 3-node cluster
 
 Pick stable node ids (`n1`, `n2`, `n3`), free Raft ports (`7001` /
@@ -89,13 +107,25 @@ commits.
   majority is restored. There is no automatic single-survivor recovery
   in v1; the operator should restart enough members or, as a last
   resort, force-reconfigure (manual, unsafe).
+- **Graceful leader restart** — shutting down the leader (SIGTERM)
+  first hands leadership to a caught-up follower via `TimeoutNow`, so
+  the successor is elected within a round trip rather than after an
+  election timeout. A `kill -9` skips that; the cluster re-elects on
+  the usual timeout.
 
 ## Health / observability
 
-- The TCP `stats` command returns the local node's lock state.
-- A cluster admin HTTP endpoint is a follow-on (see PLAN.md §6 /
-  Phase 11). For now log output (`level=INFO`) shows role changes,
-  elections, and snapshot events.
+- The TCP `stats` command returns the local node's lock state, and in
+  cluster mode an extra `"cluster"` object: this node's id, role
+  (`leader`/`follower`/`candidate`/`pre-candidate`), term, leader id +
+  client address, commit index, last-log index, snapshot index, and the
+  voter set. Poll any node — a follower's view is consistent enough for
+  monitoring.
+- A follower also reveals the leader via the `error_not_leader <addr>`
+  redirect on any mutating command.
+- Log output (`level=INFO`) shows role changes, elections, leadership
+  transfers, and snapshot events. A Prometheus surface for cluster
+  metrics is a follow-on.
 
 ## v1 caveats
 
@@ -103,8 +133,6 @@ commits.
   currently calls the LockManager directly; routing it through the
   cluster's propose path is a follow-on. Use the TCP API in cluster
   mode.
-- **TLS / cluster-shared-secret** on the Raft transport are not yet
-  wired. Run on a trusted network.
 - **FIFO across leader failover** — a client blocked in `acquire` /
   `wait` when the leader fails loses its queue position; the holder
   entry (if any was minted) expires via its lease. Already-granted
