@@ -781,33 +781,82 @@ green; race-clean; docs complete.
   `raft-dir` empty" vs. "one node with `--cluster-bootstrap`, others
   `--cluster-join`". Leaning toward the latter (clearer, fewer footguns,
   standard). Decide at Phase 9; document whichever.
+  - **Resolved**: shipped *both*. `--cluster-peers` is the static-list path
+    (every member started with the full membership) — the path
+    `internal/cluster` E2E + `tools/cluster-smoke` exercise.
+    `--cluster-bootstrap` is the one-node-then-grow path: a single member
+    comes up alone and additional members are added via `AddVoter` later.
+    Static is the recommended bootstrap for a fresh 3- or 5-node cluster;
+    bootstrap+`AddVoter` is the recommended path when growing from one.
 - **Command codec**: JSON (debuggable, slower) vs. a hand-rolled binary form.
   Start JSON; the format is internal so switching later is a one-package change.
   Revisit if soak shows it matters.
+  - **Resolved**: JSON (`encoding/json`, base64 for byte fields like salts).
+    Stable on the wire only insofar as the `Kind` discriminator is — see
+    `internal/cluster/command.go`'s "never renumber existing values" comment.
+    No measured need to switch.
 - **Leader forwarding vs. redirect**: v1 = redirect (`error_not_leader`). If
   operators want a single VIP with no client changes, a follower-forwards-to-leader
   proxy mode could be a later phase — but it complicates two-phase op stickiness
   and connID semantics, so not now.
+  - **Resolved**: redirect. TCP: `error_not_leader <addr>`. HTTP: `503
+    {"error":"not_leader"}` + `X-Dflockd-Leader: <addr>`. No proxy mode
+    planned.
 - **`stats` linearizability**: applied-state read vs. `Barrier`-then-read. Start
   with applied-state (cheap); add a `?linearizable=1` knob if asked.
+  - **Resolved**: applied-state (best-effort) for `stats`. `Barrier(ctx)` is
+    on `cluster.Node` and can be invoked by a future linearizable-read
+    public API. No `?linearizable=1` knob has been requested.
 
 ---
 
 ## 10. Phase checklist
 
-- [x] Phase 0 — scaffolding & shared types
-- [x] Phase 1 — persistent storage
-- [x] Phase 2 — Raft log + node core (election)
-- [x] Phase 3 — replication RPCs + Transport (+ MemTransport faults)
-- [x] Phase 4 — FSM, apply pipeline, snapshots & compaction
-- [ ] Phase 5 — LockManager as a deterministic FSM
-- [ ] Phase 6 — internal/cluster (assemble it)
-- [ ] Phase 7 — framed TCP transport for Raft RPCs
-- [ ] Phase 8 — server integration (propose / redirect / leader-only loops)
-- [ ] Phase 9 — config + cmd/dflockd wiring
-- [ ] Phase 10 — Go client cluster mode
-- [ ] Phase 11 — HTTP API cluster awareness + admin endpoints
-- [ ] Phase 12 — dynamic membership changes
-- [ ] Phase 13 — integration & soak tests
-- [ ] Phase 14 — docs + changelog + metrics
-- [ ] Phase 15 — production-readiness review
+*Updated by the one-shot audit on 2026-05-16. `✅` = shipped, `🟡` =
+partial (sub-deliverable deferred — see note), `❌` = not shipped.*
+
+- [x] Phase 0 — scaffolding & shared types ✅
+- [x] Phase 1 — persistent storage ✅
+- [x] Phase 2 — Raft log + node core (election) ✅
+- [x] Phase 3 — replication RPCs + Transport (+ MemTransport faults) ✅
+- [x] Phase 4 — FSM, apply pipeline, snapshots & compaction ✅
+- [x] Phase 5 — LockManager as a deterministic FSM ✅ (`ApplyAcquire`/
+      `Enqueue`/`Release`/`Renew`/`Evict`/`CleanupConn`/`GC` in
+      `internal/lock/apply.go`)
+- [x] Phase 6 — internal/cluster (assemble it) ✅ (`cluster.Node` in
+      `internal/cluster/node.go`)
+- [x] Phase 7 — framed TCP transport for Raft RPCs ✅
+      (`internal/raft/tcptransport.go` + `tcpframe.go`)
+- [x] Phase 8 — server integration (propose / redirect / leader-only loops) ✅
+- [x] Phase 9 — config + cmd/dflockd wiring ✅ (`--raft-dir`, `--node-id`,
+      `--raft-addr`, `--cluster-peers`, `--cluster-bootstrap`, plus mTLS
+      flags and `--lease-sweep-interval`)
+- [ ] Phase 10 — Go client cluster mode 🟡 (`*NotLeaderError` shipped;
+      `ClusterMode`/`clusterRouter`/leader cache/auto-retry **deferred**
+      — see PRODUCTION_READINESS.md "Recommended next work" item 4)
+- [ ] Phase 11 — HTTP API cluster awareness + admin endpoints 🟡
+      (HTTP-in-cluster shipped with `503 {"error":"not_leader"}` +
+      `X-Dflockd-Leader` header; **admin endpoints** —
+      `GET /v1/admin/cluster`, `POST /v1/admin/transfer-leadership`,
+      `POST /v1/admin/members`, `DELETE /v1/admin/members/{id}` —
+      **deferred**, see PRODUCTION_READINESS.md item 1)
+- [ ] Phase 12 — dynamic membership changes 🟡 (`AddVoter` / `RemoveServer`
+      exist on `cluster.Node` and `internal/raft/membership_test.go`
+      proves them; no admin surface yet to call them from outside a Go
+      program; full `--cluster-join` snapshot-transfer joiner flow
+      **deferred** — see PRODUCTION_READINESS.md item 5)
+- [ ] Phase 13 — integration & soak tests 🟡 (`internal/cluster/e2e3_test.go`
+      + `tools/cluster-smoke` shipped; **`cmd/cluster-soak`** with
+      fault-injection knobs **deferred** — see PRODUCTION_READINESS.md
+      item 3)
+- [ ] Phase 14 — docs + changelog + metrics 🟡 (CHANGELOG, docs site
+      ([cluster.md], [server.md], [protocol.md]), README HA section,
+      OpenAPI sync all shipped; **counter-style metrics**
+      (`_leader_changes_total`, `_proposals_total{result}`,
+      `_apply_duration_seconds`, `_replication_lag_entries{peer}`,
+      `_peer_up{peer}`) **deferred** — gauges shipped; see
+      PRODUCTION_READINESS.md item 2)
+- [x] Phase 15 — production-readiness review ✅
+      ([PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) +
+      post-review hardening pass + mTLS / graceful transfer / cluster
+      observability / HTTP-in-cluster follow-ons)

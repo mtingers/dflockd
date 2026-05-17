@@ -112,7 +112,45 @@ vocabulary was spread across README, PLAN.md, comments in
 
 ## Phase 3 — Plan
 
-*Pending audit.*
+**State.** `PLAN.md` is a thorough 800-line design doc covering the
+whole cluster lift (sections 1–10, 16 phases). It's marked a "living
+document" with §10 declared the source of truth for progress.
+
+**Audit findings (Phase 3).**
+
+- ❌ Drift in `PLAN.md` §10 (the *declared* source of truth for
+  progress): the checklist showed Phases 5–15 all unchecked. That was
+  factually wrong — CHANGELOG and PRODUCTION_READINESS.md both show
+  Phases 5–9 and 14–15 fully delivered (with Phase 15 plus a
+  post-review hardening pass plus mTLS / graceful leader transfer /
+  cluster observability / HTTP-in-cluster follow-ons), and Phases
+  10/11/12/13 partly delivered.
+- ❌ `PLAN.md` §9 Open Questions left four design decisions
+  "to confirm during implementation" — all four are answered by the
+  code (both bootstrap shapes shipped; JSON command codec; redirect
+  not forwarding; applied-state stats reads) but the doc didn't
+  record the resolutions.
+- ✅ The §6 phase narratives accurately describe what was built
+  (spot-checked across `internal/raft`, `internal/cluster`,
+  `internal/lock`, `internal/server`, `internal/httpapi`, `client/`).
+- ✅ The §7 production-readiness checklist matches what
+  `PRODUCTION_READINESS.md` actually validated.
+
+**Fixes this session.**
+- Updated `PLAN.md` §9: each Open Question now has a **Resolved**
+  bullet recording the decision and a short pointer to the
+  implementing code (or wire shape).
+- Updated `PLAN.md` §10: every phase is now marked ✅ / 🟡 / ❌ with a
+  one-line note. Partial phases point to the matching
+  PRODUCTION_READINESS.md "Recommended next work" item so a reader
+  has one canonical place to track the deferred sub-deliverables.
+
+**Follow-ups.**
+- (Tracked separately as the four PRODUCTION_READINESS.md "Recommended
+  next work" items: admin endpoints, counter-style metrics,
+  `cmd/cluster-soak`, cluster-aware Go client.) Not in scope for this
+  audit per the user's "audit + fix gaps in alignment, not implement
+  new features" framing.
 
 ---
 
