@@ -156,7 +156,83 @@ document" with §10 declared the source of truth for progress.
 
 ## Phase 4 — Interfaces & schemas
 
-*Pending audit.*
+**State.** Go module, stdlib-only (`go.sum` is empty). Two
+machine-readable contracts: the OpenAPI spec
+(`internal/httpapi/openapi.json`, mirrored to `docs/openapi.json` via
+`make openapi-sync`) and the TCP wire format
+(`docs/architecture/protocol.md`). Eight internal packages plus a
+`client` package, all Go. PRODUCTION_READINESS.md claims "Every
+exported symbol in `internal/raft` / `internal/cluster` has a doc
+comment".
+
+**Audit findings (Phase 4).**
+
+- ✅ `go vet ./...`, `go build ./...`, `gofmt -l .` all clean.
+- ✅ `internal/httpapi/openapi.json` == `docs/openapi.json` (the
+  Makefile's `openapi-sync` target is up-to-date).
+- ❌ Doc-comment coverage (was a real gap): a scripted check
+  (`/tmp/docscheck2.sh`) found **74 exported symbols** across `client`,
+  `internal/raft`, `internal/cluster`, `internal/server`,
+  `internal/httpapi`, `internal/protocol` missing a directly-attached
+  doc comment. The PRODUCTION_READINESS.md "every exported symbol has
+  a doc comment" claim was wrong.
+  - The biggest concrete gap was `client/lock.go`: all eight public
+    `Lock.{Acquire,Enqueue,Wait,Release}` and
+    `Semaphore.{Acquire,Enqueue,Wait,Release}` methods — i.e. **the
+    Go API users actually call** — had no doc comments.
+  - The `internal/raft/transport.go` section dividers (`---`-style
+    block comments) explained each pair of request/response types but
+    didn't attach (per `go doc` convention, a blank line between
+    comment and decl breaks the link). Same pattern in
+    `storage_file.go` and `storage_mem.go`'s `// --- Storage
+    interface ---` blocks: the methods themselves had no per-method
+    docs.
+  - Five `Cluster*` exported methods on `internal/server.Server`
+    (`ClusterAcquire/Enqueue/Wait/Release/Renew`) — the
+    package-boundary cluster surface — were undocumented.
+
+**Fixes this session.**
+- Added doc comments to **64** previously-undocumented exported
+  symbols (74 → 10):
+  - `client/lock.go`: 8 public `Lock`/`Semaphore` methods.
+  - `client/cluster.go`: `NotLeaderError.Error`.
+  - `internal/server/cluster_ops.go`: 5 `Cluster*` methods.
+  - `internal/cluster/command.go`: `Kind.String`, `DecodeSalt`.
+  - `internal/cluster/fsm.go`: `fsmSnapshot.Persist`, `Release`, plus
+    type comment.
+  - `internal/raft/transport.go`: 8 RPC request/response type
+    comments (`RequestVoteReq/Resp`, `AppendEntriesReq/Resp`,
+    `InstallSnapshotReq/Resp`, `TimeoutNowReq/Resp`).
+  - `internal/raft/tcptransport.go`: `TCPTransport` type comment +
+    `LocalID/SetHandler/AddPeer/RemovePeer/Close` per-method
+    "implements raft.Transport" docs.
+  - `internal/raft/transport_mem.go`: `MemTransport`'s 5
+    interface-impl methods.
+  - `internal/raft/storage_file.go`: `FileStorage`'s 12 interface-impl
+    methods.
+  - `internal/raft/storage_mem.go`: `MemStorage`'s 12 interface-impl
+    methods.
+  - `internal/raft/fsm.go`: `noopFSM`'s 3 + `noopFSMSnapshot`'s 2.
+  - `internal/raft/types.go`: `EntryType.String`.
+  - `internal/protocol/protocol.go`: `ProtocolError.Error`.
+- 7 remaining "missing" results are methods on **unexported** types
+  whose only callers are inside the package
+  (`role.String`, `noopWriter.Write` in `internal/raft/node.go`;
+  `statusRecorder.{WriteHeader,Write,Unwrap}` in
+  `internal/httpapi/metrics.go`; `sessionShutdown.{Start,Wait}` in
+  `internal/httpapi/server.go`). Per Go convention these don't need
+  doc comments — the receiver can't be referenced from outside the
+  package, so the method names being capitalised is incidental
+  (forced by the standard-library interface signatures they satisfy
+  — `http.ResponseWriter`, `io.Writer`, `fmt.Stringer`).
+- `go vet`, `go build`, `gofmt -l` continue to be clean.
+
+**Follow-ups.**
+- (Cosmetic) The `/tmp/docscheck2.sh` script can't distinguish
+  exported-receiver from unexported-receiver — a more precise check
+  would need to track type declarations. Out of scope for this audit;
+  worth adding a `make doccheck` target later if doc coverage is
+  worth enforcing in CI.
 
 ---
 

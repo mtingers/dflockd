@@ -24,6 +24,15 @@ import (
 // wired in v1 (see PLAN.md §3); they are additive over this layer.
 type rpcHandler = func(from NodeID, req Message) Message
 
+// TCPTransport is the production raft.Transport. It owns a listener
+// for inbound RPCs, lazily-dialed outbound connections per peer, and
+// background goroutines for accept + per-conn read loops. Construct
+// via NewTCPTransport; install the dispatcher via SetHandler before
+// Start; cleanup via Close (idempotent, joins all goroutines).
+//
+// Concurrency: safe for concurrent Send calls (one outbound conn per
+// peer is reused, with serialised writes). The atomic handler pointer
+// and the sync.Maps avoid locking on the hot path.
 type TCPTransport struct {
 	id           NodeID
 	listener     net.Listener
@@ -78,26 +87,36 @@ func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger, opts ...
 	return t, nil
 }
 
+// LocalID implements raft.Transport.
 func (t *TCPTransport) LocalID() NodeID { return t.id }
 
 // ListenAddr returns the resolved listen address (useful when the
 // caller bound to ":0" and needs the assigned port).
 func (t *TCPTransport) ListenAddr() string { return t.listener.Addr().String() }
 
+// SetHandler implements raft.Transport. Stored as an atomic.Pointer
+// so the accept loop reads it lock-free per inbound RPC.
 func (t *TCPTransport) SetHandler(h func(from NodeID, req Message) Message) {
 	t.handler.Store(&h)
 }
 
+// AddPeer implements raft.Transport. Updates the peer-id → address
+// map; the actual TCP connection is dialed lazily on first Send.
 func (t *TCPTransport) AddPeer(id NodeID, addr string) { t.addrs.Store(id, addr) }
 
+// RemovePeer implements raft.Transport. Drops the address, clears the
+// dial-failure cool-down, and closes any open outbound connection to
+// the peer.
 func (t *TCPTransport) RemovePeer(id NodeID) {
 	t.addrs.Delete(id)
 	t.lastDialFail.Delete(id)
 	t.dropOutbound(id)
 }
 
-// Close stops the accept loop, closes the listener and every active
-// outbound connection, and waits for all background goroutines to exit.
+// Close implements raft.Transport. Stops the accept loop, closes the
+// listener and every active outbound connection, and waits for all
+// background goroutines to exit. Idempotent — second and subsequent
+// calls return nil immediately.
 func (t *TCPTransport) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
 		return nil

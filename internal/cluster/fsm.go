@@ -127,10 +127,18 @@ func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 // snapshot) and on follower InstallSnapshot.
 func (f *fsm) Restore(r io.Reader) error { return f.lm.Restore(r) }
 
+// fsmSnapshot is an immutable bytes view of a LockManager snapshot,
+// owned by raft until Release. It is intentionally simple: the heavy
+// lifting (sorted serialisation) happens at Snapshot time, so Persist
+// is a single Write call.
 type fsmSnapshot struct{ data []byte }
 
+// Persist implements raft.FSMSnapshot.
 func (s *fsmSnapshot) Persist(w io.Writer) error {
 	_, err := w.Write(s.data)
 	return err
 }
+
+// Release implements raft.FSMSnapshot. No-op — the snapshot is a
+// plain byte slice and Go's GC reclaims it.
 func (s *fsmSnapshot) Release() {}

@@ -19,6 +19,7 @@ type NotLeaderError struct {
 	Leader string // empty when the server has no known leader yet
 }
 
+// Error implements the error interface.
 func (e *NotLeaderError) Error() string {
 	if e.Leader == "" {
 		return "dflockd: not leader; no leader currently known"

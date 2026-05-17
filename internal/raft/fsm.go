@@ -43,11 +43,19 @@ type noopFSM struct{}
 // that exercise consensus without an application.
 func NewNoopFSM() FSM { return noopFSM{} }
 
-func (noopFSM) Apply(Entry) any                { return nil }
+// Apply implements FSM. No-op.
+func (noopFSM) Apply(Entry) any { return nil }
+
+// Snapshot implements FSM. Returns an empty noopFSMSnapshot.
 func (noopFSM) Snapshot() (FSMSnapshot, error) { return noopFSMSnapshot{}, nil }
-func (noopFSM) Restore(r io.Reader) error      { _, err := io.Copy(io.Discard, r); return err }
+
+// Restore implements FSM. Drains and discards r.
+func (noopFSM) Restore(r io.Reader) error { _, err := io.Copy(io.Discard, r); return err }
 
 type noopFSMSnapshot struct{}
 
+// Persist implements FSMSnapshot. No-op.
 func (noopFSMSnapshot) Persist(io.Writer) error { return nil }
-func (noopFSMSnapshot) Release()                {}
+
+// Release implements FSMSnapshot. No-op.
+func (noopFSMSnapshot) Release() {}

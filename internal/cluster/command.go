@@ -37,6 +37,8 @@ var kindNames = [...]string{
 	KindEvictExpired: "evict_expired",
 }
 
+// String returns the snake_case name of the kind, or "kind(N)" for an
+// unknown value. Used for logs, error messages, and metric labels.
 func (k Kind) String() string {
 	if int(k) < len(kindNames) && kindNames[k] != "" {
 		return kindNames[k]
@@ -128,6 +130,9 @@ func EncodeSalt(salt [8]byte) string {
 	return base64.StdEncoding.EncodeToString(salt[:])
 }
 
+// DecodeSalt reverses EncodeSalt. The empty string decodes to the zero
+// salt (a Command with no salt-bearing semantics — e.g. KindBarrier).
+// Anything else must base64-decode to exactly 8 bytes.
 func DecodeSalt(s string) ([8]byte, error) {
 	var out [8]byte
 	if s == "" {

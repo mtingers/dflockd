@@ -121,19 +121,32 @@ type MemTransport struct {
 
 var _ Transport = (*MemTransport)(nil)
 
+// LocalID implements raft.Transport.
 func (t *MemTransport) LocalID() NodeID { return t.id }
 
+// SetHandler implements raft.Transport. Registers h on the underlying
+// MemNetwork so other MemTransports can route to this node.
 func (t *MemTransport) SetHandler(h func(from NodeID, req Message) Message) {
 	t.handler = h
 	t.net.register(t.id, h)
 }
 
-func (t *MemTransport) AddPeer(NodeID, string) {} // membership is implicit on a MemNetwork
-func (t *MemTransport) RemovePeer(NodeID)      {}
+// AddPeer implements raft.Transport. No-op on MemTransport:
+// membership on a MemNetwork is implicit (a peer exists if it has
+// called SetHandler).
+func (t *MemTransport) AddPeer(NodeID, string) {}
 
+// RemovePeer implements raft.Transport. No-op on MemTransport (see
+// AddPeer).
+func (t *MemTransport) RemovePeer(NodeID) {}
+
+// Close implements raft.Transport. Unregisters this node from the
+// network and waits for every in-flight handler goroutine to finish
+// before returning, so a clean Close means no callback can fire
+// against a torn-down receiver.
 func (t *MemTransport) Close() error {
 	t.net.unregister(t.id)
-	t.wg.Wait() // join every invoke handler goroutine before returning
+	t.wg.Wait()
 	return nil
 }
 

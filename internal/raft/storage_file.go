@@ -141,9 +141,16 @@ func (s *FileStorage) loadHardState() error {
 }
 
 // --- Storage interface ---
+// These methods implement raft.Storage. See the interface in
+// storage.go for contract documentation; per-method comments here
+// only call out file-backed specifics.
 
+// LoadHardState implements raft.Storage.
 func (s *FileStorage) LoadHardState() (HardState, error) { return s.hard, nil }
 
+// SaveHardState implements raft.Storage. Persists via the
+// checksummed two-slot HardState file (fsync'd) before returning;
+// only on success does the in-memory copy advance.
 func (s *FileStorage) SaveHardState(hs HardState) error {
 	if err := s.hs.save(hs); err != nil {
 		return err
@@ -152,12 +159,21 @@ func (s *FileStorage) SaveHardState(hs HardState) error {
 	return nil
 }
 
-func (s *FileStorage) FirstIndex() Index          { return s.firstIndex() }
-func (s *FileStorage) LastIndex() Index           { return s.lastIndex() }
+// FirstIndex implements raft.Storage.
+func (s *FileStorage) FirstIndex() Index { return s.firstIndex() }
+
+// LastIndex implements raft.Storage.
+func (s *FileStorage) LastIndex() Index { return s.lastIndex() }
+
+// Term implements raft.Storage.
 func (s *FileStorage) Term(i Index) (Term, error) { return s.term(i) }
 
+// Entries implements raft.Storage.
 func (s *FileStorage) Entries(lo, hi Index) ([]Entry, error) { return s.slice(lo, hi) }
 
+// Append implements raft.Storage. Durably appends entries to the WAL
+// (one fsync per call) and then to the in-memory shadow log; either
+// both happen or neither does.
 func (s *FileStorage) Append(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -172,6 +188,10 @@ func (s *FileStorage) Append(entries []Entry) error {
 	return nil
 }
 
+// TruncateSuffix implements raft.Storage. Truncates the in-memory log
+// then rewrites the WAL atomically (write-new + rename + fsync-dir),
+// so a crash mid-truncate leaves either the old or new log on disk —
+// never a torn one.
 func (s *FileStorage) TruncateSuffix(from Index) error {
 	if from > s.lastIndex() {
 		return nil
@@ -182,6 +202,10 @@ func (s *FileStorage) TruncateSuffix(from Index) error {
 	return s.wal.rewrite(s.memLog.entries)
 }
 
+// SaveSnapshot implements raft.Storage. Writes the snapshot file
+// atomically (tmp + rename + fsync-dir), updates the in-memory
+// metadata, then rewrites the WAL so log entries at or before the
+// snapshot index are dropped.
 func (s *FileStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
 	fsm, err := readSnapshotData(data)
 	if err != nil {
@@ -208,6 +232,7 @@ func readSnapshotData(r io.Reader) ([]byte, error) {
 	return fsm, nil
 }
 
+// SnapshotMeta implements raft.Storage.
 func (s *FileStorage) SnapshotMeta() (SnapshotMeta, bool) {
 	if !s.hasSnapshot() {
 		return SnapshotMeta{}, false
@@ -215,6 +240,9 @@ func (s *FileStorage) SnapshotMeta() (SnapshotMeta, bool) {
 	return s.memLog.snap, true
 }
 
+// OpenSnapshot implements raft.Storage. The whole snapshot payload is
+// read into memory (dflockd's state is small); the returned reader is
+// a bytes.Reader wrapped in NopCloser.
 func (s *FileStorage) OpenSnapshot() (io.ReadCloser, error) {
 	if !s.hasSnapshot() {
 		return nil, ErrNoSnapshot
@@ -229,6 +257,9 @@ func (s *FileStorage) OpenSnapshot() (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(fsm)), nil
 }
 
+// Close implements raft.Storage. Releases the WAL handle, the
+// HardState handle, and the --raft-dir advisory lock. Idempotent —
+// later calls return the first error seen.
 func (s *FileStorage) Close() error {
 	var err error
 	if s.wal != nil {

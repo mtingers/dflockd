@@ -124,6 +124,7 @@ type ProtocolError struct {
 	Message string
 }
 
+// Error implements the error interface.
 func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("protocol error %d: %s", e.Code, e.Message)
 }

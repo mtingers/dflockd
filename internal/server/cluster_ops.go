@@ -72,6 +72,11 @@ func (s *Server) ClusterStatusJSON() []byte {
 //       StatusErrX / StatusErrLeaseExpired : domain error
 // ---------------------------------------------------------------------------
 
+// ClusterAcquire is the cluster-mode entrypoint for lock/semaphore
+// acquire. Proposes a KindAcquire command through Raft; if the FSM
+// answers StatusQueued, blocks on a grant listener for up to
+// acquireTimeout. Returns ErrNotClusterLeader on a follower so the
+// caller can redirect.
 func (s *Server) ClusterAcquire(ctx context.Context, key string, limit int, connID uint64, leaseTTL, acquireTimeout time.Duration) (lock.ApplyResult, error) {
 	c, err := s.clusterLeaderOrErr()
 	if err != nil {
@@ -95,6 +100,10 @@ func (s *Server) ClusterAcquire(ctx context.Context, key string, limit int, conn
 	return s.waitGrantResult(ctx, grants, acquireTimeout)
 }
 
+// ClusterEnqueue is phase 1 of the two-phase enqueue/wait flow in
+// cluster mode. Proposes a KindEnqueue command; if it commits with
+// StatusQueued, stashes the grant listener on the connection so the
+// matching ClusterWait can claim it without a lost-wakeup window.
 func (s *Server) ClusterEnqueue(ctx context.Context, key string, limit int, connID uint64, leaseTTL time.Duration) (lock.ApplyResult, error) {
 	c, err := s.clusterLeaderOrErr()
 	if err != nil {
@@ -120,6 +129,10 @@ func (s *Server) ClusterEnqueue(ctx context.Context, key string, limit int, conn
 	return result, nil
 }
 
+// ClusterWait is phase 2 of the two-phase enqueue/wait flow in cluster
+// mode. Consumes the listener stashed by ClusterEnqueue (or, as a
+// fallback, opens a fresh one keyed by the cluster ref) and blocks
+// up to acquireTimeout for the grant to land.
 func (s *Server) ClusterWait(ctx context.Context, connID uint64, acquireTimeout time.Duration) (lock.ApplyResult, error) {
 	if _, err := s.clusterLeaderOrErr(); err != nil {
 		return lock.ApplyResult{}, err
@@ -133,6 +146,8 @@ func (s *Server) ClusterWait(ctx context.Context, connID uint64, acquireTimeout 
 	return s.waitGrantResult(ctx, grants, acquireTimeout)
 }
 
+// ClusterRelease proposes a KindRelease command and returns the FSM
+// result. ErrNotClusterLeader on a follower.
 func (s *Server) ClusterRelease(ctx context.Context, key, token string) (lock.ApplyResult, error) {
 	c, err := s.clusterLeaderOrErr()
 	if err != nil {
@@ -145,6 +160,8 @@ func (s *Server) ClusterRelease(ctx context.Context, key, token string) (lock.Ap
 	return result, nil
 }
 
+// ClusterRenew proposes a KindRenew command and returns the FSM
+// result. ErrNotClusterLeader on a follower.
 func (s *Server) ClusterRenew(ctx context.Context, key, token string, leaseTTL time.Duration) (lock.ApplyResult, error) {
 	c, err := s.clusterLeaderOrErr()
 	if err != nil {

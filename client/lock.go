@@ -682,6 +682,13 @@ type Lock struct {
 	renewableResource
 }
 
+// Acquire opens a persistent connection to the server that owns Key
+// (resolved via ShardFunc, default CRC32 over Servers), sends an
+// acquire RPC, and starts a background renewer at half the lease TTL
+// (with jitter from RenewJitter). Returns (true, nil) on success;
+// (false, nil) when the wait timed out without a grant; a non-nil
+// error on transport or validation failure. Safe to call once per
+// Lock value; pair with Release on the same Lock value.
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	p, err := l.flowParams()
 	if err != nil {
@@ -690,6 +697,11 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	return l.runAcquire(ctx, p)
 }
 
+// Enqueue is phase 1 of the two-phase acquire flow: it opens a
+// persistent connection and registers a FIFO slot, returning the
+// preliminary token immediately. Call Wait on the same Lock to block
+// for the actual grant. Useful when the caller needs to confirm it is
+// in the queue before parking the request.
 func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	p, err := l.flowParams()
 	if err != nil {
@@ -698,6 +710,11 @@ func (l *Lock) Enqueue(ctx context.Context) (string, error) {
 	return l.runEnqueue(ctx, p)
 }
 
+// Wait is phase 2 of the two-phase acquire flow: blocks on the
+// connection opened by Enqueue for up to timeout. Returns (true, nil)
+// once the slot is granted (and starts the background renewer);
+// (false, nil) on timeout (the slot stays queued — call Wait again
+// or Release to abandon it); error on transport failure.
 func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	p, err := l.flowParams()
 	if err != nil {
@@ -706,6 +723,10 @@ func (l *Lock) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	return l.runWait(ctx, p, timeout)
 }
 
+// Release stops the background renewer and sends a release RPC over
+// the persistent connection. Safe to call after a failed Acquire (it
+// is a no-op if no resource is held). After Release the Lock can be
+// reused for another Acquire.
 func (l *Lock) Release(ctx context.Context) error {
 	return l.runRelease(ctx, l.Key, Release)
 }
@@ -769,6 +790,10 @@ type Semaphore struct {
 	renewableResource
 }
 
+// Acquire is the semaphore equivalent of Lock.Acquire. Returns
+// (true, nil) when a slot is granted (one of up to Limit), starting
+// the background renewer; (false, nil) on wait timeout; error on
+// transport failure.
 func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	p, err := s.flowParams()
 	if err != nil {
@@ -777,6 +802,8 @@ func (s *Semaphore) Acquire(ctx context.Context) (bool, error) {
 	return s.runAcquire(ctx, p)
 }
 
+// Enqueue is the semaphore equivalent of Lock.Enqueue (phase 1 of the
+// two-phase flow).
 func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	p, err := s.flowParams()
 	if err != nil {
@@ -785,6 +812,8 @@ func (s *Semaphore) Enqueue(ctx context.Context) (string, error) {
 	return s.runEnqueue(ctx, p)
 }
 
+// Wait is the semaphore equivalent of Lock.Wait (phase 2 of the
+// two-phase flow).
 func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
 	p, err := s.flowParams()
 	if err != nil {
@@ -793,6 +822,8 @@ func (s *Semaphore) Wait(ctx context.Context, timeout time.Duration) (bool, erro
 	return s.runWait(ctx, p, timeout)
 }
 
+// Release is the semaphore equivalent of Lock.Release. Frees the
+// caller's slot and stops the background renewer.
 func (s *Semaphore) Release(ctx context.Context) error {
 	return s.runRelease(ctx, s.Key, SemRelease)
 }

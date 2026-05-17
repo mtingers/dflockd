@@ -41,6 +41,11 @@ type Message interface{ messageTerm() Term }
 // PreVote does not persist a vote or advance any term).
 // ---------------------------------------------------------------------------
 
+// RequestVoteReq is the §5.2 RequestVote RPC (also used for the PreVote
+// phase when PreVote is true; PreVote does not persist a vote or advance
+// any term). The candidate offers its term and the head of its log; a
+// peer grants if the candidate's term is current and its log is at
+// least as up-to-date as the peer's (§5.4.1).
 type RequestVoteReq struct {
 	Term         Term
 	CandidateID  NodeID
@@ -49,6 +54,10 @@ type RequestVoteReq struct {
 	PreVote      bool
 }
 
+// RequestVoteResp answers a RequestVoteReq. Term is the responder's
+// current term; VoteGranted is true iff the vote was given (or, for
+// PreVote, would have been given). PreVote echoes the request so the
+// candidate can distinguish a real vote from a pre-vote.
 type RequestVoteResp struct {
 	Term        Term
 	VoteGranted bool
@@ -62,6 +71,12 @@ func (m *RequestVoteResp) messageTerm() Term { return m.Term }
 // AppendEntries (heartbeat when Entries is empty).
 // ---------------------------------------------------------------------------
 
+// AppendEntriesReq is the §5.3 AppendEntries RPC; a heartbeat when
+// Entries is empty. PrevLogIndex/Term are the consistency check —
+// the follower rejects unless its log matches at that index. Entries
+// are contiguous starting at PrevLogIndex+1. LeaderCommit lets the
+// follower raise its own commitIndex up to min(LeaderCommit, last new
+// entry).
 type AppendEntriesReq struct {
 	Term         Term
 	LeaderID     NodeID
@@ -71,6 +86,10 @@ type AppendEntriesReq struct {
 	LeaderCommit Index
 }
 
+// AppendEntriesResp answers an AppendEntriesReq. Success is true iff
+// the consistency check passed and the entries were appended.
+// MatchIndex / ConflictIndex / ConflictTerm carry the leader's
+// fast-back-off hints (see field comments).
 type AppendEntriesResp struct {
 	Term    Term
 	Success bool
@@ -91,6 +110,10 @@ func (m *AppendEntriesResp) messageTerm() Term { return m.Term }
 // InstallSnapshot (whole snapshot in one frame; dflockd's state is small).
 // ---------------------------------------------------------------------------
 
+// InstallSnapshotReq ships a full FSM snapshot to a follower whose
+// log start is behind the leader's snapshot index. dflockd's state is
+// small enough to fit a snapshot in a single frame, so the RPC is
+// monolithic rather than chunked.
 type InstallSnapshotReq struct {
 	Term     Term
 	LeaderID NodeID
@@ -98,6 +121,9 @@ type InstallSnapshotReq struct {
 	Data     []byte
 }
 
+// InstallSnapshotResp answers an InstallSnapshotReq. LastIndex is the
+// follower's log end after installing (== Meta.LastIncludedIndex); the
+// leader sets that peer's nextIndex to LastIndex+1.
 type InstallSnapshotResp struct {
 	Term Term
 	// LastIndex is the follower's log end after installing (== Meta.LastIncludedIndex);
@@ -113,11 +139,17 @@ func (m *InstallSnapshotResp) messageTerm() Term { return m.Term }
 // starts an election immediately (skipping its election timeout).
 // ---------------------------------------------------------------------------
 
+// TimeoutNowReq is sent by a leader transferring leadership; the
+// recipient starts an election immediately, skipping its randomized
+// election timeout. Used by raft.Node.TransferLeadership and by
+// cluster.Node.Close on a graceful leader shutdown.
 type TimeoutNowReq struct {
 	Term     Term
 	LeaderID NodeID
 }
 
+// TimeoutNowResp acknowledges a TimeoutNowReq with the responder's
+// current term. The body has no other payload.
 type TimeoutNowResp struct{ Term Term }
 
 func (m *TimeoutNowReq) messageTerm() Term  { return m.Term }

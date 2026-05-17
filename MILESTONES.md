@@ -27,7 +27,7 @@ Deliverables of the audit:
 - [x] **Phase 3 — Plan**: `PLAN.md` matches what shipped; deltas noted *(✅ — checklist + Open Questions reconciled in `PLAN.md` §§9–10; see [ONE_SHOT_AUDIT.md §Phase 3](ONE_SHOT_AUDIT.md#phase-3--plan))*
 
 ## Build
-- [ ] **Phase 4 — Interfaces & schemas**: exported surfaces documented; OpenAPI + protocol stable; types/contracts crisp
+- [x] **Phase 4 — Interfaces & schemas**: exported surfaces documented; OpenAPI + protocol stable; types/contracts crisp *(✅ — `go vet`/`go build`/`gofmt`/OpenAPI all clean; 64 missing doc comments added across `client` + `internal/{raft,cluster,server,protocol}`; see [ONE_SHOT_AUDIT.md §Phase 4](ONE_SHOT_AUDIT.md#phase-4--interfaces--schemas))*
 - [ ] **Phase 5 — RED tests**: coverage targets met (≥80% service-tier); test pyramid honest; characterization tests where refactor mode applies
 - [ ] **Phase 6 — GREEN implementation**: `go test -race ./...` clean; complexity ceilings (cyclo ≤12, funlen ≤40) verified; any breaches documented
 

@@ -32,6 +32,8 @@ const (
 	EntryConfig
 )
 
+// String returns the lower-case name of the entry type, or
+// "entrytype(N)" for an unknown value. Used for logs and debug output.
 func (t EntryType) String() string {
 	switch t {
 	case EntryNoOp:

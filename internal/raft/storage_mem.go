@@ -21,23 +21,39 @@ func NewMemStorage() *MemStorage { return &MemStorage{} }
 
 var _ Storage = (*MemStorage)(nil)
 
+// The following methods implement raft.Storage. See storage.go for
+// contract documentation.
+
+// LoadHardState implements raft.Storage.
 func (m *MemStorage) LoadHardState() (HardState, error) { return m.hard, nil }
 
+// SaveHardState implements raft.Storage. In-memory: no disk write.
 func (m *MemStorage) SaveHardState(hs HardState) error {
 	m.hard = hs
 	return nil
 }
 
-func (m *MemStorage) FirstIndex() Index          { return m.firstIndex() }
-func (m *MemStorage) LastIndex() Index           { return m.lastIndex() }
+// FirstIndex implements raft.Storage.
+func (m *MemStorage) FirstIndex() Index { return m.firstIndex() }
+
+// LastIndex implements raft.Storage.
+func (m *MemStorage) LastIndex() Index { return m.lastIndex() }
+
+// Term implements raft.Storage.
 func (m *MemStorage) Term(i Index) (Term, error) { return m.term(i) }
 
+// Entries implements raft.Storage.
 func (m *MemStorage) Entries(lo, hi Index) ([]Entry, error) { return m.slice(lo, hi) }
 
+// Append implements raft.Storage.
 func (m *MemStorage) Append(entries []Entry) error { return m.append(entries) }
 
+// TruncateSuffix implements raft.Storage.
 func (m *MemStorage) TruncateSuffix(from Index) error { return m.truncateSuffix(from) }
 
+// SaveSnapshot implements raft.Storage. Reads data fully into memory
+// (tests only use small payloads) and updates the snapshot bookkeeping
+// in-place.
 func (m *MemStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
 	raw, err := io.ReadAll(data)
 	if err != nil {
@@ -48,6 +64,7 @@ func (m *MemStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
 	return nil
 }
 
+// SnapshotMeta implements raft.Storage.
 func (m *MemStorage) SnapshotMeta() (SnapshotMeta, bool) {
 	if !m.hasSnapshot() {
 		return SnapshotMeta{}, false
@@ -55,6 +72,7 @@ func (m *MemStorage) SnapshotMeta() (SnapshotMeta, bool) {
 	return m.snap, true
 }
 
+// OpenSnapshot implements raft.Storage.
 func (m *MemStorage) OpenSnapshot() (io.ReadCloser, error) {
 	if !m.hasSnapshot() {
 		return nil, ErrNoSnapshot
@@ -62,4 +80,5 @@ func (m *MemStorage) OpenSnapshot() (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(m.snapData)), nil
 }
 
+// Close implements raft.Storage. In-memory: no-op.
 func (m *MemStorage) Close() error { return nil }
