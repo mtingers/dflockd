@@ -23,7 +23,7 @@ Deliverables of the audit:
 
 ## Discovery & Planning
 - [x] **Phase 1 — Discovery**: project scope captured as a one-paragraph summary *(✅ — see [ONE_SHOT_AUDIT.md §Phase 1](ONE_SHOT_AUDIT.md#phase-1--discovery))*
-- [ ] **Phase 2 — Glossary**: `GLOSSARY.md` present and matches code usage
+- [x] **Phase 2 — Glossary**: `GLOSSARY.md` present and matches code usage *(✅ — created [GLOSSARY.md](GLOSSARY.md); follow-up: align code comments on pinned terms)*
 - [ ] **Phase 3 — Plan**: `PLAN.md` matches what shipped; deltas noted
 
 ## Build

@@ -75,7 +75,38 @@ from README, PLAN.md, PRODUCTION_READINESS.md, CHANGELOG, and the code.
 
 ## Phase 2 — Glossary
 
-*Pending audit.*
+**State.** No `GLOSSARY.md` existed before this session. Domain
+vocabulary was spread across README, PLAN.md, comments in
+`internal/lock/lock.go` and `internal/raft/doc.go`. Some terms drift:
+
+- `Node` alone means either `raft.Node` or `cluster.Node` depending on
+  package context.
+- "Lock state" appears in pre-v2 callers; the unified type is
+  `ResourceState` (lock = semaphore with `Limit=1`).
+- "Fence" / "fence token" / "fencing token" all appear; the README's
+  canonical spelling is *fencing token*.
+- "Cluster member" / "voter" / "peer" are synonyms today and will
+  diverge if non-voting learners are added later (PLAN.md §1).
+
+**Audit findings (Phase 2).**
+- ❌ Gap (fixed): `GLOSSARY.md` was missing. Created with ~30 terms
+  covering core domain (lock/semaphore/resource/holder/waiter/lease/
+  fencing token/salt), wire protocols (TCP, HTTP, session,
+  `error_not_leader`), cluster + Raft (term, log entry, commit index,
+  WAL, HardState, snapshot, FSM, FSM determinism, apply path,
+  membership change, leadership transfer, ReadIndex/Barrier, mTLS,
+  PreVote), and ops (`--raft-dir`, `--fence-state-file`, sweep loops,
+  `/metrics`, `stats`, CRC32 sharding).
+- ✅ Drifting terms pinned in the glossary's "Known to drift if not
+  pinned" section — code/docs can be unified incrementally.
+
+**Fixes this session.**
+- Created `GLOSSARY.md` (above).
+
+**Follow-ups.**
+- (Low priority) Sweep code comments to align on the pinned terms —
+  particularly `"fence token"` → `"fencing token"`, ambiguous
+  `"node"` → `"raft.Node"` / `"cluster.Node"`.
 
 ---
 
