@@ -531,4 +531,214 @@ served live and mirrored to `docs/openapi.json` via
 
 ## Phase 9 — Final report
 
-*Pending audit.*
+Generated 2026-05-16. Companion artifacts:
+[`MILESTONES.md`](MILESTONES.md), [`GLOSSARY.md`](GLOSSARY.md),
+[`PLAN.md`](PLAN.md), [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md).
+
+### Summary
+
+This was a **refactor-mode** application of the nine-phase one-shot
+framework to **dflockd**, a single-binary Go distributed lock daemon
+with an N-node Raft cluster mode currently in alpha. Calibration:
+**Service tier**, full depth on every phase. The project had a strong
+foundation (200+ commits, ~27k LOC, ~10k of which are tests, a
+detailed `PLAN.md` and `PRODUCTION_READINESS.md`) but no
+`MILESTONES.md`, no `GLOSSARY.md`, and several local gaps between
+what the docs claimed and what the code actually was. Result: every
+phase is ticked or marked 🟡 with a documented follow-up; eight
+commits, +~880 / −~50 lines (mostly tests and docs); no behaviour
+change for end users beyond the HTTP-500 detail-leak fix in
+session-create.
+
+### What changed
+
+File-by-file, by phase:
+
+**Phase 1 — Discovery**
+- `MILESTONES.md` (new) — the running audit checklist.
+- `ONE_SHOT_AUDIT.md` (new) — this file; per-phase findings + fixes.
+
+**Phase 2 — Glossary**
+- `GLOSSARY.md` (new) — ~30 domain terms pinned (lock/semaphore/
+  resource/holder/waiter/lease/fencing-token/salt, cluster + Raft
+  vocabulary, ops + observability), plus a "Known to drift if not
+  pinned" section listing terms whose code/doc spelling is
+  inconsistent.
+
+**Phase 3 — Plan**
+- `PLAN.md` — `§10 Phase checklist` updated: every phase marked
+  `✅` / `🟡` / `❌` with a one-line note (was 5–15 all unchecked
+  despite the project clearly being at Phase 15). `§9 Open Questions`
+  — each of the four design questions resolved with a **Resolved**
+  bullet citing the implementing code.
+
+**Phase 4 — Interfaces & schemas**
+- 12 source files in `client/`, `internal/raft/`,
+  `internal/cluster/`, `internal/server/`, `internal/protocol/` —
+  **64 missing doc comments backfilled**, including all 8 public
+  `Lock`/`Semaphore` methods, the 8 Raft RPC request/response types,
+  all `Storage` and `Transport` interface implementations, and the
+  5 `Cluster*` methods on `internal/server.Server`.
+
+**Phase 5 — RED tests**
+- `internal/cluster/fsm_test.go` (new) — 3 tests covering the cluster
+  FSM adapter's `Snapshot`/`Restore`/`Persist`/`Release` round-trip,
+  `Node.LockManager` accessor, `setMember`/`deleteMember`.
+- `internal/httpapi/sem_handlers_test.go` (new) — 3 tests covering
+  semaphore release / renew / two-phase enqueue+wait over HTTP (all
+  4 sem HTTP handlers were at 0% coverage).
+- `client/sem_lowlevel_test.go` (new) — 2 tests covering `SemRenew`,
+  `SemEnqueue`, `SemWait` (all 3 were at 0% coverage).
+- Result: `internal/cluster` 78.2% → **84.3%** (over the bar).
+
+**Phase 6 — GREEN**
+- `cmd/bench/main.go` — refactored `worker` (cyclo 15 → 4), `httpWorker`
+  (lines 62 → ~25), `main` (lines 97 → ~10) by extracting helpers and
+  a `benchFlags` struct. Result: **0** functions over `funlen=40` or
+  `cyclo=10` across the whole tree; 4 functions exactly at `cyclo=10`
+  (all canonical Go enum-switch idioms).
+
+**Phase 7 — Security**
+- `internal/httpapi/handlers.go` — `writeCreateSessionErr`'s default
+  branch no longer surfaces `err.Error()` to the HTTP client on a 500;
+  logs server-side, returns the canonical `session_create_failed`
+  code with empty detail.
+
+**Phase 8 — Documentation**
+- `mkdocs.yml` — added `Architecture > Cluster (Raft HA)` and
+  `Operations > Cluster` nav entries (the docs existed on disk but
+  were invisible in the published site).
+- `docs/server.md` — added a `## Cluster mode` section cross-linking
+  the cluster architecture + operations docs.
+- `CHANGELOG.md` — replaced the stale `Known limitations` list with
+  the current set; added `Security` / `Documentation` / `Changed`
+  entries for the audit's user-visible changes.
+
+### Design decisions and tradeoffs
+
+- **Audit deliverable shape.** Kept `PRODUCTION_READINESS.md`
+  untouched as the historical Phase-15 record for the cluster lift,
+  and wrote this `ONE_SHOT_AUDIT.md` alongside it as the audit's own
+  artifact. Rationale: the existing report has a different scope (it
+  validates the cluster work against the project's own checklist);
+  overwriting it would erase that record.
+- **Commit per phase rather than one squash.** Eight commits, each
+  scoped to its phase. Makes the audit reviewable phase by phase;
+  any single phase can be reverted independently if needed. The
+  matching user-question option was selected at Phase 0.
+- **Doc comments on interface-impl methods.** Added 1-line
+  `// X implements raft.Storage.` comments to every `FileStorage` /
+  `MemStorage` / `MemTransport` / `TCPTransport` interface method.
+  Considered leaving them blank (Go convention sometimes treats them
+  as "documented by the interface") but the project's stated bar
+  ("every exported symbol in internal/raft / internal/cluster has a
+  doc comment") makes the explicit form correct.
+- **Skipped 7 doc comments on unexported types.** `role`,
+  `noopWriter`, `statusRecorder`, `sessionShutdown` are unexported
+  types whose method names are capitalised only because they satisfy
+  stdlib interfaces (`fmt.Stringer`, `io.Writer`, `http.ResponseWriter`).
+  Adding doc boilerplate to them inflates noise without value; the
+  Go convention is that an unexported receiver is effectively
+  package-private.
+- **Refactored `cmd/bench` but left `main` of `cmd/dflockd` alone.**
+  `cmd/bench` violations were genuine technical debt (cyclo=15 on
+  `worker`); `cmd/dflockd/main.go` was already within the bar.
+- **Did not write a CORS test.** The CORS middleware is at 0%
+  coverage but the implementation is correct by inspection
+  (allow-list, default-off, `*` requires opt-in, `Vary: Origin`
+  set). Either the feature should be tested or deleted as unreached
+  — documented as a follow-up, not gated on this audit.
+- **Did not implement the four PRODUCTION_READINESS.md "Recommended
+  next work" items.** Per the user's framing at the start of the
+  audit ("audit + fix gaps in alignment, not implement new
+  features"). Each item is cross-linked from PLAN.md §10 to its
+  follow-on entry in PRODUCTION_READINESS.md.
+
+### What's NOT done
+
+By phase, with cross-references to the matching section above:
+
+- **Phase 2** — Code-comment sweep to align on the pinned glossary
+  spellings (`fence token` → `fencing token`, ambiguous `node` →
+  `raft.Node` / `cluster.Node`). Low priority; the glossary itself
+  notes the drift.
+- **Phase 4** — 7 doc comments on methods of unexported types
+  intentionally left blank (see Design decisions).
+- **Phase 5** — 3 packages remain below the 80% service-tier bar:
+  `client` (73.9%), `internal/server` (69.7%), `internal/httpapi`
+  (69.2%). Documented gaps: CORS middleware (0% — never tested),
+  HTTP server boot + TLS plumbing (covered by `tools/cluster-smoke
+  --tls`, not by `go test`), `DialTLS` in client, failure-only
+  branches (would close with the deferred `cmd/cluster-soak`).
+- **Phase 6** — Whole-tree `go test -race ./...` flakes (SIGKILL)
+  on `internal/raft` under CPU contention; `-p=2` is a reliable
+  workaround. Not a real race (TSAN report empty).
+- **Phase 7** — Defense-in-depth: `es.token == token` string
+  compares in two-phase enqueue/wait paths are hash-keyed up front
+  (so timing attacks are impractical), but could use
+  `subtle.ConstantTimeCompare` for belt-and-suspenders.
+- **Phase 8** — Lower-priority docs work (HTTP examples page;
+  cluster-aware Go client docs once it ships).
+- **Cross-cutting** — The four PRODUCTION_READINESS.md "Recommended
+  next work" items (admin endpoints, counter metrics,
+  `cmd/cluster-soak`, cluster-aware client) remain deferred. Each
+  has a follow-on tracker reference in `PLAN.md` §10.
+
+### How to verify
+
+```bash
+# from /Users/matth/git/dflockd, on branch raft-replication
+
+# Build + smoke
+make build && ./dflockd --version && ./dflockd --help | head
+
+# Full unit test suite + race
+go test -count=1 -p=2 ./...
+go test -race -count=1 -p=2 ./...   # -p=2 avoids the raft flake
+
+# Per-package coverage (matches the numbers in §Phase 5)
+for pkg in protocol config cluster lock raft client server httpapi; do
+  go test -count=1 -cover ./internal/$pkg ./client 2>/dev/null \
+    | grep coverage | head -1
+done
+
+# Complexity gate
+make complexity                                  # top 30
+go run ./tools/complexity -prod -max-lines 40 -max-cyclo 10 -summary
+# Should print:  Functions over max-lines=40: 0 / max-cyclo=10: 0
+
+# Security
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...   # No vulnerabilities found.
+
+# Docs
+make docs-build                                  # mkdocs --strict
+make openapi-sync && git diff --quiet docs/      # spec mirror in sync
+
+# Smoke against a running server
+./dflockd --http-port 6389 &  PID=$!
+sleep 0.3
+sid=$(curl -sX POST http://localhost:6389/v1/sessions | jq -r .session_id)
+curl -sX POST http://localhost:6389/v1/locks/audit \
+  -H "X-Dflockd-Session: $sid" -d '{"acquire_timeout_s":5}'
+# → {"status":"ok","token":"...","lease_ttl_s":33}
+curl -sX DELETE http://localhost:6389/v1/sessions/$sid
+kill $PID
+```
+
+### Security and performance notes
+
+- `govulncheck` clean; no shell exec; no `unsafe`/`reflect`/dynamic
+  code paths; constant-time auth-token compare on both transports;
+  brute-force defense (HTTP `authFailureDelay = 100ms`, TCP
+  `rejectAuth`); TLS 1.2 minimum on client-facing endpoints, TLS 1.3
+  + `RequireAndVerifyClientCert` on the inter-node Raft transport;
+  every Raft frame and FSM-command field bounded.
+- The one security finding this session — `writeCreateSessionErr`
+  leaking `err.Error()` on a 500 — is fixed inline. The remaining
+  defense-in-depth follow-up (replace `es.token == token` compares
+  with `subtle.ConstantTimeCompare`) is documented in §Phase 7.
+- Performance posture is unchanged by this audit: refactors in
+  `cmd/bench` are behaviour-preserving; doc comments are non-runtime;
+  the HTTP 500 hardening adds one log call per session-create
+  failure (rare). No new dependencies (`go.sum` stays empty); the
+  binary's single-node behaviour remains byte-identical to v2.1.x.

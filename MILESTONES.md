@@ -36,4 +36,4 @@ Deliverables of the audit:
 - [x] **Phase 8 — Documentation pass**: missing docs written; README install/run verified on a fresh checkout; drift reconciled (CHANGELOG, OpenAPI, docs site, comments) *(✅ — `make build` + `make docs-build` clean; mkdocs nav updated to include the missing cluster docs; `docs/server.md` gains a Cluster section; `CHANGELOG.md` Known-Limitations list de-staled; see [ONE_SHOT_AUDIT.md §Phase 8](ONE_SHOT_AUDIT.md#phase-8--documentation-pass))*
 
 ## Handoff
-- [ ] **Phase 9 — `ONE_SHOT_AUDIT.md`** written; `MILESTONES.md` fully resolved; commits per phase on `raft-replication`
+- [x] **Phase 9 — `ONE_SHOT_AUDIT.md`** written; `MILESTONES.md` fully resolved; commits per phase on `raft-replication` *(✅ — final 6-section report in [ONE_SHOT_AUDIT.md §Phase 9](ONE_SHOT_AUDIT.md#phase-9--final-report); 9 commits on `raft-replication` (`cba9463`..this commit))*
