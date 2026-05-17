@@ -33,12 +33,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Persistence durability hardening:** the WAL and HardState directory entries are fsync'd after creation (so the first `SaveHardState` survives a crash on a brand-new `--raft-dir`); a corrupt snapshot file now fails the open loudly instead of being silently treated as "no snapshot" (which, after a log compaction, would reset the node to empty state at term 0); WAL/snapshot reads are size-capped (≤ 64 MiB) so a corrupt length can't OOM the process; a partial WAL write is rolled back; `walFile.rewrite` no longer leaves the handle nil on a mid-rewrite error; `handleInstallSnapshot` ignores a snapshot at-or-below the committed index; a decoded `cluster.Command` is validated (key/ref length, limit range, TTL sign) before it touches the FSM.
 - **Data race fixed:** `cluster.Node`'s members map (read by `LeaderClientAddr` on every redirect, written by `AddVoter`/`RemoveServer`) is now mutex-guarded; `TCPTransport`'s handler field is an `atomic.Pointer`; `Send`/`dialFresh` check the closed flag so a `Send` racing `Close` can't misuse the WaitGroup. Also: `node.shipApplyBatch` drains `snapSavec` while blocked on a full `applyc`, removing a (rare) deadlock under sustained writes with a tiny snapshot threshold.
 
+### Security
+
+- **HTTP `POST /v1/sessions` no longer leaks raw Go error messages on a 500.** `writeCreateSessionErr`'s default branch was passing `err.Error()` straight into the response body. Known sentinel errors (`ErrMaxSessions`, `ErrMaxSessionsPerIP`, `ErrShuttingDown`) already used empty-detail responses; the unknown-error path now matches them — log server-side, return `session_create_failed` with no detail.
+
+### Documentation
+
+- **Cluster docs are now in the mkdocs nav.** `docs/architecture/cluster.md` and `docs/operations/cluster.md` shipped weeks ago but were never added to `mkdocs.yml`, so a reader landing on the published docs site couldn't find them from the left rail. Added under new `Architecture > Cluster (Raft HA)` and `Operations > Cluster` entries.
+- **`docs/server.md` has a Cluster mode section.** The page documented every non-cluster flag but never mentioned the cluster-mode flags or pointed at the cluster docs; a short section now cross-links architecture + operations.
+- **`PLAN.md` §§9–10 reconciled with reality.** The phase checklist (declared the project's source of truth for progress) showed Phases 5–15 all unchecked when in fact Phases 5–9 and 14–15 had fully shipped. Open Questions left four design decisions "to confirm during implementation" — all four are answered by the code (both bootstrap shapes shipped; JSON command codec; redirect not forwarding; applied-state stats reads). Each phase now carries ✅ / 🟡 / ❌ with a pointer to the matching PRODUCTION_READINESS.md follow-on for partial phases; each Open Question carries a **Resolved** bullet.
+- **`GLOSSARY.md` added** (~30 domain terms) — pins resource/holder/waiter/lease/fencing-token semantics, the raft.Node vs cluster.Node distinction, the FSM determinism contract, and ops-facing terms (`--raft-dir`, `--fence-state-file`, sweep loops, `/metrics`).
+- **64 missing doc comments backfilled** across `client/`, `internal/raft/`, `internal/cluster/`, `internal/server/`, `internal/protocol/` — including the 8 public `Lock`/`Semaphore` methods in `client/lock.go`, the 8 Raft RPC request/response types in `internal/raft/transport.go`, every `Storage` interface implementation on `FileStorage` and `MemStorage`, and the 5 `Cluster*` methods on `internal/server.Server`.
+
+### Changed
+
+- **`cmd/bench`'s `worker`, `httpWorker`, `main` refactored to fit the cyclo≤10 / funlen≤40 bar.** Same behaviour; helpers extracted (`dialBenchConns` / `warmupLoop` / `measuredLoop` / `acquireReleaseOnce` for the TCP worker; equivalent `buildBenchHTTPClient` / `httpWarmupLoop` / `httpMeasuredLoop` for HTTP; `parseBenchFlags` / `runBenchWorkers` / `printBenchStats` for `main`).
+- **Coverage** for `internal/cluster` 78.2% → 84.3% (added direct tests of the FSM raft adapter's `Snapshot`/`Restore`/`Persist`/`Release` round-trip + the membership-state accessors). `internal/httpapi` and `client` gained semaphore-path tests covering 4 + 3 previously-uncovered exported entry points.
+
 ### Known limitations (cluster mode, v1)
 
-- The HTTP API is rejected at startup when `--raft-dir` is set; wiring the HTTP handlers through the cluster's propose path is a follow-on.
 - A client blocked in `acquire` / `wait` when the leader fails loses its queue position (the holder entry it never observed expires via lease; FIFO is preserved for already-granted tokens). Stable client refs that re-attach across failover are documented in `PLAN.md` §4.7 as a follow-on.
-- `AddVoter` / `RemoveServer` exist on `cluster.Node` but aren't exposed via the TCP protocol or an admin API yet — runtime reconfiguration needs a small Go program; fixed-size clusters (static `--cluster-peers`) need none.
-- Dynamic-join with snapshot transfer to a node started without prior state is not yet implemented; the supported flows are static bootstrap (all members listed in `--cluster-peers`) and `AddVoter` against a node that already has its members map in place.
+- `AddVoter` / `RemoveServer` exist on `cluster.Node` but aren't exposed via the TCP protocol or an admin API yet — runtime reconfiguration needs a small Go program; fixed-size clusters (static `--cluster-peers`) need none. Tracked as PRODUCTION_READINESS.md "Recommended next work" item 1.
+- Dynamic-join with snapshot transfer to a node started without prior state is not yet implemented; the supported flows are static bootstrap (all members listed in `--cluster-peers`) and `AddVoter` against a node that already has its members map in place. Tracked as item 5.
+- Counter-style cluster metrics (`dflockd_raft_leader_changes_total`, `_proposals_total{result}`, `_apply_duration_seconds`, `_replication_lag_entries{peer}`, `_peer_up{peer}`) are not yet exposed on `/metrics`; the gauge metrics are. Tracked as item 2.
+- The cluster-aware Go client (transparent leader cache + auto-redirect/retry on `*NotLeaderError`) is not yet shipped — callers handle `*NotLeaderError` themselves. Tracked as item 4.
 
 ## [v2.1.1] - 2026-05-11
 

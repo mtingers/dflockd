@@ -162,3 +162,20 @@ accepting new connections; in-flight handlers run to completion
 bounded by `--shutdown-timeout`. A timeout expiry force-closes
 remaining connections so the process can exit. Set
 `--shutdown-timeout=0` to wait forever.
+
+## Cluster mode
+
+dflockd can also run as an N-node Raft-replicated cluster. Cluster
+mode is opt-in via a small set of additional flags
+(`--raft-dir`, `--node-id`, `--raft-addr`, `--cluster-peers` or
+`--cluster-bootstrap`, and the optional `--advertise-addr` +
+`--raft-tls-cert`/`--raft-tls-key`/`--raft-tls-ca` mTLS triple). With
+none of those set the server runs exactly as documented above —
+single-process, in-memory, byte-for-byte the v2.1.x single-node
+binary. See:
+
+- [architecture/cluster.md](architecture/cluster.md) — design,
+  topology, FSM, durability layout, failure modes.
+- [operations/cluster.md](operations/cluster.md) — runbook: bootstrap
+  a 3-node cluster, add/remove members, leadership transfer, backup
+  and recovery, monitoring, common ops.

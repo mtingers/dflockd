@@ -466,7 +466,66 @@ the cluster lift; this audit re-walks them against the current tree.
 
 ## Phase 8 — Documentation pass
 
-*Pending audit.*
+**State.** Layered docs: in-repo README + CHANGELOG + PLAN.md +
+PRODUCTION_READINESS.md + this audit; a mkdocs site under `docs/`
+published to https://mtingers.github.io/dflockd/; an OpenAPI 3.1 spec
+served live and mirrored to `docs/openapi.json` via
+`make openapi-sync`.
+
+**Audit findings (Phase 8).**
+
+- ✅ `make build` succeeds. `./dflockd --help` prints 39 flags.
+  `./dflockd --version` prints the LDFlags-stamped string ("dev" on a
+  plain `make build`).
+- ✅ OpenAPI mirror in sync: `diff internal/httpapi/openapi.json
+  docs/openapi.json` clean.
+- ✅ `docs/changelog.md` deliberately just points to the root
+  `CHANGELOG.md` — no drift to reconcile.
+- ✅ `make docs-build` (uses `uvx --with mkdocs-material mkdocs
+  build --strict`) succeeds, including the new nav entries this
+  session.
+- ❌ Gap (fixed): `mkdocs.yml` nav was missing
+  `docs/architecture/cluster.md` and `docs/operations/cluster.md`.
+  Both files exist with full content (shipped weeks ago — commit
+  `cf570a3 docs: cluster architecture + operations + changelog
+  entry`), but they were never added to the published site's left
+  rail. A reader landing on the docs site could not find them from
+  the nav.
+- ❌ Gap (fixed): `docs/server.md` documented every non-cluster flag
+  and the lock manager, HTTP, TLS, etc., but had **no Cluster mode
+  section** — a reader looking up "how do I configure dflockd?"
+  couldn't tell cluster mode existed from this page. Added a short
+  section pointing at `architecture/cluster.md` and
+  `operations/cluster.md`.
+- ❌ Gap (fixed): `CHANGELOG.md` `### Known limitations (cluster
+  mode, v1)` led with "The HTTP API is rejected at startup when
+  `--raft-dir` is set" — false since commit `3d00a42 feat(httpapi,
+  server,config): HTTP API works in cluster mode`. Removed and
+  replaced the stale list with the **current** set of follow-ons,
+  each cross-referenced to its PRODUCTION_READINESS.md "Recommended
+  next work" item.
+- ✅ `CHANGELOG.md` `[Unreleased]` now also records this audit's
+  user-visible changes (HTTP-500 detail-leak fix in Security; cluster
+  docs added to mkdocs nav + server.md cluster section + PLAN.md
+  reconciliation + GLOSSARY.md + 64 backfilled doc comments in
+  Documentation; `cmd/bench` refactor in Changed).
+
+**Fixes this session.**
+
+- `mkdocs.yml` — added `Architecture > Cluster (Raft HA)` and
+  `Operations > Cluster` entries; `make docs-build` re-verified.
+- `docs/server.md` — added a "Cluster mode" section listing the
+  cluster flags' names and cross-linking to the two cluster docs.
+- `CHANGELOG.md` — replaced the stale "Known limitations" list with
+  the current set + added `[Unreleased]` entries for this session's
+  audit changes (Security / Documentation / Changed).
+
+**Follow-ups.** None blocking. Lower-priority docs work:
+- Add a `Client > HTTP examples` page that mirrors `docs/client.md`
+  (Go client) for languages without a SDK.
+- Once the cluster-aware Go client (PRODUCTION_READINESS.md item 4)
+  ships, document `Lock.ClusterMode` + the typed `*NotLeaderError`
+  handling in `docs/client.md`.
 
 ---
 

@@ -33,7 +33,7 @@ Deliverables of the audit:
 
 ## Hardening
 - [x] **Phase 7 — Security pass**: trust-boundary checklist walked; gaps fixed or recorded *(✅ — `govulncheck` clean; full checklist green except a 500-response detail leak in HTTP session-create which is now fixed; see [ONE_SHOT_AUDIT.md §Phase 7](ONE_SHOT_AUDIT.md#phase-7--security-pass))*
-- [ ] **Phase 8 — Documentation pass**: missing docs written; README install/run verified on a fresh checkout; drift reconciled (CHANGELOG, OpenAPI, docs site, comments)
+- [x] **Phase 8 — Documentation pass**: missing docs written; README install/run verified on a fresh checkout; drift reconciled (CHANGELOG, OpenAPI, docs site, comments) *(✅ — `make build` + `make docs-build` clean; mkdocs nav updated to include the missing cluster docs; `docs/server.md` gains a Cluster section; `CHANGELOG.md` Known-Limitations list de-staled; see [ONE_SHOT_AUDIT.md §Phase 8](ONE_SHOT_AUDIT.md#phase-8--documentation-pass))*
 
 ## Handoff
 - [ ] **Phase 9 — `ONE_SHOT_AUDIT.md`** written; `MILESTONES.md` fully resolved; commits per phase on `raft-replication`
