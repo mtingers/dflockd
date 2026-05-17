@@ -35,83 +35,112 @@ import (
 	"github.com/mtingers/dflockd/client"
 )
 
-func main() {
-	workers := flag.Int("workers", 10, "number of concurrent workers")
-	rounds := flag.Int("rounds", 50, "acquire/release rounds per worker")
-	key := flag.String("key", "bench", "lock key (used as a prefix unless --shared-key is set)")
-	timeout := flag.Int("timeout", 30, "acquire timeout in seconds")
-	servers := flag.String("servers", "127.0.0.1:6388", "comma-separated host:port pairs")
-	leaseTTL := flag.Int("lease", 10, "lease TTL in seconds")
-	connections := flag.Int("connections", 0, "connections per worker (0 = 1 persistent conn per worker)")
-	warmup := flag.Int("warmup", 10, "warmup rounds per worker (not measured)")
-	sharedKey := flag.Bool("shared-key", false, "all workers contend on the literal --key value (measures single-key throughput). "+
-		"Default is to append the worker ID, so workers use unique keys and throughput scales with sharding.")
-	httpMode := flag.Bool("http", false, "drive the HTTP REST API instead of TCP. --servers entries must be http(s)://host:port.")
-	authToken := flag.String("auth-token", "", "shared secret for authentication (TCP: protocol auth; HTTP: Bearer header)")
-	flag.Parse()
+type benchFlags struct {
+	workers, rounds, timeout, leaseTTL, connections, warmup int
+	key, servers, authToken                                 string
+	sharedKey, httpMode                                     bool
+}
 
-	addrs, connsPerWorker, err := validateBenchFlags(*workers, *rounds, *timeout, *leaseTTL, *connections, *warmup, *servers)
+func parseBenchFlags() benchFlags {
+	var f benchFlags
+	flag.IntVar(&f.workers, "workers", 10, "number of concurrent workers")
+	flag.IntVar(&f.rounds, "rounds", 50, "acquire/release rounds per worker")
+	flag.StringVar(&f.key, "key", "bench", "lock key (used as a prefix unless --shared-key is set)")
+	flag.IntVar(&f.timeout, "timeout", 30, "acquire timeout in seconds")
+	flag.StringVar(&f.servers, "servers", "127.0.0.1:6388", "comma-separated host:port pairs")
+	flag.IntVar(&f.leaseTTL, "lease", 10, "lease TTL in seconds")
+	flag.IntVar(&f.connections, "connections", 0, "connections per worker (0 = 1 persistent conn per worker)")
+	flag.IntVar(&f.warmup, "warmup", 10, "warmup rounds per worker (not measured)")
+	flag.BoolVar(&f.sharedKey, "shared-key", false, "all workers contend on the literal --key value (measures single-key throughput). "+
+		"Default is to append the worker ID, so workers use unique keys and throughput scales with sharding.")
+	flag.BoolVar(&f.httpMode, "http", false, "drive the HTTP REST API instead of TCP. --servers entries must be http(s)://host:port.")
+	flag.StringVar(&f.authToken, "auth-token", "", "shared secret for authentication (TCP: protocol auth; HTTP: Bearer header)")
+	flag.Parse()
+	return f
+}
+
+type benchResult struct {
+	latencies []float64
+	err       error
+}
+
+func main() {
+	f := parseBenchFlags()
+	addrs, connsPerWorker := mustResolveBenchAddrs(f)
+	printBenchHeader(f, connsPerWorker)
+	results, wall := runBenchWorkers(f, addrs, connsPerWorker)
+	all := mustCollectLatencies(results)
+	printBenchStats(all, wall)
+}
+
+// mustResolveBenchAddrs validates flags and (for --http) requires HTTP
+// URLs; exits the process with status 2 on failure.
+func mustResolveBenchAddrs(f benchFlags) ([]string, int) {
+	addrs, connsPerWorker, err := validateBenchFlags(f.workers, f.rounds, f.timeout, f.leaseTTL, f.connections, f.warmup, f.servers)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench: %v\n", err)
 		os.Exit(2)
 	}
-
-	mode := "unique per-worker keys"
-	displayKey := *key + "_<id>"
-	if *sharedKey {
-		mode = "shared key (contended)"
-		displayKey = *key
-	}
-	transport := "TCP"
-	if *httpMode {
-		transport = "HTTP"
+	if f.httpMode {
 		if err := validateHTTPAddrs(addrs); err != nil {
 			fmt.Fprintf(os.Stderr, "bench: %v\n", err)
 			os.Exit(2)
 		}
 	}
-	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d, transport=%s, %s)\n\n",
-		*workers, *rounds, displayKey, connsPerWorker, transport, mode)
+	return addrs, connsPerWorker
+}
 
-	type result struct {
-		latencies []float64
-		err       error
+func printBenchHeader(f benchFlags, connsPerWorker int) {
+	mode := "unique per-worker keys"
+	displayKey := f.key + "_<id>"
+	if f.sharedKey {
+		mode = "shared key (contended)"
+		displayKey = f.key
 	}
+	transport := "TCP"
+	if f.httpMode {
+		transport = "HTTP"
+	}
+	fmt.Printf("bench: %d workers x %d rounds (key=%q, conns/worker=%d, transport=%s, %s)\n\n",
+		f.workers, f.rounds, displayKey, connsPerWorker, transport, mode)
+}
 
-	results := make([]result, *workers)
-	var wg sync.WaitGroup
-	var warmupWg sync.WaitGroup    // tracks warmup completion
-	startCh := make(chan struct{}) // closed to signal "go measure"
+// runBenchWorkers spawns workers, waits for warmup completion, opens
+// the start gate, joins, and returns the per-worker results plus the
+// measured wall time.
+func runBenchWorkers(f benchFlags, addrs []string, connsPerWorker int) ([]benchResult, float64) {
+	results := make([]benchResult, f.workers)
+	var wg, warmupWg sync.WaitGroup
+	startCh := make(chan struct{})
+	warmupWg.Add(f.workers)
 
-	warmupWg.Add(*workers)
-
-	for i := range *workers {
+	for i := range f.workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			workerKey := workerKeyFor(*key, id, *sharedKey)
-			addr := addrs[id%len(addrs)]
-			var (
-				lats []float64
-				err  error
-			)
-			if *httpMode {
-				lats, err = httpWorker(workerKey, addr, *authToken, *rounds, *timeout, *leaseTTL, *warmup, &warmupWg, startCh)
-			} else {
-				lats, err = worker(workerKey, addr, *authToken, *rounds, *timeout, *leaseTTL, connsPerWorker, *warmup, &warmupWg, startCh)
-			}
-			results[id] = result{latencies: lats, err: err}
+			results[id] = runOneWorker(f, addrs, connsPerWorker, id, &warmupWg, startCh)
 		}(i)
 	}
 
-	// Wait for all workers to finish warmup, then start measurement.
 	warmupWg.Wait()
 	wallStart := time.Now()
 	close(startCh)
-
 	wg.Wait()
-	wall := time.Since(wallStart).Seconds()
+	return results, time.Since(wallStart).Seconds()
+}
 
+func runOneWorker(f benchFlags, addrs []string, connsPerWorker, id int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) benchResult {
+	workerKey := workerKeyFor(f.key, id, f.sharedKey)
+	addr := addrs[id%len(addrs)]
+	if f.httpMode {
+		lats, err := httpWorker(workerKey, addr, f.authToken, f.rounds, f.timeout, f.leaseTTL, f.warmup, warmupWg, startCh)
+		return benchResult{latencies: lats, err: err}
+	}
+	lats, err := worker(workerKey, addr, f.authToken, f.rounds, f.timeout, f.leaseTTL, connsPerWorker, f.warmup, warmupWg, startCh)
+	return benchResult{latencies: lats, err: err}
+}
+
+func mustCollectLatencies(results []benchResult) []float64 {
 	var all []float64
 	for i, r := range results {
 		if r.err != nil {
@@ -120,31 +149,27 @@ func main() {
 		}
 		all = append(all, r.latencies...)
 	}
-
-	totalOps := len(all)
-	if totalOps == 0 {
+	if len(all) == 0 {
 		fmt.Fprintln(os.Stderr, "no operations completed")
 		os.Exit(1)
 	}
 	sort.Float64s(all)
+	return all
+}
 
+func printBenchStats(all []float64, wall float64) {
+	totalOps := len(all)
 	mean := mean(all)
-	mn := all[0]
-	mx := all[totalOps-1]
-	p50 := percentile(all, 50)
-	p99 := percentile(all, 99)
-	sd := stdev(all, mean)
-
 	fmt.Printf("  total ops : %d\n", totalOps)
 	fmt.Printf("  wall time : %.3fs\n", wall)
 	fmt.Printf("  throughput: %.1f ops/s\n", float64(totalOps)/wall)
 	fmt.Println()
 	fmt.Printf("  mean      : %.3f ms\n", mean*1000)
-	fmt.Printf("  min       : %.3f ms\n", mn*1000)
-	fmt.Printf("  max       : %.3f ms\n", mx*1000)
-	fmt.Printf("  p50       : %.3f ms\n", p50*1000)
-	fmt.Printf("  p99       : %.3f ms\n", p99*1000)
-	fmt.Printf("  stdev     : %.3f ms\n", sd*1000)
+	fmt.Printf("  min       : %.3f ms\n", all[0]*1000)
+	fmt.Printf("  max       : %.3f ms\n", all[totalOps-1]*1000)
+	fmt.Printf("  p50       : %.3f ms\n", percentile(all, 50)*1000)
+	fmt.Printf("  p99       : %.3f ms\n", percentile(all, 99)*1000)
+	fmt.Printf("  stdev     : %.3f ms\n", stdev(all, mean)*1000)
 }
 
 // workerKeyFor picks the lock key for a given worker id. When shared is
@@ -194,74 +219,91 @@ func validateBenchFlags(workers, rounds, timeoutSec, leaseTTL, connections, warm
 }
 
 func worker(key, addr, authToken string, rounds, timeoutSec, leaseTTL, numConns, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
-	// Open persistent connection(s) up front.
+	conns, err := dialBenchConns(addr, authToken, numConns)
+	if err != nil {
+		warmupWg.Done() // unblock barrier so main doesn't hang
+		return nil, err
+	}
+	defer closeConns(conns)
+
+	acquireTimeout := time.Duration(timeoutSec) * time.Second
+	opts := leaseTTLOpts(leaseTTL)
+
+	if err := warmupLoop(conns, key, acquireTimeout, opts, warmupRounds); err != nil {
+		warmupWg.Done()
+		return nil, err
+	}
+	warmupWg.Done()
+	<-startCh
+	return measuredLoop(conns, key, acquireTimeout, opts, rounds)
+}
+
+func dialBenchConns(addr, authToken string, numConns int) ([]*client.Conn, error) {
 	conns := make([]*client.Conn, 0, numConns)
-	defer func() {
-		for _, c := range conns {
-			c.Close()
-		}
-	}()
 	for i := 0; i < numConns; i++ {
 		c, err := client.Dial(addr)
 		if err != nil {
-			warmupWg.Done() // unblock barrier so main doesn't hang
+			closeConns(conns)
 			return nil, fmt.Errorf("dial: %w", err)
 		}
 		if authToken != "" {
 			if err := client.Authenticate(c, authToken); err != nil {
-				c.Close() // not yet appended to conns; the deferred close won't see it
-				warmupWg.Done()
+				c.Close()
+				closeConns(conns)
 				return nil, fmt.Errorf("auth: %w", err)
 			}
 		}
 		conns = append(conns, c)
 	}
+	return conns, nil
+}
 
-	acquireTimeout := time.Duration(timeoutSec) * time.Second
-	var opts []client.Option
-	if leaseTTL > 0 {
-		opts = append(opts, client.WithLeaseTTL(leaseTTL))
+func closeConns(conns []*client.Conn) {
+	for _, c := range conns {
+		c.Close()
 	}
+}
 
-	// Warmup: run unmeasured rounds to let the server and runtime stabilize.
-	for i := range warmupRounds {
-		c := conns[i%len(conns)]
-		token, _, err := client.Acquire(c, key, acquireTimeout, opts...)
-		if err != nil {
-			warmupWg.Done()
-			return nil, fmt.Errorf("warmup acquire: %w", err)
-		}
-		if token == "" {
-			warmupWg.Done()
-			return nil, fmt.Errorf("warmup acquire timed out")
-		}
-		if err := client.Release(c, key, token); err != nil {
-			warmupWg.Done()
-			return nil, fmt.Errorf("warmup release: %w", err)
+func leaseTTLOpts(leaseTTL int) []client.Option {
+	if leaseTTL <= 0 {
+		return nil
+	}
+	return []client.Option{client.WithLeaseTTL(leaseTTL)}
+}
+
+func warmupLoop(conns []*client.Conn, key string, acquireTimeout time.Duration, opts []client.Option, rounds int) error {
+	for i := range rounds {
+		if err := acquireReleaseOnce(conns[i%len(conns)], key, acquireTimeout, opts); err != nil {
+			return fmt.Errorf("warmup: %w", err)
 		}
 	}
+	return nil
+}
 
-	// Signal warmup done and wait for all workers to be ready.
-	warmupWg.Done()
-	<-startCh
-
+func measuredLoop(conns []*client.Conn, key string, acquireTimeout time.Duration, opts []client.Option, rounds int) ([]float64, error) {
 	latencies := make([]float64, 0, rounds)
 	for i := range rounds {
-		c := conns[i%len(conns)]
 		t0 := time.Now()
-		token, _, err := client.Acquire(c, key, acquireTimeout, opts...)
-		if err != nil {
-			return nil, fmt.Errorf("acquire: %w", err)
-		}
-		if token == "" {
-			return nil, fmt.Errorf("acquire timed out")
-		}
-		if err := client.Release(c, key, token); err != nil {
-			return nil, fmt.Errorf("release: %w", err)
+		if err := acquireReleaseOnce(conns[i%len(conns)], key, acquireTimeout, opts); err != nil {
+			return nil, err
 		}
 		latencies = append(latencies, time.Since(t0).Seconds())
 	}
 	return latencies, nil
+}
+
+func acquireReleaseOnce(c *client.Conn, key string, acquireTimeout time.Duration, opts []client.Option) error {
+	token, _, err := client.Acquire(c, key, acquireTimeout, opts...)
+	if err != nil {
+		return fmt.Errorf("acquire: %w", err)
+	}
+	if token == "" {
+		return fmt.Errorf("acquire timed out")
+	}
+	if err := client.Release(c, key, token); err != nil {
+		return fmt.Errorf("release: %w", err)
+	}
+	return nil
 }
 
 // validateHTTPAddrs rejects --servers entries that aren't http(s) URLs.
@@ -278,25 +320,9 @@ func validateHTTPAddrs(addrs []string) error {
 // session up front, reuses an http.Client (with keep-alive) for the
 // acquire/release rounds, and deletes the session on exit.
 func httpWorker(key, base, authToken string, rounds, timeoutSec, leaseTTL, warmupRounds int, warmupWg *sync.WaitGroup, startCh <-chan struct{}) ([]float64, error) {
-	// Tune the transport so per-worker keep-alive holds and connection
-	// reuse actually happens — http.DefaultTransport's defaults can
-	// cause idle conns to be evicted under our request rate.
-	tr := &http.Transport{
-		MaxIdleConns:        1,
-		MaxIdleConnsPerHost: 1,
-		IdleConnTimeout:     90 * time.Second,
-	}
-	hc := &http.Client{
-		Transport: tr,
-		Timeout:   time.Duration(timeoutSec+30) * time.Second,
-	}
+	hc, tr := buildBenchHTTPClient(timeoutSec)
+	authHdr := bearerHeader(authToken)
 
-	authHdr := ""
-	if authToken != "" {
-		authHdr = "Bearer " + authToken
-	}
-
-	// Create a session and capture its ID.
 	sessionID, err := httpCreateSession(hc, base, authHdr)
 	if err != nil {
 		warmupWg.Done()
@@ -307,41 +333,73 @@ func httpWorker(key, base, authToken string, rounds, timeoutSec, leaseTTL, warmu
 		tr.CloseIdleConnections()
 	}()
 
-	// Pre-encode the acquire body — same fields every round.
-	acquireBody, err := json.Marshal(map[string]int{
-		"acquire_timeout_s": timeoutSec,
-		"lease_ttl_s":       leaseTTL,
-	})
+	acquireBody, err := encodeAcquireBody(timeoutSec, leaseTTL)
 	if err != nil {
 		warmupWg.Done()
 		return nil, err
 	}
 
-	// Warmup: not measured.
-	for i := 0; i < warmupRounds; i++ {
-		token, err := httpAcquire(hc, base, authHdr, sessionID, key, acquireBody)
-		if err != nil {
-			warmupWg.Done()
-			return nil, fmt.Errorf("warmup acquire: %w", err)
-		}
-		if err := httpRelease(hc, base, authHdr, sessionID, key, token); err != nil {
-			warmupWg.Done()
-			return nil, fmt.Errorf("warmup release: %w", err)
-		}
+	if err := httpWarmupLoop(hc, base, authHdr, sessionID, key, acquireBody, warmupRounds); err != nil {
+		warmupWg.Done()
+		return nil, err
 	}
-
 	warmupWg.Done()
 	<-startCh
+	return httpMeasuredLoop(hc, base, authHdr, sessionID, key, acquireBody, rounds)
+}
 
+// buildBenchHTTPClient returns an HTTP client tuned for per-worker
+// keep-alive reuse — http.DefaultTransport evicts idle conns at our
+// request rate, which inflates latency.
+func buildBenchHTTPClient(timeoutSec int) (*http.Client, *http.Transport) {
+	tr := &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	return &http.Client{Transport: tr, Timeout: time.Duration(timeoutSec+30) * time.Second}, tr
+}
+
+func bearerHeader(authToken string) string {
+	if authToken == "" {
+		return ""
+	}
+	return "Bearer " + authToken
+}
+
+func encodeAcquireBody(timeoutSec, leaseTTL int) ([]byte, error) {
+	return json.Marshal(map[string]int{
+		"acquire_timeout_s": timeoutSec,
+		"lease_ttl_s":       leaseTTL,
+	})
+}
+
+func httpAcquireReleaseOnce(hc *http.Client, base, authHdr, sessionID, key string, acquireBody []byte) error {
+	token, err := httpAcquire(hc, base, authHdr, sessionID, key, acquireBody)
+	if err != nil {
+		return fmt.Errorf("acquire: %w", err)
+	}
+	if err := httpRelease(hc, base, authHdr, sessionID, key, token); err != nil {
+		return fmt.Errorf("release: %w", err)
+	}
+	return nil
+}
+
+func httpWarmupLoop(hc *http.Client, base, authHdr, sessionID, key string, acquireBody []byte, rounds int) error {
+	for i := 0; i < rounds; i++ {
+		if err := httpAcquireReleaseOnce(hc, base, authHdr, sessionID, key, acquireBody); err != nil {
+			return fmt.Errorf("warmup: %w", err)
+		}
+	}
+	return nil
+}
+
+func httpMeasuredLoop(hc *http.Client, base, authHdr, sessionID, key string, acquireBody []byte, rounds int) ([]float64, error) {
 	latencies := make([]float64, 0, rounds)
 	for i := 0; i < rounds; i++ {
 		t0 := time.Now()
-		token, err := httpAcquire(hc, base, authHdr, sessionID, key, acquireBody)
-		if err != nil {
-			return nil, fmt.Errorf("acquire: %w", err)
-		}
-		if err := httpRelease(hc, base, authHdr, sessionID, key, token); err != nil {
-			return nil, fmt.Errorf("release: %w", err)
+		if err := httpAcquireReleaseOnce(hc, base, authHdr, sessionID, key, acquireBody); err != nil {
+			return nil, err
 		}
 		latencies = append(latencies, time.Since(t0).Seconds())
 	}
