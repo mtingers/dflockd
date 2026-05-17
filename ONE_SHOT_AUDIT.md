@@ -238,7 +238,105 @@ comment".
 
 ## Phase 5 — RED tests
 
-*Pending audit.*
+**State.** ~10K lines of test code across ~50 test files. Existing
+fuzz targets for the parsing/validation surface
+(`FuzzParseRequest`, `FuzzReadRequest`, `FuzzFenceFromToken`,
+`FuzzParseServerResponse`, `FuzzRESTValidators`, `FuzzDecodeJSONBody`,
+`FuzzDecodeFenceRecord`, `FuzzLockManagerSequentialOps`). Test-first
+discipline is loosely visible in commit history (e.g. `tests(*)` →
+`feat(*)` pairs) but isn't strictly enforced — many recent commits
+combine test + impl in one (e.g. `90b8564 test(httpapi): cover the
+cluster enqueue fast-path + queued + follower-redirect`).
+
+**Service-tier target.** ≥80% per-package line coverage.
+
+**Coverage measurement (this session).**
+
+| Package | Before this session | After | Service-tier ≥80%? |
+|---|---|---|---|
+| `internal/protocol` | 91.7% | 91.7% | ✅ |
+| `internal/config` | 90.8% | 90.8% | ✅ |
+| `internal/cluster` | 78.2% | **84.3%** | ✅ (was below) |
+| `internal/lock` | 82.6% | 82.6% | ✅ |
+| `internal/raft` | 81.6% | 81.6% | ✅ |
+| `client` | 72.9% | 73.9% | ❌ still under |
+| `internal/server` | 69.7% | 69.7% | ❌ still under |
+| `internal/httpapi` | 68.1% | 69.2% | ❌ still under |
+
+**Audit findings (Phase 5).**
+
+- ❌ Gap (fixed): `internal/cluster/fsm.go` had 4 entry points
+  (`Snapshot`, `Restore`, `fsmSnapshot.Persist`, `Release`) at 0% —
+  the higher-level cluster tests never naturally trigger a snapshot
+  (their state is too small to cross the threshold). The
+  membership-state accessors (`setMember`, `deleteMember`,
+  `LockManager` accessor) were also 0%.
+- ❌ Gap (fixed): `internal/httpapi/handlers.go` had 4 semaphore HTTP
+  handlers (`handleReleaseSem`, `handleRenewSem`, `handleEnqueueSem`,
+  `handleWaitSem`) at 0% coverage. The single existing semaphore HTTP
+  test only exercised acquire + timeout. A refactor that broke the
+  release/renew/enqueue/wait paths would not have been caught.
+- ❌ Gap (fixed): `client/client.go` had `SemRenew`, `SemEnqueue`,
+  `SemWait` at 0% coverage. Only `SemAcquire` and `SemRelease` had a
+  direct test.
+- 🟡 Gap (documented as follow-up): `internal/httpapi/middleware.go`
+  CORS support (`newCORSPolicy`, `serveCORS`, `writeCORSHeaders`,
+  `setCORSAllowOrigin`, `isCORSPreflight` — 9 funcs total) is wired
+  but no test ever enabled it. Either a CORS test should be added or
+  the feature should be deleted as unreached.
+- 🟡 Gap (documented): `internal/httpapi/server.go` `Run`,
+  `buildHTTPListener`, `httpHostFor`, `wrapTLSIfConfigured`,
+  `tlsConfig` (server boot + TLS plumbing) at 0%. They are exercised
+  by `cmd/dflockd` (integration) and `tools/cluster-smoke --tls` (the
+  optional `DFLOCKD_SMOKE_TLS=1` mode shipped recently) but not by
+  `go test`. Add `httptest`-style unit tests for the helpers, or
+  accept the gap as "covered by integration".
+- 🟡 Gap (documented): `internal/server/server.go` TLS plumbing
+  (`validateTLSConfig`, `wrapTLS`, `wrapRequiredTLS`, `tlsConfig`,
+  etc.) is in the same state — exercised by the smoke harness, not by
+  unit tests.
+- 🟡 Gap (documented): `client/client.go:DialTLS` (the TLS dialer)
+  has no test in-package. The smoke harness exercises it indirectly.
+- 🟡 Gap (documented): The package-level coverage gap to ≥80% on
+  `client` (73.9%) and `internal/server` (69.7%) and `internal/httpapi`
+  (69.2%) is mostly in failure-only branches (lost-connection cleanup,
+  dial-retry tails) that need fault injection to exercise. A real
+  fault-injection harness — the deferred `cmd/cluster-soak` per
+  PRODUCTION_READINESS.md item 3 — would close most of these gaps.
+
+**Fixes this session.**
+- New `internal/cluster/fsm_test.go` with 3 tests:
+  - `TestFSMAdapterSnapshotPersistRestoreRoundTrip` — drives state in
+    via `ApplyAcquire`, snapshots → persists → restores into a fresh
+    LockManager, asserts the re-snapshot is byte-identical (which
+    pins both the adapter wiring and the FSM determinism property).
+  - `TestNodeLockManagerAccessor`.
+  - `TestSetDeleteMember`.
+  - Result: `internal/cluster` 78.2% → **84.3%** (over the bar).
+- New `internal/httpapi/sem_handlers_test.go` with 3 tests:
+  - `TestHTTP_SemRelease` — acquire + release happy path.
+  - `TestHTTP_SemRenew` — acquire + renew + lease-extended response.
+  - `TestHTTP_SemEnqueueWait` — two-phase enqueue → wait with a
+    holder + queuer, holder releases, queuer's wait gets the slot.
+  - Result: `internal/httpapi` 68.1% → 69.2%. (Small absolute bump
+    because the four newly-covered handlers are tiny one-line
+    delegators; the bulk of the uncovered code is CORS + server boot
+    + TLS plumbing.)
+- New `client/sem_lowlevel_test.go` with 2 tests:
+  - `TestSemRenew_BumpsLease`.
+  - `TestSemEnqueueWait_GrantsAfterRelease`.
+  - Result: `client` 72.9% → 73.9%.
+
+**Follow-ups.**
+- Add CORS test (or delete the dead CORS middleware) — `internal/httpapi/middleware.go`.
+- Add `httptest`-style unit tests for HTTP server boot + TLS plumbing
+  (`Run`, `buildHTTPListener`, `tlsConfig`, `wrapTLSIfConfigured`).
+- Add `DialTLS` test in `client` package.
+- The remaining `internal/server` / `internal/httpapi` / `client` gap
+  to 80% will mostly close once the deferred `cmd/cluster-soak`
+  harness lands (PRODUCTION_READINESS.md item 3) — failure-only
+  branches are easier to cover with fault injection than with
+  hand-crafted unit tests.
 
 ---
 
