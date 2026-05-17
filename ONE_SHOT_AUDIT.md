@@ -1,0 +1,120 @@
+# dflockd — one-shot audit
+
+Audit of the project against the nine-phase one-shot framework
+(Discovery → Glossary → Plan → Interfaces → RED → GREEN → Security →
+Docs → Final report) at **service-tier** depth in **refactor mode**.
+Run on branch `raft-replication`. Companion artifacts:
+[`MILESTONES.md`](MILESTONES.md), [`GLOSSARY.md`](GLOSSARY.md),
+[`PLAN.md`](PLAN.md), [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md).
+
+Each phase records: **State**, **Audit findings**, **Fixes this
+session**, **Follow-ups**.
+
+---
+
+## Phase 1 — Discovery
+
+**State.** Refactor mode: not a greenfield grilling. Discovery comes
+from README, PLAN.md, PRODUCTION_READINESS.md, CHANGELOG, and the code.
+
+**One-paragraph project summary.**
+
+> **dflockd** is a single-binary Go daemon implementing a distributed
+> FIFO lock + semaphore server with leases and fencing tokens.
+> Users: backend / platform / SRE engineers who need cross-process
+> mutual exclusion without standing up Redis or ZooKeeper. Run shape:
+> a single OS process (binary or container) on Linux/macOS, optionally
+> assembled into an N-node Raft-replicated cluster (`--raft-dir
+> --node-id --raft-addr --cluster-peers`). Wire protocols: a
+> line-based TCP protocol (canonical), an HTTP REST API (optional,
+> auth-opt-in), both backed by the same in-memory `LockManager` so a
+> TCP and an HTTP caller on the same key share a single FIFO queue.
+> Scale: ~13k ops/s single-client, ~90k ops/s at 200 concurrent
+> workers on an M1 (single-node, localhost, unique keys); cluster
+> throughput is bounded by Raft commit. Data flow: opaque keys + 32-
+> hex tokens; no user content stored; FSM state is in memory + WAL +
+> snapshot on disk. Worst failure mode: **incorrect grants** (a
+> partitioned node hands out a lock the cluster has already given
+> away) — addressed by the Raft safety properties (election
+> restriction, same-term commit, durable HardState, fencing tokens).
+> External integrations: none mandatory — `go.sum` is empty, no
+> runtime dependencies; optional fence-state file (`flock(2)`),
+> optional mTLS files. Constraints: single-binary, stdlib-only,
+> backward-compatible defaults (single-node binary is byte-identical
+> to v2.1.x). Success criteria: cluster mode reaches GA after the six
+> follow-ons listed in PRODUCTION_READINESS.md; single-node already
+> shipped (v2.1.1). Out of scope: pub/sub (v1 had it, v2 dropped it),
+> persistence of granted-lock state beyond Raft, multi-region
+> consensus, key-value storage of arbitrary payloads.
+
+**Scale & calibration confirm.**
+- Project type: **Service** (with library aspect via `client/`).
+- Source: ~26,929 lines of Go; ~9,982 of those are tests
+  (~37% test-to-source by line).
+- Commits since project inception: 201 (`git log --oneline | wc -l`).
+- Phases apply at full depth; no phase is N/A by virtue of project
+  type. Individual sub-items may be N/A and will be marked as such.
+
+**Audit findings (Phase 1).**
+- ✅ Problem space, users, run shape, scale, worst failure mode are
+  all documented across README + PLAN.md + PRODUCTION_READINESS.md.
+- 🟡 Discovery artifacts are scattered (README has "who/what/how-to-
+  run", PLAN.md has "design + acceptance", PRODUCTION_READINESS.md
+  has "what got built + what's left"). For a service-tier project
+  this is fine — but no single document has the one-paragraph "what
+  is this thing" view that a new joiner could read in 30 seconds.
+
+**Fixes this session.**
+- Created `MILESTONES.md` (the audit checklist).
+- Created `ONE_SHOT_AUDIT.md` (this file) carrying the one-paragraph
+  summary above as the canonical "what is this thing" anchor.
+
+**Follow-ups.** None for this phase.
+
+---
+
+## Phase 2 — Glossary
+
+*Pending audit.*
+
+---
+
+## Phase 3 — Plan
+
+*Pending audit.*
+
+---
+
+## Phase 4 — Interfaces & schemas
+
+*Pending audit.*
+
+---
+
+## Phase 5 — RED tests
+
+*Pending audit.*
+
+---
+
+## Phase 6 — GREEN implementation
+
+*Pending audit.*
+
+---
+
+## Phase 7 — Security pass
+
+*Pending audit.*
+
+---
+
+## Phase 8 — Documentation pass
+
+*Pending audit.*
+
+---
+
+## Phase 9 — Final report
+
+*Pending audit.*
