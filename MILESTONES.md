@@ -32,7 +32,7 @@ Deliverables of the audit:
 - [x] **Phase 6 — GREEN implementation**: `go test -race ./...` clean; complexity ceilings (cyclo ≤10, funlen ≤40) verified; any breaches documented *(✅ — every package race-clean in isolation; whole-tree flake is CPU-contention, fixed with `-p=2`; refactored `cmd/bench` `worker`/`httpWorker`/`main` to bring 0 functions over the bar; see [ONE_SHOT_AUDIT.md §Phase 6](ONE_SHOT_AUDIT.md#phase-6--green-implementation))*
 
 ## Hardening
-- [ ] **Phase 7 — Security pass**: trust-boundary checklist walked; gaps fixed or recorded
+- [x] **Phase 7 — Security pass**: trust-boundary checklist walked; gaps fixed or recorded *(✅ — `govulncheck` clean; full checklist green except a 500-response detail leak in HTTP session-create which is now fixed; see [ONE_SHOT_AUDIT.md §Phase 7](ONE_SHOT_AUDIT.md#phase-7--security-pass))*
 - [ ] **Phase 8 — Documentation pass**: missing docs written; README install/run verified on a fresh checkout; drift reconciled (CHANGELOG, OpenAPI, docs site, comments)
 
 ## Handoff

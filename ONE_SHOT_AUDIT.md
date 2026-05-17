@@ -414,7 +414,53 @@ targets: `make complexity` (top 30 report) and `make complexity-strict`
 
 ## Phase 7 — Security pass
 
-*Pending audit.*
+**State.** Long-running, network-facing daemon. Trust boundaries:
+operator-supplied flags/env (boot only); TCP wire protocol (untrusted
+clients); HTTP REST API (untrusted callers); Raft TCP transport
+(peer nodes — trusted with optional mTLS); persistent files on disk
+under `--raft-dir` and `--fence-state-file` (operator).
+PRODUCTION_READINESS.md already walks Phase-15 security checks for
+the cluster lift; this audit re-walks them against the current tree.
+
+**Audit walk (Phase 7 checklist).**
+
+| Item | Verdict | Evidence |
+|---|---|---|
+| Known CVEs | ✅ | `govulncheck ./...` → "No vulnerabilities found." `go.sum` empty (stdlib only). |
+| Shell exec / `os.Exec` / `syscall.Exec` | ✅ N/A | grep for `exec\.(Command\|LookPath\|Run)`, `syscall.Exec` returns 0 production matches. |
+| `unsafe` / `reflect` / dynamic code | ✅ N/A | None in prod code; `os.Getenv` only in `internal/config/config.go` for documented `DFLOCKD_*` env vars. |
+| Constant-time secret compare | ✅ | `subtle.ConstantTimeCompare` in both `internal/server/conn.go:263` (TCP auth) and `internal/httpapi/middleware.go:38` (HTTP Bearer). |
+| Brute-force defense | ✅ | `internal/server/conn.go:266 rejectAuth` (TCP) + `internal/httpapi/middleware.go:39 authFailureDelay = 100ms` (HTTP). Tested in `TestHTTP_AuthFailureSlowdown`. |
+| Random source for tokens | ✅ | `crypto/rand` (`internal/lock/state.go:290`). Panics on failure (correct — crypto/rand failure is unrecoverable). Buffered to amortise syscalls. |
+| Token validation timing | ✅ | Release/Renew validate via `st.Holders[token]` map-lookup (hash-keyed, no character-level compare). Two-phase enqueue/wait does a follow-up `es.token == token` after a different hash lookup — gated by `(connID, key)` map first, so a timing attack would need both the connID and the key. |
+| TLS minimum version | ✅ | TCP server + HTTP server: `TLS 1.2`. Raft inter-node: `TLS 1.3` with `RequireAndVerifyClientCert`. |
+| Path traversal | ✅ N/A | All file opens use operator-supplied directories joined with hard-coded filenames (`walFileName`, `hardStateFileName`, `snapshotsSubdir`). No user/request-controlled file paths. |
+| Output sanitization (XSS, log injection) | ✅ | All HTTP responses go through `writeJSON` (JSON encoding — no HTML, no template) with `X-Content-Type-Options: nosniff`. |
+| Authorization on privileged ops | ✅ | `withAuth` middleware on every HTTP route except `/health`, `/ready`, `/v1/openapi.json` (intentional + documented in `middleware.go`). TCP `auth` command gates everything else per session. |
+| Rate limiting / DoS bounds | ✅ | `MaxConnections`, `MaxConnectionsPerIP`, `MaxLocks`, `MaxWaiters`, `HTTPMaxSessions`, `HTTPMaxSessionsPerIP`, `HTTPMaxConnectionsPerIP`, `HTTPRateLimitPerIP`/`Burst`. Startup warns when these are 0 (CHANGELOG entry). Per-Raft-frame size caps (`maxEntryDataBytes = 16 MiB`, `maxTCPFrameBytes = 64 MiB`) per PRODUCTION_READINESS.md. |
+| Error messages don't leak internals | 🟡 | 4 of 5 `writeError(..., err.Error())` sites are on `400 bad_request` — intentional + helpful. **Was 1** site on `500 session_create_failed` that leaked the raw Go error message; fixed this session (now logs internally, returns `""` detail). |
+| Audit logs for sensitive ops | ✅ | `cluster.Node` logs leader changes / membership changes via slog; HTTP auth failures are visible by their `100ms` slowdown; lock grants/releases are not logged per-event (would be unbounded volume) — this is a deliberate design choice, matching the project's "low-overhead lock service" framing. |
+| Frame bounds | ✅ | `internal/raft/tcpframe.go` + `internal/cluster/command.go:maxCommandKeyBytes/RefBytes/Limit` + `internal/raft/storage_file.go:maxSnapshotFileBytes` + Command.Validate. |
+| CORS posture | ✅ | `internal/httpapi/middleware.go:withCORS` is allow-list, disabled by default (`HTTPCORSAllowedOrigins == nil`). `*` requires explicit operator opt-in. Tested (config layer); 🟡 the middleware itself is untested (noted as a Phase-5 follow-up). |
+
+**Fixes this session.**
+
+- Hardened `internal/httpapi/handlers.go:writeCreateSessionErr` — the
+  default branch was emitting `writeError(..., err.Error())` on a
+  500, leaking the raw Go error message to the client. Now logs the
+  error to `h.log` server-side and returns the canonical 500
+  `session_create_failed` with empty detail (matches the rest of the
+  500-class responses).
+
+**Follow-ups.**
+
+- (Defense-in-depth, low priority) Replace the `es.token == token`
+  string compares in `internal/lock/lock.go` two-phase paths with
+  `subtle.ConstantTimeCompare(...)==1`. The path is already gated by
+  a `(connID, key)` map lookup so a timing attack is impractical;
+  this is belt-and-suspenders.
+- (From Phase 5) CORS middleware has no test. Add one, or delete the
+  feature if it's unused.
 
 ---
 

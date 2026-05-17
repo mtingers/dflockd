@@ -109,7 +109,7 @@ type createSessionResponse struct {
 func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	s, err := h.sessions.Create(remoteIPFromAddr(r.RemoteAddr))
 	if err != nil {
-		writeCreateSessionErr(w, err)
+		h.writeCreateSessionErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, createSessionResponse{
@@ -117,8 +117,11 @@ func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// writeCreateSessionErr maps Create errors to HTTP responses.
-func writeCreateSessionErr(w http.ResponseWriter, err error) {
+// writeCreateSessionErr maps Create errors to HTTP responses. Known
+// sentinel errors get a stable user-facing code with no detail; an
+// unexpected error is logged server-side and surfaces as a generic 500
+// so the client can't probe internal state via error-message diffs.
+func (h *httpServer) writeCreateSessionErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrMaxSessions):
 		writeError(w, http.StatusServiceUnavailable, "max_sessions", "")
@@ -127,7 +130,8 @@ func writeCreateSessionErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrShuttingDown):
 		writeError(w, http.StatusServiceUnavailable, "draining", "")
 	default:
-		writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())
+		h.log.Error("session create failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "session_create_failed", "")
 	}
 }
 
