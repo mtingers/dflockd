@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
@@ -87,7 +86,7 @@ func (s *Server) ClusterAcquire(ctx context.Context, key string, limit int, conn
 		return lock.ApplyResult{}, err
 	}
 	cid := s.clusterConnID(connID)
-	ref := fmt.Sprintf("%d", cid)
+	ref := s.effectiveRef(connID, cid)
 	grants, cancel := s.lm.WatchGrants(ref)
 	defer cancel()
 	result, err := c.ProposeAcquire(ctx, key, limit, ref, cid, leaseTTL, salt)
@@ -114,7 +113,7 @@ func (s *Server) ClusterEnqueue(ctx context.Context, key string, limit int, conn
 		return lock.ApplyResult{}, err
 	}
 	cid := s.clusterConnID(connID)
-	ref := fmt.Sprintf("%d", cid)
+	ref := s.effectiveRef(connID, cid)
 	ch, cancel := s.lm.WatchGrants(ref)
 	result, err := c.ProposeEnqueue(ctx, key, limit, ref, cid, leaseTTL, salt)
 	if err != nil {

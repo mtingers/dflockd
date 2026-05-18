@@ -37,6 +37,11 @@ type Config struct {
 	MaxLocks           int
 	MaxWaiters         int
 	FenceStateFile     string
+	// OrphanTTL bounds how long a stable-ref waiter/holder survives in
+	// the FSM after its TCP connection went away. Zero means today's
+	// strict behavior (CleanupConn removes immediately). Must be the
+	// same on every cluster member — it's read in the FSM apply path.
+	OrphanTTL time.Duration
 
 	// HTTP API (HTTPPort=0 disables).
 	HTTPPort                int

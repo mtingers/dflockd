@@ -163,7 +163,7 @@ func (s *Server) clusterAcquire(ctx context.Context, c Cluster, req *protocol.Re
 		return &protocol.Ack{Status: protocol.StatusError}
 	}
 	cid := s.clusterConnID(connID)
-	return s.clusterDoAcquire(ctx, c, req, fmt.Sprintf("%d", cid), cid, salt)
+	return s.clusterDoAcquire(ctx, c, req, s.effectiveRef(connID, cid), cid, salt)
 }
 
 func (s *Server) clusterDoAcquire(ctx context.Context, c Cluster, req *protocol.Request, ref string, cid uint64, salt [8]byte) *protocol.Ack {
@@ -215,7 +215,7 @@ func (s *Server) clusterEnqueue(ctx context.Context, c Cluster, req *protocol.Re
 		return &protocol.Ack{Status: protocol.StatusError}
 	}
 	cid := s.clusterConnID(connID)
-	ref := fmt.Sprintf("%d", cid)
+	ref := s.effectiveRef(connID, cid)
 	// Register the grant listener before proposing and hold it on the
 	// connection: a promotion can land between this Enqueue's commit and
 	// the client's Wait, and without a live listener that grant is lost

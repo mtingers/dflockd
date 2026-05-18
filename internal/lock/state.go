@@ -34,10 +34,17 @@ func StripKeyPrefix(key string) string {
 // truth for them. Both fields coexist so that cluster failover (where
 // connID is meaningless across nodes) can route by Ref while the
 // single-node fast paths continue to key off connID.
+//
+// abandonedAtNanos != 0 means the original connection went away while the
+// holder had a stable ref. The slot is preserved (not removed via
+// CleanupConn) and the FSM's evict sweep retires it after OrphanTTL.
+// A reconnect with matching ref before that deadline re-adopts the
+// holder (resets abandonedAtNanos, rebinds connID).
 type holder struct {
-	connID       uint64
-	leaseExpires time.Time
-	ref          string
+	connID           uint64
+	leaseExpires     time.Time
+	ref              string
+	abandonedAtNanos int64
 }
 
 // waiter is a queued grant request waiting for capacity.
@@ -46,12 +53,17 @@ type holder struct {
 // change can preserve which client a queued slot belongs to and so
 // promotion can mint a token deterministically; single-node callers
 // continue to use ch + connID for routing.
+//
+// abandonedAtNanos behaves identically to the same field on holder: a
+// stable-ref waiter whose connection died is parked here until the
+// caller reconnects (and re-adopts) or the OrphanTTL fires.
 type waiter struct {
-	ch       chan string
-	connID   uint64
-	leaseTTL time.Duration
-	ref      string
-	salt     [8]byte
+	ch               chan string
+	connID           uint64
+	leaseTTL         time.Duration
+	ref              string
+	salt             [8]byte
+	abandonedAtNanos int64
 }
 
 // connKey identifies one connection's two-phase state for one key.

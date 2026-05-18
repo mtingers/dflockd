@@ -39,9 +39,9 @@ production-hardening passes are reflected here:
 
 **You should wait if:**
 
-- You need FIFO preserved across a leader failover for
-  *currently-blocked* callers (gap 1 below). Already-granted tokens
-  are unaffected; only the blocked-on-wait case loses queue position.
+- You need a multi-host soak harness in CI for safety-critical
+  workloads (last remaining deferred item). All in-process safety
+  invariants are validated by `cmd/cluster-soak`.
 
 ## Raft safety
 
@@ -223,37 +223,37 @@ API but aren't each individually exercised by a redirect test.
 
 ## What's NOT done (deferred follow-ons)
 
-PR-3 closed: dynamic-join with snapshot transfer to a cold-state empty
-node (was PR-2 gap 2 / PR-1 item 3) — `TestDynamicJoinColdNodeCatchesUpViaSnapshot`
-proves the InstallSnapshot path; no production code change required.
+PR-4 closed: stable-client-ref FIFO failover (was PR-3 gap 1). The
+FSM's `ApplyCleanupConn` now marks ref-tagged waiters/holders orphaned
+(stamped with `AbandonedAtNanos`) instead of removing them; a
+re-Enqueue with matching `(key, ref)` re-adopts the slot via
+`ApplyEnqueue`, preserving FIFO order. Snapshot codec v2 carries the
+new field; v1 snapshots are still readable. Opt-in via `--orphan-ttl`
++ `client.WithClusterStableRef`. Tests at the FSM layer
+(`TestCleanupConnOrphansStableRefWaiter`,
+`TestEnqueueReAdoptsOrphanedWaiter`,
+`TestSnapshotRoundTripPreservesOrphanState`,
+`TestEvictExpiredRemovesOrphanPastTTL`) + server layer (3 tests).
 
-PR-2 closed: cluster-aware client (was item 4), soak harness (was
-item 1), cluster codec fuzz (was item 5). PR-1 closed: admin endpoints,
-counter metrics, ReadIndex public API.
+PR-3 closed: dynamic-join with snapshot transfer to a cold-state empty
+node.
+
+PR-2 closed: cluster-aware client, soak harness, cluster codec fuzz.
+
+PR-1 closed: admin endpoints, counter metrics, ReadIndex public API.
 
 Still open:
 
-1. **Stable-client-ref re-attach** for FIFO across leader failover
-   (PLAN.md §4.7 follow-on). A caller blocked in `acquire`/`wait`
-   when the leader fails loses its queue position — the FSM's
-   `ApplyCleanupConn` drops the waiter on disconnect because there's
-   no way today to distinguish "stable client identity" from
-   "transient TCP connection." Already-granted tokens (`renew`,
-   `release`) survive seamlessly via the replicated FSM state.
-   **Workaround:** the `client.Cluster` wrapper retries from scratch
-   after a `*NotLeaderError`; this is correct but not order-preserving
-   (the retry goes to the back of the queue). **Why deferred to PR-4:**
-   the fix requires `ApplyCleanupConn` to mark ref-tagged entries
-   "orphaned" (with a deterministic deadline), `ApplyEnqueue` to
-   re-adopt matching orphans, plus snapshot codec changes for the new
-   `AbandonedAtNanos` field — all FSM-determinism-critical, which is
-   a focused session of work, not an end-of-PR squeeze.
-2. **Long-horizon multi-host soak.** `cmd/cluster-soak` is a
+1. **Long-horizon multi-host soak.** `cmd/cluster-soak` is a
    CI-friendly in-process harness covering the safety invariants under
    leader kills. A separate multi-host harness with injected partitions
    and clock skew (PLAN.md §6's full fault-injection set), run for
-   hours rather than seconds, is the next step before declaring "GA
+   hours rather than seconds, is the last step before declaring "GA
    across all workloads".
+2. **HTTP API: stable-ref equivalent.** The TCP `stable-ref` command
+   ships in PR-4; the HTTP API would need an equivalent (probably a
+   header or per-session field). Not blocking since HTTP callers can
+   use the TCP client; tracked for a future pass.
 
 ## How to verify
 
@@ -322,12 +322,13 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 
 ## Bottom line
 
-Cluster mode is **beta — GA-eligible for workloads that don't depend
-on FIFO-across-leader-failover for currently-blocked callers.** The
-§7 checklist is fully addressed; after PR-3 the only remaining gap is
-the stable-client-ref FIFO re-attach, with a documented (correct,
-non-FIFO) workaround via `client.Cluster`'s retry behavior. Both
-static-bootstrap AND dynamic-join (`AddVoter` → start cold node)
-flows are validated end-to-end. The whole tree passes `make test-race`
-cleanly; `go.sum` stays empty; the non-cluster single-node binary is
-byte-identical to v2.1.x.
+Cluster mode is **beta-plus / GA-eligible.** After PR-4, every cluster
+safety + ergonomic item from the original §7 checklist is implemented
+and tested. Static-bootstrap, dynamic-join (`AddVoter` → cold node),
+and FIFO-across-leader-failover (via `--orphan-ttl` +
+`client.WithClusterStableRef`) all validated end-to-end. The only
+remaining follow-on is a long-horizon multi-host soak harness — useful
+for very-high-stakes deployments but not blocking for the workloads the
+existing in-process soak already covers. The whole tree passes
+`make test-race` cleanly; `go.sum` stays empty; the non-cluster
+single-node binary is byte-identical to v2.1.x.

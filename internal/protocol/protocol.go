@@ -63,7 +63,22 @@ const (
 	// node mode it returns ok immediately. On a follower it returns
 	// error_not_leader.
 	CmdBarrier = "barrier"
+	// CmdStableRef sets a per-connection opaque identifier so the client
+	// can re-attach to its existing FSM slots (waiters / holders with the
+	// matching ref) after a leader failover + reconnect. Wire form:
+	//   stable-ref\n<ref>\n_\n
+	// where <ref> is any non-empty ASCII string ≤ 64 bytes. Subsequent
+	// acquire/enqueue/wait on this connection use the stable ref instead
+	// of the connID-derived ref. Sending it twice on the same connection
+	// returns error_invalid (the ref is locked in on first use).
+	CmdStableRef = "stable-ref"
 )
+
+// MaxStableRefLen bounds the stable ref string a client may send. Refs
+// flow through the wire frame size (capped at ~64 KiB), but a stable
+// ref is just a session-life-of-the-client identifier — 64 bytes is
+// more than enough for a UUID + a small prefix.
+const MaxStableRefLen = 64
 
 // Status values returned in responses.
 const (
@@ -144,6 +159,7 @@ type Request struct {
 	LeaseTTL       time.Duration // for l/sl/n/sn/e/se
 	Limit          int           // for sl/se
 	AuthToken      string        // for auth
+	StableRef      string        // for stable-ref
 }
 
 // Ack is a fully formed server response.
@@ -214,8 +230,9 @@ type requestParser func(cmd, key, arg string, defaultLeaseTTL time.Duration) (*R
 
 var requestParsers = map[string]requestParser{
 	CmdPing: parseNoKeyCommand, CmdStats: parseNoKeyCommand, CmdBarrier: parseNoKeyCommand,
-	CmdAuth:    parseAuthCommand,
-	CmdAcquire: parseKeyedCommand(parseAcquire), CmdSemAcquire: parseKeyedCommand(parseAcquire),
+	CmdAuth:      parseAuthCommand,
+	CmdStableRef: parseStableRefCommand,
+	CmdAcquire:   parseKeyedCommand(parseAcquire), CmdSemAcquire: parseKeyedCommand(parseAcquire),
 	CmdRelease: parseKeyedCommand(parseReleaseCommand), CmdSemRelease: parseKeyedCommand(parseReleaseCommand),
 	CmdRenew: parseKeyedCommand(parseRenew), CmdSemRenew: parseKeyedCommand(parseRenew),
 	CmdEnqueue: parseKeyedCommand(parseEnqueue), CmdSemEnqueue: parseKeyedCommand(parseEnqueue),
@@ -228,6 +245,25 @@ func parseNoKeyCommand(cmd, _, _ string, _ time.Duration) (*Request, error) {
 
 func parseAuthCommand(cmd, _, arg string, _ time.Duration) (*Request, error) {
 	return &Request{Cmd: cmd, AuthToken: strings.TrimSpace(arg)}, nil
+}
+
+// parseStableRefCommand reads the ref from the key line (wire form:
+// "stable-ref\n<ref>\n_\n"). Refs are bounded to MaxStableRefLen and
+// must be non-empty and printable ASCII.
+func parseStableRefCommand(cmd, key, _ string, _ time.Duration) (*Request, error) {
+	ref := strings.TrimSpace(key)
+	if ref == "" {
+		return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: "stable-ref: empty"}
+	}
+	if len(ref) > MaxStableRefLen {
+		return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: fmt.Sprintf("stable-ref: too long (%d > %d)", len(ref), MaxStableRefLen)}
+	}
+	for _, r := range ref {
+		if r < 0x20 || r > 0x7e {
+			return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: "stable-ref: non-printable byte"}
+		}
+	}
+	return &Request{Cmd: cmd, StableRef: ref}, nil
 }
 
 func parseKeyedCommand(parser requestParser) requestParser {

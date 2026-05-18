@@ -184,6 +184,43 @@ rather than blindly following the header. Read-only endpoints
 (`/health`, `/ready`, `/v1/stats`, `/metrics`, `/openapi.json`) work on
 any node.
 
+## FIFO across leader failover (stable client refs)
+
+A caller blocked in `enqueue → wait` when the leader fails ordinarily
+loses its queue position (the waiter slot is keyed by TCP connection
+id, which the new leader doesn't recognize). PR-4 adds **stable client
+refs** to fix this:
+
+1. Set `--orphan-ttl 30s` (or similar) on every node so the FSM is
+   willing to retain orphaned waiters/holders that long.
+2. The Go client opts in via `client.WithClusterStableRef("session-X")`.
+
+```go
+cl, _ := client.NewCluster(members,
+    client.WithClusterStableRef(uuid.NewString()), // any opaque per-session id
+)
+status, _, _, _ := cl.Enqueue(ctx, "deploy", ...) // status == "queued"
+token, _, _ := cl.Wait(ctx, "deploy", 30*time.Second)
+// ... if the leader dies during Wait, the Cluster wrapper reconnects
+// to the new leader, re-sends the stable ref, and re-attaches to the
+// original waiter — preserving the caller's FIFO position.
+```
+
+Under the hood: on `CleanupConn` (proposed when a TCP conn ends), the
+FSM marks ref-tagged waiters and holders "orphaned" (records a
+`AbandonedAtNanos` stamp) instead of removing them. On a reconnect with
+matching `(key, ref)`, `ApplyEnqueue` re-adopts the existing slot
+(preserving the original salt, queue position, and minted token if
+already promoted). The next `EvictExpired` sweep evicts orphans past
+`OrphanTTL`.
+
+**Security note:** stable refs are caller-supplied identifiers, not
+authenticated credentials. Anyone who knows your ref can re-attach to
+your waiter/holder (and claim the eventual token). Treat refs like
+session tokens — generate randomly (e.g., `uuid.NewString()`), don't
+log them, don't share them. The `--auth-token` mechanism, when set,
+gates the connection before the ref is accepted.
+
 ## Using the cluster-aware Go client
 
 ```go

@@ -44,6 +44,11 @@ type Server struct {
 	// disconnect cleanup) can consume/cancel it — closing the lost-
 	// wakeup window between the Enqueue's commit and the client's Wait.
 	pendingGrants sync.Map // uint64 connID → *pendingGrant
+	// stableRefs maps connID → caller-supplied stable ref (set by the
+	// stable-ref TCP command). When non-empty, the ref overrides the
+	// connID-derived ref in cluster-mode propose calls so a reconnect
+	// after leader failover re-attaches to the original FSM slot.
+	stableRefs sync.Map // uint64 connID → string
 }
 
 // connCounter wraps a count function so we can store it through
@@ -58,6 +63,44 @@ func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
 
 // LockManager exposes the underlying LockManager (used by the HTTP API).
 func (s *Server) LockManager() *lock.LockManager { return s.lm }
+
+// stableRefFor returns the caller-supplied stable ref for connID, or
+// the empty string if none is set. Used by the cluster propose path
+// to override the connID-derived ref when the client opted in.
+func (s *Server) stableRefFor(connID uint64) string {
+	v, ok := s.stableRefs.Load(connID)
+	if !ok {
+		return ""
+	}
+	r, _ := v.(string)
+	return r
+}
+
+// setStableRef records ref for connID. Returns false if a ref was
+// already set (the stable-ref command is once-per-connection).
+func (s *Server) setStableRef(connID uint64, ref string) bool {
+	_, loaded := s.stableRefs.LoadOrStore(connID, ref)
+	return !loaded
+}
+
+// clearStableRef drops the stable ref entry for connID. Called from
+// the per-conn teardown path so an exiting connection releases the
+// map slot.
+func (s *Server) clearStableRef(connID uint64) {
+	s.stableRefs.Delete(connID)
+}
+
+// effectiveRef returns the FSM-visible ref for a cluster propose
+// originated by the given (cluster) cid + raw connID: the
+// caller-supplied stable ref if one was set on this connection, or
+// the connID-derived fallback. Centralizing the lookup keeps every
+// propose path consistent.
+func (s *Server) effectiveRef(rawConnID, cid uint64) string {
+	if r := s.stableRefFor(rawConnID); r != "" {
+		return r
+	}
+	return strconv.FormatUint(cid, 10)
+}
 
 // Config exposes the server config (used by the HTTP API).
 func (s *Server) Config() *config.Config { return s.cfg }

@@ -16,7 +16,12 @@ import (
 
 const (
 	snapshotMagic = "dfllksn1"
-	snapshotVer   = byte(1)
+	// snapshotVer is the writer's version. Version 2 added the
+	// abandonedAtNanos field to each holder and waiter (PR-4 / stable
+	// client ref re-attach). Restore reads both versions: v1 entries
+	// have abandonedAtNanos = 0 implicitly.
+	snapshotVer  = byte(2)
+	snapshotVer1 = byte(1)
 	// snapshotMaxStr16 is the largest string the u16-length-prefixed
 	// encoding can represent. Keys are bounded far below this by the
 	// protocol (a key gets a "lock:"/"sem:" prefix, so up to ~261 bytes);
@@ -152,7 +157,10 @@ func writeOneHolder(w io.Writer, token string, h *holder) error {
 	if err := writeU64(w, h.connID); err != nil {
 		return err
 	}
-	return writeI64(w, unixNanosOf(h.leaseExpires))
+	if err := writeI64(w, unixNanosOf(h.leaseExpires)); err != nil {
+		return err
+	}
+	return writeI64(w, h.abandonedAtNanos) // snapshotVer 2+
 }
 
 func writeWaiters(w io.Writer, waiters []*waiter) error {
@@ -177,7 +185,10 @@ func writeWaiter(w io.Writer, wt *waiter) error {
 	if err := writeU64(w, wt.connID); err != nil {
 		return err
 	}
-	return writeI64(w, int64(wt.leaseTTL))
+	if err := writeI64(w, int64(wt.leaseTTL)); err != nil {
+		return err
+	}
+	return writeI64(w, wt.abandonedAtNanos) // snapshotVer 2+
 }
 
 func writeOneEnqueued(w io.Writer, ck connKey, es *enqueuedState) error {
@@ -201,7 +212,8 @@ func writeOneEnqueued(w io.Writer, ck connKey, es *enqueuedState) error {
 // is discarded. Restore MUST be called with no in-flight Apply calls;
 // the cluster layer arranges that via its apply pipeline.
 func (lm *LockManager) Restore(r io.Reader) error {
-	if err := readSnapshotHeader(r); err != nil {
+	ver, err := readSnapshotHeader(r)
+	if err != nil {
 		return err
 	}
 	fc, err := readU64(r)
@@ -210,25 +222,25 @@ func (lm *LockManager) Restore(r io.Reader) error {
 	}
 	lm.clearAllShards()
 	lm.fsmFenceCounter = fc
-	return lm.restoreShards(r)
+	return lm.restoreShards(r, ver)
 }
 
-func readSnapshotHeader(r io.Reader) error {
+func readSnapshotHeader(r io.Reader) (byte, error) {
 	magic := make([]byte, len(snapshotMagic))
 	if _, err := io.ReadFull(r, magic); err != nil {
-		return fmt.Errorf("snapshot magic: %w", err)
+		return 0, fmt.Errorf("snapshot magic: %w", err)
 	}
 	if string(magic) != snapshotMagic {
-		return fmt.Errorf("snapshot: bad magic %q", magic)
+		return 0, fmt.Errorf("snapshot: bad magic %q", magic)
 	}
 	ver := make([]byte, 1)
 	if _, err := io.ReadFull(r, ver); err != nil {
-		return fmt.Errorf("snapshot version: %w", err)
+		return 0, fmt.Errorf("snapshot version: %w", err)
 	}
-	if ver[0] != snapshotVer {
-		return fmt.Errorf("snapshot: unsupported version %d", ver[0])
+	if ver[0] != snapshotVer && ver[0] != snapshotVer1 {
+		return 0, fmt.Errorf("snapshot: unsupported version %d", ver[0])
 	}
-	return nil
+	return ver[0], nil
 }
 
 // clearAllShards wipes per-shard state ahead of Restore. resourceTotal
@@ -246,20 +258,20 @@ func (lm *LockManager) clearAllShards() {
 	lm.resourceTotal.Store(0)
 }
 
-func (lm *LockManager) restoreShards(r io.Reader) error {
+func (lm *LockManager) restoreShards(r io.Reader, ver byte) error {
 	nRes, err := readU32(r)
 	if err != nil {
 		return fmt.Errorf("snapshot total resources: %w", err)
 	}
 	for i := uint32(0); i < nRes; i++ {
-		if err := lm.restoreOneResource(r); err != nil {
+		if err := lm.restoreOneResource(r, ver); err != nil {
 			return err
 		}
 	}
 	return lm.restoreEnqueuedIndex(r)
 }
 
-func (lm *LockManager) restoreOneResource(r io.Reader) error {
+func (lm *LockManager) restoreOneResource(r io.Reader, ver byte) error {
 	key, err := readString16(r)
 	if err != nil {
 		return err
@@ -273,14 +285,14 @@ func (lm *LockManager) restoreOneResource(r io.Reader) error {
 		return err
 	}
 	st := &ResourceState{Limit: int(limit), Holders: map[string]*holder{}, LastActivity: timeFromNanos(lastActivity)}
-	return lm.restoreResourceBody(r, key, st)
+	return lm.restoreResourceBody(r, key, st, ver)
 }
 
-func (lm *LockManager) restoreResourceBody(r io.Reader, key string, st *ResourceState) error {
-	if err := readHolders(r, st); err != nil {
+func (lm *LockManager) restoreResourceBody(r io.Reader, key string, st *ResourceState, ver byte) error {
+	if err := readHolders(r, st, ver); err != nil {
 		return err
 	}
-	if err := readWaiters(r, st); err != nil {
+	if err := readWaiters(r, st, ver); err != nil {
 		return err
 	}
 	sh := lm.shardFor(key)
@@ -292,20 +304,20 @@ func (lm *LockManager) restoreResourceBody(r io.Reader, key string, st *Resource
 	return nil
 }
 
-func readHolders(r io.Reader, st *ResourceState) error {
+func readHolders(r io.Reader, st *ResourceState, ver byte) error {
 	n, err := readU32(r)
 	if err != nil {
 		return err
 	}
 	for i := uint32(0); i < n; i++ {
-		if err := readOneHolder(r, st); err != nil {
+		if err := readOneHolder(r, st, ver); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func readOneHolder(r io.Reader, st *ResourceState) error {
+func readOneHolder(r io.Reader, st *ResourceState, ver byte) error {
 	token, err := readString16(r)
 	if err != nil {
 		return err
@@ -322,17 +334,23 @@ func readOneHolder(r io.Reader, st *ResourceState) error {
 	if err != nil {
 		return err
 	}
-	st.Holders[token] = &holder{connID: connID, leaseExpires: timeFromNanos(leaseExpiresNanos), ref: ref}
+	var abandoned int64
+	if ver >= snapshotVer {
+		if abandoned, err = readI64(r); err != nil {
+			return err
+		}
+	}
+	st.Holders[token] = &holder{connID: connID, leaseExpires: timeFromNanos(leaseExpiresNanos), ref: ref, abandonedAtNanos: abandoned}
 	return nil
 }
 
-func readWaiters(r io.Reader, st *ResourceState) error {
+func readWaiters(r io.Reader, st *ResourceState, ver byte) error {
 	n, err := readU32(r)
 	if err != nil {
 		return err
 	}
 	for i := uint32(0); i < n; i++ {
-		w, err := readOneWaiter(r)
+		w, err := readOneWaiter(r, ver)
 		if err != nil {
 			return err
 		}
@@ -341,7 +359,7 @@ func readWaiters(r io.Reader, st *ResourceState) error {
 	return nil
 }
 
-func readOneWaiter(r io.Reader) (*waiter, error) {
+func readOneWaiter(r io.Reader, ver byte) (*waiter, error) {
 	ref, err := readString16(r)
 	if err != nil {
 		return nil, err
@@ -358,7 +376,13 @@ func readOneWaiter(r io.Reader) (*waiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &waiter{ref: ref, connID: connID, leaseTTL: time.Duration(leaseTTLNanos), salt: salt}, nil
+	var abandoned int64
+	if ver >= snapshotVer {
+		if abandoned, err = readI64(r); err != nil {
+			return nil, err
+		}
+	}
+	return &waiter{ref: ref, connID: connID, leaseTTL: time.Duration(leaseTTLNanos), salt: salt, abandonedAtNanos: abandoned}, nil
 }
 
 func rebuildOwnedIndex(sh *shard, key string, st *ResourceState) {

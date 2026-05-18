@@ -30,6 +30,7 @@ type clusterCfg struct {
 	budget    int
 	dial      dialFunc
 	authToken string
+	stableRef string
 }
 
 // ClusterOption configures NewCluster.
@@ -51,6 +52,24 @@ func WithClusterRedirectBudget(n int) ClusterOption {
 // no authentication step (the default).
 func WithClusterAuthToken(tok string) ClusterOption {
 	return func(c *clusterCfg) { c.authToken = tok }
+}
+
+// WithClusterStableRef makes every dialed Conn send a `stable-ref`
+// command with ref before the first operation. With a stable ref set,
+// a Cluster operation's underlying acquire/enqueue/wait carries this
+// identity across a leader failover — a reconnect re-attaches to the
+// existing FSM slot (preserving FIFO position) rather than starting
+// from the back of the queue.
+//
+// ref must be non-empty and ≤ 64 ASCII bytes; longer or empty values
+// are silently ignored (the Cluster falls back to the default
+// connID-derived ref).
+func WithClusterStableRef(ref string) ClusterOption {
+	return func(c *clusterCfg) {
+		if ref != "" && len(ref) <= 64 {
+			c.stableRef = ref
+		}
+	}
 }
 
 // withClusterDial is an internal option used by tests to inject a
@@ -151,12 +170,17 @@ func (cl *Cluster) isKnownMember(addr string) bool {
 	return false
 }
 
-// runOnConn handles auth+op+close so dispatch stays under the cyclo
-// ceiling.
+// runOnConn handles auth+stable-ref+op+close so dispatch stays under
+// the cyclo ceiling.
 func (cl *Cluster) runOnConn(conn *Conn, op func(c *Conn) error) error {
 	defer conn.Close()
 	if cl.cfg.authToken != "" {
 		if err := Authenticate(conn, cl.cfg.authToken); err != nil {
+			return err
+		}
+	}
+	if cl.cfg.stableRef != "" {
+		if err := SetStableRef(conn, cl.cfg.stableRef); err != nil {
 			return err
 		}
 	}

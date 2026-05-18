@@ -91,6 +91,13 @@ func (lm *LockManager) applyAcquireLocked(sh *shard, key string, limit int, ref 
 
 // ApplyEnqueue is the FSM-side phase-1 enqueue (two-phase). Returns
 // either StatusAcquired with a token (fast path) or StatusQueued.
+//
+// Stable-ref re-adopt path: when OrphanTTL > 0 and the caller supplied
+// a non-empty ref, the FSM first looks for an existing orphaned holder
+// or waiter on (key, ref). A matching holder → re-adopt and return the
+// original token (StatusAcquired). A matching waiter → re-adopt and
+// return StatusQueued. Otherwise the regular fast-path / queue logic
+// runs.
 func (lm *LockManager) ApplyEnqueue(now time.Time, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (ApplyResult, []Grant, error) {
 	eqKey := connKey{ConnID: connID, Key: key}
 	sh := lm.shardFor(key)
@@ -107,7 +114,62 @@ func (lm *LockManager) ApplyEnqueue(now time.Time, key string, limit int, ref st
 	if err != nil {
 		return ApplyResult{}, nil, err
 	}
+	if res, ok := lm.tryReAdopt(sh, st, eqKey, key, ref, connID, leaseTTL, now); ok {
+		return res, pre, nil
+	}
 	return lm.applyEnqueueOnto(sh, st, eqKey, key, ref, connID, leaseTTL, salt, now, pre)
+}
+
+// tryReAdopt looks for an orphaned holder or waiter on (key, ref) and,
+// if found, re-attaches it to the new connID. Returns (result, true)
+// if a re-adopt happened; (zero, false) otherwise. Caller holds sh.mu.
+func (lm *LockManager) tryReAdopt(sh *shard, st *ResourceState, eqKey connKey, key, ref string, connID uint64, leaseTTL time.Duration, now time.Time) (ApplyResult, bool) {
+	if ref == "" || lm.cfg.OrphanTTL <= 0 {
+		return ApplyResult{}, false
+	}
+	if tok, h := findOrphanHolder(st, ref); h != nil {
+		h.connID = connID
+		h.abandonedAtNanos = 0
+		// Recompute leaseExpires off the caller's new TTL request — a
+		// reconnect implicitly renews the lease the same way a direct
+		// renew would. (The new TTL is what the FSM sees on the apply,
+		// so it's deterministic.)
+		h.leaseExpires = now.Add(leaseTTL)
+		sh.addOwned(connID, key, tok)
+		sh.setEnqueued(eqKey, &enqueuedState{token: tok, leaseTTL: leaseTTL})
+		return ApplyResult{Status: StatusAcquired, Token: tok, LeaseSec: secondsOf(leaseTTL)}, true
+	}
+	if w := findOrphanWaiter(st, ref); w != nil {
+		w.connID = connID
+		w.abandonedAtNanos = 0
+		w.leaseTTL = leaseTTL
+		sh.setEnqueued(eqKey, &enqueuedState{waiter: w, leaseTTL: leaseTTL})
+		return ApplyResult{Status: StatusQueued}, true
+	}
+	return ApplyResult{}, false
+}
+
+// findOrphanHolder returns (token, holder) for the first orphaned
+// holder on st with matching ref, or ("", nil).
+func findOrphanHolder(st *ResourceState, ref string) (string, *holder) {
+	for tok, h := range st.Holders {
+		if h.ref == ref && h.abandonedAtNanos != 0 {
+			return tok, h
+		}
+	}
+	return "", nil
+}
+
+// findOrphanWaiter returns the first orphaned waiter on st with
+// matching ref, or nil.
+func findOrphanWaiter(st *ResourceState, ref string) *waiter {
+	for i := st.WaiterHead; i < len(st.Waiters); i++ {
+		w := st.Waiters[i]
+		if w != nil && w.ref == ref && w.abandonedAtNanos != 0 {
+			return w
+		}
+	}
+	return nil
 }
 
 func (lm *LockManager) applyEnqueueOnto(sh *shard, st *ResourceState, eqKey connKey, key, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte, now time.Time, pre []Grant) (ApplyResult, []Grant, error) {
@@ -215,34 +277,80 @@ func (lm *LockManager) ApplyCleanupConn(now time.Time, ref string, connID uint64
 func (lm *LockManager) applyCleanupConnShard(sh *shard, ref string, connID uint64, now time.Time) ([]Grant, error) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	lm.cleanupEnqueuedForRef(sh, ref, connID)
-	lm.cleanupPendingWaitersForRef(sh, ref, connID)
+	lm.cleanupEnqueuedForRef(sh, ref, connID, now)
+	lm.cleanupPendingWaitersForRef(sh, ref, connID, now)
 	return lm.releaseOwnedForRef(sh, ref, connID, now)
 }
 
-func (lm *LockManager) cleanupEnqueuedForRef(sh *shard, ref string, connID uint64) {
-	_ = ref // routed via connID in v1; reserved for stable-ref cleanup
+func (lm *LockManager) cleanupEnqueuedForRef(sh *shard, ref string, connID uint64, now time.Time) {
+	_ = ref // routed via connID; the per-waiter ref drives orphan vs remove
 	for _, ck := range sh.enqueuedKeys(connID) {
 		es := sh.connEnqueued[ck]
 		sh.removeEnqueued(ck)
-		if es != nil && es.waiter != nil {
-			if st := sh.resources[ck.Key]; st != nil {
-				st.removeWaiter(es.waiter)
-			}
+		if es == nil || es.waiter == nil {
+			continue
 		}
+		st := sh.resources[ck.Key]
+		if st == nil {
+			continue
+		}
+		if lm.orphanWaiterIfStable(es.waiter, now) {
+			continue // kept in st.Waiters, abandoned, awaiting re-adopt
+		}
+		st.removeWaiter(es.waiter)
 	}
 }
 
-func (lm *LockManager) cleanupPendingWaitersForRef(sh *shard, ref string, connID uint64) {
-	_ = ref // routed via connID in v1; reserved for stable-ref cleanup
+// orphanWaiterIfStable returns true iff the waiter was marked abandoned
+// (kept in the FSM for re-adopt). Otherwise false → caller removes it
+// today's way.
+func (lm *LockManager) orphanWaiterIfStable(w *waiter, now time.Time) bool {
+	if w == nil || w.ref == "" || lm.cfg.OrphanTTL <= 0 {
+		return false
+	}
+	w.abandonedAtNanos = now.UnixNano()
+	w.connID = 0 // dead conn; new connection re-binds on re-adopt
+	return true
+}
+
+func (lm *LockManager) cleanupPendingWaitersForRef(sh *shard, ref string, connID uint64, now time.Time) {
+	_ = ref
 	closed := map[chan string]struct{}{}
 	for _, st := range sh.resources {
-		st.removeWaitersByConn(connID, closed)
+		lm.orphanOrRemoveWaitersByConn(st, connID, now, closed)
 	}
+}
+
+// orphanOrRemoveWaitersByConn walks st.Waiters, partitioning each
+// waiter owned by connID into orphan-keep vs remove-now. Mirrors
+// ResourceState.removeWaitersByConn but with the stable-ref carve-out.
+func (lm *LockManager) orphanOrRemoveWaitersByConn(st *ResourceState, connID uint64, now time.Time, closed map[chan string]struct{}) {
+	n := st.WaiterHead
+	for i := st.WaiterHead; i < len(st.Waiters); i++ {
+		w := st.Waiters[i]
+		if w.connID != connID {
+			st.Waiters[n] = w
+			n++
+			continue
+		}
+		if lm.orphanWaiterIfStable(w, now) {
+			st.Waiters[n] = w
+			n++
+			continue
+		}
+		if _, already := closed[w.ch]; !already && w.ch != nil {
+			close(w.ch)
+			closed[w.ch] = struct{}{}
+		}
+	}
+	for i := n; i < len(st.Waiters); i++ {
+		st.Waiters[i] = nil
+	}
+	st.Waiters = st.Waiters[:n]
 }
 
 func (lm *LockManager) releaseOwnedForRef(sh *shard, ref string, connID uint64, now time.Time) ([]Grant, error) {
-	_ = ref // routed via connID in v1; reserved for stable-ref cleanup
+	_ = ref // per-holder ref drives orphan vs drop
 	owned := sh.connOwned[connID]
 	var grants []Grant
 	// Iterate keys in sorted order: grantNextAt mints fence numbers
@@ -253,19 +361,39 @@ func (lm *LockManager) releaseOwnedForRef(sh *shard, ref string, connID uint64, 
 		if st == nil {
 			continue
 		}
+		anyDropped := false
 		for token := range owned[key] {
-			if h, ok := st.Holders[token]; ok {
-				lm.dropHolder(sh, st, key, token, h, now)
+			h, ok := st.Holders[token]
+			if !ok {
+				continue
 			}
+			if lm.orphanHolderIfStable(h, now) {
+				continue // kept in st.Holders; awaits re-adopt
+			}
+			lm.dropHolder(sh, st, key, token, h, now)
+			anyDropped = true
 		}
-		g, err := lm.grantNextAt(sh, key, st, now)
-		if err != nil {
-			return grants, err
+		if anyDropped {
+			g, err := lm.grantNextAt(sh, key, st, now)
+			if err != nil {
+				return grants, err
+			}
+			grants = append(grants, g...)
 		}
-		grants = append(grants, g...)
 	}
 	delete(sh.connOwned, connID)
 	return grants, nil
+}
+
+// orphanHolderIfStable returns true iff the holder was marked
+// abandoned. Mirrors orphanWaiterIfStable.
+func (lm *LockManager) orphanHolderIfStable(h *holder, now time.Time) bool {
+	if h == nil || h.ref == "" || lm.cfg.OrphanTTL <= 0 {
+		return false
+	}
+	h.abandonedAtNanos = now.UnixNano()
+	h.connID = 0
+	return true
 }
 
 // sortedKeys returns m's keys in ascending order (m may be nil).
@@ -370,16 +498,53 @@ func (lm *LockManager) getOrCreateAt(sh *shard, key string, limit int, now time.
 func (lm *LockManager) evictExpiredAt(sh *shard, key string, st *ResourceState, now time.Time) ([]Grant, error) {
 	any := false
 	for token, h := range st.Holders {
-		if !leaseHasExpired(h, now) {
-			continue
+		if leaseHasExpired(h, now) || lm.orphanPastTTL(h.abandonedAtNanos, now) {
+			lm.dropHolder(sh, st, key, token, h, now)
+			any = true
 		}
-		lm.dropHolder(sh, st, key, token, h, now)
+	}
+	if lm.evictExpiredOrphanWaiters(st, now) {
 		any = true
 	}
 	if !any {
 		return nil, nil
 	}
 	return lm.grantNextAt(sh, key, st, now)
+}
+
+// orphanPastTTL reports whether an entry's abandonedAtNanos is older
+// than OrphanTTL relative to now. Returns false when not configured
+// (OrphanTTL == 0) or the entry isn't abandoned.
+func (lm *LockManager) orphanPastTTL(abandonedAtNanos int64, now time.Time) bool {
+	if abandonedAtNanos == 0 || lm.cfg.OrphanTTL <= 0 {
+		return false
+	}
+	return now.UnixNano()-abandonedAtNanos > int64(lm.cfg.OrphanTTL)
+}
+
+// evictExpiredOrphanWaiters removes waiters whose abandonedAtNanos is
+// older than OrphanTTL. Returns true iff at least one was removed
+// (caller uses this to decide whether to promote the next waiter).
+func (lm *LockManager) evictExpiredOrphanWaiters(st *ResourceState, now time.Time) bool {
+	removed := false
+	n := st.WaiterHead
+	for i := st.WaiterHead; i < len(st.Waiters); i++ {
+		w := st.Waiters[i]
+		if w == nil {
+			continue
+		}
+		if lm.orphanPastTTL(w.abandonedAtNanos, now) {
+			removed = true
+			continue
+		}
+		st.Waiters[n] = w
+		n++
+	}
+	for i := n; i < len(st.Waiters); i++ {
+		st.Waiters[i] = nil
+	}
+	st.Waiters = st.Waiters[:n]
+	return removed
 }
 
 // grantNextAt drains the waiter queue while capacity is available,

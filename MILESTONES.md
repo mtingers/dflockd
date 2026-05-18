@@ -172,3 +172,37 @@ Tick rules: `✅ shipped`, `🟡 partial`, `❌ deferred with workaround`,
 
 ## Handoff
 - [x] **Phase 9 — `PRODUCTION_READINESS.md` updated**: Gap 2 closed; Gap 1 explicitly deferred with workaround ✅
+
+---
+
+# Production-hardening pass 4 (2026-05-17)
+
+Fifth one-shot pass. Closes the last cluster-mode safety gap from PR-3:
+FIFO across leader failover via stable client refs.
+
+Scope (shipped):
+- **Gap 1: FIFO-across-leader-failover via stable-client-ref re-attach.**
+  Implemented across 4 layers:
+  - **FSM** (`internal/lock`): `holder` + `waiter` carry `abandonedAtNanos`; `ApplyCleanupConn` orphans ref-tagged entries instead of removing; `ApplyEnqueue` re-adopts matching `(key, ref)` orphans; `ApplyEvictExpired` retires orphans past `OrphanTTL`.
+  - **Snapshot codec**: bumped to v2, carries the new field; v1 still readable.
+  - **Config**: `OrphanTTL time.Duration` (default 0 = old behavior).
+  - **Wire**: `stable-ref <ref>` TCP command (`protocol.CmdStableRef`); per-conn server state; `effectiveRef` helper threads it through all propose paths.
+  - **Go client**: `client.SetStableRef(conn, ref)` + `client.WithClusterStableRef(ref)` option.
+- 8 new tests: 5 FSM-level (orphan, re-adopt, snapshot round-trip, evict-past-TTL, old-behavior-preserved), 3 server-level (set-once, effective-ref-fallback, clear-releases-slot).
+
+## Discovery & Planning
+- [x] **Phase 1 — Discovery**: FSM-determinism risk model; scope: waiter + holder orphan/re-adopt ✅
+- [x] **Phase 2 — Glossary delta**: orphan, abandonedAtNanos, stable ref already pinned in PR-3 prep ✅
+- [x] **Phase 3 — Plan**: 4-layer change set; default OrphanTTL=0 preserves old behavior ✅
+
+## Build
+- [x] **Phase 4 — Interfaces**: state struct + snapshot codec + config + protocol + client option ✅
+- [x] **Phase 5 — RED tests**: 5 FSM-level tests written; failing on today's behavior ✅
+- [x] **Phase 6 — GREEN**: FSM logic + snapshot codec + wire + client; all tests green; cyclo + funlen under bar ✅
+
+## Hardening
+- [x] **Phase 7 — Security pass**: ref is a session-scoped opaque identifier (NOT authenticated); documented as a secret; bounded length + ASCII validation ✅
+- [x] **Phase 8 — Documentation pass**: docs/operations/cluster.md FIFO section + security note; CHANGELOG entry ✅
+
+## Handoff
+- [x] **Phase 9 — `PRODUCTION_READINESS.md` updated**: bottom-line posture upgraded to "beta-plus / GA-eligible"; only multi-host soak remaining ✅

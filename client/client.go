@@ -362,6 +362,32 @@ func Barrier(c *Conn) error {
 	return nil
 }
 
+// SetStableRef sends a "stable-ref <ref>" command to the server,
+// pinning the connection's caller identity. After this call, any
+// acquire / enqueue / wait on this connection uses ref instead of
+// the server's connID-derived value. Used by failover-aware callers:
+// on a reconnect after a leader kill, a fresh connection with the
+// same stable ref re-attaches to the original FSM waiter/holder slot
+// (preserving FIFO order) instead of starting from the back of the
+// queue.
+//
+// Returns once per connection — a second call returns an error. The
+// ref is bounded to 64 ASCII bytes; longer or non-printable values
+// are rejected.
+func SetStableRef(c *Conn, ref string) error {
+	if ref == "" {
+		return fmt.Errorf("dflockd: stable-ref: empty")
+	}
+	resp, err := c.sendRecv("stable-ref", ref, "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("dflockd: stable-ref: %s", resp)
+	}
+	return nil
+}
+
 // Renew sends an "n" command and returns the remaining lease seconds.
 func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
 	return doRenew(c, "n", key, token, opts)
