@@ -101,6 +101,11 @@ type Node struct {
 	stopc     chan struct{}
 	donec     chan struct{}
 	applyDone chan struct{} // closed when the apply goroutine exits
+
+	// counters records monotonic operational metrics (proposals, applies,
+	// leader-change count). Updated from many goroutines under atomics;
+	// readers call Snapshot for a consistent read.
+	counters *Counters
 }
 
 // confChange is one membership change submitted to the run loop. It is
@@ -226,6 +231,7 @@ func newNode(cfg Config, fsm FSM, rl *raftLog, transport Transport, config Confi
 		stopc:       make(chan struct{}),
 		donec:       make(chan struct{}),
 		applyDone:   make(chan struct{}),
+		counters:    &Counters{},
 	}
 }
 
@@ -499,6 +505,7 @@ func (n *Node) becomeLeader() {
 		n.progress[id] = &peerProgress{nextIndex: last + 1}
 	}
 	n.heartbeatElapsed = 0
+	n.counters.IncLeaderChange()
 	n.logger.Info("became leader", "term", n.term)
 	n.appendLeaderNoop()
 	n.broadcastAppendEntries()

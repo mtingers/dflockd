@@ -172,7 +172,15 @@ mode is opt-in via a small set of additional flags
 `--raft-tls-cert`/`--raft-tls-key`/`--raft-tls-ca` mTLS triple). With
 none of those set the server runs exactly as documented above —
 single-process, in-memory, byte-for-byte the v2.1.x single-node
-binary. See:
+binary.
+
+The `--admin-token <token>` flag (or `DFLOCKD_ADMIN_TOKEN` env var)
+enables the cluster reconfiguration HTTP endpoints
+(`POST /v1/admin/voters`, `DELETE /v1/admin/voters/{id}`). It is
+**default-deny** — when unset, those endpoints return `503
+admin_disabled`. The admin token is separate from the session-auth
+token (`--auth-token`); pair it with `--http-port` and TLS at the
+ingress. See:
 
 - [architecture/cluster.md](architecture/cluster.md) — design,
   topology, FSM, durability layout, failure modes.

@@ -37,3 +37,85 @@ Deliverables of the audit:
 
 ## Handoff
 - [x] **Phase 9 — `ONE_SHOT_AUDIT.md`** written; `MILESTONES.md` fully resolved; commits per phase on `raft-replication` *(✅ — final 6-section report in [ONE_SHOT_AUDIT.md §Phase 9](ONE_SHOT_AUDIT.md#phase-9--final-report); 9 commits on `raft-replication` (`cba9463`..this commit))*
+
+---
+
+# Production-hardening pass (2026-05-17)
+
+Second one-shot pass on `raft-replication`, this time **build** mode: the
+audit declared the cluster mode "alpha"; this pass aims to graduate it to
+"GA-eligible for static-bootstrap workloads that don't depend on
+FIFO-across-leader-failover," closing the audit's deferred items that are
+safely shippable in a single session. Calibration: **service tier**,
+refactor mode (extending an existing tree).
+
+Deliverables this pass:
+- `MILESTONES.md` (this file — second checklist below)
+- `GLOSSARY.md` (extended)
+- `PRODUCTION_READINESS.md` (rewritten — see Phase 9)
+- New code: counter metrics, admin add/remove voter endpoints
+  (HTTP + TCP), public ReadIndex/Barrier API, constant-time token
+  compare, CORS middleware test, race-flake-resistant `make test-race`.
+- Documented deferrals (with workarounds): dynamic-join InstallSnapshot,
+  FIFO across leader failover (stable client ref), multi-node
+  fault-injection soak harness.
+
+Tick rules: `✅ shipped`, `🟡 partial`, `❌ deferred with workaround`,
+`N/A`.
+
+## Discovery & Planning
+- [x] **Phase 1 — Discovery**: deficits restated; scope cut from the 8-item gap list ✅
+- [x] **Phase 2 — Glossary**: new terms pinned (admin endpoint, voter, ReadIndex public API, counter metric, stable client ref) ✅
+- [x] **Phase 3 — Plan**: ship-now vs deferred matrix, with reasons ✅
+
+## Build
+- [x] **Phase 4 — Interfaces & schemas**: HTTP routes, TCP commands, Go client methods, counter store API — stubs only ✅
+- [x] **Phase 5 — RED tests**: failing tests for every new interface ✅
+- [x] **Phase 6 — GREEN implementation**: tests green; cyclo ≤10, funlen ≤40 preserved ✅
+
+## Hardening
+- [x] **Phase 7 — Security pass**: admin auth, audit logs, follower-redirect, no info leak; constant-time compare on tokens ✅
+- [x] **Phase 8 — Documentation pass**: README + operations/cluster.md + OpenAPI + CHANGELOG reconciled ✅
+
+## Handoff
+- [x] **Phase 9 — `PRODUCTION_READINESS.md` rewritten**: declares GA-eligibility for the supported workloads; remaining gaps named ✅
+
+---
+
+# Production-hardening pass 2 (2026-05-17)
+
+Third one-shot pass on `raft-replication`. Pass 1 (the audit) said
+"alpha". Pass 2 graduated it to beta — GA-eligible for static-bootstrap
+workloads that don't depend on FIFO across leader failover. This pass
+closes three more of the deferred follow-ons to widen the
+GA envelope without taking on FSM-determinism-touching work in a single
+session. Calibration: **service tier**, refactor mode.
+
+Scope (ship now):
+- **Cluster-aware Go client** (`client.Cluster`) — transparent leader cache + automatic redirect/retry on `*NotLeaderError`. Closes PR-1 item 4.
+- **Soak harness** (`cmd/cluster-soak`) — in-process 3-node cluster + sustained writes + injected leader-kills, asserts no fence-token regression and no lost-grant violations. Closes PR-1 item 1.
+- **Fuzz targets for cluster codecs** — `internal/raft` frame codec and `internal/cluster` Command codec. Closes PR-1 item 5.
+
+Deferred (with workarounds, documented):
+- **FIFO across leader failover** (PR-1 item 2 / PLAN.md §4.7) — stable client refs in the FSM. Single-session-sized on its own; touches FSM determinism; defer.
+- **Dynamic-join with InstallSnapshot to empty node** (PR-1 item 3) — affects boot sequence and recovery semantics; defer; workaround is pre-seed snapshot then `AddVoter`.
+
+Tick rules: `✅ shipped`, `🟡 partial`, `❌ deferred with workaround`,
+`N/A`.
+
+## Discovery & Planning
+- [x] **Phase 1 — Discovery (non-interactive)**: scope cut from PR-1 deferred items ✅
+- [x] **Phase 2 — Glossary delta**: new terms — cluster-aware client, leader cache, retry budget, soak harness ✅
+- [x] **Phase 3 — Plan + ship-vs-defer matrix**: per-item reason ✅
+
+## Build
+- [x] **Phase 4 — Interfaces & schemas**: `client.Cluster` API, soak harness CLI, fuzz target signatures ✅
+- [x] **Phase 5 — RED tests**: failing tests for client leader-cache / redirect / budget; fuzz seed corpus ✅
+- [x] **Phase 6 — GREEN implementation**: tests green; cyclo ≤10, funlen ≤40 preserved ✅
+
+## Hardening
+- [x] **Phase 7 — Security pass**: leader-hint clamp added; redirect-to-attacker-addr now bounded; retry budget DoS-resistant ✅
+- [x] **Phase 8 — Documentation pass**: client + soak docs in operations/cluster.md; CHANGELOG entries ✅
+
+## Handoff
+- [x] **Phase 9 — `PRODUCTION_READINESS.md` updated**: PR-1 items 1/4/5 closed; envelope tightened ✅

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/raft"
 	"github.com/mtingers/dflockd/internal/server"
 )
 
@@ -62,7 +63,19 @@ func (f *httpFakeCluster) ProposeCleanupConn(_ context.Context, _ string, _ uint
 	return lock.ApplyResult{Status: lock.StatusOK}, nil
 }
 
-func newClusterHTTPTest(t *testing.T, fc *httpFakeCluster) *httpServer {
+func (f *httpFakeCluster) Barrier(_ context.Context) error { return nil }
+
+func (f *httpFakeCluster) AddVoter(_ context.Context, _ raft.NodeID, _, _ string) error {
+	return nil
+}
+
+func (f *httpFakeCluster) RemoveServer(_ context.Context, _ raft.NodeID) error { return nil }
+
+func (f *httpFakeCluster) MetricsSnapshot() raft.ClusterMetrics {
+	return raft.ClusterMetrics{}
+}
+
+func newClusterHTTPTest(t *testing.T, fc server.Cluster) *httpServer {
 	t.Helper()
 	cfg := defaultTestConfig()
 	log := discardLogger()

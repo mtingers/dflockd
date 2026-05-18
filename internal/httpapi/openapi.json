@@ -128,6 +128,59 @@
         }
       }
     },
+    "/v1/readindex": {
+      "get": {
+        "tags": ["cluster"],
+        "summary": "Linearizable read barrier",
+        "operationId": "readIndex",
+        "description": "Proposes a no-op through Raft and returns 200 once it applies. After the call returns, every preceding committed write is reflected in state observable on this leader. On a follower returns 503 with X-Dflockd-Leader; on a single-node server returns 404.",
+        "responses": {
+          "200": {"description": "Barrier applied", "content": {"application/json": {"schema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["ok"]}}}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"description": "Not in cluster mode", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "cluster_disabled"}}}},
+          "503": {"description": "Not leader (X-Dflockd-Leader header carries the leader's raft client address)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_leader"}}}}
+        }
+      }
+    },
+    "/v1/admin/voters": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Add a voting cluster member",
+        "operationId": "adminAddVoter",
+        "description": "Proposes a single-server addition through Raft. Requires X-Dflockd-Admin (constant-time compared against --admin-token / DFLOCKD_ADMIN_TOKEN). 503 admin_disabled when no admin token is configured; 503 not_leader on a follower (X-Dflockd-Leader carries the leader address).",
+        "parameters": [
+          {"name": "X-Dflockd-Admin", "in": "header", "required": true, "schema": {"type": "string"}, "description": "Admin secret. Constant-time compared."}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"type": "object", "required": ["node_id", "raft_addr", "client_addr"], "properties": {"node_id": {"type": "string"}, "raft_addr": {"type": "string", "example": "10.0.0.4:7001"}, "client_addr": {"type": "string", "example": "10.0.0.4:6388"}}}}}
+        },
+        "responses": {
+          "200": {"description": "Voter added", "content": {"application/json": {"schema": {"type": "object", "properties": {"status": {"type": "string"}, "node_id": {"type": "string"}}}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"description": "Wrong admin token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "admin_unauthorized"}}}},
+          "503": {"description": "Either admin disabled (no token) or this node is a follower", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}}}}
+        }
+      }
+    },
+    "/v1/admin/voters/{id}": {
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Remove a voting cluster member",
+        "operationId": "adminRemoveVoter",
+        "description": "Proposes a single-server removal through Raft. Same auth model as POST /v1/admin/voters. A leader that removes itself steps down once the entry commits.",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Stable node id."},
+          {"name": "X-Dflockd-Admin", "in": "header", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {"description": "Voter removed", "content": {"application/json": {"schema": {"type": "object", "properties": {"status": {"type": "string"}, "node_id": {"type": "string"}}}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"description": "Wrong admin token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}}}},
+          "503": {"description": "Either admin disabled (no token) or this node is a follower", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}}}}
+        }
+      }
+    },
     "/v1/locks/{key}": {
       "post": {
         "tags": ["locks"],

@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"time"
 )
 
 // runApply is the dedicated FSM-apply goroutine: it drains committed
@@ -43,7 +44,13 @@ func (n *Node) restoreFSMFromBatch(req applyReq) {
 // which the FSM never sees) and resolves the proposer's future if any.
 // A panic in Apply is contained and surfaced through the future.
 func (n *Node) applyOne(e Entry, p *proposal) {
+	start := time.Now()
 	result, applyErr := n.fsmApplySafely(e)
+	if applyErr == nil {
+		n.counters.IncApply(time.Since(start))
+	} else {
+		n.counters.IncApplyFailed()
+	}
 	if p != nil {
 		p.future.resolve(result, applyErr)
 	}

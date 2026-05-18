@@ -47,14 +47,17 @@ func (n *Node) submitProposal(ctx context.Context, p *proposal) (*Future, error)
 // node clusters) advance commit immediately.
 func (n *Node) onPropose(p *proposal) {
 	if n.role != roleLeader {
+		n.counters.IncProposalsFailed()
 		p.future.resolve(nil, ErrNotLeader)
 		return
 	}
 	entry := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: p.typ, Data: p.data}
 	if err := n.log.append([]Entry{entry}); err != nil {
+		n.counters.IncProposalsFailed()
 		p.future.resolve(nil, err)
 		return
 	}
+	n.counters.IncProposals()
 	n.proposals[entry.Index] = p
 	n.advanceSelfProgress(entry.Index)
 	n.broadcastAppendEntries()

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
@@ -76,6 +77,12 @@ type Node struct {
 
 	sweepStop chan struct{}
 	sweepWG   sync.WaitGroup
+
+	// admin-op counters (monotonic; read by MetricsSnapshot)
+	adminAdds         atomic.Uint64
+	adminAddFailed    atomic.Uint64
+	adminRemoves      atomic.Uint64
+	adminRemoveFailed atomic.Uint64
 }
 
 // NewNode wires the raft node + FSM. It does not start any work until
@@ -364,10 +371,15 @@ func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAdd
 	n.setMember(id, Member{RaftAddr: raftAddr, ClientAddr: clientAddr})
 	fut, err := n.raft.AddVoter(ctx, id, raftAddr)
 	if err != nil {
+		n.adminAddFailed.Add(1)
 		return err
 	}
-	_, err = fut.Wait(ctx)
-	return err
+	if _, err = fut.Wait(ctx); err != nil {
+		n.adminAddFailed.Add(1)
+		return err
+	}
+	n.adminAdds.Add(1)
+	return nil
 }
 
 // RemoveServer proposes removing a voter from the cluster. A leader
@@ -375,13 +387,29 @@ func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAdd
 func (n *Node) RemoveServer(ctx context.Context, id raft.NodeID) error {
 	fut, err := n.raft.RemoveServer(ctx, id)
 	if err != nil {
+		n.adminRemoveFailed.Add(1)
 		return err
 	}
 	if _, err = fut.Wait(ctx); err != nil {
+		n.adminRemoveFailed.Add(1)
 		return err
 	}
 	n.deleteMember(id)
+	n.adminRemoves.Add(1)
 	return nil
+}
+
+// MetricsSnapshot returns a flat read of every monotonic cluster
+// counter — including the raft-layer counters (proposals, applies,
+// leader-change count) plus the cluster-layer admin-op counters.
+func (n *Node) MetricsSnapshot() raft.ClusterMetrics {
+	return raft.ClusterMetrics{
+		Raft:              n.raft.Counters().Snapshot(),
+		AdminAddVoter:     n.adminAdds.Load(),
+		AdminAddVoterFail: n.adminAddFailed.Load(),
+		AdminRemoveServer: n.adminRemoves.Load(),
+		AdminRemoveFail:   n.adminRemoveFailed.Load(),
+	}
 }
 
 func (n *Node) setMember(id raft.NodeID, m Member) {

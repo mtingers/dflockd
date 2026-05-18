@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build test lint clean run docs-serve docs-build complexity openapi-sync
+.PHONY: help build test test-race lint clean run docs-serve docs-build complexity openapi-sync
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -12,6 +12,9 @@ build: ## Build the dflockd binary
 
 test: ## Run tests
 	go test ./... -v
+
+test-race: ## Run tests with -race (parallelism capped to avoid raft timer flakes under whole-tree load)
+	go test -race -p=2 -count=1 -timeout=240s ./...
 
 lint: ## Run linter
 	go vet ./...

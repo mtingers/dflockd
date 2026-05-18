@@ -299,6 +299,9 @@ var registeredRoutes = []RegisteredPath{
 	{Pattern: "/v1/semaphores/{key}/renew", Methods: []string{"POST"}},
 	{Pattern: "/v1/semaphores/{key}/enqueue", Methods: []string{"POST"}},
 	{Pattern: "/v1/semaphores/{key}/wait", Methods: []string{"POST"}},
+	{Pattern: "/v1/readindex", Methods: []string{"GET"}},
+	{Pattern: "/v1/admin/voters", Methods: []string{"POST"}},
+	{Pattern: "/v1/admin/voters/{id}", Methods: []string{"DELETE"}},
 }
 
 // Routes returns the registered route list for tests.
@@ -329,6 +332,11 @@ func (h *httpServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/semaphores/{key}/renew", withKey(h.handleRenewSem))
 	mux.HandleFunc("POST /v1/semaphores/{key}/enqueue", withKey(h.handleEnqueueSem))
 	mux.HandleFunc("POST /v1/semaphores/{key}/wait", withKey(h.handleWaitSem))
+
+	mux.HandleFunc("GET /v1/readindex", h.handleReadIndex)
+
+	mux.HandleFunc("POST /v1/admin/voters", h.handleAdminAddVoter)
+	mux.HandleFunc("DELETE /v1/admin/voters/{id}", h.handleAdminRemoveVoter)
 }
 
 // withKey extracts and validates the {key} path param.

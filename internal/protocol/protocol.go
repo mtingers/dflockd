@@ -57,6 +57,12 @@ const (
 	CmdPing       = "ping"
 	CmdStats      = "stats"
 	CmdAuth       = "auth"
+	// CmdBarrier proposes a no-op through Raft and waits for it to apply.
+	// In cluster mode it's a linearizable-read barrier (every preceding
+	// committed write is visible after the call returns ok). In single-
+	// node mode it returns ok immediately. On a follower it returns
+	// error_not_leader.
+	CmdBarrier = "barrier"
 )
 
 // Status values returned in responses.
@@ -207,7 +213,7 @@ func parseRequest(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request
 type requestParser func(cmd, key, arg string, defaultLeaseTTL time.Duration) (*Request, error)
 
 var requestParsers = map[string]requestParser{
-	CmdPing: parseNoKeyCommand, CmdStats: parseNoKeyCommand,
+	CmdPing: parseNoKeyCommand, CmdStats: parseNoKeyCommand, CmdBarrier: parseNoKeyCommand,
 	CmdAuth:    parseAuthCommand,
 	CmdAcquire: parseKeyedCommand(parseAcquire), CmdSemAcquire: parseKeyedCommand(parseAcquire),
 	CmdRelease: parseKeyedCommand(parseReleaseCommand), CmdSemRelease: parseKeyedCommand(parseReleaseCommand),

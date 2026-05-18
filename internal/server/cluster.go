@@ -12,6 +12,7 @@ import (
 
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
+	"github.com/mtingers/dflockd/internal/raft"
 )
 
 // Cluster is the contract the cluster.Node fulfills for the server's
@@ -33,6 +34,17 @@ type Cluster interface {
 	ProposeRelease(ctx context.Context, key, token string) (lock.ApplyResult, error)
 	ProposeRenew(ctx context.Context, key, token string, leaseTTL time.Duration) (lock.ApplyResult, error)
 	ProposeCleanupConn(ctx context.Context, ref string, connID uint64) (lock.ApplyResult, error)
+	// Barrier proposes a no-op and waits for it to apply — the public
+	// linearizable-read primitive. Returns ErrNotLeader on a follower.
+	Barrier(ctx context.Context) error
+	// AddVoter proposes a single-server addition. Returns
+	// ErrConfigChangeInProgress / ErrNotLeader for the obvious cases.
+	AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAddr string) error
+	// RemoveServer proposes a single-server removal. A leader removing
+	// itself steps down once the entry commits.
+	RemoveServer(ctx context.Context, id raft.NodeID) error
+	// MetricsSnapshot returns a flat read of monotonic cluster counters.
+	MetricsSnapshot() raft.ClusterMetrics
 }
 
 // SetCluster wires a cluster.Node into this server. After this call,

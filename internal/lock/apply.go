@@ -420,7 +420,7 @@ func (lm *LockManager) promoteWaiter(sh *shard, st *ResourceState, key string, w
 func (lm *LockManager) dropHolder(sh *shard, st *ResourceState, key, token string, h *holder, now time.Time) {
 	sh.removeOwned(h.connID, key, token)
 	eqKey := connKey{ConnID: h.connID, Key: key}
-	if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
+	if es, ok := sh.connEnqueued[eqKey]; ok && constantTimeTokenEqual(es.token, token) {
 		sh.removeEnqueued(eqKey)
 	}
 	delete(st.Holders, token)

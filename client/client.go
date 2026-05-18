@@ -344,6 +344,24 @@ func Release(c *Conn, key, token string) error {
 	return doRelease(c, "r", key, token)
 }
 
+// Barrier sends a "barrier" command and returns once the server
+// acknowledges it. In cluster mode this is a linearizable-read barrier:
+// when the call returns nil, every preceding write that committed
+// against the connected leader is reflected in state the same
+// connection's subsequent read will see. In single-node mode it
+// returns immediately. On a follower the error is a *NotLeaderError —
+// reconnect to the named leader and retry.
+func Barrier(c *Conn) error {
+	resp, err := c.sendRecv("barrier", "_", "")
+	if err != nil {
+		return err
+	}
+	if resp != "ok" {
+		return fmt.Errorf("dflockd: barrier: %s", resp)
+	}
+	return nil
+}
+
 // Renew sends an "n" command and returns the remaining lease seconds.
 func Renew(c *Conn, key, token string, opts ...Option) (remaining int, err error) {
 	return doRenew(c, "n", key, token, opts)

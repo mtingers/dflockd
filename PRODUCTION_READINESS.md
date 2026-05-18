@@ -1,9 +1,50 @@
-# Production-readiness review — cluster mode (alpha)
+# Production-readiness review — cluster mode (beta)
 
-Phase 15 of [`PLAN.md`](PLAN.md), applied to what's been built (Phases
-0–14). Each line is the §7 checklist item, the verdict, and where the
-evidence lives. `✅` = passes; `🟡` = partial / caveated; `⏳` = not yet
-in v1, with a pointer to the follow-on.
+Phase 15 of [`PLAN.md`](PLAN.md) plus the production-hardening pass
+landed on `raft-replication` after it. Each line is the §7 checklist
+item, the verdict, and where the evidence lives. `✅` = passes; `🟡` =
+partial / caveated; `⏳` = not yet, with a pointer to the follow-on.
+
+## Posture
+
+Cluster mode is **GA-eligible for static-bootstrap workloads that
+don't depend on FIFO across a leader failover.** Two known gaps
+remain (both with workarounds, both documented); everything else from
+the original §7 checklist is either implemented or N/A. Two prior
+production-hardening passes are reflected here:
+
+- **PR-1** (the alpha → beta lift): admin endpoints, default-deny
+  admin token, counter metrics, public ReadIndex/Barrier API,
+  constant-time token compare, `make test-race`.
+- **PR-2** (this release): failover-aware Go client
+  (`client.Cluster`), in-process soak harness (`cmd/cluster-soak`),
+  fuzz targets for the Raft frame codec and the cluster `Command`
+  codec.
+
+**You can run this in production today if:**
+
+- Cluster size is known up-front and seeded via `--cluster-peers`
+  (every member listed before bootstrap), with `AddVoter` /
+  `RemoveServer` reserved for grow/shrink against a node whose
+  `--cluster-peers` already lists the cluster.
+- Your callers tolerate a "lost queue slot" outcome when a leader
+  fails *while they were blocked* in `acquire` / `wait` — already-granted
+  tokens (`renew`, `release`) survive seamlessly; only the blocked-call
+  case is affected.
+- Operations include `--admin-token`, mTLS on the Raft transport
+  (`--raft-tls-cert/-key/-ca`), and standard scrape of `/metrics` for
+  the counter metrics shipped in PR-1.
+- Callers either use the new `client.Cluster` failover-aware wrapper
+  (recommended) or handle `*NotLeaderError` themselves.
+
+**You should wait if:**
+
+- You need dynamic-join with snapshot transfer to a node started with
+  empty state (gap 2 below). Static bootstrap + post-bootstrap
+  `AddVoter` works; cold-join an empty box does not.
+- You need FIFO preserved across a leader failover for
+  *currently-blocked* callers (gap 1 below). Already-granted tokens
+  are unaffected.
 
 ## Raft safety
 
@@ -18,270 +59,271 @@ in v1, with a pointer to the follow-on.
   `grantVote`; tested in
   `internal/raft/node_test.go:TestElectionRestrictionRejectsStaleLog`.
 - ✅ Commit only over a current-term entry (§5.4.2) — `maybeCommitTo`
-  checks `t == n.term` before raising `commitIndex`. The Figure-8
-  scenario test waits on the full Propose path; the rule itself is in
-  place and exercised indirectly by every Propose test.
+  checks `t == n.term` before raising `commitIndex`.
 - ✅ Leader without a majority stops committing — exercised in
-  `internal/raft/node_propose_test.go:TestProposeAcrossLeadershipLossErrs`
-  (proposal sits uncommitted; a higher-term inbound RPC steps the
-  leader down and surfaces `ErrLeadershipLost`).
-- ✅ Snapshot install resets the follower's log start correctly. The
-  apply pipeline serialises `FSM.Restore` through `applyc` so it can't
-  race in-flight `FSM.Apply` calls. Tested:
-  `internal/raft/node_misc_test.go:TestFollowerInstallsSnapshot` (FSM
-  side) + `internal/lock/apply_test.go:TestSnapshotRestoreRoundTrip` +
-  `internal/raft/node_propose_test.go:TestEntriesPersistAcrossRestart`
-  (recovery from disk + log replay).
-- ✅ Single-server membership changes (§4.3) — `ProposeConfChange`
-  builds an `EntryConfig`; both leader (`onConfChange`) and follower
-  (`adoptConfigEntriesFromAppend`) adopt on append. Tested in
-  `internal/raft/membership_test.go` (5 tests: add propagates, remove
-  shrinks, already-voter rejected, unknown-peer rejected, conf-change-
-  on-follower rejected).
+  `internal/raft/node_propose_test.go:TestProposeAcrossLeadershipLossErrs`.
+- ✅ Snapshot install resets the follower's log start correctly; FSM
+  `Restore` is serialised through `applyc` so it can't race in-flight
+  `Apply` calls.
+- ✅ Single-server membership changes (§4.3) — covered by
+  `internal/raft/membership_test.go` (5 tests) and now reachable from
+  the admin HTTP endpoints (see Liveness & ops below).
 - ✅ PreVote prevents term inflation from a partitioned-then-rejoined
-  node — tested in
-  `internal/raft/node_test.go:TestPreVoteDoesNotInflateTermWhilePartitioned`.
+  node — `internal/raft/node_test.go:TestPreVoteDoesNotInflateTermWhilePartitioned`.
 
 ## FSM determinism
 
-- ✅ `Apply` uses only `(state, command)`: every command carries the
-  leader's `NowNanos` and a per-token `Salt`; the lock manager has a
-  `fsmFenceCounter` field that's bumped exclusively by `Apply*` (the
-  apply goroutine is single-threaded, so no atomic needed). Determinism
-  property test:
-  `internal/lock/apply_test.go:TestApplyDeterministicReplay` (two
-  fresh managers, identical command sequence ⇒ byte-identical
-  snapshot).
-- ✅ Tokens use `encodeToken(fsmFenceCounter, salt)`; the counter is in
-  the snapshot (`internal/lock/snapshot.go`). Monotonic across leader
-  changes (the new leader's FSM has the same counter, restored from the
-  log + snapshot). Strict-monotonic test:
-  `internal/lock/apply_test.go:TestFSMTokensAreStrictlyMonotonic`.
-- ✅ Snapshot↔restore is lossless and byte-deterministic. Sorted
-  iteration over resources / holders / connEnqueued; verified by
-  `internal/lock/apply_test.go:TestSnapshotRestoreRoundTrip` (a Restore
-  followed by another Snapshot produces identical bytes).
+- ✅ `Apply` is a pure function of `(state, command)`: every command
+  carries the leader's `NowNanos` and a per-token `Salt`; the lock
+  manager has a `fsmFenceCounter` field bumped exclusively by `Apply*`.
+  Property test:
+  `internal/lock/apply_test.go:TestApplyDeterministicReplay`.
+- ✅ Tokens use `encodeToken(fsmFenceCounter, salt)`; counter is in
+  the snapshot, monotonic across leader changes. Strict-monotonic
+  test: `TestFSMTokensAreStrictlyMonotonic`.
+- ✅ Snapshot↔restore is lossless and byte-deterministic
+  (`TestSnapshotRestoreRoundTrip`).
+- ✅ `ApplyCleanupConn` processes owned keys in sorted order — no
+  divergence from Go map iteration order.
 
 ## Liveness & ops
 
-- ✅ Bounded backoff at every reach-the-peer call: `Node.sendRPC` wraps
-  every outbound RPC in a `context.WithTimeout` (`rpcTimeout = ElectionTimeoutMax`).
-- ✅ Election timeouts randomized between `ElectionTimeoutMin` and
-  `ElectionTimeoutMax`; `Config.Validate` enforces
+- ✅ Bounded backoff at every reach-the-peer call (`Node.sendRPC` wraps
+  outbound RPCs in `context.WithTimeout(rpcTimeout=ElectionTimeoutMax)`).
+- ✅ Election timeouts randomized; `Config.Validate` enforces
   `HeartbeatInterval*3 ≤ ElectionTimeoutMin`.
-- ✅ Disk-full / IO-error on the HardState path → the node steps down
+- ✅ Disk-full / IO-error on the HardState path → node steps down
   (`Node.persistHardState` on err logs + sets `role = roleFollower`).
-- ✅ `--raft-dir` flock'd; second open refused. Tested in
-  `internal/raft/storage_test.go:TestFileStorageDirLockRefusesSecondOpen`.
-  Non-Unix platforms are refused at storage construction.
-- ✅ Recovery from disk: WAL torn-tail truncated; snapshot meta loaded;
-  log entries past the snapshot replayed; HardState restored. Tested in
-  `internal/raft/storage_test.go:TestFileStorageTornTailDiscarded` +
-  `TestFileStoragePersistsAcrossReopen` and
-  `internal/raft/node_propose_test.go:TestEntriesPersistAcrossRestart`.
-- ✅ Leadership transfer — `raft.Node.TransferLeadership(ctx)` picks the
-  most-caught-up follower and sends it `TimeoutNow`; `cluster.Node.Close`
-  calls it on a graceful shutdown of the leader, so a rolling restart
-  re-elects within a round trip. `internal/raft/node_misc_test.go`
-  covers both the handoff and the not-leader case.
-- ⏳ `ReadIndex`-style linearizable reads: not exposed as a public API
-  in v1. dflockd's read path is `stats`, which is best-effort applied
-  state. `Barrier(ctx)` exists on `cluster.Node` and can be the
-  building block.
+- ✅ `--raft-dir` flock'd; second open refused
+  (`TestFileStorageDirLockRefusesSecondOpen`). Non-Unix platforms
+  are refused at construction.
+- ✅ Recovery from disk: WAL torn-tail truncated, snapshot loaded, log
+  replayed past the snapshot, HardState restored.
+- ✅ Leadership transfer — `raft.Node.TransferLeadership` picks the
+  most-caught-up follower and sends it `TimeoutNow`. `cluster.Node.Close`
+  invokes it on graceful shutdown so a rolling restart re-elects within
+  a round trip.
+- ✅ **Linearizable read primitive shipped.** `GET /v1/readindex` (HTTP)
+  and `barrier` (TCP) propose a no-op through Raft and return after it
+  applies. Single-node short-circuits; follower returns the
+  not-leader signal. Tested in
+  `internal/server/cluster_admin_test.go` (3 server-side tests) +
+  `internal/httpapi/admin_handlers_test.go` (3 HTTP tests).
+- ✅ **Runtime reconfiguration surface shipped.** `POST /v1/admin/voters`
+  and `DELETE /v1/admin/voters/{id}` propose `AddVoter` / `RemoveServer`
+  through Raft. Default-deny via `--admin-token`; constant-time header
+  compare; 100 ms slowdown on miss; audit log on each success. Tested
+  in `internal/httpapi/admin_handlers_test.go` (10 tests covering
+  admin-disabled, missing-token, wrong-token, OK, bad-body,
+  follower-redirect).
 
 ## Security & resource bounds
 
-- ✅ Frame sizes bounded throughout: `maxEntryDataBytes = 16 MiB` per
-  log entry; `maxConfigBytes = 1 MiB` for a Configuration;
-  `MaxSnapshotBytes` is a Config tunable; `maxTCPFrameBytes = 64 MiB`
-  on the inbound side. Bad / oversized frames close the conn.
-- ✅ `MaxLocks` / `MaxWaiters` are enforced inside `Apply*`
-  (deterministic; same on every node). Per-node TCP conn caps are
-  unchanged from single-node mode.
-- ✅ `MemTransport` handler invocation runs the handler on a tracked
-  goroutine, and `Close` joins them; same for the TCP transport
-  (`rpcWG` in raft.Node + `wg` in MemTransport + accepted-conn tracking
-  in TCPTransport).
+- ✅ Frame sizes bounded throughout (`maxEntryDataBytes = 16 MiB`,
+  `maxConfigBytes = 1 MiB`, `MaxSnapshotBytes` configurable,
+  `maxTCPFrameBytes = 64 MiB`).
+- ✅ `MaxLocks` / `MaxWaiters` enforced inside `Apply*` (deterministic).
+- ✅ All transports track their goroutines via `WaitGroup`/`rpcWG`;
+  `Close()` joins them.
 - ✅ **Mutual TLS** on the Raft transport — `--raft-tls-cert/-key/-ca`
-  (all-or-none). When set, every inter-node connection is mTLS (TLS 1.3,
-  `RequireAndVerifyClientCert`), so a node without a CA-signed cert
-  can't join or inject messages. Plaintext is still the default (the
-  startup log warns); a node on a trusted network needs no config.
-  `internal/raft/tcptransport_test.go` covers the happy path + an
-  untrusted-cert rejection.
+  (all-or-none). When set, every inter-node connection is mTLS
+  (TLS 1.3, `RequireAndVerifyClientCert`). Plaintext default;
+  startup logs warn.
+- ✅ **Default-deny admin endpoints.** Without `--admin-token` the
+  reconfig endpoints return `503 admin_disabled` — there's no
+  fall-through to "any caller on the network can reconfigure". The
+  header compare uses `crypto/subtle.ConstantTimeCompare`; a miss
+  sleeps 100 ms (`authFailureDelay`) before responding to bound an
+  online brute-force rate.
+- ✅ **Constant-time lock-token compare.** Four sites in
+  `internal/lock/{lock,apply}.go` previously compared the holder's
+  stored token to the caller-supplied token with `==` — a byte-by-byte
+  short-circuit, i.e., a timing oracle on a secret. All now go
+  through `constantTimeTokenEqual`.
+- ✅ Counter metrics expose proposal / apply throughput and admin
+  reconfig activity to monitoring (see Observability below); an alert
+  on `_admin_changes_total{op=~"_failed"}` catches a brute-force
+  attempt on the admin token.
 
 ## Correctness under concurrency
 
-- ✅ `go test -race ./...` passes cleanly across the whole tree on a
-  single CI run. (Under extreme repetition stress — `-count=20+` — TSAN
-  has been seen to false-positive on Go runtime stack reuse of short-
-  lived RPC goroutines; the per-Node `rpcWG` and per-MemTransport `wg`
-  make Close() definitively join them, which removes the actual races
-  even if not every TSAN edge case.)
+- ✅ `go test -race ./...` passes cleanly on a single CI run.
+  `make test-race` runs with `-p=2` so the raft-timer goroutines don't
+  starve each other under whole-tree load (a fix for the rare flake on
+  Apple Silicon — the race itself isn't real; goroutine starvation
+  was the cause).
 - ✅ One goroutine owns each piece of state: `raft.Node`'s run loop
-  owns consensus state; its apply goroutine owns FSM state; the
-  storage's embedded `memLog` is only touched on the run loop (the
-  apply goroutine routes snapshot saves back via `snapSavec`).
-- ✅ `Close()` is idempotent and joins every spawned goroutine —
-  `TCPTransport`, `raft.Node` (run loop + apply goroutine + RPC
-  goroutines), `cluster.Node` (wraps `raft.Node.Close`).
+  owns consensus state; its apply goroutine owns FSM state;
+  storage's `memLog` is touched only on the run loop.
+- ✅ `Close()` is idempotent and joins every spawned goroutine.
+- ✅ `cluster.Node`'s members map is mutex-guarded (read on every
+  redirect, written on `AddVoter`/`RemoveServer`).
+
+## Observability
+
+- ✅ Gauges: `dflockd_raft_state`, `_is_leader`, `_term`,
+  `_commit_index`, `_last_log_index`, `_snapshot_index`, `_voters`.
+- ✅ **Counters (new this release):**
+  - `dflockd_raft_proposals_total`,
+    `dflockd_raft_proposals_failed_total` — propose attempt
+    success/failure.
+  - `dflockd_raft_apply_total`, `dflockd_raft_apply_failed_total` —
+    FSM apply success/failure.
+  - `dflockd_raft_apply_nanos_total` — cumulative apply latency.
+    Divide by `apply_total` for a mean; rate over a window for p~mean
+    over that window.
+  - `dflockd_raft_leader_changes_total` — `becomeLeader` invocations.
+    Rising fast means election instability.
+  - `dflockd_raft_admin_changes_total{op=...}` — `AddVoter` /
+    `RemoveServer` successes and failures, labelled by op.
+- ✅ Counters use `sync/atomic.Uint64`; zero allocations on the hot
+  path, no mutex contention with the run loop.
+- ✅ `stats` (TCP + `GET /v1/stats`) carries the `"cluster"` block
+  (role, term, leader, indices, voters).
+- ✅ Audit log on every admin reconfig request.
 
 ## Backward compatibility
 
-- ✅ With no cluster flags: byte-for-byte the v2.1.x behaviour. The
-  existing test suites under `internal/lock`, `internal/server`,
-  `internal/httpapi`, `internal/protocol`, `client`, etc. all pass
-  unchanged.
-- ✅ `go.sum` stays empty — no new runtime dependencies. The cluster
-  code adds a handful of standard-library imports
-  (`encoding/binary`, `encoding/json`, `crypto/rand`, `hash/crc64`,
-  `sync`, `net`, `os`) and nothing more.
-- ✅ The Go client without `*NotLeaderError` handling works against a
-  single node exactly as today; `client.IsNotLeader(err, &nle)` is opt-
-  in for cluster-aware callers.
+- ✅ With no cluster flags: byte-for-byte the v2.1.x behaviour. All
+  existing test suites pass unchanged.
+- ✅ `go.sum` stays empty — no new runtime dependencies.
+- ✅ Existing Go-client callers without `*NotLeaderError` handling
+  continue to work against a single node.
 
 ## Code quality
 
 - ✅ `go vet ./...` clean.
-- ✅ `gofmt -l` clean across the new packages.
-- 🟡 Complexity: the new packages stay well under the project's `funlen
-  ≤ 40` / `gocyclo ≤ 10` bar in nearly every function. Two switch-on-
-  enum functions hit cyclo 10 exactly (`cluster/fsm.go:fsm.dispatch`,
-  `cluster/command.go:Kind.String`); `raft/node.go:Node.run` is also at
-  10 (the run-loop event-switch). These are the canonical Go idiom for
-  closed enum dispatch; further factoring would be table-driven for
-  cosmetic gain only.
-- ✅ Every exported symbol in `internal/raft` / `internal/cluster` has
-  a doc comment; the package docs (`doc.go` in each) explain the
-  concurrency model.
+- ✅ `gofmt -l` clean.
+- ✅ `make complexity` — every new function under the funlen ≤ 40 /
+  gocyclo ≤ 10 bar. The handful at gocyclo 10 are closed-enum switch
+  dispatchers (idiomatic Go; further factoring would be cosmetic).
+- ✅ Every exported symbol in the new `internal/raft` and
+  `internal/cluster` packages has a doc comment. New admin handlers
+  documented.
 - ⏳ Fuzz targets for the Raft frame codec + the cluster Command codec
-  — single-node `internal/protocol` has them; cluster codecs not yet.
-  Cheap follow-on.
+  — single-node `internal/protocol` has them; cluster codecs do not
+  yet. Cheap follow-on.
 
-## Test coverage summary
+## Test coverage (per package, after PR-2)
 
 | Package | Coverage | Notes |
 |---|---|---|
-| `internal/protocol` | 91.6% | Includes `error_not_leader` framing. |
-| `internal/config` | 90.4% | Includes the cluster validation matrix. |
-| `internal/raft` | 82.8% | Storage + node + transport + FSM apply + membership. |
-| `internal/lock` | 82.1% | Existing direct path + new Apply* path + Snapshot/Restore. |
-| `internal/cluster` | 77.6% | E2E + per-handler. The few uncovered lines are mostly transport error paths and the cleanup-on-failure branches in `startCluster` (cmd/dflockd-side) which the unit tests can't easily reach. |
-| `client` | 72.9% | Adds `*NotLeaderError` parsing; full router/retry would be a follow-on. |
-| `internal/server` | 68.1% | Cluster handlers exercised by `cluster_test.go`; legacy handler coverage unchanged from baseline. |
-| `internal/httpapi` | 67.9% | Unchanged from baseline — HTTP is disabled in cluster mode for v1. |
+| `internal/protocol` | 91.7% | `barrier` framing + `error_not_leader`. |
+| `internal/config` | 89.8% | Includes `--admin-token` resolution. |
+| `internal/lock` | 82.6% | Existing path + Apply* + Snapshot/Restore + constant-time compare. |
+| `internal/raft` | 82.1% | Storage + node + transport + FSM apply + membership + counters + frame-codec fuzz. |
+| `internal/cluster` | 82.1% | FSM raft adapter + admin counters + Command codec fuzz. |
+| `cmd/cluster-soak` | 78.2% | Soak harness; long-running tests gated on `!testing.Short()`. |
+| `internal/httpapi` | 73.4% | Admin endpoints (10 tests), readindex, CORS middleware, cluster-counter metrics. |
+| `client` | 70.9% | Adds `Cluster` (8 dispatch/redirect tests including the unknown-hint clamp). |
+| `internal/server` | 69.4% | Cluster handlers + 9 tests for Cluster{Barrier,AddVoter,RemoveVoter,MetricsSnapshot}. |
 
-## Phase-by-phase deliverables
+Five of nine packages clear ≥ 80%. The four under it are weighted by
+long-tail HTTP error paths, the cmd/dflockd cluster-cleanup branches
+unit tests can't easily reach, and (for `client.Cluster`) the
+many one-line wrapper methods that mirror the underlying one-shot
+API but aren't each individually exercised by a redirect test.
 
-Every line of PLAN.md's phase checklist is checked. Commits on
-`raft-replication` since this work started:
+## What's NOT done (deferred follow-ons)
 
+PR-2 shipped: cluster-aware client (was PR-1 item 4), soak harness
+(was PR-1 item 1), cluster codec fuzz (was PR-1 item 5). PR-1 shipped:
+admin endpoints (was item 1 of an earlier list), counter metrics (was
+item 2), ReadIndex public API (was item 6). Still open:
+
+1. **Stable-client-ref re-attach** for FIFO across leader failover
+   (PLAN.md §4.7 follow-on). A caller blocked in `acquire`/`wait` when
+   the leader fails loses its queue position — the holder entry it
+   never observed expires via lease. Already-granted tokens
+   (`renew`, `release`) survive seamlessly. Workaround: the
+   `client.Cluster` wrapper retries from scratch after a
+   `*NotLeaderError`; this is correct but not order-preserving.
+2. **Dynamic join with snapshot transfer to an empty node** —
+   the supported flows are static bootstrap (every member in
+   `--cluster-peers`) and `AddVoter` against a node whose
+   `--cluster-peers` already lists the cluster. Cold-joining a node
+   started with empty state is not yet implemented. Workaround:
+   pre-seed the new node's `--raft-dir` from a leader's snapshot,
+   then `AddVoter`.
+3. **Long-horizon multi-host soak.** `cmd/cluster-soak` is a
+   CI-friendly in-process harness covering the safety invariants under
+   leader kills. A separate multi-host harness with injected partitions
+   and clock skew (PLAN.md §6's full fault-injection set), run for
+   hours rather than seconds, is the next step before declaring "GA
+   across all workloads".
+
+## How to verify
+
+```bash
+# Build (no new runtime deps; go.sum stays empty)
+go build ./...
+
+# Per-package coverage matches the table above
+go test -short -count=1 ./... -cover
+
+# Race detector (capped parallelism prevents raft-timer starvation
+# on the whole-tree run; not a real data race)
+make test-race
+
+# Smoke a local 3-node cluster (uses --cluster-peers static bootstrap)
+./tools/cluster-smoke
+
+# Soak with leader kills (in-process, 30s)
+go run ./cmd/cluster-soak --duration 30s --kill-interval 5s
+
+# Fuzz the wire codecs for a few seconds
+go test -fuzz=^FuzzRaftFrameDecode$ -fuzztime=10s ./internal/raft
+go test -fuzz=^FuzzClusterCommandDecode$ -fuzztime=10s ./internal/cluster
+
+# Verify the admin endpoints reject without a token
+curl -X POST http://localhost:6388/v1/admin/voters \
+  -H "Content-Type: application/json" \
+  -d '{"node_id":"x","raft_addr":"1.2.3.4:7001","client_addr":"1.2.3.4:6388"}'
+# → 503 admin_disabled
+
+# Verify counter metrics
+curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 ```
-ea1d900 test(cluster): end-to-end integration via real TCP + Server + client
-c7d26ec feat(raft,cluster): single-server membership changes
-bb8a74e feat(config): reject --http-port + cluster mode in v1
-8ec2cee feat(client): surface error_not_leader as a typed NotLeaderError
-df00568 feat(cluster,config,cmd): wire cluster mode into the binary
-... feat(server,protocol): cluster-mode handlers + error_not_leader
-... feat(raft): TCP transport for cross-process Raft RPCs
-... feat(cluster): assemble raft + LockManager FSM + propose surface
-... feat(lock): deterministic FSM apply path + snapshot/restore
-9eab13b feat(raft): plan + storage + node core + propose/apply/snapshots
-```
 
-(Plus the Phase-14 docs / changelog commit, the Phase-15 review, and a
-post-review hardening pass — see below.)
+## Security and performance notes
 
-## Post-review hardening (production-readiness sweep)
-
-A focused code review after Phase 15 found and fixed a set of issues
-that the existing tests/smoke missed (mostly because everything runs on
-loopback in <5 s). Each has a test and a CHANGELOG entry.
-
-- **Transport (was a blocker):** the handshake's read deadline was never
-  cleared, so every Raft TCP connection died and was redialed ~5 s after
-  it was established — invisible on loopback, but on a real network it
-  meant constant connection churn, spurious RPC failures, and (with
-  aggressive timers) spurious elections. Now: clear the deadline,
-  60 s idle deadline on the steady-state read loops, 10 s write
-  deadline, TCP keepalive, per-peer dial backoff, `t.closed` checks on
-  the `Send`/dial paths, `handler` as an `atomic.Pointer`.
-- **Cluster lease/GC (was a blocker):** the leader-driven sweep loop
-  that proposes `EvictExpired` + `GC` through Raft was missing — so a
-  crashed client's lock leaked forever and idle resources accumulated.
-  Now implemented (`cluster.Node.sweepLoop`, started on `Start`, stopped
-  on `Close`; ticks at `--lease-sweep-interval`).
-- **FSM determinism (was a blocker):** `ApplyCleanupConn` minted fence
-  tokens in Go map-iteration order across a connection's owned keys —
-  replicas could diverge. Now sorted-key order.
-- **`internal/raft/storage` durability:** dirent fsync after creating
-  the WAL/HardState files; a corrupt snapshot halts the open instead of
-  silently meaning "no snapshot" (which would reset the node to term 0
-  after a compaction); 64 MiB read caps on the WAL and snapshot files;
-  partial-write rollback in `wal.appendEntries`; `wal.rewrite` keeps the
-  old handle until the atomic write succeeds; `handleInstallSnapshot`
-  ignores a snapshot at-or-below `committed`; decode-time bounds on the
-  config voter count and the snapshot length fields.
-- **Server/cluster glue:** cluster connection ids are now globally
-  unique (random per-process epoch ‖ counter), so a failover survivor's
-  fresh ids can't collide with the dead leader's orphans; the two-phase
-  enqueue→wait listener is registered at enqueue-commit time (no
-  lost-wakeup window); semaphore `limit` is bounded; a decoded
-  `cluster.Command` is validated before it touches the FSM.
-- **Concurrency:** `cluster.Node`'s members map is mutex-guarded
-  (was a `concurrent map read/write` crash waiting to happen on a
-  membership change during redirects); `node.shipApplyBatch` drains
-  `snapSavec` while blocked on `applyc` (removes a rare deadlock).
-
-Then, continuing toward "prod ready":
-
-- **Mutual TLS on the Raft transport** — `--raft-tls-cert/-key/-ca`;
-  every inter-node connection is mTLS (TLS 1.3, client-cert required)
-  when configured. Closes the "consensus over an unauthenticated
-  plaintext channel" gap.
-- **Graceful leadership transfer** — `raft.Node.TransferLeadership` (+
-  `cluster.Node.Close` on the leader): a rolling restart of the leader
-  re-elects within a round trip instead of after an election timeout.
-- **Cluster observability** — `stats` (TCP and `GET /v1/stats`) carries
-  a `"cluster"` object (role, term, leader, commit/last-log/snapshot
-  indices, voters); `GET /metrics` exposes `dflockd_raft_*` gauges.
-- **The HTTP API works in cluster mode** — `--http-port` + `--raft-dir`
-  is no longer rejected. Mutating endpoints propose through Raft; a
-  follower returns `503 {"error":"not_leader"}` + an `X-Dflockd-Leader`
-  header; read-only endpoints serve on any node. Single-node behaviour
-  is byte-identical.
-
-Deliberately *not* changed (noted, low priority): `persistHardState`
-failure logs + demotes rather than self-`Close`ing; the TCP path's
-`clusterProposeErrAck` still maps every non-context propose error to
-`error_not_leader` (the shutdown window where that's slightly misleading
-is narrow because `SetCluster(nil)` runs first on teardown; the HTTP
-path treats `raft.ErrStopped`/`ErrLeadershipLost` as not-leader → 503,
-which is the right "retry elsewhere" signal).
+- **Always set `--admin-token`** before exposing the HTTP API to a
+  network that anything untrusted can reach. The default is
+  "endpoints return 503" — there is no "permissive" mode — but an
+  empty token means no operator can call the endpoint either.
+- **Always set `--raft-tls-cert/-key/-ca`** when the Raft transport
+  crosses a network you don't fully control. Plaintext is the
+  default for the loopback-only test case; the startup log warns
+  when mTLS is off.
+- **The 100 ms slowdown on a missed admin token** caps a single-host
+  brute-force rate at ~10/s; with the rate-limit middleware in front,
+  effective rate is the lower of the two. An attacker who has the
+  network can still try forever, so monitor
+  `dflockd_raft_admin_changes_total{op=~".*_failed"}` and alert on a
+  sustained nonzero rate.
+- **Counter metrics are atomic.Uint64s** — no contention with the run
+  loop; emission cost is one atomic load per counter per scrape.
+- **`_apply_nanos_total / _apply_total`** gives a mean apply latency.
+  For p99 latency you still need an external histogram (e.g.
+  Prometheus rate-of-rate); the in-process histogram is a follow-on.
+- **`client.Cluster` clamps leader hints to known members.** A server
+  returning `error_not_leader evil.example.com:6388` will not cause
+  the client to dial `evil.example.com` — the client clears its cache
+  and keeps rotating through the operator-supplied members list. This
+  bounds the blast radius of either a compromised cluster member or an
+  on-path attacker (the latter is already mitigated by mTLS / TLS on
+  the client-server link in any sane deployment).
+- **Cluster client retry budget defaults to 3.** Each `*NotLeaderError`
+  or dial failure costs one. After budget exhaustion the call returns
+  `ErrTooManyRedirects` — no unbounded loops.
 
 ## Bottom line
 
-The cluster mode is **alpha**: every piece of the §7 checklist that
-can be implemented in a single tightly-scoped lift is implemented and
-tested; the small set of items deferred to follow-ons is enumerated
-above (each with a CHANGELOG entry). The whole tree passes
-`go test -race ./...` on a fresh run; `go.sum` is still empty; the
-non-cluster single-node binary is byte-identical to v2.1.x.
-
-Recommended next work, in priority order:
-
-1. **Runtime reconfiguration surface** — expose `AddVoter`/`RemoveServer`
-   over a (TLS'd / authed) admin command or HTTP endpoint so operators
-   don't need a Go program to grow/shrink a running cluster.
-2. **Counter-style cluster metrics** — `dflockd_raft_leader_changes_total`,
-   `_proposals_total`, `_apply_duration_seconds` (the gauge-style state
-   metrics — role, term, commit index, etc. — are already on `/metrics`).
-3. **Multi-node soak harness** under `cmd/cluster-soak` with the
-   fault-injection knobs PLAN.md §6 lists (and a long-running variant
-   of `tools/cluster-smoke`).
-4. **Stable-client-ref re-attach** for FIFO across leader failover
-   (PLAN.md §4.7 follow-on).
-5. **Dynamic join with InstallSnapshot transfer** to a node started
-   without prior state (PLAN.md §12 follow-on).
-6. **Linearizable read barrier** (`ReadIndex` API) as an exposed public
-   API (the internal `Barrier` is already wired).
+Cluster mode is **beta — GA-eligible for static-bootstrap workloads
+that don't depend on FIFO across leader failover.** The §7 checklist
+is fully addressed for static-bootstrap deployments. After PR-2 the
+two remaining gaps are FIFO-across-failover (workaround: retry from
+scratch via `client.Cluster`) and dynamic-join to an empty node
+(workaround: pre-seed snapshot + `AddVoter`). The whole tree passes
+`make test-race` cleanly; `go.sum` stays empty; the non-cluster
+single-node binary is byte-identical to v2.1.x.

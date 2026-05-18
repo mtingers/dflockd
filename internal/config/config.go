@@ -64,6 +64,11 @@ type Config struct {
 	RaftTLSCert string
 	RaftTLSKey  string
 	RaftTLSCA   string
+	// AdminToken gates the cluster-reconfig HTTP endpoints
+	// (POST/DELETE /v1/admin/voters). Empty → admin endpoints return
+	// 503 admin_disabled (default-deny). Sourced from --admin-token or
+	// DFLOCKD_ADMIN_TOKEN. Compared in constant time.
+	AdminToken string
 
 	// Diagnostics.
 	Debug   bool
@@ -131,6 +136,7 @@ func applyDerivedDefaults(c *Config) {
 type flagPtrs struct {
 	host, tlsCert, tlsKey                           *string
 	authToken, authTokenFile                        *string
+	adminToken                                      *string
 	httpHost, httpCORSOrigins                       *string
 	fenceStateFile                                  *string
 	raftDir, nodeID, clusterPeers                   *string
@@ -165,6 +171,7 @@ func defineStringFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.tlsKey = fs.String("tls-key", "", "Path to TLS private key PEM file")
 	f.authToken = fs.String("auth-token", "", "Shared secret token (visible in process list; prefer --auth-token-file)")
 	f.authTokenFile = fs.String("auth-token-file", "", "Path to file containing the auth token (one line)")
+	f.adminToken = fs.String("admin-token", "", "Admin secret token for cluster reconfig (POST/DELETE /v1/admin/voters). Empty = admin endpoints return 503 admin_disabled. Prefer DFLOCKD_ADMIN_TOKEN env to avoid process-list exposure.")
 	f.httpHost = fs.String("http-host", "", "HTTP API bind address (defaults to --host)")
 	f.httpCORSOrigins = fs.String("http-cors-allowed-origins", "", "Comma-separated allowed CORS origins for the HTTP API (empty = disabled)")
 	f.fenceStateFile = fs.String("fence-state-file", "", "Path to the fence-counter state file. Set to enable strict cross-restart fencing-token monotonicity (one fsync per ~1M grants). Empty = best-effort wall-clock seeding.")
@@ -386,6 +393,7 @@ func resolveAuth(r *resolver, f *flagPtrs, c *Config) error {
 		return err
 	}
 	c.AuthToken = tok
+	c.AdminToken = r.loadAdminToken(*f.adminToken)
 	return nil
 }
 
@@ -874,6 +882,26 @@ func envAuthToken() (string, error) {
 		return readAuthTokenFile(v)
 	}
 	return "", nil
+}
+
+// loadAdminToken resolves the admin token: --admin-token > DFLOCKD_ADMIN_TOKEN.
+// Whitespace is trimmed; an admin token containing newlines is treated
+// as unset (admin endpoints stay default-deny rather than admitting a
+// malformed secret). Errors from cleaning are dropped intentionally —
+// the conservative choice is "admin disabled" not "startup fails".
+func (r *resolver) loadAdminToken(flagToken string) string {
+	if r.setFlags["admin-token"] && flagToken != "" {
+		if v, err := cleanAuthToken("--admin-token", flagToken); err == nil {
+			return v
+		}
+		return ""
+	}
+	if v := os.Getenv("DFLOCKD_ADMIN_TOKEN"); v != "" {
+		if v, err := cleanAuthToken("DFLOCKD_ADMIN_TOKEN", v); err == nil {
+			return v
+		}
+	}
+	return ""
 }
 
 func cleanAuthToken(source, token string) (string, error) {

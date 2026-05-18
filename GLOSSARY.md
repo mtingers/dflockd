@@ -187,6 +187,75 @@ references and quoted in the "See also" line where helpful.
   same key reaches the same node in single-node, multi-instance
   deployments. Bypassed in cluster-aware client code paths.
 
+## Admin & operational APIs (2026-05-17 production-hardening pass)
+
+- **Admin endpoint** — A privileged operation that mutates cluster
+  configuration rather than lock state. Today: `AddVoter` and
+  `RemoveServer`. Exposed over both transports as
+  `POST /v1/admin/voters` + `DELETE /v1/admin/voters/{id}` (HTTP) and
+  the TCP `cluster add-voter` / `cluster remove-voter` commands.
+  Auth-gated by a **separate** admin token (`--admin-token` /
+  `DFLOCKD_ADMIN_TOKEN`) — distinct from the regular auth token so
+  read/write client credentials don't carry reconfiguration authority.
+- **Admin token** — Static secret in `--admin-token` /
+  `DFLOCKD_ADMIN_TOKEN`. Required on every admin endpoint; compared
+  in constant time. If unset, admin endpoints return `503 admin_disabled`
+  (default-deny — admin must be explicitly enabled).
+- **`X-Dflockd-Admin`** — HTTP header carrying the admin token on
+  admin endpoints. Body: `{"node_id": ..., "raft_addr": ..., "client_addr": ...}`.
+- **ReadIndex (public API)** — `client.ReadIndex(ctx)` and `GET
+  /v1/readindex`. The leader proposes a no-op-equivalent barrier
+  through Raft; once committed and applied, the response means: every
+  preceding write that committed on the leader is reflected in the
+  state a subsequent read against this same leader will return.
+  Backed by [[Barrier]]. Not a snapshot read on followers — followers
+  return 503 `not_leader`.
+- **Counter metric** — A `# TYPE counter` Prometheus series that is
+  monotonic for the lifetime of the process. New ones in this pass:
+  `dflockd_raft_leader_changes_total`,
+  `dflockd_raft_proposals_total`,
+  `dflockd_raft_proposals_failed_total`,
+  `dflockd_raft_apply_total`,
+  `dflockd_raft_apply_failed_total`,
+  `dflockd_raft_admin_changes_total{op}`.
+- **Stable client ref** — Not implemented in v1. Future mechanism by
+  which a client supplies an opaque identifier on `enqueue`/`wait`,
+  so its queue position survives a leader failover + reconnect.
+  Tracked as PLAN.md §4.7 follow-on. Today the only failover-safe
+  primitive is already-granted tokens.
+
+## Cluster client + soak harness (2026-05-17 production-hardening pass 2)
+
+- **Cluster-aware client** — `client.Cluster`: a wrapper over the
+  one-shot `*Conn` API that consults a leader cache, dials the cached
+  leader first, and transparently follows `*NotLeaderError` redirects
+  (up to a budget). The single-conn `Acquire/Release/Renew/Enqueue/Wait`
+  API is unchanged — `Cluster` adds operation-level wrappers that
+  retry against the right leader. Distinct from the existing
+  CRC32-sharding client (which assumes a fixed multi-instance topology
+  and is not failover-aware).
+- **Leader cache** — On a `*NotLeaderError` the client records the
+  hinted leader address. Subsequent operations dial the cache first.
+  Process-local; no persistence; expires on the next miss.
+- **Retry budget** — Hard cap on consecutive redirects per operation
+  (default 3). Prevents an attacker-controlled redirect from looping
+  forever. Surface error: `ErrTooManyRedirects`. The budget is per
+  operation, not per `Cluster` instance, so legitimate cluster
+  reconfigurations during a long-running client don't bleed budget.
+- **Soak harness** — `cmd/cluster-soak`: spins up an N-node in-process
+  raft cluster on a `MemTransport`, drives sustained writes from K
+  worker goroutines, periodically kills the leader by calling
+  `Close()` on its node and spinning up a replacement, asserts that
+  every successful write's fence token is strictly greater than the
+  last, and that no granted-then-released token is ever re-issued.
+  Exits non-zero on the first invariant violation. Configurable
+  `--duration`, `--nodes`, `--workers`, `--kill-interval`.
+- **Cluster Command codec fuzz** — `FuzzClusterCommandRoundTrip` /
+  `FuzzClusterCommandDecode` in `internal/cluster`; Raft frame codec
+  fuzz `FuzzRaftFrameDecode` in `internal/raft`. Seeds: representative
+  Apply/Enqueue/Release/Renew/Evict/CleanupConn/GC commands and the
+  Raft RPC types.
+
 ## Known to drift if not pinned
 
 - **"Node"** alone is ambiguous: prefer [[`raft.Node`]] or

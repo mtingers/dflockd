@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mtingers/dflockd/internal/raft"
 )
 
 // metricsRegistry collects per-route request counts and total
@@ -154,7 +156,8 @@ func (h *httpServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeGauge(&b, "dflockd_lock_waiters", "Current lock waiters.", float64(lockWaiters))
 	writeGauge(&b, "dflockd_semaphore_holders", "Currently held semaphore slots.", float64(semHolders))
 	writeGauge(&b, "dflockd_semaphore_waiters", "Current semaphore waiters.", float64(semWaiters))
-	writeClusterMetrics(&b, h.sessions.Server().ClusterStatusJSON())
+	srv := h.sessions.Server()
+	writeClusterMetrics(&b, srv.ClusterStatusJSON(), srv.ClusterMetricsSnapshot())
 	_, _ = w.Write([]byte(b.String()))
 }
 
@@ -171,10 +174,10 @@ type clusterMetricView struct {
 
 var raftStates = []string{"leader", "follower", "candidate", "pre-candidate"}
 
-// writeClusterMetrics emits dflockd_raft_* gauges when clusterJSON is
-// non-nil (i.e. this node is part of a cluster). In single-node mode it
-// writes nothing.
-func writeClusterMetrics(b *strings.Builder, clusterJSON []byte) {
+// writeClusterMetrics emits dflockd_raft_* gauges and counters when
+// clusterJSON is non-nil (i.e. this node is part of a cluster). In
+// single-node mode it writes nothing.
+func writeClusterMetrics(b *strings.Builder, clusterJSON []byte, m raft.ClusterMetrics) {
 	if clusterJSON == nil {
 		return
 	}
@@ -182,6 +185,11 @@ func writeClusterMetrics(b *strings.Builder, clusterJSON []byte) {
 	if err := json.Unmarshal(clusterJSON, &v); err != nil {
 		return // shouldn't happen; skip rather than corrupt the exposition
 	}
+	writeClusterGauges(b, v)
+	writeClusterCounters(b, m)
+}
+
+func writeClusterGauges(b *strings.Builder, v clusterMetricView) {
 	b.WriteString("# HELP dflockd_raft_state This node's Raft role (1 for the current state, 0 otherwise).\n")
 	b.WriteString("# TYPE dflockd_raft_state gauge\n")
 	for _, s := range raftStates {
@@ -197,6 +205,27 @@ func writeClusterMetrics(b *strings.Builder, clusterJSON []byte) {
 	writeGauge(b, "dflockd_raft_last_log_index", "Index of the last entry in the Raft log.", float64(v.LastLogIndex))
 	writeGauge(b, "dflockd_raft_snapshot_index", "Index of the latest persisted snapshot (0 if none).", float64(v.SnapshotIndex))
 	writeGauge(b, "dflockd_raft_voters", "Number of voting members in the current configuration.", float64(len(v.Voters)))
+}
+
+func writeClusterCounters(b *strings.Builder, m raft.ClusterMetrics) {
+	writeCounter(b, "dflockd_raft_proposals_total", "Successful Raft proposals (entries appended to the local leader log).", m.Raft.Proposals)
+	writeCounter(b, "dflockd_raft_proposals_failed_total", "Raft proposals rejected before append (not-leader, ctx, validation).", m.Raft.ProposalsFailed)
+	writeCounter(b, "dflockd_raft_apply_total", "Committed entries this node has applied to its FSM.", m.Raft.Applies)
+	writeCounter(b, "dflockd_raft_apply_failed_total", "FSM applies that returned an error or panicked.", m.Raft.AppliesFailed)
+	writeCounter(b, "dflockd_raft_apply_nanos_total", "Cumulative FSM apply time (nanoseconds). Divide by apply_total for mean latency.", m.Raft.ApplyNanosTotal)
+	writeCounter(b, "dflockd_raft_leader_changes_total", "Times this node has become leader.", m.Raft.LeaderChanges)
+	b.WriteString("# HELP dflockd_raft_admin_changes_total Cluster admin operations partitioned by op.\n")
+	b.WriteString("# TYPE dflockd_raft_admin_changes_total counter\n")
+	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "add_voter", m.AdminAddVoter)
+	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "add_voter_failed", m.AdminAddVoterFail)
+	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "remove_server", m.AdminRemoveServer)
+	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "remove_server_failed", m.AdminRemoveFail)
+}
+
+func writeCounter(b *strings.Builder, name, help string, v uint64) {
+	fmt.Fprintf(b, "# HELP %s %s\n", name, help)
+	fmt.Fprintf(b, "# TYPE %s counter\n", name)
+	fmt.Fprintf(b, "%s %d\n", name, v)
 }
 
 func boolFloat(b bool) float64 {

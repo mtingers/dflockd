@@ -345,6 +345,9 @@ var commandTable = map[string]commandHandler{
 	},
 	protocol.CmdWait:    (*Server).handleWait,
 	protocol.CmdSemWait: (*Server).handleWait,
+	protocol.CmdBarrier: func(s *Server, ctx context.Context, _ *protocol.Request, _ uint64) *protocol.Ack {
+		return s.handleBarrier(ctx)
+	},
 }
 
 // handleRequest dispatches a fully-parsed request via commandTable.
@@ -368,6 +371,25 @@ func (s *Server) logRequest(req *protocol.Request, connID uint64) {
 func (s *Server) unknownCommand(req *protocol.Request, connID uint64) *protocol.Ack {
 	s.log.Warn("unknown command", "cmd", req.Cmd, "conn", connID)
 	return &protocol.Ack{Status: protocol.StatusError}
+}
+
+// handleBarrier services the TCP `barrier` command. In cluster mode it
+// proposes a no-op through Raft and waits for it to apply — a public
+// linearizable-read primitive. In single-node mode it returns ok
+// immediately (every preceding write is already visible). On a follower
+// it returns error_not_leader with the leader's client address as Extra.
+func (s *Server) handleBarrier(ctx context.Context) *protocol.Ack {
+	c := s.clusterOrNil()
+	if c == nil {
+		return &protocol.Ack{Status: protocol.StatusOK}
+	}
+	if err := s.ClusterBarrier(ctx); err != nil {
+		if errors.Is(err, ErrNotClusterLeader) {
+			return &protocol.Ack{Status: protocol.StatusErrorNotLeader, Extra: s.ClusterLeaderAddr()}
+		}
+		return &protocol.Ack{Status: protocol.StatusError}
+	}
+	return &protocol.Ack{Status: protocol.StatusOK}
 }
 
 // handleStats returns the JSON-encoded LockManager snapshot.

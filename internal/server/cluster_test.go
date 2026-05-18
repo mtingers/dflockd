@@ -14,6 +14,7 @@ import (
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/protocol"
+	"github.com/mtingers/dflockd/internal/raft"
 )
 
 // fakeCluster is a controllable Cluster used to drive the cluster-mode
@@ -109,6 +110,31 @@ func (f *fakeCluster) ProposeCleanupConn(ctx context.Context, ref string, connID
 	f.cleanupCalls++
 	f.mu.Unlock()
 	return lock.ApplyResult{Status: lock.StatusOK}, nil
+}
+
+func (f *fakeCluster) Barrier(ctx context.Context) error {
+	if f.proposeErr != nil {
+		return f.proposeErr
+	}
+	return nil
+}
+
+func (f *fakeCluster) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAddr string) error {
+	if f.proposeErr != nil {
+		return f.proposeErr
+	}
+	return nil
+}
+
+func (f *fakeCluster) RemoveServer(ctx context.Context, id raft.NodeID) error {
+	if f.proposeErr != nil {
+		return f.proposeErr
+	}
+	return nil
+}
+
+func (f *fakeCluster) MetricsSnapshot() raft.ClusterMetrics {
+	return raft.ClusterMetrics{}
 }
 
 // --- harness ---

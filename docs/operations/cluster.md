@@ -78,18 +78,56 @@ error_not_leader 10.0.0.2:6389
 
 ## Adding a node
 
-The cluster operator runs `AddVoter` against the leader (via a future
-admin endpoint; for now via a small Go program importing
-`internal/cluster`). The new entry adds the member to the
-configuration immediately on append; the new node should be started
-with the **same** `--cluster-peers` list so its membership view
-matches.
+Add a voting member via the leader's admin endpoint:
+
+```bash
+curl -X POST https://leader:6388/v1/admin/voters \
+  -H "X-Dflockd-Admin: $DFLOCKD_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id":"d","raft_addr":"10.0.0.4:7001","client_addr":"10.0.0.4:6388"}'
+# → 200 {"status":"ok","node_id":"d"}
+```
+
+The leader proposes a `ConfigEntry`; the change takes effect immediately
+on append, and the new node starts being counted toward quorum. The new
+node must be **started** before it can apply incoming AppendEntries —
+boot it with `--cluster-peers` listing every member (including itself)
+so its membership view matches.
+
+Requires the operator to have set `--admin-token` (or
+`DFLOCKD_ADMIN_TOKEN`) on the leader; without it the endpoint returns
+`503 admin_disabled`. On a follower the endpoint returns `503 not_leader`
+with the leader's raft client address in `X-Dflockd-Leader`.
 
 ## Removing a node
 
-`RemoveServer` on the leader proposes a `ConfigEntry` that drops the
-named node. A leader removing itself steps down once the change
-commits.
+```bash
+curl -X DELETE https://leader:6388/v1/admin/voters/d \
+  -H "X-Dflockd-Admin: $DFLOCKD_ADMIN_TOKEN"
+# → 200 {"status":"ok","node_id":"d"}
+```
+
+A leader removing itself steps down once the entry commits.
+
+## Linearizable reads
+
+The `GET /v1/readindex` endpoint (HTTP) and the `barrier` TCP command
+both propose a no-op through Raft and return only after it applies.
+Use this as a "wait for the cluster to catch up" primitive before a
+read that must reflect every preceding committed write:
+
+```bash
+# HTTP
+curl https://leader:6388/v1/readindex
+# → 200 {"status":"ok"}  (or 503 not_leader if you hit a follower)
+
+# TCP (Go client)
+err := client.Barrier(conn)
+```
+
+In single-node mode this is a no-op (returns immediately). On a
+follower the HTTP returns `503 not_leader` and the TCP returns
+`error_not_leader <addr>`.
 
 ## Restart / recovery
 
@@ -145,6 +183,45 @@ addresses), so an HTTP client should retry against another node it knows
 rather than blindly following the header. Read-only endpoints
 (`/health`, `/ready`, `/v1/stats`, `/metrics`, `/openapi.json`) work on
 any node.
+
+## Using the cluster-aware Go client
+
+```go
+cl, err := client.NewCluster(
+    []string{"10.0.0.1:6388", "10.0.0.2:6389", "10.0.0.3:6390"},
+    client.WithClusterRedirectBudget(3), // default
+    client.WithClusterAuthToken(os.Getenv("DFLOCKD_AUTH_TOKEN")),
+)
+ctx := context.Background()
+token, ttl, err := cl.Acquire(ctx, "deploy-job", 60*time.Second)
+// ... use lock ...
+_ = cl.Release(ctx, "deploy-job", token)
+```
+
+`client.Cluster` keeps a process-local leader cache and transparently
+follows `*NotLeaderError` redirects up to the configured budget. The
+cache only honors hints that name an address in the operator-supplied
+members list — a hostile or stale `error_not_leader evil:6388` does
+not cause the client to dial an arbitrary host. An exhausted budget
+surfaces `client.ErrTooManyRedirects`.
+
+The single-`*Conn` package-level API (`client.Acquire(conn, …)`) is
+unchanged and still works against any node — callers that need to
+handle redirects themselves can use it directly with `client.IsNotLeader`.
+
+## Soak testing
+
+`cmd/cluster-soak` runs an in-process N-node soak with optional
+periodic leader-kill, asserting fence-token monotonicity per key and
+no duplicate token across the run:
+
+```bash
+go run ./cmd/cluster-soak --nodes 3 --workers 4 --duration 30s --kill-interval 5s
+# soak: clean run: writes=… successes=… not_leader=… killed=… duration=…
+```
+
+Exit code is non-zero on the first invariant violation. Intended for
+pre-release smoke; a long-horizon, multi-host harness is a follow-on.
 
 ## v1 caveats
 

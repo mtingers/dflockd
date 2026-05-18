@@ -14,6 +14,7 @@ package lock
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -23,6 +24,15 @@ import (
 
 	"github.com/mtingers/dflockd/internal/config"
 )
+
+// constantTimeTokenEqual is constant-time string equality for tokens.
+// Defense-in-depth: the call sites are already gated by a (connID, key)
+// map lookup, so a timing attack would need to know both pieces — but
+// keeping the comparison constant-time avoids creating a side channel
+// in case a future refactor changes the gating.
+func constantTimeTokenEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
 
 // Sentinel errors returned by LockManager methods.
 var (
@@ -257,7 +267,7 @@ func (lm *LockManager) evictExpired(sh *shard, key string, st *ResourceState) er
 		lm.log.Warn("evicting expired lease on acquire", "key", key, "conn", h.connID)
 		sh.removeOwned(h.connID, key, token)
 		eqKey := connKey{ConnID: h.connID, Key: key}
-		if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
+		if es, ok := sh.connEnqueued[eqKey]; ok && constantTimeTokenEqual(es.token, token) {
 			sh.removeEnqueued(eqKey)
 		}
 		delete(st.Holders, token)
@@ -700,7 +710,7 @@ func (lm *LockManager) Release(key, token string) (ok bool, err error) {
 	st.LastActivity = now
 	sh.removeOwned(h.connID, key, token)
 	eqKey := connKey{ConnID: h.connID, Key: key}
-	if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
+	if es, ok := sh.connEnqueued[eqKey]; ok && constantTimeTokenEqual(es.token, token) {
 		sh.removeEnqueued(eqKey)
 	}
 	delete(st.Holders, token)
@@ -768,7 +778,7 @@ func (lm *LockManager) rejectExpiredRenew(sh *shard, st *ResourceState, key, tok
 // key) when its token matches. Caller holds sh.mu.
 func dropMatchingEnqueued(sh *shard, connID uint64, key, token string) {
 	eqKey := connKey{ConnID: connID, Key: key}
-	if es, ok := sh.connEnqueued[eqKey]; ok && es.token == token {
+	if es, ok := sh.connEnqueued[eqKey]; ok && constantTimeTokenEqual(es.token, token) {
 		sh.removeEnqueued(eqKey)
 	}
 }

@@ -174,6 +174,55 @@ func (s *Server) ClusterRenew(ctx context.Context, key, token string, leaseTTL t
 	return result, nil
 }
 
+// ClusterBarrier proposes a no-op and waits for it to apply — the
+// linearizable-read primitive. ErrNotClusterLeader on a follower so
+// the caller (HTTP / TCP) can redirect.
+func (s *Server) ClusterBarrier(ctx context.Context) error {
+	c, err := s.clusterLeaderOrErr()
+	if err != nil {
+		return err
+	}
+	if err := c.Barrier(ctx); err != nil {
+		return classifyProposeErr(err)
+	}
+	return nil
+}
+
+// ClusterAddVoter proposes a single-server addition. ErrNotClusterLeader
+// on a follower; any other error is the underlying raft error.
+func (s *Server) ClusterAddVoter(ctx context.Context, id, raftAddr, clientAddr string) error {
+	c, err := s.clusterLeaderOrErr()
+	if err != nil {
+		return err
+	}
+	if err := c.AddVoter(ctx, raft.NodeID(id), raftAddr, clientAddr); err != nil {
+		return classifyProposeErr(err)
+	}
+	return nil
+}
+
+// ClusterRemoveVoter proposes a single-server removal. ErrNotClusterLeader
+// on a follower; any other error is the underlying raft error.
+func (s *Server) ClusterRemoveVoter(ctx context.Context, id string) error {
+	c, err := s.clusterLeaderOrErr()
+	if err != nil {
+		return err
+	}
+	if err := c.RemoveServer(ctx, raft.NodeID(id)); err != nil {
+		return classifyProposeErr(err)
+	}
+	return nil
+}
+
+// ClusterMetricsSnapshot returns counters for /metrics rendering, or
+// the zero value in single-node mode.
+func (s *Server) ClusterMetricsSnapshot() raft.ClusterMetrics {
+	if c := s.clusterOrNil(); c != nil {
+		return c.MetricsSnapshot()
+	}
+	return raft.ClusterMetrics{}
+}
+
 // CleanupConnID proposes a cluster-wide CleanupConn (when clustered &
 // leader) or runs the local LockManager cleanup. Used by the HTTP
 // session store. On a follower the cluster cleanup is dropped — lease
