@@ -119,3 +119,56 @@ Tick rules: `✅ shipped`, `🟡 partial`, `❌ deferred with workaround`,
 
 ## Handoff
 - [x] **Phase 9 — `PRODUCTION_READINESS.md` updated**: PR-1 items 1/4/5 closed; envelope tightened ✅
+
+---
+
+# Production-hardening pass 3 (2026-05-17)
+
+Fourth one-shot pass. PR-1 + PR-2 (committed as `6cb94cc`) left two
+gaps: FIFO across leader failover, and dynamic-join with InstallSnapshot
+to an empty node. This pass closes both. Calibration: **service tier**,
+refactor mode (touches FSM-determinism-critical code paths).
+
+Scope (ship now):
+- **Gap 2: dynamic-join with InstallSnapshot to empty node.** Closed:
+  `sendAppendEntries → sendInstallSnapshot` fallback is wired and
+  proven by `TestDynamicJoinColdNodeCatchesUpViaSnapshot` — a node
+  added via `AddVoter` and started with empty `MemStorage` catches
+  up via a real snapshot (asserted: `LastSnapshotIndex > 0` on the
+  joiner).
+
+Out of scope (deferred to PR-4 with workaround):
+- **Gap 1: FIFO across leader failover via stable-client-ref
+  re-attach.** Touching `ApplyCleanupConn` (skip-on-ref) +
+  `ApplyEnqueue` (re-adopt-on-ref) + snapshot codec (new orphan
+  fields) is FSM-determinism-critical — a careful PR-4 session
+  with focused review, not an end-of-PR-3 squeeze. **Workaround
+  today (PR-2):** `client.Cluster` retries the enqueue from
+  scratch against the new leader on `*NotLeaderError` — correct,
+  but not order-preserving (the retry goes to the back of the queue).
+  Already-granted holders (renew/release) survive seamlessly via
+  the replicated FSM state, no client change needed.
+- **Single-phase `acquire` re-attach** — same FSM-determinism
+  concerns; same defer.
+- **Long-horizon multi-host soak harness** — the in-process one
+  ships now; the next-gen one needs real hosts and time.
+
+Tick rules: `✅ shipped`, `🟡 partial`, `❌ deferred with workaround`,
+`N/A`.
+
+## Discovery & Planning
+- [x] **Phase 1 — Discovery (non-interactive)**: scope per-gap; risk model ✅
+- [x] **Phase 2 — Glossary delta**: orphan TTL, stable ref, dynamic-join closure ✅
+- [x] **Phase 3 — Plan + ship-vs-defer matrix**: Gap 2 first, then Gap 1 waiter-only ✅
+
+## Build (Gap 2 only — Gap 1 deferred to PR-4)
+- [x] **Phase 4 — Interfaces & schemas**: no new public surface; `LastSnapshotIndex` already in `raft.Status` ✅
+- [x] **Phase 5 — RED test**: `TestDynamicJoinColdNodeCatchesUpViaSnapshot` ✅
+- [x] **Phase 6 — GREEN**: mechanism already works (no code change required); test passes with snapshot-traversal assertion ✅
+
+## Hardening
+- [N/A] **Phase 7 — Security pass**: no new attack surface — Gap 2 exercises an existing internal mechanism; no new wire/client/auth code.
+- [x] **Phase 8 — Documentation pass**: CHANGELOG + cluster.md + PRODUCTION_READINESS updated ✅
+
+## Handoff
+- [x] **Phase 9 — `PRODUCTION_READINESS.md` updated**: Gap 2 closed; Gap 1 explicitly deferred with workaround ✅

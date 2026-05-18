@@ -256,6 +256,35 @@ references and quoted in the "See also" line where helpful.
   Apply/Enqueue/Release/Renew/Evict/CleanupConn/GC commands and the
   Raft RPC types.
 
+## FIFO failover + dynamic-join (2026-05-17 production-hardening pass 3)
+
+- **Stable client ref (PR-3)** — Opaque caller-supplied identifier
+  carried on `enqueue` / `wait`. Distinct from the `connID` (which
+  identifies a TCP conn). Used to re-attach across a leader failover:
+  on a new connection from the same caller, the FSM recognizes the
+  ref and resumes its existing waiter/holder slot. The protocol field
+  is optional — empty ref preserves today's strict
+  `CleanupConn-removes-everything` semantic for non-failover-aware
+  callers.
+- **Orphaned waiter** — A waiter whose TCP connection went away
+  while the FSM still recognizes its stable ref. Marked with an
+  `AbandonedAt` timestamp in the FSM state; a reconnect with the same
+  ref re-adopts it. If no reconnect happens by `AbandonedAt +
+  OrphanTTL`, the EvictExpired sweep removes it. Deterministic across
+  replicas because the timestamp is the leader's `Now` stamp on the
+  CleanupConn entry, and the TTL is config.
+- **Orphan TTL** — `--orphan-ttl` (default 30s). Bounds how long the
+  FSM retains an orphaned waiter / holder waiting for the original
+  client to reconnect. Set conservatively: too long → orphaned slots
+  pile up if a client crashes; too short → a slow client misses its
+  re-attach window during a leader election.
+- **Dynamic-join (PR-3 closure)** — Operator runs `AddVoter` on the
+  leader, then starts the new node with empty `--raft-dir`. The
+  leader's `sendAppendEntries → sendInstallSnapshot` fallback already
+  ships a fresh snapshot when the follower's nextIndex falls below
+  the leader's log start; PR-3 adds the integration test that proves
+  this works end-to-end and fixes any bugs the test surfaces.
+
 ## Known to drift if not pinned
 
 - **"Node"** alone is ambiguous: prefer [[`raft.Node`]] or

@@ -39,12 +39,9 @@ production-hardening passes are reflected here:
 
 **You should wait if:**
 
-- You need dynamic-join with snapshot transfer to a node started with
-  empty state (gap 2 below). Static bootstrap + post-bootstrap
-  `AddVoter` works; cold-join an empty box does not.
 - You need FIFO preserved across a leader failover for
   *currently-blocked* callers (gap 1 below). Already-granted tokens
-  are unaffected.
+  are unaffected; only the blocked-on-wait case loses queue position.
 
 ## Raft safety
 
@@ -226,26 +223,32 @@ API but aren't each individually exercised by a redirect test.
 
 ## What's NOT done (deferred follow-ons)
 
-PR-2 shipped: cluster-aware client (was PR-1 item 4), soak harness
-(was PR-1 item 1), cluster codec fuzz (was PR-1 item 5). PR-1 shipped:
-admin endpoints (was item 1 of an earlier list), counter metrics (was
-item 2), ReadIndex public API (was item 6). Still open:
+PR-3 closed: dynamic-join with snapshot transfer to a cold-state empty
+node (was PR-2 gap 2 / PR-1 item 3) — `TestDynamicJoinColdNodeCatchesUpViaSnapshot`
+proves the InstallSnapshot path; no production code change required.
+
+PR-2 closed: cluster-aware client (was item 4), soak harness (was
+item 1), cluster codec fuzz (was item 5). PR-1 closed: admin endpoints,
+counter metrics, ReadIndex public API.
+
+Still open:
 
 1. **Stable-client-ref re-attach** for FIFO across leader failover
-   (PLAN.md §4.7 follow-on). A caller blocked in `acquire`/`wait` when
-   the leader fails loses its queue position — the holder entry it
-   never observed expires via lease. Already-granted tokens
-   (`renew`, `release`) survive seamlessly. Workaround: the
-   `client.Cluster` wrapper retries from scratch after a
-   `*NotLeaderError`; this is correct but not order-preserving.
-2. **Dynamic join with snapshot transfer to an empty node** —
-   the supported flows are static bootstrap (every member in
-   `--cluster-peers`) and `AddVoter` against a node whose
-   `--cluster-peers` already lists the cluster. Cold-joining a node
-   started with empty state is not yet implemented. Workaround:
-   pre-seed the new node's `--raft-dir` from a leader's snapshot,
-   then `AddVoter`.
-3. **Long-horizon multi-host soak.** `cmd/cluster-soak` is a
+   (PLAN.md §4.7 follow-on). A caller blocked in `acquire`/`wait`
+   when the leader fails loses its queue position — the FSM's
+   `ApplyCleanupConn` drops the waiter on disconnect because there's
+   no way today to distinguish "stable client identity" from
+   "transient TCP connection." Already-granted tokens (`renew`,
+   `release`) survive seamlessly via the replicated FSM state.
+   **Workaround:** the `client.Cluster` wrapper retries from scratch
+   after a `*NotLeaderError`; this is correct but not order-preserving
+   (the retry goes to the back of the queue). **Why deferred to PR-4:**
+   the fix requires `ApplyCleanupConn` to mark ref-tagged entries
+   "orphaned" (with a deterministic deadline), `ApplyEnqueue` to
+   re-adopt matching orphans, plus snapshot codec changes for the new
+   `AbandonedAtNanos` field — all FSM-determinism-critical, which is
+   a focused session of work, not an end-of-PR squeeze.
+2. **Long-horizon multi-host soak.** `cmd/cluster-soak` is a
    CI-friendly in-process harness covering the safety invariants under
    leader kills. A separate multi-host harness with injected partitions
    and clock skew (PLAN.md §6's full fault-injection set), run for
@@ -319,11 +322,12 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 
 ## Bottom line
 
-Cluster mode is **beta — GA-eligible for static-bootstrap workloads
-that don't depend on FIFO across leader failover.** The §7 checklist
-is fully addressed for static-bootstrap deployments. After PR-2 the
-two remaining gaps are FIFO-across-failover (workaround: retry from
-scratch via `client.Cluster`) and dynamic-join to an empty node
-(workaround: pre-seed snapshot + `AddVoter`). The whole tree passes
-`make test-race` cleanly; `go.sum` stays empty; the non-cluster
-single-node binary is byte-identical to v2.1.x.
+Cluster mode is **beta — GA-eligible for workloads that don't depend
+on FIFO-across-leader-failover for currently-blocked callers.** The
+§7 checklist is fully addressed; after PR-3 the only remaining gap is
+the stable-client-ref FIFO re-attach, with a documented (correct,
+non-FIFO) workaround via `client.Cluster`'s retry behavior. Both
+static-bootstrap AND dynamic-join (`AddVoter` → start cold node)
+flows are validated end-to-end. The whole tree passes `make test-race`
+cleanly; `go.sum` stays empty; the non-cluster single-node binary is
+byte-identical to v2.1.x.

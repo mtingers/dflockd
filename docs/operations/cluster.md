@@ -231,10 +231,13 @@ pre-release smoke; a long-horizon, multi-host harness is a follow-on.
   tokens survive seamlessly (the client can `renew` / `release` them
   against the new leader). Stable-client-ref re-attach across failover
   is laid out in PLAN.md §4.7 as a follow-on.
-- **Dynamic-join with snapshot transfer** to a node started without
-  prior state is not yet implemented. The supported flows are static
-  bootstrap (all members listed in `--cluster-peers`) and `AddVoter`
-  against a node whose `--cluster-peers` already lists the cluster.
+- **Dynamic-join with snapshot transfer** to a node started with
+  empty `--raft-dir` works as of PR-3. Operator flow: `AddVoter` on
+  the leader, then start the new node with empty storage and
+  `--cluster-peers` listing the full cluster. The leader's
+  `sendAppendEntries → sendInstallSnapshot` fallback detects the cold
+  follower (`nextIndex < firstIndex`) and ships a snapshot. Validated
+  by `TestDynamicJoinColdNodeCatchesUpViaSnapshot` in `internal/cluster`.
 
 ## Pointers
 
