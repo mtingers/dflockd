@@ -40,16 +40,23 @@ type e2eNode struct {
 }
 
 type e2eCluster struct {
-	t       *testing.T
-	ids     []raft.NodeID
-	members map[raft.NodeID]Member
-	nodes   map[raft.NodeID]*e2eNode
-	mu      sync.Mutex
+	t         *testing.T
+	ids       []raft.NodeID
+	members   map[raft.NodeID]Member
+	nodes     map[raft.NodeID]*e2eNode
+	orphanTTL time.Duration // OrphanTTL for every node's LockManager (0 = off)
+	mu        sync.Mutex
 }
 
 func startE2ECluster(t *testing.T, ids ...raft.NodeID) *e2eCluster {
+	return startE2EClusterOrphan(t, 0, ids...)
+}
+
+// startE2EClusterOrphan is startE2ECluster with stable-ref re-attach
+// enabled (OrphanTTL > 0) on every node, for failover re-attach tests.
+func startE2EClusterOrphan(t *testing.T, orphanTTL time.Duration, ids ...raft.NodeID) *e2eCluster {
 	t.Helper()
-	c := &e2eCluster{t: t, ids: ids, nodes: map[raft.NodeID]*e2eNode{}}
+	c := &e2eCluster{t: t, ids: ids, nodes: map[raft.NodeID]*e2eNode{}, orphanTTL: orphanTTL}
 	c.allocMembers()
 	for _, id := range ids {
 		c.startOne(id)
@@ -90,6 +97,7 @@ func (c *e2eCluster) bringNodeUp(n *e2eNode) {
 		DefaultLeaseTTL: 30 * time.Second,
 		GCMaxIdleTime:   60 * time.Second,
 		MaxLocks:        128,
+		OrphanTTL:       c.orphanTTL,
 	}
 	lm, err := lock.NewLockManager(n.cfg, slog.Default())
 	if err != nil {
@@ -147,8 +155,8 @@ func (c *e2eCluster) bindClientPort(n *e2eNode) {
 func (c *e2eCluster) stopOne(id raft.NodeID) {
 	c.t.Helper()
 	n := c.nodes[id]
-	if n == nil {
-		return
+	if n == nil || n.srv == nil {
+		return // never started, or already stopped (idempotent)
 	}
 	n.srv.SetCluster(nil)
 	n.srvCancel()
@@ -404,6 +412,87 @@ func freeLoopback(t *testing.T) string {
 	addr := l.Addr().String()
 	l.Close()
 	return addr
+}
+
+// TestE2EStableRefReAttachAcrossFailover proves the headline failover
+// promise end-to-end over real TCP: a client holding a lock under a
+// stable ref, whose leader is HARD-crashed (no graceful CleanupConn),
+// reclaims the SAME lock token on reconnect to the freshly-elected
+// leader. This needs OrphanTTL > 0. Before the PR-5 re-adopt fix the
+// reconnect's single-phase Acquire would queue behind its own orphaned
+// holder and time out — so this test is the regression guard for the
+// gap PR-4 shipped but did not close.
+func TestE2EStableRefReAttachAcrossFailover(t *testing.T) {
+	c := startE2EClusterOrphan(t, 30*time.Second, "alpha", "beta", "gamma")
+	defer c.stopAll()
+
+	leader := c.waitLeader(3 * time.Second)
+
+	// Acquire kA under a stable ref and KEEP the connection open. Closing
+	// it would gracefully orphan the holder (abandonedAtNanos set) — the
+	// case even the old finders matched. Holding it open until the crash
+	// is what makes this a true hard crash: stopOne tears the node down
+	// with cluster=nil, so no CleanupConn is ever replicated and the
+	// holder reaches the new leader with abandonedAtNanos == 0.
+	conn, err := client.Dial(c.clientAddrOf(leader))
+	if err != nil {
+		t.Fatalf("dial leader: %v", err)
+	}
+	if err := client.SetStableRef(conn, "worker-1"); err != nil {
+		t.Fatalf("SetStableRef: %v", err)
+	}
+	token, _, err := client.Acquire(conn, "kA", 2*time.Second)
+	if err != nil {
+		t.Fatalf("Acquire kA: %v", err)
+	}
+	for _, id := range c.ids {
+		if !waitForN(t, 2*time.Second, func() bool { return c.holdersOnNode(id, "kA") == 1 }) {
+			t.Fatalf("node %s never observed the kA holder", id)
+		}
+	}
+
+	// HARD crash the leader, then close the now-dead socket.
+	c.stopOne(leader)
+	_ = conn.Close()
+	rest := otherIDs(c.ids, leader)
+	newLeader := c.waitLeader(5*time.Second, rest...)
+	if newLeader == leader {
+		t.Fatalf("new leader == crashed leader %s", leader)
+	}
+	// The holder survived the crash un-orphaned (abandonedAtNanos == 0) —
+	// the exact state PR-4's finders skipped.
+	for _, id := range rest {
+		toks := c.nodes[id].lm.DebugHolderTokens("lock:kA")
+		if len(toks) != 1 || toks[0] != token {
+			t.Fatalf("pre-reconnect survivor %s kA = %v, want [%s]", id, toks, token)
+		}
+	}
+
+	// Reconnect to the new leader with the SAME stable ref and re-acquire.
+	// Without re-adopt this single-phase Acquire would queue behind the
+	// orphaned holder and time out; with it, the original token returns.
+	conn2, err := client.Dial(c.clientAddrOf(newLeader))
+	if err != nil {
+		t.Fatalf("dial new leader: %v", err)
+	}
+	defer conn2.Close()
+	if err := client.SetStableRef(conn2, "worker-1"); err != nil {
+		t.Fatalf("SetStableRef on reconnect: %v", err)
+	}
+	token2, _, err := client.Acquire(conn2, "kA", 2*time.Second)
+	if err != nil {
+		t.Fatalf("re-acquire kA on new leader: %v", err)
+	}
+	if token2 != token {
+		t.Fatalf("re-attach token = %q, want original %q (reconnect must reclaim its holder, not re-queue)", token2, token)
+	}
+	// Exactly one holder on every survivor — re-adopted, not duplicated.
+	for _, id := range rest {
+		toks := c.nodes[id].lm.DebugHolderTokens("lock:kA")
+		if len(toks) != 1 || toks[0] != token {
+			t.Fatalf("survivor %s kA holders = %v, want [%s] (one re-adopted holder)", id, toks, token)
+		}
+	}
 }
 
 // hush a couple of unused-import gripes when the test file is the only

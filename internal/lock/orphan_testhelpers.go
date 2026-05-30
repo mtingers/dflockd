@@ -83,3 +83,52 @@ func (lm *LockManager) WaiterSaltForTest(key, ref string) [8]byte {
 	}
 	return [8]byte{}
 }
+
+// HolderCountForTest returns the number of holders on key.
+func (lm *LockManager) HolderCountForTest(key string) int {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil {
+		return 0
+	}
+	return len(st.Holders)
+}
+
+// HolderTokenForRefTest returns the token of the holder on key whose
+// ref matches, or "" if none. Used to assert a re-adopt returned the
+// original holder (same token) rather than minting a fresh one.
+func (lm *LockManager) HolderTokenForRefTest(key, ref string) string {
+	sh := lm.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	st := sh.resources[key]
+	if st == nil {
+		return ""
+	}
+	for tok, h := range st.Holders {
+		if h.ref == ref {
+			return tok
+		}
+	}
+	return ""
+}
+
+// ConnTrackedForTest reports whether any shard still has per-connection
+// index state (owned tokens or enqueued keys) for connID. Used to
+// assert that re-adopting a hard-crashed holder/waiter evicted the
+// dead connection's stale index entries.
+func (lm *LockManager) ConnTrackedForTest(connID uint64) bool {
+	for i := range lm.shards {
+		sh := &lm.shards[i]
+		sh.mu.Lock()
+		_, owned := sh.connOwned[connID]
+		_, enq := sh.connEnqueuedByID[connID]
+		sh.mu.Unlock()
+		if owned || enq {
+			return true
+		}
+	}
+	return false
+}

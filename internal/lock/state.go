@@ -35,11 +35,14 @@ func StripKeyPrefix(key string) string {
 // connID is meaningless across nodes) can route by Ref while the
 // single-node fast paths continue to key off connID.
 //
-// abandonedAtNanos != 0 means the original connection went away while the
-// holder had a stable ref. The slot is preserved (not removed via
-// CleanupConn) and the FSM's evict sweep retires it after OrphanTTL.
-// A reconnect with matching ref before that deadline re-adopts the
-// holder (resets abandonedAtNanos, rebinds connID).
+// abandonedAtNanos != 0 means a graceful CleanupConn observed the
+// connection go away while the holder had a stable ref: the slot is
+// preserved (not removed) and the FSM's evict sweep retires it once
+// OrphanTTL elapses. The stamp drives only that TTL eviction — re-adopt
+// matches by ref alone, so a reconnect reclaims the holder whether the
+// previous connection closed gracefully (stamp set) or hard-crashed
+// (stamp still 0 — a new leader inherited the FSM via snapshot and never
+// saw a CleanupConn). Re-adopt rebinds connID and resets the stamp.
 type holder struct {
 	connID           uint64
 	leaseExpires     time.Time
@@ -55,8 +58,10 @@ type holder struct {
 // continue to use ch + connID for routing.
 //
 // abandonedAtNanos behaves identically to the same field on holder: a
-// stable-ref waiter whose connection died is parked here until the
-// caller reconnects (and re-adopts) or the OrphanTTL fires.
+// gracefully-closed stable-ref waiter is parked here (stamp set) until
+// the caller reconnects or OrphanTTL fires. Re-adopt itself matches by
+// ref regardless of the stamp, so a hard-crashed waiter (stamp 0) is
+// reclaimed on reconnect too.
 type waiter struct {
 	ch               chan string
 	connID           uint64

@@ -7,19 +7,26 @@ partial / caveated; `⏳` = not yet, with a pointer to the follow-on.
 
 ## Posture
 
-Cluster mode is **GA-eligible for static-bootstrap workloads that
-don't depend on FIFO across a leader failover.** Two known gaps
-remain (both with workarounds, both documented); everything else from
-the original §7 checklist is either implemented or N/A. Two prior
-production-hardening passes are reflected here:
+Cluster mode is **GA-eligible for static-bootstrap workloads.** FIFO
+across a leader failover — once the headline gap — is now available as
+an opt-in (stable client refs; see below). One known gap remains (a
+long-horizon multi-host soak harness, with a workaround); everything
+else from the original §7 checklist is either implemented or N/A. The
+production-hardening passes reflected here:
 
 - **PR-1** (the alpha → beta lift): admin endpoints, default-deny
   admin token, counter metrics, public ReadIndex/Barrier API,
   constant-time token compare, `make test-race`.
-- **PR-2** (this release): failover-aware Go client
-  (`client.Cluster`), in-process soak harness (`cmd/cluster-soak`),
-  fuzz targets for the Raft frame codec and the cluster `Command`
-  codec.
+- **PR-2**: failover-aware Go client (`client.Cluster`), in-process
+  soak harness (`cmd/cluster-soak`), fuzz targets for the Raft frame
+  codec and the cluster `Command` codec.
+- **PR-3**: dynamic-join via InstallSnapshot to a cold node, validated.
+- **PR-4 + PR-5**: FIFO across leader failover via stable client refs.
+  PR-4 introduced the mechanism; PR-5 closed it for the case that
+  matters — hard leader crash (not just graceful disconnect), the
+  single-phase `Acquire` path (not just two-phase `Enqueue`), and the
+  `--orphan-ttl` flag itself (PR-4 left it unwired). Proven end-to-end
+  by `TestE2EStableRefReAttachAcrossFailover`.
 
 **You can run this in production today if:**
 
@@ -27,10 +34,12 @@ production-hardening passes are reflected here:
   (every member listed before bootstrap), with `AddVoter` /
   `RemoveServer` reserved for grow/shrink against a node whose
   `--cluster-peers` already lists the cluster.
-- Your callers tolerate a "lost queue slot" outcome when a leader
-  fails *while they were blocked* in `acquire` / `wait` — already-granted
-  tokens (`renew`, `release`) survive seamlessly; only the blocked-call
-  case is affected.
+- Your callers either enable stable client refs (`--orphan-ttl` +
+  `client.WithClusterStableRef`) to keep their queue slot / held lock
+  across a failover, or tolerate a "lost queue slot" outcome when a
+  leader fails *while they were blocked* in `acquire` / `wait` —
+  already-granted tokens (`renew`, `release`) survive seamlessly
+  either way.
 - Operations include `--admin-token`, mTLS on the Raft transport
   (`--raft-tls-cert/-key/-ca`), and standard scrape of `/metrics` for
   the counter metrics shipped in PR-1.
@@ -223,17 +232,24 @@ API but aren't each individually exercised by a redirect test.
 
 ## What's NOT done (deferred follow-ons)
 
-PR-4 closed: stable-client-ref FIFO failover (was PR-3 gap 1). The
-FSM's `ApplyCleanupConn` now marks ref-tagged waiters/holders orphaned
-(stamped with `AbandonedAtNanos`) instead of removing them; a
-re-Enqueue with matching `(key, ref)` re-adopts the slot via
-`ApplyEnqueue`, preserving FIFO order. Snapshot codec v2 carries the
-new field; v1 snapshots are still readable. Opt-in via `--orphan-ttl`
-+ `client.WithClusterStableRef`. Tests at the FSM layer
-(`TestCleanupConnOrphansStableRefWaiter`,
-`TestEnqueueReAdoptsOrphanedWaiter`,
-`TestSnapshotRoundTripPreservesOrphanState`,
-`TestEvictExpiredRemovesOrphanPastTTL`) + server layer (3 tests).
+PR-4 + PR-5 closed: stable-client-ref FIFO failover (was PR-3 gap 1).
+PR-4 introduced the mechanism — `ApplyCleanupConn` marks ref-tagged
+waiters/holders orphaned (`abandonedAtNanos`) instead of removing them,
+snapshot codec v2 carries the field (v1 still readable), opt-in via
+`--orphan-ttl` + `client.WithClusterStableRef`. PR-5 made it real for
+the failover that matters: re-adopt now matches by `(key, ref)` alone
+(so a hard-crashed leader — which never replicates a `CleanupConn` —
+re-attaches, not just a graceful disconnect), runs in both the
+single-phase `ApplyAcquire` and two-phase `ApplyEnqueue` paths (PR-4
+wired only the latter), evicts the dead connection's stale index on
+re-adopt, and the `--orphan-ttl` flag/env is actually parsed (PR-4 left
+only the `Config` field, so the feature was unreachable in a real
+deployment). Tests: FSM layer (`TestEnqueueReAdoptsHardCrashedHolder`,
+`…Waiter`, `TestAcquireReAdoptsHardCrashedHolder`, `…Waiter`, plus the
+PR-4 graceful-path + snapshot tests), config layer
+(`TestLoad_OrphanTTL_*`), server layer (3 tests), and an end-to-end
+real-TCP hard-crash regression guard
+(`TestE2EStableRefReAttachAcrossFailover`).
 
 PR-3 closed: dynamic-join with snapshot transfer to a cold-state empty
 node.
@@ -322,11 +338,12 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 
 ## Bottom line
 
-Cluster mode is **beta-plus / GA-eligible.** After PR-4, every cluster
+Cluster mode is **beta-plus / GA-eligible.** After PR-5, every cluster
 safety + ergonomic item from the original §7 checklist is implemented
 and tested. Static-bootstrap, dynamic-join (`AddVoter` → cold node),
 and FIFO-across-leader-failover (via `--orphan-ttl` +
-`client.WithClusterStableRef`) all validated end-to-end. The only
+`client.WithClusterStableRef`) are all validated end-to-end — the last
+now including a hard-crash regression guard over real TCP. The only
 remaining follow-on is a long-horizon multi-host soak harness — useful
 for very-high-stakes deployments but not blocking for the workloads the
 existing in-process soak already covers. The whole tree passes

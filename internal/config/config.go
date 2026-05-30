@@ -150,7 +150,7 @@ type flagPtrs struct {
 	port, maxLocks                                  *int
 	maxConnections, maxConnectionsPerIP, maxWaiters *int
 	defaultLeaseTTL, leaseSweepInterval             *int
-	gcInterval, gcMaxIdle                           *int
+	gcInterval, gcMaxIdle, orphanTTL                *int
 	readTimeout, writeTimeout, shutdownTimeout      *int
 	httpPort, httpIdle                              *int
 	httpMaxSessions, httpMaxSessionsPerIP           *int
@@ -196,6 +196,7 @@ func defineIntFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.leaseSweepInterval = fs.Int("lease-sweep-interval", 1, "Lease expiry check interval (seconds)")
 	f.gcInterval = fs.Int("gc-interval", 5, "Lock state GC interval (seconds)")
 	f.gcMaxIdle = fs.Int("gc-max-idle", 60, "Idle seconds before pruning lock state")
+	f.orphanTTL = fs.Int("orphan-ttl", 0, "Cluster only: seconds a stable-ref lock/queue slot survives in the FSM after its client's connection drops, before reclamation. Enables FIFO-preserving failover re-attach (reconnect with the same stable ref reclaims the slot). 0 = reclaim immediately. Must be identical on every cluster member.")
 	f.maxLocks = fs.Int("max-locks", 1024, "Maximum number of unique lock keys")
 	f.maxConnections = fs.Int("max-connections", 0, "Maximum concurrent connections (0 = unlimited)")
 	f.maxConnectionsPerIP = fs.Int("max-connections-per-ip", 0, "Maximum concurrent TCP connections per remote IP (0 = unlimited)")
@@ -383,6 +384,7 @@ func durationResolvers(f *flagPtrs) []durationResolver {
 		{"lease-sweep-interval", "DFLOCKD_LEASE_SWEEP_INTERVAL_S", f.leaseSweepInterval, func(c *Config, v time.Duration) { c.LeaseSweepInterval = v }},
 		{"gc-interval", "DFLOCKD_GC_INTERVAL_S", f.gcInterval, func(c *Config, v time.Duration) { c.GCInterval = v }},
 		{"gc-max-idle", "DFLOCKD_GC_MAX_IDLE_S", f.gcMaxIdle, func(c *Config, v time.Duration) { c.GCMaxIdleTime = v }},
+		{"orphan-ttl", "DFLOCKD_ORPHAN_TTL_S", f.orphanTTL, func(c *Config, v time.Duration) { c.OrphanTTL = v }},
 		{"read-timeout", "DFLOCKD_READ_TIMEOUT_S", f.readTimeout, func(c *Config, v time.Duration) { c.ReadTimeout = v }},
 		{"write-timeout", "DFLOCKD_WRITE_TIMEOUT_S", f.writeTimeout, func(c *Config, v time.Duration) { c.WriteTimeout = v }},
 		{"shutdown-timeout", "DFLOCKD_SHUTDOWN_TIMEOUT_S", f.shutdownTimeout, func(c *Config, v time.Duration) { c.ShutdownTimeout = v }},
@@ -445,6 +447,21 @@ var validators = []func(*Config) error{
 	validateClusterFields,
 	validateClusterVsFenceFile,
 	validateRaftTLS,
+	validateOrphanTTL,
+}
+
+// validateOrphanTTL rejects a negative TTL and the no-op combination of
+// a positive TTL outside cluster mode (the orphan/re-adopt machinery
+// lives in the Raft FSM apply path, which single-node mode never runs —
+// so a single-node --orphan-ttl would silently do nothing).
+func validateOrphanTTL(c *Config) error {
+	if c.OrphanTTL < 0 {
+		return fmt.Errorf("--orphan-ttl must be >= 0")
+	}
+	if c.OrphanTTL > 0 && !c.IsCluster() {
+		return fmt.Errorf("--orphan-ttl requires cluster mode (--raft-dir); it has no effect single-node")
+	}
+	return nil
 }
 
 // validateClusterFields enforces that cluster fields are coherent: if

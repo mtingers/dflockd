@@ -52,6 +52,7 @@ var configEnvKeys = []string{
 	"DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP",
 	"DFLOCKD_HTTP_RATE_LIMIT_PER_IP", "DFLOCKD_HTTP_RATE_LIMIT_BURST",
 	"DFLOCKD_HTTP_CORS_ALLOWED_ORIGINS", "DFLOCKD_DEBUG",
+	"DFLOCKD_ORPHAN_TTL_S",
 }
 
 func clearEnvKey(t *testing.T, key string) {
@@ -339,5 +340,73 @@ func TestUnboundedLimitWarnings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// orphanClusterArgs returns a minimal valid cluster flag set with any
+// extra args appended — OrphanTTL > 0 is only valid in cluster mode.
+func orphanClusterArgs(extra ...string) []string {
+	return append([]string{
+		"--raft-dir", "/tmp/raft", "--node-id", "n1",
+		"--raft-addr", "127.0.0.1:7001",
+		"--cluster-peers", "n1=127.0.0.1:7001@127.0.0.1:6388",
+	}, extra...)
+}
+
+func TestLoad_OrphanTTL_Default(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load defaults: %v", err)
+	}
+	if cfg.OrphanTTL != 0 {
+		t.Fatalf("default OrphanTTL = %v, want 0 (disabled)", cfg.OrphanTTL)
+	}
+}
+
+func TestLoad_OrphanTTL_Flag(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load(orphanClusterArgs("--orphan-ttl", "45"))
+	if err != nil {
+		t.Fatalf("Load --orphan-ttl: %v", err)
+	}
+	if cfg.OrphanTTL != 45*time.Second {
+		t.Fatalf("OrphanTTL = %v, want 45s", cfg.OrphanTTL)
+	}
+}
+
+func TestLoad_OrphanTTL_EnvAndPrecedence(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_ORPHAN_TTL_S": "30"})
+	cfg, err := Load(orphanClusterArgs())
+	if err != nil {
+		t.Fatalf("Load env: %v", err)
+	}
+	if cfg.OrphanTTL != 30*time.Second {
+		t.Fatalf("OrphanTTL from env = %v, want 30s", cfg.OrphanTTL)
+	}
+	cfg, err = Load(orphanClusterArgs("--orphan-ttl", "10"))
+	if err != nil {
+		t.Fatalf("Load flag+env: %v", err)
+	}
+	if cfg.OrphanTTL != 10*time.Second {
+		t.Fatalf("OrphanTTL = %v, want 10s (flag wins over env)", cfg.OrphanTTL)
+	}
+}
+
+func TestLoad_OrphanTTL_RequiresCluster(t *testing.T) {
+	clearEnv(t)
+	_, err := Load([]string{"--orphan-ttl", "30"})
+	if err == nil || !strings.Contains(err.Error(), "--orphan-ttl requires cluster mode") {
+		t.Fatalf("want orphan-ttl-requires-cluster error, got %v", err)
+	}
+}
+
+func TestLoad_OrphanTTL_Negative(t *testing.T) {
+	clearEnv(t)
+	withEnv(t, map[string]string{"DFLOCKD_ORPHAN_TTL_S": "-5"})
+	_, err := Load(nil)
+	if err == nil || !strings.Contains(err.Error(), "--orphan-ttl must be >= 0") {
+		t.Fatalf("want orphan-ttl>=0 error, got %v", err)
 	}
 }

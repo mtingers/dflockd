@@ -74,6 +74,12 @@ func (lm *LockManager) applyAcquireLocked(sh *shard, key string, limit int, ref 
 	if err != nil {
 		return nil, ApplyResult{}, nil, err
 	}
+	// Re-adopt first: a reconnecting stable ref must reclaim its existing
+	// holder/waiter rather than mint a second slot (which, on a semaphore
+	// with a free slot, would let one ref hold twice).
+	if kind, tok, _ := lm.reAttachByRef(sh, st, key, ref, connID, leaseTTL, now); kind != reAdoptNone {
+		return st, acquireReAdoptResult(kind, tok, leaseTTL), pre, nil
+	}
 	if len(st.Holders) < st.Limit && st.waiterCount() == 0 {
 		token, err := lm.mintFSMToken(salt)
 		if err != nil {
@@ -87,6 +93,16 @@ func (lm *LockManager) applyAcquireLocked(sh *shard, key string, limit int, ref 
 	}
 	st.Waiters = append(st.Waiters, &waiter{ref: ref, connID: connID, leaseTTL: leaseTTL, salt: salt})
 	return st, ApplyResult{Status: StatusQueued}, pre, nil
+}
+
+// acquireReAdoptResult maps a re-adopt outcome to the single-phase
+// Acquire result: a re-adopted holder grants immediately (StatusOK with
+// the original token); a re-adopted waiter stays queued.
+func acquireReAdoptResult(kind reAdoptKind, tok string, leaseTTL time.Duration) ApplyResult {
+	if kind == reAdoptHolder {
+		return ApplyResult{Status: StatusOK, Token: tok, LeaseSec: secondsOf(leaseTTL)}
+	}
+	return ApplyResult{Status: StatusQueued}
 }
 
 // ApplyEnqueue is the FSM-side phase-1 enqueue (two-phase). Returns
@@ -120,52 +136,128 @@ func (lm *LockManager) ApplyEnqueue(now time.Time, key string, limit int, ref st
 	return lm.applyEnqueueOnto(sh, st, eqKey, key, ref, connID, leaseTTL, salt, now, pre)
 }
 
-// tryReAdopt looks for an orphaned holder or waiter on (key, ref) and,
-// if found, re-attaches it to the new connID. Returns (result, true)
-// if a re-adopt happened; (zero, false) otherwise. Caller holds sh.mu.
+// reAdoptKind classifies what reAttachByRef re-adopted.
+type reAdoptKind uint8
+
+const (
+	reAdoptNone reAdoptKind = iota
+	reAdoptHolder
+	reAdoptWaiter
+)
+
+// tryReAdopt is the two-phase Enqueue's re-adopt wrapper: it re-attaches
+// any holder/waiter on (key, ref) to connID and records the new
+// connection's two-phase index entry. Returns (result, true) on a
+// re-adopt; (zero, false) otherwise. Caller holds sh.mu.
 func (lm *LockManager) tryReAdopt(sh *shard, st *ResourceState, eqKey connKey, key, ref string, connID uint64, leaseTTL time.Duration, now time.Time) (ApplyResult, bool) {
-	if ref == "" || lm.cfg.OrphanTTL <= 0 {
-		return ApplyResult{}, false
-	}
-	if tok, h := findOrphanHolder(st, ref); h != nil {
-		h.connID = connID
-		h.abandonedAtNanos = 0
-		// Recompute leaseExpires off the caller's new TTL request — a
-		// reconnect implicitly renews the lease the same way a direct
-		// renew would. (The new TTL is what the FSM sees on the apply,
-		// so it's deterministic.)
-		h.leaseExpires = now.Add(leaseTTL)
-		sh.addOwned(connID, key, tok)
+	kind, tok, w := lm.reAttachByRef(sh, st, key, ref, connID, leaseTTL, now)
+	switch kind {
+	case reAdoptHolder:
 		sh.setEnqueued(eqKey, &enqueuedState{token: tok, leaseTTL: leaseTTL})
 		return ApplyResult{Status: StatusAcquired, Token: tok, LeaseSec: secondsOf(leaseTTL)}, true
-	}
-	if w := findOrphanWaiter(st, ref); w != nil {
-		w.connID = connID
-		w.abandonedAtNanos = 0
-		w.leaseTTL = leaseTTL
+	case reAdoptWaiter:
 		sh.setEnqueued(eqKey, &enqueuedState{waiter: w, leaseTTL: leaseTTL})
 		return ApplyResult{Status: StatusQueued}, true
+	default:
+		return ApplyResult{}, false
 	}
-	return ApplyResult{}, false
 }
 
-// findOrphanHolder returns (token, holder) for the first orphaned
-// holder on st with matching ref, or ("", nil).
-func findOrphanHolder(st *ResourceState, ref string) (string, *holder) {
+// reAttachByRef re-attaches an existing holder or waiter on (key, ref)
+// to newConnID — regardless of whether it was gracefully orphaned
+// (abandonedAtNanos != 0) or hard-crashed (still 0). Matching by ref
+// alone is what closes the hard-crash failover gap: a new leader that
+// inherited the FSM via snapshot never saw a CleanupConn for the dead
+// connection, so the entry's orphan stamp is 0 — but the ref still
+// identifies the reconnecting client. The previous (now-dead)
+// connection's stale index entries are evicted. Holder takes precedence
+// over waiter (a ref holds at most one of either per key). Returns
+// reAdoptNone when nothing matches. Caller holds sh.mu.
+//
+// Gated on OrphanTTL > 0 and a non-empty ref, so it is inert under the
+// default config and for connID-only (single-node) callers. The
+// ref-is-one-live-connection assumption is the same one the grant
+// router (WatchGrants(ref)) already relies on.
+func (lm *LockManager) reAttachByRef(sh *shard, st *ResourceState, key, ref string, newConnID uint64, leaseTTL time.Duration, now time.Time) (reAdoptKind, string, *waiter) {
+	if ref == "" || lm.cfg.OrphanTTL <= 0 {
+		return reAdoptNone, "", nil
+	}
+	if tok, h := findHolderByRef(st, ref); h != nil {
+		lm.rebindHolder(sh, key, tok, h, newConnID, leaseTTL, now)
+		return reAdoptHolder, tok, nil
+	}
+	if w := findWaiterByRef(st, ref); w != nil {
+		lm.rebindWaiter(sh, key, w, newConnID, leaseTTL)
+		return reAdoptWaiter, "", w
+	}
+	return reAdoptNone, "", nil
+}
+
+// rebindHolder re-points an existing holder to newConnID, clears the
+// orphan stamp, renews the lease off the caller's TTL (a reconnect
+// implicitly renews, deterministically — the new TTL is in the apply),
+// indexes the new owner, and evicts the dead connection's stale index.
+func (lm *LockManager) rebindHolder(sh *shard, key, tok string, h *holder, newConnID uint64, leaseTTL time.Duration, now time.Time) {
+	oldConnID := h.connID
+	h.connID = newConnID
+	h.abandonedAtNanos = 0
+	h.leaseExpires = now.Add(leaseTTL)
+	sh.addOwned(newConnID, key, tok)
+	lm.evictDeadConn(sh, oldConnID, newConnID, key, tok)
+}
+
+// rebindWaiter re-points an existing waiter to newConnID, clears the
+// orphan stamp, refreshes its lease TTL, and evicts the dead
+// connection's stale index. The waiter keeps its queue position and
+// salt (so a later promotion mints the same deterministic token).
+func (lm *LockManager) rebindWaiter(sh *shard, key string, w *waiter, newConnID uint64, leaseTTL time.Duration) {
+	oldConnID := w.connID
+	w.connID = newConnID
+	w.abandonedAtNanos = 0
+	w.leaseTTL = leaseTTL
+	lm.evictDeadConn(sh, oldConnID, newConnID, key, "")
+}
+
+// evictDeadConn removes the previous (now-dead) connection's per-conn
+// index for key after its holder/waiter was re-adopted by newConnID.
+// token is "" for a re-adopted waiter (no owned slot to drop). No-op
+// when oldConnID is the sentinel 0 (a gracefully-orphaned entry, whose
+// index CleanupConn already removed) or equals newConnID (defensive — a
+// reconnect always gets a fresh connID).
+func (lm *LockManager) evictDeadConn(sh *shard, oldConnID, newConnID uint64, key, token string) {
+	if oldConnID == 0 || oldConnID == newConnID {
+		return
+	}
+	if token != "" {
+		sh.removeOwned(oldConnID, key, token)
+	}
+	sh.removeEnqueued(connKey{ConnID: oldConnID, Key: key})
+}
+
+// findHolderByRef returns the holder on st whose ref matches, preferring
+// the lexicographically smallest token so the choice is deterministic
+// across replicas if (pathologically) more than one matches. Returns
+// ("", nil) when none match.
+func findHolderByRef(st *ResourceState, ref string) (string, *holder) {
+	var bestTok string
+	var best *holder
 	for tok, h := range st.Holders {
-		if h.ref == ref && h.abandonedAtNanos != 0 {
-			return tok, h
+		if h.ref != ref {
+			continue
+		}
+		if best == nil || tok < bestTok {
+			bestTok, best = tok, h
 		}
 	}
-	return "", nil
+	return bestTok, best
 }
 
-// findOrphanWaiter returns the first orphaned waiter on st with
-// matching ref, or nil.
-func findOrphanWaiter(st *ResourceState, ref string) *waiter {
+// findWaiterByRef returns the first waiter (by queue position) on st
+// whose ref matches, or nil.
+func findWaiterByRef(st *ResourceState, ref string) *waiter {
 	for i := st.WaiterHead; i < len(st.Waiters); i++ {
 		w := st.Waiters[i]
-		if w != nil && w.ref == ref && w.abandonedAtNanos != 0 {
+		if w != nil && w.ref == ref {
 			return w
 		}
 	}

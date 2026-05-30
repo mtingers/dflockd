@@ -186,33 +186,42 @@ any node.
 
 ## FIFO across leader failover (stable client refs)
 
-A caller blocked in `enqueue → wait` when the leader fails ordinarily
-loses its queue position (the waiter slot is keyed by TCP connection
-id, which the new leader doesn't recognize). PR-4 adds **stable client
-refs** to fix this:
+A caller holding — or blocked waiting on — a lock when the leader fails
+ordinarily loses its place (the holder/waiter slot is keyed by TCP
+connection id, which the new leader doesn't recognize). **Stable client
+refs** fix this:
 
-1. Set `--orphan-ttl 30s` (or similar) on every node so the FSM is
-   willing to retain orphaned waiters/holders that long.
+1. Set `--orphan-ttl 30` (seconds; or `DFLOCKD_ORPHAN_TTL_S`) on every
+   node so the FSM retains a ref-tagged holder/waiter that long after
+   its connection drops. The value must be identical on every member —
+   it's read in the replicated apply path — and cluster-mode only (the
+   loader rejects `--orphan-ttl > 0` without `--raft-dir`).
 2. The Go client opts in via `client.WithClusterStableRef("session-X")`.
 
 ```go
 cl, _ := client.NewCluster(members,
     client.WithClusterStableRef(uuid.NewString()), // any opaque per-session id
 )
-status, _, _, _ := cl.Enqueue(ctx, "deploy", ...) // status == "queued"
-token, _, _ := cl.Wait(ctx, "deploy", 30*time.Second)
-// ... if the leader dies during Wait, the Cluster wrapper reconnects
-// to the new leader, re-sends the stable ref, and re-attaches to the
-// original waiter — preserving the caller's FIFO position.
+// Works for both the single-phase Acquire and the two-phase Enqueue/Wait:
+token, _, _ := cl.Acquire(ctx, "deploy", 30*time.Second)
+// ... if the leader dies, the Cluster wrapper reconnects to the new
+// leader, re-sends the stable ref, and re-attaches to the original
+// holder — the SAME token comes back. A queued caller keeps its FIFO
+// position the same way.
 ```
 
-Under the hood: on `CleanupConn` (proposed when a TCP conn ends), the
-FSM marks ref-tagged waiters and holders "orphaned" (records a
-`AbandonedAtNanos` stamp) instead of removing them. On a reconnect with
-matching `(key, ref)`, `ApplyEnqueue` re-adopts the existing slot
-(preserving the original salt, queue position, and minted token if
-already promoted). The next `EvictExpired` sweep evicts orphans past
-`OrphanTTL`.
+Under the hood: re-adopt matches by `(key, ref)` alone, in **both** the
+`ApplyAcquire` and `ApplyEnqueue` paths. It works whether the previous
+connection closed **gracefully** (the FSM's `ApplyCleanupConn` stamped
+the slot `abandonedAtNanos` and cleared its conn id) or the node was
+**hard-crashed** (no `CleanupConn` ran, so the slot the new leader
+inherited still has `abandonedAtNanos == 0` — it never saw the
+disconnect). The reconnect rebinds the slot to the new connection,
+renews the lease, and evicts the dead connection's stale index entries.
+Reclamation of slots that are *never* reclaimed by a reconnect: the
+`EvictExpired` sweep retires gracefully-orphaned slots past
+`OrphanTTL`; a hard-crashed holder is bounded by its lease, and a
+hard-crashed waiter by promotion-then-lease.
 
 **Security note:** stable refs are caller-supplied identifiers, not
 authenticated credentials. Anyone who knows your ref can re-attach to
@@ -262,12 +271,14 @@ pre-release smoke; a long-horizon, multi-host harness is a follow-on.
 
 ## v1 caveats
 
-- **FIFO across leader failover** — a client blocked in `acquire` /
-  `wait` when the leader fails loses its queue position; the holder
-  entry (if any was minted) expires via its lease. Already-granted
-  tokens survive seamlessly (the client can `renew` / `release` them
-  against the new leader). Stable-client-ref re-attach across failover
-  is laid out in PLAN.md §4.7 as a follow-on.
+- **FIFO across leader failover** — *by default* a client blocked in
+  `acquire` / `wait` when the leader fails loses its queue position;
+  the holder entry (if any was minted) expires via its lease.
+  Already-granted tokens survive seamlessly (the client can `renew` /
+  `release` them against the new leader). To preserve queue position
+  and re-attach to a held lock across failover — including a
+  hard-crashed leader — enable stable client refs (`--orphan-ttl` +
+  `WithClusterStableRef`); see "FIFO across leader failover" above.
 - **Dynamic-join with snapshot transfer** to a node started with
   empty `--raft-dir` works as of PR-3. Operator flow: `AddVoter` on
   the leader, then start the new node with empty storage and
