@@ -182,15 +182,49 @@ func (lm *LockManager) reAttachByRef(sh *shard, st *ResourceState, key, ref stri
 	if ref == "" || lm.cfg.OrphanTTL <= 0 {
 		return reAdoptNone, "", nil
 	}
-	if tok, h := findHolderByRef(st, ref); h != nil {
+	if tok, h := findHolderByRef(st, ref, newConnID); h != nil {
 		lm.rebindHolder(sh, key, tok, h, newConnID, leaseTTL, now)
 		return reAdoptHolder, tok, nil
 	}
-	if w := findWaiterByRef(st, ref); w != nil {
+	if w := findWaiterByRef(st, ref, newConnID); w != nil {
 		lm.rebindWaiter(sh, key, w, newConnID, leaseTTL)
 		return reAdoptWaiter, "", w
 	}
 	return reAdoptNone, "", nil
+}
+
+// connIDEpochShift splits a cluster-mode connection id into its
+// per-server-process epoch (high 32 bits, randomised once per process)
+// and the process-local counter (low 32 bits). See
+// server.randomConnIDEpoch.
+const connIDEpochShift = 32
+
+// reclaimableBy reports whether an entry owned by ownerConnID may be
+// re-adopted by a request arriving on newConnID.
+//
+// `ref` comes off the wire, so matching on it alone would let any
+// caller who names another client's ref be handed that client's slot —
+// and, for a holder, its fencing token. The FSM can't see which
+// connections are live, but it can see two things that are replicated:
+//
+//   - an orphan stamp, set when a graceful CleanupConn observed the
+//     owner's connection go away (the stamp also zeroes connID); and
+//   - the owner's connID epoch. Every id minted by the server process
+//     handling this request shares its epoch, so a *different* epoch
+//     means the owner's connection belongs to some other process — a
+//     crashed leader, or this node before a restart. Either way it
+//     cannot still be serving that client.
+//
+// A live connection on this process matches neither, so its slot stays
+// its own. The cost is that a client which hard-crashes without its
+// TCP connection being reaped can't re-attach on the same leader until
+// the conn teardown stamps it (or the lease expires) — the conservative
+// direction.
+func reclaimableBy(abandonedAtNanos int64, ownerConnID, newConnID uint64) bool {
+	if abandonedAtNanos != 0 {
+		return true
+	}
+	return ownerConnID>>connIDEpochShift != newConnID>>connIDEpochShift
 }
 
 // rebindHolder re-points an existing holder to newConnID, clears the
@@ -234,15 +268,16 @@ func (lm *LockManager) evictDeadConn(sh *shard, oldConnID, newConnID uint64, key
 	sh.removeEnqueued(connKey{ConnID: oldConnID, Key: key})
 }
 
-// findHolderByRef returns the holder on st whose ref matches, preferring
-// the lexicographically smallest token so the choice is deterministic
-// across replicas if (pathologically) more than one matches. Returns
-// ("", nil) when none match.
-func findHolderByRef(st *ResourceState, ref string) (string, *holder) {
+// findHolderByRef returns the holder on st whose ref matches and which
+// newConnID is allowed to reclaim, preferring the lexicographically
+// smallest token so the choice is deterministic across replicas if
+// (pathologically) more than one matches. Returns ("", nil) when none
+// match — including when the only match is a live connection's.
+func findHolderByRef(st *ResourceState, ref string, newConnID uint64) (string, *holder) {
 	var bestTok string
 	var best *holder
 	for tok, h := range st.Holders {
-		if h.ref != ref {
+		if h.ref != ref || !reclaimableBy(h.abandonedAtNanos, h.connID, newConnID) {
 			continue
 		}
 		if best == nil || tok < bestTok {
@@ -253,11 +288,11 @@ func findHolderByRef(st *ResourceState, ref string) (string, *holder) {
 }
 
 // findWaiterByRef returns the first waiter (by queue position) on st
-// whose ref matches, or nil.
-func findWaiterByRef(st *ResourceState, ref string) *waiter {
+// whose ref matches and which newConnID is allowed to reclaim, or nil.
+func findWaiterByRef(st *ResourceState, ref string, newConnID uint64) *waiter {
 	for i := st.WaiterHead; i < len(st.Waiters); i++ {
 		w := st.Waiters[i]
-		if w != nil && w.ref == ref {
+		if w != nil && w.ref == ref && reclaimableBy(w.abandonedAtNanos, w.connID, newConnID) {
 			return w
 		}
 	}

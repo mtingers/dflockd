@@ -64,6 +64,13 @@ func WithClusterAuthToken(tok string) ClusterOption {
 // ref must be non-empty and ≤ 64 ASCII bytes; longer or empty values
 // are silently ignored (the Cluster falls back to the default
 // connID-derived ref).
+//
+// A ref names one client session, so a Cluster configured with one is
+// no longer safe to drive concurrently on the same key: each call
+// dials its own connection, and two of them under one ref are two
+// claims on the same FSM slot. Give each concurrent worker its own
+// Cluster (or its own ref). Refs are also unauthenticated identifiers
+// — generate them randomly and treat them like session tokens.
 func WithClusterStableRef(ref string) ClusterOption {
 	return func(c *clusterCfg) {
 		if ref != "" && len(ref) <= 64 {

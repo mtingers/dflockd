@@ -15,6 +15,18 @@ import (
 // "Hard crash" is simulated by NOT calling ApplyCleanupConn between the
 // original acquire/enqueue and the reconnect: the orphan stamp is never
 // set, exactly as on a new leader that inherited the FSM via snapshot.
+//
+// The reconnect therefore arrives on a connID minted by a DIFFERENT
+// server process, which is how the FSM tells "the owner's node is gone"
+// from "another live client is naming this ref" — cluster connIDs carry
+// a per-process epoch in their high 32 bits (server.randomConnIDEpoch).
+// deadNodeConn / newNodeConn below make that explicit.
+
+// deadNodeConn returns a connID as minted by the node that later
+// crashed; newNodeConn returns one from the node the client reconnects
+// to. Distinct epochs, as in any real failover.
+func deadNodeConn(n uint64) uint64 { return uint64(0xDEAD0001)<<32 | n }
+func newNodeConn(n uint64) uint64  { return uint64(0xA11FE001)<<32 | n }
 
 // TestEnqueueReAdoptsHardCrashedHolder: a client holds a lock (acquired
 // via the two-phase Enqueue fast-path), its node is killed without a
@@ -23,12 +35,12 @@ import (
 // holder, and the dead connection's index entries evicted.
 func TestEnqueueReAdoptsHardCrashedHolder(t *testing.T) {
 	lm := newOrphanTestLM(t, 30*time.Second)
-	res1, _, err := lm.ApplyEnqueue(at(100), "lock:k", 1, "ref-A", 1, 30*time.Second, saltOf(1))
+	res1, _, err := lm.ApplyEnqueue(at(100), "lock:k", 1, "ref-A", deadNodeConn(1), 30*time.Second, saltOf(1))
 	if err != nil || res1.Status != StatusAcquired || res1.Token == "" {
 		t.Fatalf("initial enqueue = %+v err=%v, want StatusAcquired+token", res1, err)
 	}
 	// HARD CRASH: connID 1 vanishes; no ApplyCleanupConn.
-	res2, _, err := lm.ApplyEnqueue(at(105), "lock:k", 1, "ref-A", 2, 30*time.Second, saltOf(2))
+	res2, _, err := lm.ApplyEnqueue(at(105), "lock:k", 1, "ref-A", newNodeConn(2), 30*time.Second, saltOf(2))
 	if err != nil {
 		t.Fatalf("reconnect enqueue: %v", err)
 	}
@@ -41,10 +53,10 @@ func TestEnqueueReAdoptsHardCrashedHolder(t *testing.T) {
 	if n := lm.HolderCountForTest("lock:k"); n != 1 {
 		t.Fatalf("holder count = %d, want 1 (re-adopted, not duplicated)", n)
 	}
-	if lm.ConnTrackedForTest(1) {
+	if lm.ConnTrackedForTest(deadNodeConn(1)) {
 		t.Fatalf("dead connID 1 still tracked after re-adopt; index not evicted")
 	}
-	if !lm.ConnTrackedForTest(2) {
+	if !lm.ConnTrackedForTest(newNodeConn(2)) {
 		t.Fatalf("new connID 2 not tracked after re-adopt")
 	}
 }
@@ -55,12 +67,12 @@ func TestEnqueueReAdoptsHardCrashedHolder(t *testing.T) {
 // its own orphaned holder until the lease lapsed.
 func TestAcquireReAdoptsHardCrashedHolder(t *testing.T) {
 	lm := newOrphanTestLM(t, 30*time.Second)
-	res1, _, err := lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", 1, 30*time.Second, saltOf(1))
+	res1, _, err := lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", deadNodeConn(1), 30*time.Second, saltOf(1))
 	if err != nil || res1.Status != StatusOK || res1.Token == "" {
 		t.Fatalf("initial acquire = %+v err=%v, want StatusOK+token", res1, err)
 	}
 	// HARD CRASH: no cleanup.
-	res2, _, err := lm.ApplyAcquire(at(105), "lock:k", 1, "ref-A", 2, 30*time.Second, saltOf(2))
+	res2, _, err := lm.ApplyAcquire(at(105), "lock:k", 1, "ref-A", newNodeConn(2), 30*time.Second, saltOf(2))
 	if err != nil {
 		t.Fatalf("reconnect acquire: %v", err)
 	}
@@ -76,7 +88,7 @@ func TestAcquireReAdoptsHardCrashedHolder(t *testing.T) {
 	if lm.CountWaitersForTest("lock:k") != 0 {
 		t.Fatalf("a waiter was created; reconnect should re-adopt the holder, not queue")
 	}
-	if lm.ConnTrackedForTest(1) {
+	if lm.ConnTrackedForTest(deadNodeConn(1)) {
 		t.Fatalf("dead connID 1 still tracked after re-adopt")
 	}
 }
@@ -86,24 +98,24 @@ func TestAcquireReAdoptsHardCrashedHolder(t *testing.T) {
 // slot and original salt, and evicts the dead connection's index.
 func TestEnqueueReAdoptsHardCrashedWaiter(t *testing.T) {
 	lm := newOrphanTestLM(t, 30*time.Second)
-	_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", 1, 30*time.Second, saltOf(1))
+	_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", deadNodeConn(1), 30*time.Second, saltOf(1))
 	origSalt := saltOf(2)
-	res, _, err := lm.ApplyEnqueue(at(101), "lock:k", 1, "ref-B", 2, 30*time.Second, origSalt)
+	res, _, err := lm.ApplyEnqueue(at(101), "lock:k", 1, "ref-B", deadNodeConn(2), 30*time.Second, origSalt)
 	if err != nil || res.Status != StatusQueued {
 		t.Fatalf("enqueue B = %+v err=%v, want StatusQueued", res, err)
 	}
-	if !lm.ConnTrackedForTest(2) {
+	if !lm.ConnTrackedForTest(deadNodeConn(2)) {
 		t.Fatalf("setup: queued connID 2 should be index-tracked")
 	}
 	// HARD CRASH of connID 2; reconnect as 3 with a DIFFERENT salt.
-	res3, _, err := lm.ApplyEnqueue(at(105), "lock:k", 1, "ref-B", 3, 30*time.Second, saltOf(77))
+	res3, _, err := lm.ApplyEnqueue(at(105), "lock:k", 1, "ref-B", newNodeConn(3), 30*time.Second, saltOf(77))
 	if err != nil {
 		t.Fatalf("reconnect enqueue: %v", err)
 	}
 	if res3.Status != StatusQueued {
 		t.Fatalf("reconnect status = %v, want StatusQueued (re-adopted hard-crashed waiter)", res3.Status)
 	}
-	if !lm.HasActiveWaiterForTest("lock:k", "ref-B", 3) {
+	if !lm.HasActiveWaiterForTest("lock:k", "ref-B", newNodeConn(3)) {
 		t.Fatalf("waiter not re-adopted with new connID 3")
 	}
 	if got := lm.WaiterSaltForTest("lock:k", "ref-B"); got != origSalt {
@@ -112,7 +124,7 @@ func TestEnqueueReAdoptsHardCrashedWaiter(t *testing.T) {
 	if n := lm.CountWaitersForTest("lock:k"); n != 1 {
 		t.Fatalf("waiter count = %d, want 1 (re-adopted, not duplicated)", n)
 	}
-	if lm.ConnTrackedForTest(2) {
+	if lm.ConnTrackedForTest(deadNodeConn(2)) {
 		t.Fatalf("dead connID 2 still tracked after re-adopt")
 	}
 }
@@ -122,21 +134,21 @@ func TestEnqueueReAdoptsHardCrashedWaiter(t *testing.T) {
 // second waiter for the same ref.
 func TestAcquireReAdoptsHardCrashedWaiter(t *testing.T) {
 	lm := newOrphanTestLM(t, 30*time.Second)
-	_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", 1, 30*time.Second, saltOf(1))
+	_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", deadNodeConn(1), 30*time.Second, saltOf(1))
 	origSalt := saltOf(2)
-	res, _, _ := lm.ApplyAcquire(at(101), "lock:k", 1, "ref-B", 2, 30*time.Second, origSalt)
+	res, _, _ := lm.ApplyAcquire(at(101), "lock:k", 1, "ref-B", deadNodeConn(2), 30*time.Second, origSalt)
 	if res.Status != StatusQueued {
 		t.Fatalf("acquire B status = %v, want StatusQueued", res.Status)
 	}
 	// HARD CRASH of connID 2; reconnect as 3.
-	res3, _, err := lm.ApplyAcquire(at(105), "lock:k", 1, "ref-B", 3, 30*time.Second, saltOf(77))
+	res3, _, err := lm.ApplyAcquire(at(105), "lock:k", 1, "ref-B", newNodeConn(3), 30*time.Second, saltOf(77))
 	if err != nil {
 		t.Fatalf("reconnect acquire: %v", err)
 	}
 	if res3.Status != StatusQueued {
 		t.Fatalf("reconnect status = %v, want StatusQueued (re-adopted waiter)", res3.Status)
 	}
-	if !lm.HasActiveWaiterForTest("lock:k", "ref-B", 3) {
+	if !lm.HasActiveWaiterForTest("lock:k", "ref-B", newNodeConn(3)) {
 		t.Fatalf("waiter not re-adopted with new connID 3")
 	}
 	if got := lm.WaiterSaltForTest("lock:k", "ref-B"); got != origSalt {
@@ -153,7 +165,7 @@ func TestAcquireReAdoptsHardCrashedWaiter(t *testing.T) {
 // holder exactly as before PR-5.
 func TestAcquireNoReAdoptWhenOrphanTTLZero(t *testing.T) {
 	lm := newApplyTestLM(t) // OrphanTTL = 0
-	res1, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", 1, 30*time.Second, saltOf(1))
+	res1, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", deadNodeConn(1), 30*time.Second, saltOf(1))
 	res2, _, _ := lm.ApplyAcquire(at(101), "lock:k", 1, "ref-A", 2, 30*time.Second, saltOf(2))
 	if res2.Status != StatusQueued {
 		t.Fatalf("status = %v, want StatusQueued (no re-adopt when OrphanTTL=0)", res2.Status)

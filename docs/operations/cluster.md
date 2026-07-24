@@ -210,25 +210,48 @@ token, _, _ := cl.Acquire(ctx, "deploy", 30*time.Second)
 // position the same way.
 ```
 
-Under the hood: re-adopt matches by `(key, ref)` alone, in **both** the
-`ApplyAcquire` and `ApplyEnqueue` paths. It works whether the previous
-connection closed **gracefully** (the FSM's `ApplyCleanupConn` stamped
-the slot `abandonedAtNanos` and cleared its conn id) or the node was
-**hard-crashed** (no `CleanupConn` ran, so the slot the new leader
-inherited still has `abandonedAtNanos == 0` — it never saw the
-disconnect). The reconnect rebinds the slot to the new connection,
-renews the lease, and evicts the dead connection's stale index entries.
-Reclamation of slots that are *never* reclaimed by a reconnect: the
-`EvictExpired` sweep retires gracefully-orphaned slots past
-`OrphanTTL`; a hard-crashed holder is bounded by its lease, and a
-hard-crashed waiter by promotion-then-lease.
+Under the hood: re-adopt matches on `(key, ref)` in **both** the
+`ApplyAcquire` and `ApplyEnqueue` paths, but only for a slot whose
+owner is demonstrably gone. The FSM accepts one of two proofs, both of
+which it replicates:
+
+- the previous connection closed **gracefully** — `ApplyCleanupConn`
+  stamped the slot `abandonedAtNanos` and cleared its conn id; or
+- the slot's conn id was minted by a **different server process**. Conn
+  ids carry a per-process epoch in their high 32 bits, so a slot the
+  new leader inherited from the crashed one (no `CleanupConn` ever ran;
+  `abandonedAtNanos` is still 0) is recognisable as belonging to a
+  process that is no longer serving that client.
+
+The reconnect then rebinds the slot to the new connection, renews the
+lease, and evicts the dead connection's stale index entries.
+
+A slot held by a **live** connection on the node handling the request
+matches neither proof, so naming its ref does not take it over: the
+request queues normally. The trade-off is that a client which vanishes
+without its TCP connection being reaped cannot re-attach on the *same*
+leader until the connection teardown stamps the slot (or the lease
+lapses) — the conservative direction.
+
+Slots never reclaimed by a reconnect still go away: the `EvictExpired`
+sweep retires gracefully-orphaned slots past `OrphanTTL`; a
+hard-crashed holder is bounded by its lease, and a hard-crashed waiter
+by promotion-then-lease.
 
 **Security note:** stable refs are caller-supplied identifiers, not
-authenticated credentials. Anyone who knows your ref can re-attach to
-your waiter/holder (and claim the eventual token). Treat refs like
-session tokens — generate randomly (e.g., `uuid.NewString()`), don't
-log them, don't share them. The `--auth-token` mechanism, when set,
-gates the connection before the ref is accepted.
+authenticated credentials. They are not a capability for taking over a
+live session (see above), but anyone who knows your ref can still claim
+a slot your process left behind — on another node, or after your
+connection closed. Treat refs like session tokens: generate randomly
+(e.g. `uuid.NewString()`), don't log them, don't share them. The
+`--auth-token` mechanism, when set, gates the connection before the ref
+is accepted.
+
+**One ref, one connection.** A ref identifies a single client session.
+Do not share one across concurrent operations — two operations on the
+same key under one ref are two claims on the same slot, and `Cluster`
+dials a fresh connection per call, so give each concurrent worker its
+own `Cluster` (or its own ref).
 
 ## Using the cluster-aware Go client
 
