@@ -8,11 +8,13 @@ partial / caveated; `⏳` = not yet, with a pointer to the follow-on.
 ## Posture
 
 Cluster mode is **GA-eligible for static-bootstrap workloads.** FIFO
-across a leader failover — once the headline gap — is now available as
-an opt-in (stable client refs; see below). One known gap remains (a
-long-horizon multi-host soak harness, with a workaround); everything
-else from the original §7 checklist is either implemented or N/A. The
-production-hardening passes reflected here:
+across a leader failover — once the headline gap — is now available to
+TCP clients as an opt-in (stable client refs; see below). HTTP sessions
+cannot opt into stable refs and lose blocked queue positions on
+failover. Two known gaps remain (an HTTP stable-ref equivalent and a
+long-horizon multi-host soak harness); everything else from the original
+§7 checklist is either implemented or N/A. The production-hardening
+passes reflected here:
 
 - **PR-1** (the alpha → beta lift): admin endpoints, default-deny
   admin token, counter metrics, public ReadIndex/Barrier API,
@@ -34,12 +36,15 @@ production-hardening passes reflected here:
   (every member listed before bootstrap), with `AddVoter` /
   `RemoveServer` reserved for grow/shrink against a node whose
   `--cluster-peers` already lists the cluster.
-- Your callers either enable stable client refs (`--orphan-ttl` +
+- Your TCP callers either enable stable client refs (`--orphan-ttl` +
   `client.WithClusterStableRef`) to keep their queue slot / held lock
   across a failover, or tolerate a "lost queue slot" outcome when a
   leader fails *while they were blocked* in `acquire` / `wait` —
   already-granted tokens (`renew`, `release`) survive seamlessly
   either way.
+- Your HTTP callers tolerate recreating their node-local session and
+  losing any blocked queue position after a leader failure. HTTP has no
+  stable-ref field; `--orphan-ttl` alone does not preserve its session.
 - Operations include `--admin-token`, mandatory `--raft-auth-token-file`,
   optional mTLS on the Raft transport
   (`--raft-tls-cert/-key/-ca`), and standard scrape of `/metrics` for
@@ -49,9 +54,11 @@ production-hardening passes reflected here:
 
 **You should wait if:**
 
+- HTTP callers must preserve FIFO position or re-attach to an
+  unobserved grant across a leader failover.
 - You need a multi-host soak harness in CI for safety-critical
-  workloads (last remaining deferred item). All in-process safety
-  invariants are validated by `cmd/cluster-soak`.
+  workloads. All in-process safety invariants are validated by
+  `cmd/cluster-soak`.
 
 ## Raft safety
 
@@ -272,9 +279,12 @@ Still open:
    hours rather than seconds, is the last step before declaring "GA
    across all workloads".
 2. **HTTP API: stable-ref equivalent.** The TCP `stable-ref` command
-   ships in PR-4; the HTTP API would need an equivalent (probably a
-   header or per-session field). Not blocking since HTTP callers can
-   use the TCP client; tracked for a future pass.
+   ships in PR-4; the HTTP API has no equivalent header or per-session
+   field. Its session IDs are node-local, so after a leader failure a
+   caller must create a new session and re-enqueue at the back. Setting
+   `--orphan-ttl` does not change that. Already-observed tokens remain
+   valid for `renew` / `release` on the new leader. HTTP callers that
+   require FIFO failover should use the TCP client until this ships.
 
 ## How to verify
 
@@ -346,13 +356,13 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 ## Bottom line
 
 Cluster mode is **beta-plus / GA-eligible.** After PR-5, every cluster
-safety + ergonomic item from the original §7 checklist is implemented
-and tested. Static-bootstrap, dynamic-join (`AddVoter` → cold node),
-and FIFO-across-leader-failover (via `--orphan-ttl` +
+safety item from the original §7 checklist is implemented and tested.
+Static-bootstrap, dynamic-join (`AddVoter` → cold node), and TCP
+FIFO-across-leader-failover (via `--orphan-ttl` +
 `client.WithClusterStableRef`) are all validated end-to-end — the last
-now including a hard-crash regression guard over real TCP. The only
-remaining follow-on is a long-horizon multi-host soak harness — useful
-for very-high-stakes deployments but not blocking for the workloads the
-existing in-process soak already covers. The whole tree passes
-`make test-race` cleanly; `go.sum` stays empty; the non-cluster
-single-node binary is byte-identical to v2.1.x.
+now including a hard-crash regression guard over real TCP. HTTP sessions
+remain node-local and cannot opt into stable refs. The remaining
+follow-ons are an HTTP stable-ref equivalent and a long-horizon
+multi-host soak harness. The whole tree passes `make test-race` cleanly;
+`go.sum` stays empty; the non-cluster single-node binary is
+byte-identical to v2.1.x.

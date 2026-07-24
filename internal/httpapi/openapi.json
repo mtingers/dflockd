@@ -18,7 +18,7 @@
   ],
   "security": [{"bearerAuth": []}],
   "tags": [
-    {"name": "sessions", "description": "Create, ping, and close HTTP sessions. A session is the HTTP analogue of a persistent TCP connection."},
+    {"name": "sessions", "description": "Create, ping, and close node-local HTTP sessions. A session is the HTTP analogue of a persistent TCP connection, but cannot opt into TCP stable-ref failover re-attachment."},
     {"name": "locks", "description": "Exclusive lock primitives. Each key has at most one holder at a time. Acquires are FIFO across all transports."},
     {"name": "semaphores", "description": "Counted semaphore primitives. Up to `limit` concurrent holders per key. The first acquirer sets the limit."},
     {"name": "introspection", "description": "Server state and schema."}
@@ -77,7 +77,7 @@
         "tags": ["sessions"],
         "summary": "Create a session",
         "operationId": "createSession",
-        "description": "Mints a new session with a server-generated 32-character lowercase hex ID. The response advertises the configured idle timeout so clients know how often to ping.",
+        "description": "Mints a new node-local session with a server-generated 32-character lowercase hex ID. The response advertises the configured idle timeout so clients know how often to ping. After a cluster leader failure, clients must create a session on the new leader; blocked FIFO position is not preserved.",
         "responses": {
           "200": {"description": "Created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateSessionResponse"}, "example": {"session_id": "0fe1f0c5b6758b10fe1ce7df57c012ef", "idle_timeout_s": 20}}}},
           "401": {"$ref": "#/components/responses/Unauthorized"},

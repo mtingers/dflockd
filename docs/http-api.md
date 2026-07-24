@@ -32,6 +32,13 @@ Carry the session ID on every lock-modifying request via
 `X-Dflockd-Session: <id>`. A request without the header gets HTTP
 400; an unknown or expired session gets HTTP 410 (`session_gone`).
 
+An HTTP session is node-local, not a failover-stable client identity.
+The HTTP API has no equivalent of the TCP `stable-ref` command. After
+a cluster leader failure, create a session on the new leader and retry;
+any blocked FIFO position is lost. `--orphan-ttl` does not preserve HTTP
+sessions. Tokens already returned to the caller remain valid for
+`renew` and `release` on the new leader.
+
 Sessions die in three ways:
 
 1. **Explicit `DELETE`.** Synchronous; held tokens are released

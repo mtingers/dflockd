@@ -202,12 +202,20 @@ rather than blindly following the header. Read-only endpoints
 (`/health`, `/ready`, `/v1/stats`, `/metrics`, `/openapi.json`) work on
 any node.
 
+HTTP session IDs are node-local and there is no HTTP equivalent of the
+TCP `stable-ref` command. After a leader failure, an HTTP caller must
+create a session on the new leader and retry; a blocked acquisition
+re-enters at the back of the queue. `--orphan-ttl` does not preserve
+HTTP sessions. A token the caller already observed remains valid for
+`renew` or `release` on the new leader.
+
 ## FIFO across leader failover (stable client refs)
 
-A caller holding — or blocked waiting on — a lock when the leader fails
-ordinarily loses its place (the holder/waiter slot is keyed by TCP
-connection id, which the new leader doesn't recognize). **Stable client
-refs** fix this:
+A TCP caller holding — or blocked waiting on — a lock when the leader
+fails ordinarily loses its place (the holder/waiter slot is keyed by
+TCP connection id, which the new leader doesn't recognize). **Stable
+client refs** fix this for TCP clients. HTTP sessions cannot opt in; see
+"HTTP API in cluster mode" above.
 
 1. Set `--orphan-ttl 30` (seconds; or `DFLOCKD_ORPHAN_TTL_S`) on every
    node so the FSM retains a ref-tagged holder/waiter that long after
