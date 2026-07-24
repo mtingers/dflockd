@@ -300,11 +300,10 @@ func (n *Node) ProposeEvictExpired(ctx context.Context) (lock.ApplyResult, error
 // leader-driven background sweep
 // ---------------------------------------------------------------------------
 
-// sweepLoop runs on every node but only acts while this node is the
-// leader: it proposes a lease-expiry sweep every tick and an idle GC
-// every gcEverySweeps ticks. A non-leader tick is a no-op (the real
-// leader's loop does the work); a leadership change between the IsLeader
-// check and the propose just yields ErrNotLeader, which we ignore.
+// sweepLoop runs on every node but only acts while this node is the leader.
+// Each tick checks local FSM state before proposing maintenance, avoiding log
+// churn when no expiry or GC work is due. The replicated commands remain the
+// authority; a leadership change during submission simply yields ErrNotLeader.
 func (n *Node) sweepLoop() {
 	defer n.sweepWG.Done()
 	interval := n.cfg.SweepInterval
@@ -329,11 +328,14 @@ func (n *Node) sweepLoop() {
 func (n *Node) runOneSweep(budget time.Duration, alsoGC bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	if _, err := n.ProposeEvictExpired(ctx); err != nil {
-		n.logSweepErr("evict-expired", err)
-		return
+	now := time.Now()
+	if n.lm.EvictionDue(now) {
+		if _, err := n.ProposeEvictExpired(ctx); err != nil {
+			n.logSweepErr("evict-expired", err)
+			return
+		}
 	}
-	if alsoGC {
+	if alsoGC && n.lm.GCDue(now) {
 		if _, err := n.ProposeGC(ctx); err != nil {
 			n.logSweepErr("gc", err)
 		}

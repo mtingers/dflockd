@@ -380,6 +380,67 @@ func TestSweepLoopEvictsExpiredHolder(t *testing.T) {
 	}
 }
 
+func TestIdleSweepSkipsRaftProposals(t *testing.T) {
+	tc := newCluster(t, "n1")
+	defer tc.stopAll()
+	leader := tc.waitLeader()
+	n := tc.nodes[leader]
+	before := n.MetricsSnapshot().Raft.Proposals
+	for i := 0; i < 5; i++ {
+		n.runOneSweep(time.Second, true)
+	}
+	after := n.MetricsSnapshot().Raft.Proposals
+	if after != before {
+		t.Fatalf("idle sweeps added %d proposals, want 0", after-before)
+	}
+}
+
+func TestSweepEvictsExpiredHolderAfterLeaderFailover(t *testing.T) {
+	tc := newClusterWithSweep(t, 10*time.Millisecond, "n1", "n2", "n3")
+	defer tc.stopAll()
+	oldLeader := tc.waitLeader()
+	defer tc.net.Crash(oldLeader, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if r, err := tc.nodes[oldLeader].ProposeAcquire(
+		ctx, "lock:failover-expiry", 1, "A", 1, 300*time.Millisecond, saltOf(1),
+	); err != nil || r.Status != lock.StatusOK {
+		t.Fatalf("ProposeAcquire = %+v, %v", r, err)
+	}
+	for _, id := range tc.ids {
+		if !pollUntil(t, time.Second, func() bool {
+			return len(holderTokens(tc.lms[id], "failover-expiry")) == 1
+		}) {
+			t.Fatalf("node %s did not apply holder before failover", id)
+		}
+	}
+	tc.net.Crash(oldLeader, true)
+
+	var newLeader raft.NodeID
+	if !pollUntil(t, 2*time.Second, func() bool {
+		for _, id := range tc.ids {
+			if id != oldLeader && tc.nodes[id].IsLeader() {
+				newLeader = id
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("no replacement leader")
+	}
+	for _, id := range tc.ids {
+		if id == oldLeader {
+			continue
+		}
+		if !pollUntil(t, time.Second, func() bool {
+			return len(holderTokens(tc.lms[id], "failover-expiry")) == 0
+		}) {
+			t.Fatalf("node %s: new leader %s did not sweep expired holder", id, newLeader)
+		}
+	}
+}
+
 func TestLeaderClientAddrFromMembers(t *testing.T) {
 	tc := newCluster(t, "n1", "n2", "n3")
 	defer tc.stopAll()
