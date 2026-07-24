@@ -62,9 +62,9 @@ func (c *Counters) IncApply(dur time.Duration) {
 	}
 }
 
-// IncApplyFailed records one FSM apply that returned an error. Today
-// this is only used for cluster-command decode/validate failures; the
-// FSM itself does not return Go errors.
+// IncApplyFailed records an FSM apply rejected by the containment
+// boundary. The FSM interface has no error result, so this currently
+// means an unexpected panic.
 func (c *Counters) IncApplyFailed() {
 	if c == nil {
 		return

@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"runtime/debug"
 	"time"
 )
 
@@ -13,37 +14,51 @@ import (
 // of FSM state. It exits when applyc is closed (run-loop shutdown).
 func (n *Node) runApply() {
 	defer close(n.applyDone)
+	failed := false
 	for req := range n.applyc {
-		n.applyBatch(req)
+		if failed {
+			failApplyProposals(req, ErrStopped)
+			continue
+		}
+		failed = !n.applyBatch(req)
 	}
 }
 
-func (n *Node) applyBatch(req applyReq) {
+// applyBatch returns false after an unrecoverable FSM failure. Once that
+// happens runApply drains later batches without touching the FSM so every
+// transferred proposal future still resolves during shutdown.
+func (n *Node) applyBatch(req applyReq) bool {
 	if req.restoreData != nil {
-		n.restoreFSMFromBatch(req)
-		return
+		return n.restoreFSMFromBatch(req)
 	}
 	for _, e := range req.entries {
-		n.applyOne(e, req.proposals[e.Index])
+		if err := n.applyOne(e, req.proposals[e.Index]); err != nil {
+			failApplyProposals(req, ErrStopped)
+			return false
+		}
 	}
 	n.maybeSnapshot(req)
+	return true
 }
 
 // restoreFSMFromBatch services an InstallSnapshot by feeding the
-// persisted snapshot bytes to FSM.Restore. Errors are logged: the FSM is
-// now in an indeterminate state, but Raft state is intact and a
-// re-install (e.g. on next leader heartbeat with our nextIndex behind)
-// will get another chance.
-func (n *Node) restoreFSMFromBatch(req applyReq) {
+// persisted snapshot bytes to FSM.Restore. A failure leaves the FSM
+// indeterminate, so the node must stop rather than acknowledge or apply
+// subsequent committed entries against unknown state.
+func (n *Node) restoreFSMFromBatch(req applyReq) bool {
 	if err := n.fsm.Restore(bytes.NewReader(req.restoreData)); err != nil {
-		n.logger.Error("FSM Restore failed", "at_index", req.restoreMeta.LastIncludedIndex, "err", err)
+		n.logger.Error("fatal FSM Restore failure; stopping node", "at_index", req.restoreMeta.LastIncludedIndex, "err", err)
+		n.requestStop()
+		return false
 	}
+	return true
 }
 
 // applyOne calls FSM.Apply for one entry (unless it's a NoOp/Config,
 // which the FSM never sees) and resolves the proposer's future if any.
-// A panic in Apply is contained and surfaced through the future.
-func (n *Node) applyOne(e Entry, p *proposal) {
+// A panic in Apply is contained, surfaced through the future, and stops
+// the node before another committed entry can touch the divergent FSM.
+func (n *Node) applyOne(e Entry, p *proposal) error {
 	start := time.Now()
 	result, applyErr := n.fsmApplySafely(e)
 	if applyErr == nil {
@@ -54,19 +69,29 @@ func (n *Node) applyOne(e Entry, p *proposal) {
 	if p != nil {
 		p.future.resolve(result, applyErr)
 	}
+	return applyErr
 }
 
 func (n *Node) fsmApplySafely(e Entry) (result any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("raft: FSM Apply panicked at index %d: %v", e.Index, r)
-			n.logger.Error("FSM Apply panicked", "index", e.Index, "term", e.Term, "recovered", r)
+			n.logger.Error("fatal FSM Apply panic; stopping node",
+				"index", e.Index, "term", e.Term, "recovered", r,
+				"stack", string(debug.Stack()))
+			n.requestStop()
 		}
 	}()
 	if e.Type != EntryNormal {
 		return nil, nil // NoOp / Config entries aren't surfaced to the FSM
 	}
 	return n.fsm.Apply(e), nil
+}
+
+func failApplyProposals(req applyReq, err error) {
+	for _, p := range req.proposals {
+		p.future.resolve(nil, err)
+	}
 }
 
 // maybeSnapshot triggers a snapshot if enough entries have accumulated

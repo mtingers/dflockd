@@ -17,12 +17,15 @@ type FSM interface {
 	// to the proposer's Future (if any). Apply must be a pure function of
 	// (current state, entry) — no time.Now, no rand, no map-iteration-
 	// order-dependent output — so every node converges to the same state.
+	// An unexpected panic is recovered and fail-stops the node.
 	Apply(e Entry) any
 	// Snapshot returns a point-in-time view that Persist can encode
 	// concurrently with subsequent Apply calls.
 	Snapshot() (FSMSnapshot, error)
 	// Restore loads state from r, replacing whatever the FSM currently
 	// holds. r contains exactly what an earlier Snapshot's Persist wrote.
+	// An error during installed-snapshot restore fail-stops a running node;
+	// an error during startup is returned by NewNode.
 	Restore(r io.Reader) error
 }
 

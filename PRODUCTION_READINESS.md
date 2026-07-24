@@ -11,11 +11,9 @@ Cluster mode is **GA-eligible for static-bootstrap workloads.** FIFO
 across a leader failover — once the headline gap — is now available to
 TCP clients as an opt-in (stable client refs; see below). HTTP sessions
 cannot opt into stable refs and lose blocked queue positions on
-failover. Three follow-ons remain: an HTTP stable-ref equivalent,
-fail-stop handling for an unexpected internal FSM `Apply` panic, and a
-long-horizon multi-host soak harness. Validated client commands have no
-known panicking apply path; everything else from the original §7
-checklist is implemented or N/A. The production-hardening passes
+failover. Two follow-ons remain: an HTTP stable-ref equivalent and a
+long-horizon multi-host soak harness. Everything else from the original
+§7 checklist is implemented or N/A. The production-hardening passes
 reflected here:
 
 - **PR-1** (the alpha → beta lift): admin endpoints, default-deny
@@ -36,7 +34,8 @@ reflected here:
   lock-free leadership reads, post-commit membership publication,
   stable-ref indexing, idle-maintenance suppression, binary Raft RPCs,
   authenticated/encrypted Raft transport, and cluster-client retry
-  diagnostics.
+  diagnostics. The final FSM fault pass made unexpected `Apply` panics
+  and indeterminate installed-snapshot restores fail-stop.
 
 **You can run this in production today if:**
 
@@ -64,9 +63,6 @@ reflected here:
 
 - HTTP callers must preserve FIFO position or re-attach to an
   unobserved grant across a leader failover.
-- Your operating standard requires the node to fail-stop after an
-  unexpected internal FSM `Apply` panic. The panic is logged and
-  returned to the local proposer today, but the node continues.
 - You need a multi-host soak harness in CI for safety-critical
   workloads. All in-process safety invariants are validated by
   `cmd/cluster-soak`.
@@ -152,6 +148,11 @@ reflected here:
 - ✅ `MaxLocks` / `MaxWaiters` enforced inside `Apply*` (deterministic).
 - ✅ All transports track their goroutines via `WaitGroup`/`rpcWG`;
   `Close()` joins them.
+- ✅ An unexpected FSM `Apply` panic is recovered, logged with a stack,
+  returned to the local proposer, and fail-stops the node. The apply
+  goroutine drains already-transferred proposal futures with
+  `ErrStopped` without applying later entries. An installed-snapshot
+  `Restore` error follows the same fail-stop path.
 - ✅ **Mandatory shared-secret protection** on the Raft transport —
   a fresh-nonce HMAC-SHA256 challenge-response authenticates each peer,
   then directional AES-GCM keys protect sequence-numbered RPC frames
@@ -242,7 +243,7 @@ reflected here:
 | `internal/protocol` | 88.5% | Barrier, stable-ref, and not-leader framing. |
 | `internal/cluster` | 86.0% | FSM adapter, maintenance, admin counters, and command codec. |
 | `internal/lock` | 84.5% | Direct + Apply paths, ref indexes, snapshots, and constant-time compare. |
-| `internal/raft` | 83.1% | Storage, node, secure transport, membership, snapshots, and counters. |
+| `internal/raft` | 83.6% | Storage, node, secure transport, membership, snapshots, and FSM fault containment. |
 | `internal/httpapi` | 73.9% | Admin endpoints, readindex, CORS, and cluster metrics. |
 | `client` | 69.9% | Eleven cluster-client tests cover routing, diagnostics, and hint clamping. |
 | `internal/server` | 69.3% | Cluster handlers, stable refs, barrier, admin, and metrics. |
@@ -296,13 +297,6 @@ Still open:
    `--orphan-ttl` does not change that. Already-observed tokens remain
    valid for `renew` / `release` on the new leader. HTTP callers that
    require FIFO failover should use the TCP client until this ships.
-3. **Fail-stop on unexpected FSM `Apply` panic.** `fsmApplySafely`
-   recovers, logs, increments the failed-apply counter, and resolves the
-   local proposal with an error. It does not currently stop the node,
-   so a hypothetical internal panic could leave that replica's FSM
-   behind its committed index. No validated command is known to trigger
-   this path; fail-stop behavior remains defense in depth.
-
 ## How to verify
 
 ```bash
@@ -382,7 +376,7 @@ FIFO-across-leader-failover (via `--orphan-ttl` +
 `client.WithClusterStableRef`) are all validated end-to-end — the last
 now including a hard-crash regression guard over real TCP. HTTP sessions
 remain node-local and cannot opt into stable refs. The remaining
-follow-ons are an HTTP stable-ref equivalent, fail-stop handling for an
-unexpected internal FSM panic, and a long-horizon multi-host soak
-harness. The whole tree passes `make test-race` cleanly; `go.sum` stays
-empty; the non-cluster single-node binary is byte-identical to v2.1.x.
+follow-ons are an HTTP stable-ref equivalent and a long-horizon
+multi-host soak harness. The whole tree passes `make test-race` cleanly;
+`go.sum` stays empty; the non-cluster single-node binary is
+byte-identical to v2.1.x.

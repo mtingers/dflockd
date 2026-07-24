@@ -407,6 +407,8 @@ func (n *Node) run() {
 }
 
 func (n *Node) shutdownRunLoop() {
+	n.role, n.leaderID, n.progress = roleFollower, "", nil
+	n.publishLeadership()
 	n.failPendingProposals(ErrStopped)
 	close(n.applyc) // tells the apply goroutine to drain and exit
 	close(n.donec)

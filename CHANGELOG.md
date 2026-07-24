@@ -41,14 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-process soak scope, and shipped metric set. The Phase 15 checklist
   now carries current verdicts instead of pre-implementation boxes.
   `PRODUCTION_READINESS.md` records the completed P1-P3 hardening audit
-  and retains the three real follow-ons: HTTP stable refs, multi-host
-  fault-injection soak, and fail-stop handling for an unexpected FSM
-  `Apply` panic.
+  and retains the two real follow-ons: HTTP stable refs and multi-host
+  fault-injection soak.
 - `lock.NewLockManager` and `internal/server.Server` gain non-breaking additions: `SetCluster(c)` enables the cluster-mode handler path; mutating commands on a follower return `error_not_leader <addr>`; the per-conn cleanup proposes `CleanupConn` through the cluster; the lock manager's lease-expiry / GC loops are suppressed in cluster mode (a leader-driven `EvictExpired` / `GC` sweep through Raft replaces them).
 - Semaphore `limit` is now capped at 1,048,576 (`MaxSemaphoreLimit`) at parse time — far above any real use; the bound just keeps the value within the cluster snapshot's fixed-width encoding.
 
 ### Fixed (cluster mode)
 
+- **Unexpected FSM faults now fail-stop the Raft node.** A panic in
+  `FSM.Apply` is recovered, logged with its stack, returned to the
+  proposing caller, and immediately stops the node before another
+  committed entry can touch potentially divergent state. Proposal
+  futures already transferred to the apply queue resolve `ErrStopped`
+  without applying. An installed-snapshot `FSM.Restore` error follows
+  the same fail-stop path instead of leaving the follower running with
+  indeterminate state. Shutdown now publishes follower state so a
+  stopped node cannot continue reporting itself as leader.
 - **Raft TCP connections no longer self-recycle ~5 s after they're established.** The handshake's read deadline was never cleared, so every connection died and was redialed every ~5 s — harmless on loopback (so tests/smoke missed it) but on a real network it caused constant churn, spurious RPC failures, and, with aggressive election timers, spurious leader elections. The steady-state read loops now use a 60 s idle deadline (a dead/partitioned peer is reaped, an idle-by-design conn is recycled), writes have a 10 s deadline, every conn enables TCP keepalive, and a 250 ms per-peer dial backoff stops continuous heartbeats from hammering a downed peer.
 - **Lease expiry and idle GC now actually run in cluster mode.** A leader-bound sweep loop proposes `EvictExpired` every `--lease-sweep-interval` (default 1 s) and `GC` every 30 ticks; previously neither ran, so a holder whose client crashed held its lock forever and idle resources accumulated unbounded.
 - **`CleanupConn` is now byte-deterministic across replicas** — a connection holding multiple contended keys had its waiters promoted (and tokens minted) in Go map-iteration order, which could differ per replica and diverge the FSM. The cleanup now processes owned keys in sorted order.
@@ -82,13 +90,21 @@ Resolved in this release:
 
 - ~~`AddVoter` / `RemoveServer` need a small Go program~~ → exposed via `POST /v1/admin/voters` / `DELETE /v1/admin/voters/{id}` with default-deny `--admin-token`.
 - ~~Counter-style cluster metrics not on `/metrics`~~ → `_proposals_total`, `_proposals_failed_total`, `_apply_total`, `_apply_failed_total`, `_apply_nanos_total`, `_leader_changes_total`, `_admin_changes_total{op}` all shipped.
+- ~~FIFO state is lost across every leader failover~~ → TCP stable refs
+  re-attach waiters and holders after graceful or hard leader loss.
+- ~~Dynamic join lacks cold-node snapshot validation~~ → covered by
+  `TestDynamicJoinColdNodeCatchesUpViaSnapshot`.
+- ~~No failover-aware Go client~~ → `client.Cluster` ships with bounded
+  member-clamped routing and terminal diagnostics.
+- ~~No cluster soak harness~~ → `cmd/cluster-soak` covers concurrent
+  writes and periodic in-process leader kills.
+- ~~Unexpected `FSM.Apply` panic leaves the node running~~ → Apply
+  panics and installed-snapshot Restore failures now fail-stop.
 
 Still open (tracked in `PRODUCTION_READINESS.md`):
 
-- A client blocked in `acquire` / `wait` when the leader fails loses its queue position (the holder entry it never observed expires via lease; FIFO is preserved for already-granted tokens). Stable client refs that re-attach across failover are documented in `PLAN.md` §4.7 as a follow-on.
-- Dynamic-join with snapshot transfer to a node started without prior state is not yet implemented; the supported flows are static bootstrap (all members listed in `--cluster-peers`) and `AddVoter` against a node that already has its members map in place. Tracked as PRODUCTION_READINESS.md item 5.
-- The cluster-aware Go client (transparent leader cache + auto-redirect/retry on `*NotLeaderError`) is not yet shipped — callers handle `*NotLeaderError` themselves. Tracked as item 4.
-- A multi-node soak harness (sustained writes + injected partitions + leader kills) is not yet in CI. The race detector + per-package unit tests pass; longer-horizon validation is a follow-on.
+- HTTP sessions cannot opt into stable-ref failover re-attachment.
+- Long-horizon multi-host partition and clock-skew soak remains outside CI.
 
 ## [v2.1.1] - 2026-05-11
 

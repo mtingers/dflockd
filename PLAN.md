@@ -643,9 +643,10 @@ green; race-clean; docs complete.
       conn caps unchanged.
 - [x] No client-controllable unbounded allocation on the propose path (command
       size bounded; key/arg validation as today, before propose).
-- [ ] An unexpected panic in `Apply` is logged, contained, and returned to the
-      proposer, but does not yet fail-stop the node. Validated commands have no
-      known panicking path; fail-stop remains a defense-in-depth follow-on.
+- [x] An unexpected panic in `Apply` is logged with a stack, returned to the
+      proposer, and fail-stops the node before any later committed entry touches
+      the FSM. Queued proposal futures resolve `ErrStopped`; an indeterminate
+      `Restore` failure follows the same fail-stop path.
 
 **Correctness under concurrency**
 - [x] `go test -race ./...` green, including the in-process cluster tests and
