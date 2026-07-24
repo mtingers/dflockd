@@ -68,6 +68,7 @@ func TestAppendFailureStopsNodeAndFailsProposal(t *testing.T) {
 	storage := &faultStorage{Storage: NewMemStorage()}
 	n := newUnstartedFaultNode(t, storage)
 	n.role, n.term = roleLeader, 2
+	n.publishLeadership()
 	n.progress = map[NodeID]*peerProgress{"a": {nextIndex: 1}}
 	storage.appendErr = diskErr
 	p := &proposal{data: []byte("command"), typ: EntryNormal, future: newFuture()}
@@ -77,6 +78,9 @@ func TestAppendFailureStopsNodeAndFailsProposal(t *testing.T) {
 	_, err := mustWait(t, p.future, time.Second)
 	if !errors.Is(err, diskErr) {
 		t.Fatalf("proposal error = %v, want %v", err, diskErr)
+	}
+	if n.IsLeader() {
+		t.Fatal("storage-faulted node still reports itself as leader")
 	}
 	assertNodeStopping(t, n)
 }

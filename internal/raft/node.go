@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -64,6 +65,10 @@ type Node struct {
 	progress map[NodeID]*peerProgress // leader-only
 	votes    map[NodeID]bool          // current (pre)election tally
 	preVote  bool                     // tally is for a PreVote round
+
+	// leadership is a lock-free view for request-routing accessors. The run
+	// loop publishes it after every role/leader/term transition.
+	leadership atomic.Pointer[leadershipState]
 
 	// applyDispatched is the highest index already handed to the apply
 	// goroutine; the run loop uses it to decide which entries to ship on
@@ -165,6 +170,12 @@ type NodeStatus struct {
 	Voters            []NodeID
 }
 
+type leadershipState struct {
+	role     role
+	term     Term
+	leaderID NodeID
+}
+
 // peerProgress tracks one follower's replication state (leader-only).
 type peerProgress struct {
 	nextIndex        Index
@@ -214,6 +225,7 @@ func NewNode(cfg Config, fsm FSM, storage Storage, transport Transport, config C
 	if err := n.restoreFSMFromSnapshot(storage); err != nil {
 		return nil, err
 	}
+	n.publishLeadership()
 	return n, nil
 }
 
@@ -303,10 +315,10 @@ func (n *Node) Start() {
 	n.transport.SetHandler(n.handleRPC)
 	n.syncTransportPeers()
 	n.resetElectionTimer()
-	go n.run()
-	go n.tickLoop()
 	go n.runApply()
 	n.dispatchPendingApply() // kick off any entries already committed-but-unapplied from disk
+	go n.run()
+	go n.tickLoop()
 }
 
 // Close stops the run loop and the apply goroutine, waits for both to
@@ -422,11 +434,28 @@ func (n *Node) snapshotStatus() NodeStatus {
 }
 
 // IsLeader reports whether this node currently believes it is the leader.
-func (n *Node) IsLeader() bool { return n.Status().Role == roleLeader.String() }
+func (n *Node) IsLeader() bool {
+	state := n.leadership.Load()
+	return state != nil && state.role == roleLeader
+}
 
 // LeaderID returns the id of the node this one currently believes is
 // leader, or "" if unknown.
-func (n *Node) LeaderID() NodeID { return n.Status().LeaderID }
+func (n *Node) LeaderID() NodeID {
+	state := n.leadership.Load()
+	if state == nil {
+		return ""
+	}
+	return state.leaderID
+}
+
+func (n *Node) publishLeadership() {
+	next := &leadershipState{role: n.role, term: n.term, leaderID: n.leaderID}
+	if current := n.leadership.Load(); current != nil && *current == *next {
+		return
+	}
+	n.leadership.Store(next)
+}
 
 // handleRPC is the Transport's inbound handler. It runs on a transport
 // goroutine, hands the request to the run loop, and waits for the reply.
@@ -503,6 +532,7 @@ func (n *Node) becomeFollower(t Term, leader NodeID) {
 		n.term, n.votedFor = t, ""
 	}
 	n.role, n.leaderID, n.progress = roleFollower, leader, nil
+	n.publishLeadership()
 	n.clearVotes()
 	n.failPendingProposals(ErrLeadershipLost)
 	n.resetElectionTimer()
@@ -526,6 +556,7 @@ func (n *Node) becomeLeader() {
 	if n.stopping() {
 		return
 	}
+	n.publishLeadership()
 	n.broadcastAppendEntries()
 }
 
@@ -564,6 +595,8 @@ func (n *Node) persistHardState() bool {
 
 func (n *Node) failStorage(op string, err error) {
 	n.logger.Error("fatal storage failure; stopping node", "operation", op, "err", err)
+	n.role, n.leaderID, n.progress = roleFollower, "", nil
+	n.publishLeadership()
 	n.requestStop()
 }
 

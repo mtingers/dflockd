@@ -14,6 +14,7 @@ func (n *Node) startElection() {
 
 func (n *Node) becomePreCandidate() {
 	n.role, n.leaderID, n.progress = rolePreCandidate, "", nil
+	n.publishLeadership()
 	n.preVote = true
 	n.votes = map[NodeID]bool{n.cfg.ID: true} // we'd vote for ourselves
 	n.resetElectionTimer()
@@ -30,6 +31,7 @@ func (n *Node) campaign() {
 	if !n.persistHardState() {
 		return
 	}
+	n.publishLeadership()
 	n.preVote = false
 	n.votes = map[NodeID]bool{n.cfg.ID: true}
 	n.resetElectionTimer()

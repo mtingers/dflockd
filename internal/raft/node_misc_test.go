@@ -145,6 +145,25 @@ func TestIsLeaderAndLeaderIDAccessors(t *testing.T) {
 	}
 }
 
+func TestLeadershipAccessorsDoNotRequireRunLoop(t *testing.T) {
+	n, _ := newUnstartedNode(t, "a", "a")
+	if n.IsLeader() {
+		t.Fatal("new follower reports itself as leader")
+	}
+	if got := n.LeaderID(); got != "" {
+		t.Fatalf("new follower LeaderID = %q, want empty", got)
+	}
+
+	n.role, n.term, n.leaderID = roleLeader, 4, "a"
+	n.publishLeadership()
+	if !n.IsLeader() {
+		t.Fatal("published leader reports IsLeader false")
+	}
+	if got := n.LeaderID(); got != "a" {
+		t.Fatalf("published leader LeaderID = %q, want a", got)
+	}
+}
+
 func TestMemNetworkPartitionReconnectAndDelay(t *testing.T) {
 	net := NewMemNetwork()
 	conf := configFor([]NodeID{"a", "b", "c"})
