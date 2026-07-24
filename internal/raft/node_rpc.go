@@ -38,18 +38,69 @@ func (n *Node) dispatchRPC(from NodeID, msg Message) Message {
 	}
 }
 
-// onRPCReply dispatches the reply to an RPC this node sent. A reply with
-// a higher term (other than a PreVote reply at our own term) steps us
-// down; otherwise the reply-specific handler runs.
+// onRPCReply dispatches the reply to an RPC this node sent. A reply
+// with a higher term steps us down; a reply that belongs to a round we
+// are no longer running is discarded; otherwise the reply-specific
+// handler runs.
 func (n *Node) onRPCReply(rep rpcReply) {
 	if rep.err != nil || rep.msg == nil {
 		return // treated as "no reply"; timers/heartbeats will retry
 	}
-	if t := rep.msg.messageTerm(); t > n.term {
-		n.becomeFollower(t, "")
+	if n.stepDownForReply(rep.msg) {
+		return
+	}
+	if !n.replyIsCurrentRound(rep.msg) {
 		return
 	}
 	n.dispatchRPCReply(rep)
+}
+
+// stepDownForReply applies the step-down-on-higher-term rule to a reply
+// and reports whether it fired. A *granted* pre-vote response is
+// exempt: we deliberately sent that request one term past our own, so
+// the echoed term is expected — it only becomes real if the pre-vote
+// round wins and campaign() bumps us there.
+func (n *Node) stepDownForReply(msg Message) bool {
+	if isGrantedPreVoteResp(msg) {
+		return false
+	}
+	if t := msg.messageTerm(); t > n.term {
+		n.becomeFollower(t, "")
+		return true
+	}
+	return false
+}
+
+// replyIsCurrentRound reports whether a reply belongs to the round this
+// node is currently running. Replies outlive their round routinely —
+// sendRPC's timeout is ElectionTimeoutMax while a new election starts
+// after as little as ElectionTimeoutMin — and acting on a stale one is
+// unsafe: a vote granted in term N says nothing about term N+1 (the
+// grantor may have voted for someone else there), and an AppendEntries
+// success from a term we no longer lead describes a follower log that
+// may since have been overwritten.
+func (n *Node) replyIsCurrentRound(msg Message) bool {
+	if rv, ok := msg.(*RequestVoteResp); ok {
+		return rv.Term == n.roundTerm(rv.PreVote)
+	}
+	return msg.messageTerm() == n.term
+}
+
+// roundTerm is the term a (pre)vote reply for the round now in progress
+// must carry: our own term for a real election, one past it for a
+// pre-vote (which is a poll about a term we have not entered).
+func (n *Node) roundTerm(preVote bool) Term {
+	if preVote {
+		return n.term + 1
+	}
+	return n.term
+}
+
+// isGrantedPreVoteResp reports whether msg is a pre-vote response that
+// granted its vote.
+func isGrantedPreVoteResp(msg Message) bool {
+	rv, ok := msg.(*RequestVoteResp)
+	return ok && rv.PreVote && rv.VoteGranted
 }
 
 func (n *Node) dispatchRPCReply(rep rpcReply) {

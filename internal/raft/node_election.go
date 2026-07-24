@@ -50,9 +50,21 @@ func (n *Node) broadcastRequestVote(preVote bool) {
 // handleRequestVote answers a (pre)vote request.
 func (n *Node) handleRequestVote(req *RequestVoteReq) *RequestVoteResp {
 	if req.PreVote {
-		return &RequestVoteResp{Term: n.term, VoteGranted: n.shouldGrantPreVote(req), PreVote: true}
+		return n.preVoteResp(req)
 	}
 	return &RequestVoteResp{Term: n.term, VoteGranted: n.grantVote(req)}
+}
+
+// preVoteResp answers a pre-vote. A grant echoes the candidate's
+// proposed term so the candidate can tell this reply apart from one for
+// an earlier round — our own term may legitimately be lower than the
+// term being polled about. A rejection carries our term instead, so a
+// candidate behind us learns it and steps down.
+func (n *Node) preVoteResp(req *RequestVoteReq) *RequestVoteResp {
+	if n.shouldGrantPreVote(req) {
+		return &RequestVoteResp{Term: req.Term, VoteGranted: true, PreVote: true}
+	}
+	return &RequestVoteResp{Term: n.term, VoteGranted: false, PreVote: true}
 }
 
 // shouldGrantPreVote: the candidate's log must be at least as up-to-date,
