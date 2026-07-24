@@ -101,6 +101,7 @@ type Node struct {
 	stopc     chan struct{}
 	donec     chan struct{}
 	applyDone chan struct{} // closed when the apply goroutine exits
+	stopOnce  sync.Once     // Close and fatal storage faults share stopc
 
 	// counters records monotonic operational metrics (proposals, applies,
 	// leader-change count). Updated from many goroutines under atomics;
@@ -311,15 +312,24 @@ func (n *Node) Start() {
 // Close stops the run loop and the apply goroutine, waits for both to
 // exit, then joins every in-flight RPC goroutine. Idempotent.
 func (n *Node) Close() error {
-	select {
-	case <-n.stopc:
-	default:
-		close(n.stopc)
-	}
+	n.requestStop()
 	<-n.donec
 	<-n.applyDone
 	n.rpcWG.Wait()
 	return nil
+}
+
+func (n *Node) requestStop() {
+	n.stopOnce.Do(func() { close(n.stopc) })
+}
+
+func (n *Node) stopping() bool {
+	select {
+	case <-n.stopc:
+		return true
+	default:
+		return false
+	}
 }
 
 // tickLoop drives the run loop's logical clock at HeartbeatInterval. It
@@ -362,6 +372,9 @@ func (n *Node) run() {
 		case s := <-n.snapSavec:
 			n.onSnapshotSave(s)
 		}
+		if n.stopping() {
+			return
+		}
 	}
 }
 
@@ -369,7 +382,7 @@ func (n *Node) run() {
 // the only writer of storage's snapshot file outside of installSnapshot.
 func (n *Node) onSnapshotSave(s snapSaveReq) {
 	if err := n.log.storage.SaveSnapshot(s.meta, bytes.NewReader(s.data)); err != nil {
-		n.logger.Error("save snapshot failed", "err", err, "at_index", s.meta.LastIncludedIndex)
+		n.failStorage("save snapshot", err)
 	}
 }
 
@@ -510,6 +523,9 @@ func (n *Node) becomeLeader() {
 	n.counters.IncLeaderChange()
 	n.logger.Info("became leader", "term", n.term)
 	n.appendLeaderNoop()
+	if n.stopping() {
+		return
+	}
 	n.broadcastAppendEntries()
 }
 
@@ -519,8 +535,7 @@ func (n *Node) becomeLeader() {
 func (n *Node) appendLeaderNoop() {
 	entry := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: EntryNoOp}
 	if err := n.log.append([]Entry{entry}); err != nil {
-		n.logger.Error("leader noop append failed; stepping down", "err", err)
-		n.becomeFollower(n.term, "")
+		n.failStorage("append leader no-op", err)
 		return
 	}
 	n.advanceSelfProgress(entry.Index)
@@ -535,16 +550,21 @@ func (n *Node) clearVotes() {
 // hard state persistence
 // ---------------------------------------------------------------------------
 
-// persistHardState fsyncs term/vote/commit. A failure is logged and the
-// node steps down to follower — it cannot safely act on un-persisted
-// state (it might double-vote or commit-then-forget after a crash).
-func (n *Node) persistHardState() {
+// persistHardState fsyncs term/vote/commit. A failure stops the node: merely
+// stepping down is insufficient because a follower could still grant votes or
+// acknowledge entries from state that will disappear after a restart.
+func (n *Node) persistHardState() bool {
 	hs := HardState{CurrentTerm: n.term, VotedFor: n.votedFor, CommitIndex: n.log.committed}
 	if err := n.log.storage.SaveHardState(hs); err != nil {
-		n.logger.Error("persist hard state failed; stepping down", "err", err)
-		n.role, n.leaderID, n.progress = roleFollower, "", nil
-		n.clearVotes()
+		n.failStorage("save hard state", err)
+		return false
 	}
+	return true
+}
+
+func (n *Node) failStorage(op string, err error) {
+	n.logger.Error("fatal storage failure; stopping node", "operation", op, "err", err)
+	n.requestStop()
 }
 
 // ---------------------------------------------------------------------------

@@ -338,6 +338,29 @@ func TestFileStorageTornTailDiscarded(t *testing.T) {
 	}
 }
 
+func TestFileStorageFailedTruncateKeepsInMemoryLog(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	defer s.Close()
+	appendN(t, s, 1, 1, 4)
+
+	walPath := s.wal.path
+	s.wal.path = filepath.Join(dir, "missing", walFileName)
+	err := s.TruncateSuffix(3)
+	s.wal.path = walPath
+	if err == nil {
+		t.Fatal("TruncateSuffix succeeded with an unusable WAL path")
+	}
+
+	if got := s.LastIndex(); got != 4 {
+		t.Fatalf("LastIndex after failed truncate = %d, want 4", got)
+	}
+	entries, readErr := s.Entries(1, 5)
+	if readErr != nil || len(entries) != 4 {
+		t.Fatalf("Entries after failed truncate = %+v, %v; want four intact entries", entries, readErr)
+	}
+}
+
 func TestFileStorageRejectsCorruptHardState(t *testing.T) {
 	dir := t.TempDir()
 	s := mustOpenFileStorage(t, dir)

@@ -188,18 +188,23 @@ func (s *FileStorage) Append(entries []Entry) error {
 	return nil
 }
 
-// TruncateSuffix implements raft.Storage. Truncates the in-memory log
-// then rewrites the WAL atomically (write-new + rename + fsync-dir),
-// so a crash mid-truncate leaves either the old or new log on disk —
-// never a torn one.
+// TruncateSuffix implements raft.Storage. It builds the retained log without
+// mutating the in-memory view, atomically rewrites the WAL, then publishes the
+// new view. A failed rewrite therefore leaves both memory and disk unchanged.
 func (s *FileStorage) TruncateSuffix(from Index) error {
 	if from > s.lastIndex() {
 		return nil
 	}
-	if err := s.truncateSuffix(from); err != nil {
+	if from < s.firstIndex() {
+		return fmt.Errorf("raft: truncateSuffix(%d) cuts into snapshot at %d", from, s.memLog.snap.LastIncludedIndex)
+	}
+	keep := from - s.firstIndex()
+	retained := append([]Entry(nil), s.memLog.entries[:keep]...)
+	if err := s.wal.rewrite(retained); err != nil {
 		return err
 	}
-	return s.wal.rewrite(s.memLog.entries)
+	s.memLog.entries = retained
+	return nil
 }
 
 // SaveSnapshot implements raft.Storage. Writes the snapshot file

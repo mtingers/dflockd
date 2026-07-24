@@ -143,6 +143,12 @@ func (n *Node) shipApplyBatch(entries []Entry) {
 			// Keep draining so the apply goroutine can't wedge on a full
 			// snapSavec while we're wedged here on a full applyc.
 			n.onSnapshotSave(s)
+			if n.stopping() {
+				for _, p := range req.proposals {
+					p.future.resolve(nil, ErrStopped)
+				}
+				return
+			}
 		case <-n.stopc:
 			// Shutdown in flight — fail the proposals we just claimed.
 			for _, p := range req.proposals {

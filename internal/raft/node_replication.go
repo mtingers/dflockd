@@ -120,7 +120,9 @@ func (n *Node) maybeCommitTo(cand Index) {
 		return // can't commit an entry from an earlier term by counting replicas
 	}
 	n.log.commitTo(cand)
-	n.persistHardState()
+	if !n.persistHardState() {
+		return
+	}
 	n.dispatchPendingApply()
 	n.broadcastHeartbeat() // let followers learn the new commit promptly
 }
@@ -191,7 +193,7 @@ func (n *Node) appendOrReject(req *AppendEntriesReq) *AppendEntriesResp {
 func (n *Node) applyAppendEntries(req *AppendEntriesReq) *AppendEntriesResp {
 	through, err := n.log.appendFromLeader(req.PrevLogIndex, req.Entries)
 	if err != nil {
-		n.logger.Error("append from leader failed", "err", err)
+		n.failStorage("append from leader", err)
 		return &AppendEntriesResp{Term: n.term, Success: false}
 	}
 	n.adoptConfigEntriesFromAppend(req.Entries)
@@ -227,7 +229,9 @@ func (n *Node) advanceFollowerCommit(leaderCommit, lastNew Index) {
 		return
 	}
 	n.log.commitTo(target)
-	n.persistHardState()
+	if !n.persistHardState() {
+		return
+	}
 	n.dispatchPendingApply()
 }
 
@@ -274,10 +278,12 @@ func (n *Node) handleInstallSnapshot(from NodeID, req *InstallSnapshotReq) *Inst
 	}
 	last, err := n.log.installSnapshot(req.Meta, req.Data)
 	if err != nil {
-		n.logger.Error("install snapshot failed", "err", err)
+		n.failStorage("install snapshot", err)
 		return &InstallSnapshotResp{Term: n.term}
 	}
-	n.persistHardState()
+	if !n.persistHardState() {
+		return &InstallSnapshotResp{Term: n.term}
+	}
 	n.scheduleFSMRestore(req.Meta, req.Data)
 	return &InstallSnapshotResp{Term: n.term, LastIndex: last}
 }

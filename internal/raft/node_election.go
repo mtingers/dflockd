@@ -27,7 +27,9 @@ func (n *Node) becomePreCandidate() {
 func (n *Node) campaign() {
 	n.role, n.leaderID, n.progress = roleCandidate, "", nil
 	n.term, n.votedFor = n.term+1, n.cfg.ID
-	n.persistHardState()
+	if !n.persistHardState() {
+		return
+	}
 	n.preVote = false
 	n.votes = map[NodeID]bool{n.cfg.ID: true}
 	n.resetElectionTimer()
@@ -93,7 +95,9 @@ func (n *Node) grantVote(req *RequestVoteReq) bool {
 		return false
 	}
 	n.votedFor = req.CandidateID
-	n.persistHardState()
+	if !n.persistHardState() {
+		return false
+	}
 	n.resetElectionTimer()
 	return true
 }

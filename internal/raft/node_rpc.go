@@ -5,17 +5,23 @@ package raft
 // applied first (except a PreVote, which is hypothetical and never moves
 // terms), then the message-specific handler builds the reply.
 func (n *Node) onRPC(req rpcRequest) {
-	n.maybeStepDownForInbound(req.msg)
-	req.reply <- n.dispatchRPC(req.from, req.msg)
+	if !n.maybeStepDownForInbound(req.msg) {
+		return
+	}
+	reply := n.dispatchRPC(req.from, req.msg)
+	if !n.stopping() {
+		req.reply <- reply
+	}
 }
 
-func (n *Node) maybeStepDownForInbound(msg Message) {
+func (n *Node) maybeStepDownForInbound(msg Message) bool {
 	if isPreVoteReq(msg) {
-		return
+		return true
 	}
 	if t := msg.messageTerm(); t > n.term {
 		n.becomeFollower(t, "")
 	}
+	return !n.stopping()
 }
 
 func isPreVoteReq(msg Message) bool {

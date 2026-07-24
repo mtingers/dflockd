@@ -55,6 +55,7 @@ func (n *Node) onPropose(p *proposal) {
 	if err := n.log.append([]Entry{entry}); err != nil {
 		n.counters.IncProposalsFailed()
 		p.future.resolve(nil, err)
+		n.failStorage("append proposal", err)
 		return
 	}
 	n.counters.IncProposals()
@@ -186,6 +187,7 @@ func (n *Node) onConfChange(cc *confChange) {
 	entry := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: EntryConfig, Data: encodeConfig(nil, newCfg)}
 	if err := n.log.append([]Entry{entry}); err != nil {
 		cc.future.resolve(nil, err)
+		n.failStorage("append configuration", err)
 		return
 	}
 	n.adoptConfig(newCfg, entry.Index)
