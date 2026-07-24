@@ -68,3 +68,44 @@ func fuzzSeedMessages() []Message {
 		&TimeoutNowResp{Term: 11},
 	}
 }
+
+func FuzzHandshakeFrameDecode(f *testing.F) {
+	client, err := newClientHello([]byte(testClusterSecret), "fuzz-client")
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(encodeHello(client))
+	f.Add(encodeAuth(client.proof))
+	f.Fuzz(func(t *testing.T, body []byte) {
+		_, _ = decodeHello(body)
+		_, _ = decodeAuth(body)
+	})
+}
+
+func FuzzSecureFrameOpen(f *testing.F) {
+	secret := []byte(testClusterSecret)
+	client, err := newClientHello(secret, "fuzz-client")
+	if err != nil {
+		f.Fatal(err)
+	}
+	server, err := newServerHello(secret, client, "fuzz-server")
+	if err != nil {
+		f.Fatal(err)
+	}
+	clientSession, err := newSecureSession(secret, client, server, true)
+	if err != nil {
+		f.Fatal(err)
+	}
+	seed, err := clientSession.seal([]byte("raft-rpc"))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Fuzz(func(t *testing.T, body []byte) {
+		serverSession, err := newSecureSession(secret, client, server, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = serverSession.open(body)
+	})
+}

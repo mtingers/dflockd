@@ -91,7 +91,7 @@ references and quoted in the "See also" line where helpful.
   the sole source of truth; in-memory state only (except optional
   fence-state file). Byte-identical behaviour to v2.1.x.
 - **Cluster mode** — Opt-in: `--raft-dir`, `--node-id`, `--raft-addr`,
-  `--cluster-peers`. The `LockManager` becomes the *FSM* of a Raft
+  `--cluster-peers`, and `--raft-auth-token-file`. The `LockManager` becomes the *FSM* of a Raft
   group; every mutating command is proposed through Raft and applied
   on every node in the same order.
 - **Raft** — The consensus algorithm (Ongaro & Ousterhout). In this
@@ -158,8 +158,12 @@ references and quoted in the "See also" line where helpful.
   `ReadIndex` API is a documented follow-on.
 - **Mutual TLS (mTLS) on Raft transport** — `--raft-tls-cert/-key/-ca`
   (all-or-none). When set, every inter-node TCP connection is TLS 1.3
-  with `RequireAndVerifyClientCert`. Default off; the startup log
-  warns when running plaintext.
+  with `RequireAndVerifyClientCert`, and each certificate Common Name
+  must equal its NodeID. This is optional defense in depth over the
+  mandatory shared-secret authenticated encryption.
+- **Raft auth token** — The high-entropy cluster secret loaded through
+  `--raft-auth-token-file`. It authenticates the challenge-response
+  handshake and derives per-connection AES-GCM keys.
 - **PreVote** — A pre-flight vote round before bumping `currentTerm`.
   A partitioned node that rejoins doesn't disturb the term.
 

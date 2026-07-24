@@ -98,12 +98,12 @@ func TestConfigurationCodecCanonicalAndStrict(t *testing.T) {
 	}
 }
 
-func TestTCPHelloRejectsLegacyJSONProtocol(t *testing.T) {
+func TestTCPHelloRejectsLegacyProtocol(t *testing.T) {
 	body := []byte{frameHello}
 	body = appendString16(body, "peer")
-	body = appendString16(body, "raft.v1")
+	body = appendString16(body, "raft.v2")
 	if _, err := decodeHello(body); err == nil {
-		t.Fatal("decodeHello accepted legacy JSON protocol")
+		t.Fatal("decodeHello accepted legacy protocol")
 	}
 }
 

@@ -315,11 +315,11 @@ the new leader → they ride lease expiry, as intended).
 
 ### 4.9 Security & limits
 
-- Raft RPC transport: optional mutual TLS (`--cluster-tls-cert/-key/-ca`),
-  reusing the TLS plumbing already present. A static **cluster shared secret**
-  (`--cluster-secret-file`) is checked on the Raft handshake — a node without it
-  can't join the consensus group. (Independent of `--auth-token`, which is the
-  client-facing secret.)
+- Raft RPC transport: a static **cluster shared secret**
+  (`--raft-auth-token-file`) drives challenge-response authentication and
+  directional AES-GCM sessions. Optional mutual TLS
+  (`--raft-tls-cert/-key/-ca`) additionally binds certificate CN to NodeID.
+  (Independent of `--auth-token`, which is the client-facing secret.)
 - `MaxLocks` / `MaxWaiters` are enforced at `Apply` time (deterministically — a
   command that would exceed the cap returns the error sentinel from `Apply`, and
   the leader relays it to the client). `--max-connections*` stay per-node, on the
@@ -523,13 +523,14 @@ note staged. Phases are ordered so each builds on tested foundations.
 - Done: a working dflockd Raft cluster, transport-agnostic, tested in-process.
 
 ### Phase 7 — framed TCP transport for Raft RPCs (`internal/raft/nettransport.go` or `cluster/transport_tcp.go`)
-- A length-prefixed, CRC-less (TCP already checksums; TLS authenticates) framed
+- A length-prefixed framed
   codec over `net.Conn`: `{len uint32}{frame bytes}`; frame = `{type, reqID,
   payload}`; request/response correlated by `reqID`. One persistent conn per
   peer pair (dial lazily, redial with backoff on failure), a single reader
   goroutine demuxing replies to waiting callers, write-mutex-serialized sends.
-  Handshake: proto version + cluster id + cluster secret (constant-time compare)
-  + optional mutual TLS; reject mismatches. Listener accepts inbound peer conns,
+  Handshake: proto version + fresh-nonce HMAC proof + optional mutual TLS;
+  derive directional AEAD keys and reject secret/protocol/certificate-ID
+  mismatches. Listener accepts inbound peer conns,
   dispatches frames to the registered `raft.Node` handler, writes replies back.
   Reuse the TLS config helpers already in `internal/server`/`internal/httpapi`.
 - Bounded frame sizes (normal vs. snapshot); idle/read/write deadlines;
@@ -723,8 +724,9 @@ green; race-clean; docs complete.
       a majority lost (documented manual procedure — unsafe, operator-forced).
 
 **Security & resource bounds**
-- [ ] Raft transport: optional mTLS; cluster shared secret on the handshake
-      (constant-time); proto/cluster-id mismatch refused.
+- [x] Raft transport: mandatory shared-secret HMAC handshake; directional
+      AES-GCM RPC sessions; optional mTLS binds certificate CN to NodeID;
+      protocol mismatch refused.
 - [ ] All Raft frames length-bounded (normal vs. snapshot caps); a peer sending
       garbage is dropped without affecting the node.
 - [ ] `MaxLocks`/`MaxWaiters` enforced at `Apply` (deterministically); per-node
@@ -829,8 +831,8 @@ partial (sub-deliverable deferred — see note), `❌` = not shipped.*
       (`internal/raft/tcptransport.go` + `tcpframe.go`)
 - [x] Phase 8 — server integration (propose / redirect / leader-only loops) ✅
 - [x] Phase 9 — config + cmd/dflockd wiring ✅ (`--raft-dir`, `--node-id`,
-      `--raft-addr`, `--cluster-peers`, `--cluster-bootstrap`, plus mTLS
-      flags and `--lease-sweep-interval`)
+      `--raft-addr`, `--cluster-peers`, `--cluster-bootstrap`,
+      `--raft-auth-token-file`, plus mTLS flags and `--lease-sweep-interval`)
 - [ ] Phase 10 — Go client cluster mode 🟡 (`*NotLeaderError` shipped;
       `ClusterMode`/`clusterRouter`/leader cache/auto-retry **deferred**
       — see PRODUCTION_READINESS.md "Recommended next work" item 4)

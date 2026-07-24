@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"reflect"
 	"sync"
@@ -12,15 +13,22 @@ import (
 	"github.com/mtingers/dflockd/internal/testutil"
 )
 
+const testClusterSecret = "0123456789abcdef0123456789abcdef"
+
+func newTestTCPTransport(id NodeID, addr string, logger *slog.Logger, opts ...TCPOption) (*TCPTransport, error) {
+	opts = append([]TCPOption{WithClusterSecret(testClusterSecret)}, opts...)
+	return NewTCPTransport(id, addr, logger, opts...)
+}
+
 // Stand up two real TCP transports on loopback, wire them as the
 // transports for two raft.Nodes, and run an election + restart.
 
 func TestTCPTransportTwoNodesElectLeader(t *testing.T) {
-	trA, err := NewTCPTransport("a", "127.0.0.1:0", nil)
+	trA, err := newTestTCPTransport("a", "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatalf("listen a: %v", err)
 	}
-	trB, err := NewTCPTransport("b", "127.0.0.1:0", nil)
+	trB, err := newTestTCPTransport("b", "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatalf("listen b: %v", err)
 	}
@@ -63,7 +71,7 @@ func TestTCPTransportThreeNodesProposeReplicates(t *testing.T) {
 	trs := map[NodeID]*TCPTransport{}
 	ids := []NodeID{"a", "b", "c"}
 	for _, id := range ids {
-		tr, err := NewTCPTransport(id, "127.0.0.1:0", nil)
+		tr, err := newTestTCPTransport(id, "127.0.0.1:0", nil)
 		if err != nil {
 			t.Fatalf("NewTCPTransport(%s): %v", id, err)
 		}
@@ -210,7 +218,7 @@ func TestTCPTransportFrameRoundTrip(t *testing.T) {
 }
 
 func TestTCPTransportRejectsUnknownPeer(t *testing.T) {
-	tr, err := NewTCPTransport("only", "127.0.0.1:0", nil)
+	tr, err := newTestTCPTransport("only", "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
@@ -224,7 +232,7 @@ func TestTCPTransportRejectsUnknownPeer(t *testing.T) {
 }
 
 func TestTCPTransportCloseIsIdempotent(t *testing.T) {
-	tr, err := NewTCPTransport("x", "127.0.0.1:0", nil)
+	tr, err := newTestTCPTransport("x", "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
@@ -262,12 +270,12 @@ func TestReadFrameClearsStaleDeadline(t *testing.T) {
 }
 
 func TestTCPTransportMutualTLS(t *testing.T) {
-	cfg := testutil.MutualTLS(t) // shared by both ends
-	trA, err := NewTCPTransport("a", "127.0.0.1:0", nil, WithTLS(cfg))
+	cfg := testutil.MutualTLSNodes(t, "a", "b")
+	trA, err := newTestTCPTransport("a", "127.0.0.1:0", nil, WithTLS(cfg["a"]))
 	if err != nil {
 		t.Fatalf("NewTCPTransport a: %v", err)
 	}
-	trB, err := NewTCPTransport("b", "127.0.0.1:0", nil, WithTLS(cfg))
+	trB, err := newTestTCPTransport("b", "127.0.0.1:0", nil, WithTLS(cfg["b"]))
 	if err != nil {
 		t.Fatalf("NewTCPTransport b: %v", err)
 	}
@@ -289,11 +297,15 @@ func TestTCPTransportMutualTLS(t *testing.T) {
 }
 
 func TestTCPTransportTLSRejectsUntrustedPeer(t *testing.T) {
-	trA, err := NewTCPTransport("a", "127.0.0.1:0", nil, WithTLS(testutil.MutualTLS(t)))
+	trA, err := newTestTCPTransport(
+		"a", "127.0.0.1:0", nil, WithTLS(testutil.MutualTLSNodes(t, "a")["a"]),
+	)
 	if err != nil {
 		t.Fatalf("NewTCPTransport a: %v", err)
 	}
-	trB, err := NewTCPTransport("b", "127.0.0.1:0", nil, WithTLS(testutil.MutualTLS(t))) // a different cert/pool
+	trB, err := newTestTCPTransport(
+		"b", "127.0.0.1:0", nil, WithTLS(testutil.MutualTLSNodes(t, "b")["b"]),
+	) // a different cert/pool
 	if err != nil {
 		t.Fatalf("NewTCPTransport b: %v", err)
 	}
@@ -321,7 +333,7 @@ func TestNewMutualTLSConfig(t *testing.T) {
 }
 
 func TestTCPTransportDialBackoff(t *testing.T) {
-	tr, err := NewTCPTransport("a", "127.0.0.1:0", nil)
+	tr, err := newTestTCPTransport("a", "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
@@ -344,8 +356,8 @@ func TestTCPTransportDialBackoff(t *testing.T) {
 }
 
 func TestTCPTransportSendAfterCloseFails(t *testing.T) {
-	trA, _ := NewTCPTransport("a", "127.0.0.1:0", nil)
-	trB, _ := NewTCPTransport("b", "127.0.0.1:0", nil)
+	trA, _ := newTestTCPTransport("a", "127.0.0.1:0", nil)
+	trB, _ := newTestTCPTransport("b", "127.0.0.1:0", nil)
 	defer trB.Close()
 	trA.AddPeer("b", trB.ListenAddr())
 	if err := trA.Close(); err != nil {
@@ -363,8 +375,8 @@ func TestTCPTransportConnSurvivesPastHandshakeDeadline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("sleeps past handshakeTimeout")
 	}
-	trA, _ := NewTCPTransport("a", "127.0.0.1:0", nil)
-	trB, _ := NewTCPTransport("b", "127.0.0.1:0", nil)
+	trA, _ := newTestTCPTransport("a", "127.0.0.1:0", nil)
+	trB, _ := newTestTCPTransport("b", "127.0.0.1:0", nil)
 	defer trA.Close()
 	defer trB.Close()
 	trA.AddPeer("b", trB.ListenAddr())
@@ -388,8 +400,8 @@ func TestTCPTransportConnSurvivesPastHandshakeDeadline(t *testing.T) {
 }
 
 func TestTCPTransportConcurrentSends(t *testing.T) {
-	trA, _ := NewTCPTransport("a", "127.0.0.1:0", nil)
-	trB, _ := NewTCPTransport("b", "127.0.0.1:0", nil)
+	trA, _ := newTestTCPTransport("a", "127.0.0.1:0", nil)
+	trB, _ := newTestTCPTransport("b", "127.0.0.1:0", nil)
 	defer trA.Close()
 	defer trB.Close()
 	trA.AddPeer("b", trB.ListenAddr())

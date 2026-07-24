@@ -85,11 +85,14 @@ func startCluster(cfg *config.Config, lm *lock.LockManager, srv *server.Server, 
 		return nil, err
 	}
 	if tlsCfg != nil {
-		log.Info("raft transport: mutual TLS enabled")
+		log.Info("raft transport: shared-secret encryption + mutual TLS enabled")
 	} else {
-		log.Warn("raft transport: plaintext (set --raft-tls-cert/--raft-tls-key/--raft-tls-ca to enable mutual TLS)")
+		log.Info("raft transport: shared-secret authentication and encryption enabled")
 	}
-	transport, err := raft.NewTCPTransport(raft.NodeID(cfg.NodeID), cfg.RaftAddr, log, raft.WithTLS(tlsCfg))
+	transport, err := raft.NewTCPTransport(
+		raft.NodeID(cfg.NodeID), cfg.RaftAddr, log,
+		raft.WithClusterSecret(cfg.RaftAuthToken), raft.WithTLS(tlsCfg),
+	)
 	if err != nil {
 		_ = storage.Close()
 		return nil, fmt.Errorf("open raft transport on %s: %w", cfg.RaftAddr, err)

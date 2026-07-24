@@ -13,6 +13,8 @@ import (
 // the same and additionally *requires* the dialer to present a cert
 // (RequireAndVerifyClientCert). TLS 1.3 minimum. All three paths must be
 // non-empty; pass empty strings to disable TLS (returns nil, nil).
+// The TCP transport separately requires each verified leaf certificate's
+// Common Name to exactly match the peer's hello NodeID.
 func NewMutualTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if certFile == "" && keyFile == "" && caFile == "" {
 		return nil, nil

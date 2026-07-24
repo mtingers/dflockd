@@ -1,9 +1,13 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+const testRaftAuthToken = "0123456789abcdef0123456789abcdef"
 
 func TestParseClusterPeers(t *testing.T) {
 	cases := map[string]struct {
@@ -73,6 +77,7 @@ func TestClusterFieldValidation(t *testing.T) {
 			"--node-id", "n1",
 			"--raft-addr", "127.0.0.1:7001",
 			"--cluster-peers", "n1=127.0.0.1:7001@127.0.0.1:6388,n2=127.0.0.1:7002@127.0.0.1:6389",
+			"--raft-auth-token", testRaftAuthToken,
 		})
 		if err != nil {
 			t.Fatalf("load valid cluster cfg: %v", err)
@@ -109,6 +114,7 @@ func TestClusterFieldValidation(t *testing.T) {
 	c, err := Load([]string{
 		"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001",
 		"--cluster-peers", "n1=h:1@c:1",
+		"--raft-auth-token", testRaftAuthToken,
 		"--raft-tls-cert", "/c.pem", "--raft-tls-key", "/k.pem", "--raft-tls-ca", "/ca.pem",
 	})
 	if err != nil {
@@ -122,8 +128,42 @@ func TestClusterFieldValidation(t *testing.T) {
 	// through the cluster).
 	if _, err := Load([]string{
 		"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001",
-		"--cluster-peers", "n1=h:1@c:1", "--http-port", "6389", "--port", "6388",
+		"--cluster-peers", "n1=h:1@c:1", "--raft-auth-token", testRaftAuthToken,
+		"--http-port", "6389", "--port", "6388",
 	}); err != nil {
 		t.Fatalf("--http-port + cluster should be allowed now: %v", err)
+	}
+}
+
+func TestRaftAuthTokenRequiredAndResolved(t *testing.T) {
+	clearEnv(t)
+	base := []string{
+		"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001",
+		"--cluster-peers", "n1=h:1@c:1",
+	}
+	if _, err := Load(base); err == nil || !strings.Contains(err.Error(), "raft-auth-token") {
+		t.Fatalf("missing token error = %v", err)
+	}
+	if _, err := Load(append(base, "--raft-auth-token", "short")); err == nil || !strings.Contains(err.Error(), "32 bytes") {
+		t.Fatalf("short token error = %v", err)
+	}
+	if _, err := Load([]string{"--raft-auth-token", testRaftAuthToken}); err == nil || !strings.Contains(err.Error(), "requires cluster mode") {
+		t.Fatalf("single-node token error = %v", err)
+	}
+
+	withEnv(t, map[string]string{"DFLOCKD_RAFT_AUTH_TOKEN": testRaftAuthToken})
+	cfg, err := Load(base)
+	if err != nil || cfg.RaftAuthToken != testRaftAuthToken {
+		t.Fatalf("env token: cfg=%+v err=%v", cfg, err)
+	}
+
+	path := filepath.Join(t.TempDir(), "raft-token")
+	if err := os.WriteFile(path, []byte(testRaftAuthToken+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	clearEnv(t)
+	cfg, err = Load(append(base, "--raft-auth-token-file", path))
+	if err != nil || cfg.RaftAuthToken != testRaftAuthToken {
+		t.Fatalf("file token: cfg=%+v err=%v", cfg, err)
 	}
 }

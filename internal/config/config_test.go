@@ -47,6 +47,7 @@ var configEnvKeys = []string{
 	"DFLOCKD_WRITE_TIMEOUT_S", "DFLOCKD_SHUTDOWN_TIMEOUT_S",
 	"DFLOCKD_AUTO_RELEASE_ON_DISCONNECT", "DFLOCKD_TLS_CERT", "DFLOCKD_TLS_KEY",
 	"DFLOCKD_AUTH_TOKEN", "DFLOCKD_AUTH_TOKEN_FILE", "DFLOCKD_FENCE_STATE_FILE",
+	"DFLOCKD_RAFT_AUTH_TOKEN", "DFLOCKD_RAFT_AUTH_TOKEN_FILE",
 	"DFLOCKD_HTTP_PORT", "DFLOCKD_HTTP_HOST",
 	"DFLOCKD_HTTP_SESSION_IDLE_S", "DFLOCKD_HTTP_MAX_SESSIONS",
 	"DFLOCKD_HTTP_MAX_SESSIONS_PER_IP", "DFLOCKD_HTTP_MAX_CONNECTIONS_PER_IP",
@@ -350,6 +351,7 @@ func orphanClusterArgs(extra ...string) []string {
 		"--raft-dir", "/tmp/raft", "--node-id", "n1",
 		"--raft-addr", "127.0.0.1:7001",
 		"--cluster-peers", "n1=127.0.0.1:7001@127.0.0.1:6388",
+		"--raft-auth-token", testRaftAuthToken,
 	}, extra...)
 }
 

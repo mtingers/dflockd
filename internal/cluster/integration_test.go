@@ -45,7 +45,10 @@ func TestE2ESingleNodeAcquireRelease(t *testing.T) {
 	rcfg.ElectionTimeoutMin = 30 * time.Millisecond
 	rcfg.ElectionTimeoutMax = 60 * time.Millisecond
 
-	transport, err := raft.NewTCPTransport(id, tcpAddr, slog.Default())
+	transport, err := raft.NewTCPTransport(
+		id, tcpAddr, slog.Default(),
+		raft.WithClusterSecret("0123456789abcdef0123456789abcdef"),
+	)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}

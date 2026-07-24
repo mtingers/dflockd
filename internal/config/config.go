@@ -62,10 +62,14 @@ type Config struct {
 	RaftAddr         string        // this node's Raft transport bind ("host:port")
 	AdvertiseAddr    string        // this node's client-facing host:port (returned to redirected clients)
 	ClusterBootstrap bool          // bootstrap a new cluster vs. join an existing one
+	// RaftAuthToken is required in cluster mode. It authenticates the
+	// challenge-response handshake and derives per-connection AEAD keys.
+	// Every member must use the same high-entropy value.
+	RaftAuthToken string
 	// Mutual TLS on the Raft transport. All three set → every inter-node
 	// connection is mTLS (each node presents RaftTLSCert and verifies the
-	// peer against RaftTLSCA). All empty → plaintext (trusted network).
-	// Mixed → a startup error.
+	// peer against RaftTLSCA). Certificate Common Names must equal NodeID.
+	// All empty leaves the shared-secret AEAD as the transport protection.
 	RaftTLSCert string
 	RaftTLSKey  string
 	RaftTLSCA   string
@@ -141,6 +145,7 @@ func applyDerivedDefaults(c *Config) {
 type flagPtrs struct {
 	host, tlsCert, tlsKey                           *string
 	authToken, authTokenFile                        *string
+	raftAuthToken, raftAuthTokenFile                *string
 	adminToken                                      *string
 	httpHost, httpCORSOrigins                       *string
 	fenceStateFile                                  *string
@@ -185,6 +190,8 @@ func defineStringFlags(fs *flag.FlagSet, f *flagPtrs) {
 	f.clusterPeers = fs.String("cluster-peers", "", "Comma-separated list of cluster members: id=raftHost:raftPort@clientHost:clientPort. Required in cluster mode; must include this node.")
 	f.raftAddr = fs.String("raft-addr", "", "This node's Raft transport bind address (host:port). Required in cluster mode.")
 	f.advertiseAddr = fs.String("advertise-addr", "", "This node's client-facing host:port returned to clients via error_not_leader. Defaults to --host:--port.")
+	f.raftAuthToken = fs.String("raft-auth-token", "", "Shared secret for Raft peer authentication and encryption (minimum 32 bytes; prefer --raft-auth-token-file).")
+	f.raftAuthTokenFile = fs.String("raft-auth-token-file", "", "Path to a file containing the shared Raft auth token.")
 	f.raftTLSCert = fs.String("raft-tls-cert", "", "PEM cert for mutual TLS on the Raft transport. Set with --raft-tls-key and --raft-tls-ca to encrypt+authenticate all inter-node traffic.")
 	f.raftTLSKey = fs.String("raft-tls-key", "", "PEM private key for --raft-tls-cert.")
 	f.raftTLSCA = fs.String("raft-tls-ca", "", "PEM CA bundle used to verify Raft peers' certificates (enables mutual TLS when set with --raft-tls-cert/--raft-tls-key).")
@@ -400,6 +407,11 @@ func resolveAuth(r *resolver, f *flagPtrs, c *Config) error {
 		return err
 	}
 	c.AuthToken = tok
+	raftToken, err := r.loadRaftAuthToken(*f.raftAuthToken, *f.raftAuthTokenFile)
+	if err != nil {
+		return err
+	}
+	c.RaftAuthToken = raftToken
 	c.AdminToken = r.loadAdminToken(*f.adminToken)
 	return nil
 }
@@ -447,6 +459,7 @@ var validators = []func(*Config) error{
 	validateClusterFields,
 	validateClusterVsFenceFile,
 	validateRaftTLS,
+	validateRaftAuthToken,
 	validateOrphanTTL,
 }
 
@@ -539,6 +552,19 @@ func validateRaftTLS(c *Config) error {
 // RaftTLSEnabled reports whether mutual TLS is configured for the Raft
 // transport.
 func (c *Config) RaftTLSEnabled() bool { return c.RaftTLSCert != "" }
+
+func validateRaftAuthToken(c *Config) error {
+	if !c.IsCluster() {
+		if c.RaftAuthToken != "" {
+			return fmt.Errorf("--raft-auth-token requires cluster mode (--raft-dir)")
+		}
+		return nil
+	}
+	if len(c.RaftAuthToken) < 32 {
+		return fmt.Errorf("--raft-auth-token is required in cluster mode and must be at least 32 bytes")
+	}
+	return nil
+}
 
 // IsCluster reports whether cluster mode is enabled. We use --raft-dir
 // as the canonical "are we clustered?" switch: it is the only required
@@ -901,6 +927,24 @@ func envAuthToken() (string, error) {
 		return cleanAuthToken("DFLOCKD_AUTH_TOKEN", v)
 	}
 	if v := os.Getenv("DFLOCKD_AUTH_TOKEN_FILE"); v != "" {
+		return readAuthTokenFile(v)
+	}
+	return "", nil
+}
+
+// loadRaftAuthToken uses the same secret-source precedence as the client
+// auth token, but its own flags and environment variables.
+func (r *resolver) loadRaftAuthToken(flagToken, flagTokenFile string) (string, error) {
+	if r.setFlags["raft-auth-token"] && flagToken != "" {
+		return cleanAuthToken("--raft-auth-token", flagToken)
+	}
+	if r.setFlags["raft-auth-token-file"] && flagTokenFile != "" {
+		return readAuthTokenFile(flagTokenFile)
+	}
+	if v := os.Getenv("DFLOCKD_RAFT_AUTH_TOKEN"); v != "" {
+		return cleanAuthToken("DFLOCKD_RAFT_AUTH_TOKEN", v)
+	}
+	if v := os.Getenv("DFLOCKD_RAFT_AUTH_TOKEN_FILE"); v != "" {
 		return readAuthTokenFile(v)
 	}
 	return "", nil

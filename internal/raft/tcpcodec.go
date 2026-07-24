@@ -74,8 +74,8 @@ func encodeAppendEntriesReq(m *AppendEntriesReq) ([]byte, error) {
 			return nil, fmt.Errorf("entry data length %d exceeds max %d", len(entry.Data), maxEntryDataBytes)
 		}
 		size += 21 + len(entry.Data)
-		if size > maxTCPFrameBytes-rpcHeaderBytes {
-			return nil, fmt.Errorf("payload length exceeds max %d", maxTCPFrameBytes-rpcHeaderBytes)
+		if size > maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes {
+			return nil, fmt.Errorf("payload length exceeds max %d", maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes)
 		}
 	}
 	dst := make([]byte, 0, size)
@@ -111,8 +111,11 @@ func encodeInstallSnapshotReq(m *InstallSnapshotReq) ([]byte, error) {
 		return nil, err
 	}
 	size := 8 + 2 + len(m.LeaderID) + 8 + 8 + 4 + len(cfg) + 4 + len(m.Data)
-	if size > maxTCPFrameBytes-rpcHeaderBytes {
-		return nil, fmt.Errorf("payload length %d exceeds max %d", size, maxTCPFrameBytes-rpcHeaderBytes)
+	if size > maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes {
+		return nil, fmt.Errorf(
+			"payload length %d exceeds max %d",
+			size, maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes,
+		)
 	}
 	dst := make([]byte, 0, size)
 	dst = be.AppendUint64(dst, uint64(m.Term))

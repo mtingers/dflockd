@@ -168,7 +168,7 @@ remaining connections so the process can exit. Set
 dflockd can also run as an N-node Raft-replicated cluster. Cluster
 mode is opt-in via a small set of additional flags
 (`--raft-dir`, `--node-id`, `--raft-addr`, `--cluster-peers` or
-`--cluster-bootstrap`, and the optional `--advertise-addr` +
+`--cluster-bootstrap`, `--raft-auth-token-file`, and the optional `--advertise-addr` +
 `--raft-tls-cert`/`--raft-tls-key`/`--raft-tls-ca` mTLS triple). With
 none of those set the server runs exactly as documented above —
 single-process, in-memory, byte-for-byte the v2.1.x single-node

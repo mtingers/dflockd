@@ -12,28 +12,43 @@ it, and recovering from common failures. See
 | `--node-id <id>` | Stable identifier for this node (any string; must be unique within the cluster and never reused). |
 | `--raft-addr <host:port>` | This node's Raft transport bind (peer-to-peer consensus traffic). |
 | `--cluster-peers <list>` | Every member of the cluster as `id=raftHost:raftPort@clientHost:clientPort,...`. Must include this node. |
+| `--raft-auth-token-file <path>` | File containing the shared high-entropy cluster secret (minimum 32 bytes). Every member must use the same value. |
 | `--advertise-addr <host:port>` (optional) | This node's client-facing address. Defaults to `--host:--port`. Clients connect here when redirected. |
 
 `--http-port` works in cluster mode — see [HTTP API in cluster
 mode](#http-api-in-cluster-mode) below.
 
-### Securing the Raft transport (mutual TLS)
+### Securing the Raft transport
 
-Inter-node consensus traffic is plaintext by default. To encrypt and
-authenticate it, give every node a certificate signed by a shared CA
-and pass:
+Raft always performs a replay-resistant HMAC challenge-response and
+protects subsequent frames with sequence-numbered AES-GCM. Generate one
+random secret and install the same root-readable file on every member:
+
+```bash
+umask 077
+openssl rand -hex 32 > /etc/dflockd/raft-auth-token
+```
+
+`--raft-auth-token` and `DFLOCKD_RAFT_AUTH_TOKEN` are also supported,
+but a file avoids exposing the secret in the process list.
+
+For PKI-backed per-node identity in addition to the shared secret, give
+every node a certificate signed by a shared CA and pass:
 
 | Flag | Description |
 |---|---|
-| `--raft-tls-cert <pem>` | This node's certificate. |
+| `--raft-tls-cert <pem>` | This node's certificate. Its Common Name must exactly equal `--node-id`. |
 | `--raft-tls-key <pem>` | Its private key. |
 | `--raft-tls-ca <pem>` | The CA bundle used to verify peers. |
 
 All three must be set together (or all omitted). When set, every
-connection between nodes is mutual TLS (TLS 1.3, `RequireAndVerifyClientCert`)
-— a node without a CA-signed cert cannot join or inject messages. The
-startup log says `raft transport: mutual TLS enabled` (or warns when
-it's plaintext).
+connection is also mutual TLS (TLS 1.3, `RequireAndVerifyClientCert`).
+The transport rejects a hello whose NodeID differs from the verified
+leaf certificate's Common Name.
+
+The authenticated wire format is `raft.v3`; upgrading from an older
+release requires an all-node restart because mixed protocol versions
+intentionally refuse the handshake.
 
 ## Bringing up a 3-node cluster
 
@@ -47,17 +62,20 @@ dflockd \
   --node-id n1 \
   --raft-dir /var/lib/dflockd/n1 \
   --raft-addr 10.0.0.1:7001 \
+  --raft-auth-token-file /etc/dflockd/raft-auth-token \
   --port 6388 --advertise-addr 10.0.0.1:6388 \
   --cluster-peers "n1=10.0.0.1:7001@10.0.0.1:6388,n2=10.0.0.2:7002@10.0.0.2:6389,n3=10.0.0.3:7003@10.0.0.3:6390"
 
 # Host B (n2) — same --cluster-peers value
 dflockd --node-id n2 --raft-dir /var/lib/dflockd/n2 \
-        --raft-addr 10.0.0.2:7002 --port 6389 --advertise-addr 10.0.0.2:6389 \
+        --raft-addr 10.0.0.2:7002 --raft-auth-token-file /etc/dflockd/raft-auth-token \
+        --port 6389 --advertise-addr 10.0.0.2:6389 \
         --cluster-peers "n1=10.0.0.1:7001@10.0.0.1:6388,n2=10.0.0.2:7002@10.0.0.2:6389,n3=10.0.0.3:7003@10.0.0.3:6390"
 
 # Host C (n3) — same again
 dflockd --node-id n3 --raft-dir /var/lib/dflockd/n3 \
-        --raft-addr 10.0.0.3:7003 --port 6390 --advertise-addr 10.0.0.3:6390 \
+        --raft-addr 10.0.0.3:7003 --raft-auth-token-file /etc/dflockd/raft-auth-token \
+        --port 6390 --advertise-addr 10.0.0.3:6390 \
         --cluster-peers "n1=10.0.0.1:7001@10.0.0.1:6388,n2=10.0.0.2:7002@10.0.0.2:6389,n3=10.0.0.3:7003@10.0.0.3:6390"
 ```
 

@@ -20,8 +20,9 @@ import (
 // This avoids the "which side wins on a simultaneous dial" tie-break
 // and keeps the read/write halves of each connection unambiguous.
 //
-// TLS / cluster-secret auth on the handshake are intentionally NOT
-// wired in v1 (see PLAN.md §3); they are additive over this layer.
+// Every connection uses a shared-secret challenge-response handshake,
+// then protects RPC frames with a derived AEAD session. Optional mutual
+// TLS additionally binds each hello NodeID to the certificate Common Name.
 type rpcHandler = func(from NodeID, req Message) Message
 
 // TCPTransport is the production raft.Transport. It owns a listener
@@ -34,18 +35,19 @@ type rpcHandler = func(from NodeID, req Message) Message
 // peer is reused, with serialised writes). The atomic handler pointer
 // and the sync.Maps avoid locking on the hot path.
 type TCPTransport struct {
-	id           NodeID
-	listener     net.Listener
-	tlsCfg       *tls.Config                // non-nil → mutual TLS on every conn
-	handler      atomic.Pointer[rpcHandler] // set via SetHandler; read off accept goroutines
-	addrs        sync.Map                   // NodeID → string
-	outbound     sync.Map                   // NodeID → *outboundConn
-	accepted     sync.Map                   // net.Conn → struct{} (open accepted conns)
-	lastDialFail sync.Map                   // NodeID → time.Time (dial-failure cool-down)
-	dialMu       sync.Mutex                 // serialises dial-on-demand
-	log          *slog.Logger
-	wg           sync.WaitGroup
-	closed       atomic.Bool
+	id            NodeID
+	listener      net.Listener
+	tlsCfg        *tls.Config                // non-nil → mutual TLS on every conn
+	clusterSecret []byte                     // HMAC handshake + AEAD key source
+	handler       atomic.Pointer[rpcHandler] // set via SetHandler; read off accept goroutines
+	addrs         sync.Map                   // NodeID → string
+	outbound      sync.Map                   // NodeID → *outboundConn
+	accepted      sync.Map                   // net.Conn → struct{} (open accepted conns)
+	lastDialFail  sync.Map                   // NodeID → time.Time (dial-failure cool-down)
+	dialMu        sync.Mutex                 // serialises dial-on-demand
+	log           *slog.Logger
+	wg            sync.WaitGroup
+	closed        atomic.Bool
 }
 
 var _ Transport = (*TCPTransport)(nil)
@@ -56,16 +58,25 @@ var errTransportClosed = errors.New("raft: transport closed")
 // TCPOption configures a TCPTransport at construction time.
 type TCPOption func(*tcpOptions)
 
-type tcpOptions struct{ tlsCfg *tls.Config }
+type tcpOptions struct {
+	tlsCfg        *tls.Config
+	clusterSecret []byte
+}
 
 // WithTLS makes every inter-node connection use cfg (mutual TLS — see
-// NewMutualTLSConfig). A nil cfg is a no-op (plaintext).
+// NewMutualTLSConfig). A nil cfg leaves shared-secret AEAD without TLS.
 func WithTLS(cfg *tls.Config) TCPOption { return func(o *tcpOptions) { o.tlsCfg = cfg } }
+
+// WithClusterSecret authenticates peers and encrypts every Raft RPC frame.
+// The secret must contain at least 32 bytes of operator-supplied entropy.
+func WithClusterSecret(secret string) TCPOption {
+	return func(o *tcpOptions) { o.clusterSecret = append([]byte(nil), secret...) }
+}
 
 // NewTCPTransport listens on listenAddr ("host:port"; "0" gets a free
 // port) and returns a Transport bound to id. Call SetHandler before
-// expecting inbound RPCs to deliver. Pass WithTLS(cfg) to wrap every
-// connection in mutual TLS.
+// expecting inbound RPCs to deliver. WithClusterSecret is required;
+// pass WithTLS(cfg) to add mutual TLS and certificate identity binding.
 func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger, opts ...TCPOption) (*TCPTransport, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -74,6 +85,9 @@ func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger, opts ...
 	for _, opt := range opts {
 		opt(&o)
 	}
+	if err := validateTCPOptions(id, o); err != nil {
+		return nil, err
+	}
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("raft: tcp listen %s: %w", listenAddr, err)
@@ -81,10 +95,26 @@ func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger, opts ...
 	if o.tlsCfg != nil {
 		lis = tls.NewListener(lis, o.tlsCfg)
 	}
-	t := &TCPTransport{id: id, listener: lis, tlsCfg: o.tlsCfg, log: logger.With("transport", id)}
+	t := &TCPTransport{
+		id: id, listener: lis, tlsCfg: o.tlsCfg,
+		clusterSecret: o.clusterSecret, log: logger.With("transport", id),
+	}
 	t.wg.Add(1)
 	go t.acceptLoop()
 	return t, nil
+}
+
+func validateTCPOptions(id NodeID, o tcpOptions) error {
+	if id == "" {
+		return fmt.Errorf("raft: TCP transport node ID is required")
+	}
+	if len(id) >= maxString16 {
+		return fmt.Errorf("raft: TCP transport node ID exceeds %d bytes", maxString16-1)
+	}
+	if len(o.clusterSecret) < minClusterSecretBytes {
+		return fmt.Errorf("raft: cluster secret must be at least %d bytes", minClusterSecretBytes)
+	}
+	return nil
 }
 
 // LocalID implements raft.Transport.
@@ -178,49 +208,90 @@ func (t *TCPTransport) serveAccepted(conn net.Conn) {
 	if t.closed.Load() {
 		return // Close() may have already finished its accepted.Range
 	}
-	from, err := t.serverHandshake(conn)
+	from, session, err := t.serverHandshake(conn)
 	if err != nil {
 		t.log.Debug("inbound handshake failed", "err", err)
 		return
 	}
-	t.serveRequests(conn, from)
+	t.serveRequests(conn, from, session)
 }
 
-func (t *TCPTransport) serverHandshake(conn net.Conn) (NodeID, error) {
+func (t *TCPTransport) serverHandshake(conn net.Conn) (NodeID, *secureSession, error) {
+	client, err := t.readClientHello(conn)
+	if err != nil {
+		return "", nil, err
+	}
+	server, err := t.exchangeServerProof(conn, client)
+	if err != nil {
+		return "", nil, err
+	}
+	session, err := newSecureSession(t.clusterSecret, client, server, false)
+	if err != nil {
+		return "", nil, err
+	}
+	return client.id, session, nil
+}
+
+func (t *TCPTransport) readClientHello(conn net.Conn) (handshakeHello, error) {
 	body, err := readFrame(conn, handshakeTimeout)
 	if err != nil {
-		return "", fmt.Errorf("read hello: %w", err)
+		return handshakeHello{}, fmt.Errorf("read hello: %w", err)
 	}
-	from, err := decodeHello(body)
+	client, err := decodeHello(body)
 	if err != nil {
-		return "", err
+		return handshakeHello{}, err
 	}
-	if err := writeFrameTo(conn, encodeHello(t.id), handshakeTimeout); err != nil {
-		return "", fmt.Errorf("write hello reply: %w", err)
+	if err := verifyClientHello(t.clusterSecret, client); err != nil {
+		return handshakeHello{}, err
 	}
-	return from, nil
+	if err := verifyPeerTLSIdentity(conn, client.id); err != nil {
+		return handshakeHello{}, err
+	}
+	return client, nil
+}
+
+func (t *TCPTransport) exchangeServerProof(conn net.Conn, client handshakeHello) (handshakeHello, error) {
+	server, err := newServerHello(t.clusterSecret, client, t.id)
+	if err != nil {
+		return handshakeHello{}, err
+	}
+	if err := writeFrameTo(conn, encodeHello(server), handshakeTimeout); err != nil {
+		return handshakeHello{}, fmt.Errorf("write hello reply: %w", err)
+	}
+	body, err := readFrame(conn, handshakeTimeout)
+	if err != nil {
+		return handshakeHello{}, fmt.Errorf("read client auth: %w", err)
+	}
+	proof, err := decodeAuth(body)
+	if err != nil {
+		return handshakeHello{}, err
+	}
+	if err := verifyClientFinal(t.clusterSecret, client, server, proof); err != nil {
+		return handshakeHello{}, err
+	}
+	return server, nil
 }
 
 // serveRequests reads request frames in a loop, dispatches to the
 // handler, and writes responses back on the same connection. A
 // connIdleTimeout on each read recycles a peer that has gone silent.
-func (t *TCPTransport) serveRequests(conn net.Conn, from NodeID) {
+func (t *TCPTransport) serveRequests(conn net.Conn, from NodeID, session *secureSession) {
 	for {
-		body, err := readFrame(conn, connIdleTimeout)
+		body, err := readSecureFrame(conn, session, connIdleTimeout)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) && !t.closed.Load() {
 				t.log.Debug("inbound read error", "from", from, "err", err)
 			}
 			return
 		}
-		if err := t.handleOneInbound(conn, from, body); err != nil {
+		if err := t.handleOneInbound(conn, session, from, body); err != nil {
 			t.log.Debug("inbound dispatch error", "from", from, "err", err)
 			return
 		}
 	}
 }
 
-func (t *TCPTransport) handleOneInbound(conn net.Conn, from NodeID, body []byte) error {
+func (t *TCPTransport) handleOneInbound(conn net.Conn, session *secureSession, from NodeID, body []byte) error {
 	kind, reqID, msg, err := decodeRPC(body)
 	if err != nil {
 		return fmt.Errorf("inbound frame decode: %w", err)
@@ -236,7 +307,7 @@ func (t *TCPTransport) handleOneInbound(conn net.Conn, from NodeID, body []byte)
 		// redials when it next needs us.
 		return errors.New("handler returned nil")
 	}
-	return t.writeResponse(conn, reqID, resp)
+	return t.writeResponse(conn, session, reqID, resp)
 }
 
 func (t *TCPTransport) callHandler(from NodeID, msg Message) Message {
@@ -247,12 +318,12 @@ func (t *TCPTransport) callHandler(from NodeID, msg Message) Message {
 	return (*hp)(from, msg)
 }
 
-func (t *TCPTransport) writeResponse(conn net.Conn, reqID uint64, resp Message) error {
+func (t *TCPTransport) writeResponse(conn net.Conn, session *secureSession, reqID uint64, resp Message) error {
 	body, err := encodeRPC(frameResponse, reqID, resp)
 	if err != nil {
 		return err
 	}
-	return writeFrameTo(conn, body, writeTimeout)
+	return writeSecureFrameTo(conn, session, body, writeTimeout)
 }
 
 // tuneConn enables TCP keepalive so a peer whose host disappeared
@@ -319,13 +390,14 @@ func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
 		return nil, fmt.Errorf("raft: dial %s: %w", to, err)
 	}
 	tuneConn(conn)
-	if err := t.clientHandshake(conn, to); err != nil {
+	session, err := t.clientHandshake(conn, to)
+	if err != nil {
 		conn.Close()
 		t.lastDialFail.Store(to, time.Now())
 		return nil, err
 	}
 	t.lastDialFail.Delete(to)
-	oc := newOutboundConn(conn, t)
+	oc := newOutboundConn(conn, session, t)
 	t.outbound.Store(to, oc)
 	t.wg.Add(1)
 	go func() { defer t.wg.Done(); oc.runReader() }()
@@ -342,22 +414,36 @@ func (t *TCPTransport) dial(addr string) (net.Conn, error) {
 	return d.Dial("tcp", addr)
 }
 
-func (t *TCPTransport) clientHandshake(conn net.Conn, want NodeID) error {
-	if err := writeFrameTo(conn, encodeHello(t.id), handshakeTimeout); err != nil {
-		return fmt.Errorf("write hello: %w", err)
+func (t *TCPTransport) clientHandshake(conn net.Conn, want NodeID) (*secureSession, error) {
+	client, err := newClientHello(t.clusterSecret, t.id)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFrameTo(conn, encodeHello(client), handshakeTimeout); err != nil {
+		return nil, fmt.Errorf("write hello: %w", err)
 	}
 	body, err := readFrame(conn, handshakeTimeout)
 	if err != nil {
-		return fmt.Errorf("read hello reply: %w", err)
+		return nil, fmt.Errorf("read hello reply: %w", err)
 	}
-	from, err := decodeHello(body)
+	server, err := decodeHello(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if from != want {
-		return fmt.Errorf("raft: peer at %q identified as %q, want %q", conn.RemoteAddr(), from, want)
+	if server.id != want {
+		return nil, fmt.Errorf("raft: peer at %q identified as %q, want %q", conn.RemoteAddr(), server.id, want)
 	}
-	return nil
+	if err := verifyServerHello(t.clusterSecret, client, server); err != nil {
+		return nil, err
+	}
+	if err := verifyPeerTLSIdentity(conn, server.id); err != nil {
+		return nil, err
+	}
+	proof := clientFinalProof(t.clusterSecret, client, server)
+	if err := writeFrameTo(conn, encodeAuth(proof), handshakeTimeout); err != nil {
+		return nil, fmt.Errorf("write client auth: %w", err)
+	}
+	return newSecureSession(t.clusterSecret, client, server, true)
 }
 
 func (t *TCPTransport) dropOutbound(id NodeID) {
@@ -372,6 +458,7 @@ func (t *TCPTransport) dropOutbound(id NodeID) {
 
 type outboundConn struct {
 	conn      net.Conn
+	session   *secureSession
 	writeMu   sync.Mutex
 	nextReqID atomic.Uint64
 	pending   sync.Map // reqID → chan rpcReplyResult
@@ -384,8 +471,8 @@ type rpcReplyResult struct {
 	err error
 }
 
-func newOutboundConn(conn net.Conn, owner *TCPTransport) *outboundConn {
-	return &outboundConn{conn: conn, owner: owner}
+func newOutboundConn(conn net.Conn, session *secureSession, owner *TCPTransport) *outboundConn {
+	return &outboundConn{conn: conn, session: session, owner: owner}
 }
 
 func (oc *outboundConn) isClosed() bool { return oc.closed.Load() }
@@ -428,7 +515,7 @@ func (oc *outboundConn) send(ctx context.Context, req Message) (Message, error) 
 func (oc *outboundConn) writeFrameLocked(body []byte) error {
 	oc.writeMu.Lock()
 	defer oc.writeMu.Unlock()
-	return writeFrameTo(oc.conn, body, writeTimeout)
+	return writeSecureFrameTo(oc.conn, oc.session, body, writeTimeout)
 }
 
 func (oc *outboundConn) awaitReply(ctx context.Context, reply chan rpcReplyResult) (Message, error) {
@@ -446,7 +533,7 @@ func (oc *outboundConn) awaitReply(ctx context.Context, reply chan rpcReplyResul
 // than blocking forever. Exits on connection error / close.
 func (oc *outboundConn) runReader() {
 	for {
-		body, err := readFrame(oc.conn, connIdleTimeout)
+		body, err := readSecureFrame(oc.conn, oc.session, connIdleTimeout)
 		if err != nil {
 			oc.close()
 			return

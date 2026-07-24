@@ -42,31 +42,39 @@ C_RAFT=17103 C_CLIENT=17203
 PEERS="a=127.0.0.1:$A_RAFT@127.0.0.1:$A_CLIENT,b=127.0.0.1:$B_RAFT@127.0.0.1:$B_CLIENT,c=127.0.0.1:$C_RAFT@127.0.0.1:$C_CLIENT"
 
 mkdir -p "$DIR/a" "$DIR/b" "$DIR/c" "$LOGS"
+RAFT_SECRET_FILE="$DIR/raft-auth-token"
+printf '%s\n' "0123456789abcdef0123456789abcdef" >"$RAFT_SECRET_FILE"
+chmod 600 "$RAFT_SECRET_FILE"
 
 # Optional: DFLOCKD_SMOKE_TLS=1 exercises the mutual-TLS Raft transport.
-# All three nodes share one self-signed cert (it's also the CA) — fine
-# for loopback, where every node is "127.0.0.1".
-TLS_ARGS=()
+# Each node gets a distinct self-signed cert whose Common Name is its
+# NodeID; the concatenated bundle trusts all three leaves.
 if [[ "${DFLOCKD_SMOKE_TLS:-}" == "1" ]]; then
-  echo "==> generating shared cert for mutual TLS"
-  CERT="$DIR/cert.pem" KEY="$DIR/key.pem"
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "$KEY" -out "$CERT" -nodes -days 1 \
-    -subj "/CN=dflockd-smoke" \
-    -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
-    -addext "extendedKeyUsage=serverAuth,clientAuth" \
-    >/dev/null 2>&1 || { echo "openssl cert gen failed"; exit 1; }
-  TLS_ARGS=(--raft-tls-cert "$CERT" --raft-tls-key "$KEY" --raft-tls-ca "$CERT")
+  echo "==> generating per-node certs for mutual TLS"
+  for id in a b c; do
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout "$DIR/$id-key.pem" -out "$DIR/$id-cert.pem" -nodes -days 1 \
+      -subj "/CN=$id" \
+      -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+      -addext "extendedKeyUsage=serverAuth,clientAuth" \
+      >/dev/null 2>&1 || { echo "openssl cert gen failed"; exit 1; }
+  done
+  cat "$DIR/a-cert.pem" "$DIR/b-cert.pem" "$DIR/c-cert.pem" >"$DIR/raft-ca.pem"
 fi
 
 start_node() {
   local id=$1 raft=$2 client=$3
+  local tls_args=()
+  if [[ "${DFLOCKD_SMOKE_TLS:-}" == "1" ]]; then
+    tls_args=(--raft-tls-cert "$DIR/$id-cert.pem" --raft-tls-key "$DIR/$id-key.pem" --raft-tls-ca "$DIR/raft-ca.pem")
+  fi
   # ${arr[@]+"${arr[@]}"} expands to nothing when arr is empty — and is
   # safe under `set -u` on the bash 3.2 that ships with macOS.
   "$BIN" --raft-dir "$DIR/$id" --node-id "$id" \
     --raft-addr "127.0.0.1:$raft" --advertise-addr "127.0.0.1:$client" \
+    --raft-auth-token-file "$RAFT_SECRET_FILE" \
     --port "$client" --host 127.0.0.1 --cluster-peers "$PEERS" --default-lease-ttl 60 \
-    ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} \
+    ${tls_args[@]+"${tls_args[@]}"} \
     >"$LOGS/$id.log" 2>&1 &
   echo $!
 }

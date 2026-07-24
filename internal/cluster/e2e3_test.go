@@ -115,7 +115,10 @@ func (c *e2eCluster) buildRaftAndServer(n *e2eNode) {
 	rcfg.HeartbeatInterval = 10 * time.Millisecond
 	rcfg.ElectionTimeoutMin = 60 * time.Millisecond
 	rcfg.ElectionTimeoutMax = 120 * time.Millisecond
-	tr, err := raft.NewTCPTransport(n.id, n.tcpAddr, slog.Default())
+	tr, err := raft.NewTCPTransport(
+		n.id, n.tcpAddr, slog.Default(),
+		raft.WithClusterSecret("0123456789abcdef0123456789abcdef"),
+	)
 	if err != nil {
 		c.t.Fatalf("NewTCPTransport(%s): %v", n.id, err)
 	}

@@ -40,7 +40,8 @@ production-hardening passes reflected here:
   leader fails *while they were blocked* in `acquire` / `wait` —
   already-granted tokens (`renew`, `release`) survive seamlessly
   either way.
-- Operations include `--admin-token`, mTLS on the Raft transport
+- Operations include `--admin-token`, mandatory `--raft-auth-token-file`,
+  optional mTLS on the Raft transport
   (`--raft-tls-cert/-key/-ca`), and standard scrape of `/metrics` for
   the counter metrics shipped in PR-1.
 - Callers either use the new `client.Cluster` failover-aware wrapper
@@ -131,10 +132,14 @@ production-hardening passes reflected here:
 - ✅ `MaxLocks` / `MaxWaiters` enforced inside `Apply*` (deterministic).
 - ✅ All transports track their goroutines via `WaitGroup`/`rpcWG`;
   `Close()` joins them.
+- ✅ **Mandatory shared-secret protection** on the Raft transport —
+  a fresh-nonce HMAC-SHA256 challenge-response authenticates each peer,
+  then directional AES-GCM keys protect sequence-numbered RPC frames
+  against disclosure, modification, and replay.
 - ✅ **Mutual TLS** on the Raft transport — `--raft-tls-cert/-key/-ca`
   (all-or-none). When set, every inter-node connection is mTLS
-  (TLS 1.3, `RequireAndVerifyClientCert`). Plaintext default;
-  startup logs warn.
+  (TLS 1.3, `RequireAndVerifyClientCert`), and the verified leaf
+  certificate Common Name must exactly match the hello NodeID.
 - ✅ **Default-deny admin endpoints.** Without `--admin-token` the
   reconfig endpoints return `503 admin_disabled` — there's no
   fall-through to "any caller on the network can reconfigure". The
@@ -310,10 +315,12 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
   network that anything untrusted can reach. The default is
   "endpoints return 503" — there is no "permissive" mode — but an
   empty token means no operator can call the endpoint either.
-- **Always set `--raft-tls-cert/-key/-ca`** when the Raft transport
-  crosses a network you don't fully control. Plaintext is the
-  default for the loopback-only test case; the startup log warns
-  when mTLS is off.
+- **Protect `--raft-auth-token-file` like a private key.** Every member
+  shares it, so disclosure permits cluster impersonation. Rotate it with
+  an all-node restart; mixed secrets fail the challenge-response.
+- **Use `--raft-tls-cert/-key/-ca` for per-node PKI identity.** Issue
+  each leaf with `Subject.CommonName` exactly equal to that member's
+  `--node-id`.
 - **The 100 ms slowdown on a missed admin token** caps a single-host
   brute-force rate at ~10/s; with the rate-limit middleware in front,
   effective rate is the lower of the two. An attacker who has the

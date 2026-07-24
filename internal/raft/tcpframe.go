@@ -10,25 +10,30 @@ import (
 // Wire format for the TCP Raft transport:
 //
 //	u32 totalLen
-//	u8  frameKind (hello / request / response)
+//	u8  frameKind (hello / auth / secure)
 //	payload (kind-specific)
 //
-// Hello payload:    u16 idLen, id; u16 versionLen, version
+// Hello payload:    u16 idLen, id; u16 versionLen, version; nonce[32]; proof[32]
+// Auth payload:     proof[32]
+// Secure payload:   u64 sequence; AES-GCM ciphertext
 // Request payload:  u64 reqID, u8 msgTag, u32 payloadLen, binary payload
 // Response payload: u64 reqID, u8 msgTag, u32 payloadLen, binary payload
 //
-// The msgTag picks the concrete binary Message payload codec.
+// Request/response bodies only appear inside a secure frame. The msgTag
+// picks the concrete binary Message payload codec.
 
 const (
 	frameHello    uint8 = 0
 	frameRequest  uint8 = 1
 	frameResponse uint8 = 2
+	frameAuth     uint8 = 3
+	frameSecure   uint8 = 4
 
 	// maxTCPFrameBytes bounds one received frame. Snapshots can be large
 	// in production but dflockd's FSM is small; 64 MiB is a generous cap.
 	maxTCPFrameBytes = 64 << 20
 
-	tcpProtoVersion = "raft.v2"
+	tcpProtoVersion = "raft.v3"
 )
 
 const (
@@ -140,31 +145,40 @@ func readFrame(r io.Reader, deadline time.Duration) ([]byte, error) {
 	return buf, nil
 }
 
-// encodeHello builds the body of a hello frame.
-func encodeHello(id NodeID) []byte {
-	body := []byte{frameHello}
-	body = appendString16(body, string(id))
+// encodeHello builds the body of a challenge-response hello frame.
+func encodeHello(h handshakeHello) []byte {
+	body := make([]byte, 0, 1+2+len(h.id)+2+len(tcpProtoVersion)+2*handshakeValueBytes)
+	body = append(body, frameHello)
+	body = appendString16(body, string(h.id))
 	body = appendString16(body, tcpProtoVersion)
+	body = append(body, h.nonce[:]...)
+	body = append(body, h.proof[:]...)
 	return body
 }
 
-// decodeHello parses a hello body and returns the peer's NodeID.
-func decodeHello(body []byte) (NodeID, error) {
+// decodeHello parses a hello body and rejects missing or trailing fields.
+func decodeHello(body []byte) (handshakeHello, error) {
 	if len(body) == 0 || body[0] != frameHello {
-		return "", fmt.Errorf("raft: expected hello, got kind %d", first(body))
+		return handshakeHello{}, fmt.Errorf("raft: expected hello, got kind %d", first(body))
 	}
 	id, rest, err := takeString16(body[1:])
 	if err != nil {
-		return "", fmt.Errorf("hello id: %w", err)
+		return handshakeHello{}, fmt.Errorf("hello id: %w", err)
 	}
-	ver, _, err := takeString16(rest)
+	ver, rest, err := takeString16(rest)
 	if err != nil {
-		return "", fmt.Errorf("hello version: %w", err)
+		return handshakeHello{}, fmt.Errorf("hello version: %w", err)
 	}
 	if ver != tcpProtoVersion {
-		return "", fmt.Errorf("raft: peer proto version %q != %q", ver, tcpProtoVersion)
+		return handshakeHello{}, fmt.Errorf("raft: peer proto version %q != %q", ver, tcpProtoVersion)
 	}
-	return NodeID(id), nil
+	if len(rest) != 2*handshakeValueBytes {
+		return handshakeHello{}, fmt.Errorf("raft: hello auth data length %d, want %d", len(rest), 2*handshakeValueBytes)
+	}
+	h := handshakeHello{id: NodeID(id)}
+	copy(h.nonce[:], rest[:handshakeValueBytes])
+	copy(h.proof[:], rest[handshakeValueBytes:])
+	return h, nil
 }
 
 func first(b []byte) byte {
@@ -184,7 +198,7 @@ func encodeRPC(kind uint8, reqID uint64, m Message) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("raft: encode %T: %w", m, err)
 	}
-	if len(payload) > maxTCPFrameBytes-rpcHeaderBytes {
+	if len(payload) > maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes {
 		return nil, fmt.Errorf("raft: rpc payload too large (%d bytes)", len(payload))
 	}
 	return assembleRPCBody(kind, reqID, tag, payload), nil
