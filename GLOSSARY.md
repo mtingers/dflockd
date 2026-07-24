@@ -118,11 +118,12 @@ references and quoted in the "See also" line where helpful.
 - **`commitIndex`** — The highest log index known to be replicated to
   a majority of voters. The apply goroutine feeds entries `≤
   commitIndex` to the FSM in order.
-- **WAL** — Write-ahead log on disk: `<raft-dir>/raft-log/`. Append-
-  only; size-capped per file; torn-tail-truncated on open; flushed
-  with `fsync` before RPC replies. See `internal/raft/wal.go`.
+- **WAL** — Write-ahead log on disk: `<raft-dir>/wal`. A single
+  append-only file of length-prefixed CRC records; torn-tail-truncated
+  on open and flushed with `fsync` before dependent RPC replies.
+  Snapshot compaction rewrites it atomically. See `internal/raft/wal.go`.
 - **`HardState`** — `{currentTerm, votedFor, commitIndex}`; persisted
-  (with fsync) to `<raft-dir>/raft-state` before any RPC that relies
+  (with fsync) to `<raft-dir>/hardstate` before any RPC that relies
   on it is sent. See `internal/raft/hardstate.go`.
 - **Snapshot (FSM)** — A serialized full copy of the
   `LockManager` state plus its `fsmFenceCounter`, written atomically
@@ -152,10 +153,10 @@ references and quoted in the "See also" line where helpful.
   by `raft.Node.TransferLeadership` (and `cluster.Node.Close` on the
   leader during a graceful rolling restart).
 - **`ReadIndex` / `Barrier`** — The internal mechanism for a
-  linearizable read: the leader confirms its leadership with a
-  heartbeat round, then waits for `commitIndex` to apply before
-  reading. Exposed today as `cluster.Node.Barrier(ctx)`; a public
-  `ReadIndex` API is a documented follow-on.
+  linearization point: the leader commits and applies a barrier command
+  before returning. Exposed through `cluster.Node.Barrier(ctx)`, the
+  TCP `barrier` command, `client.Barrier`, `(*client.Cluster).Barrier`,
+  and `GET /v1/readindex`.
 - **Mutual TLS (mTLS) on Raft transport** — `--raft-tls-cert/-key/-ca`
   (all-or-none). When set, every inter-node TCP connection is TLS 1.3
   with `RequireAndVerifyClientCert`, and each certificate Common Name
@@ -182,7 +183,8 @@ references and quoted in the "See also" line where helpful.
 - **`/metrics`** — Prometheus exposition. Single-node: HTTP
   request/lock counters. Cluster: adds `dflockd_raft_*` gauges
   (role, term, commit index, last log index, snapshot index, voters,
-  is_leader).
+  is_leader) plus leader-change, proposal, apply, apply-time, and
+  admin-change counters.
 - **`stats`** — TCP/HTTP read-only command. Returns counts of
   resources, holders, waiters, and (cluster mode) a `cluster` JSON
   block matching the `/metrics` gauges.
@@ -195,10 +197,9 @@ references and quoted in the "See also" line where helpful.
 
 - **Admin endpoint** — A privileged operation that mutates cluster
   configuration rather than lock state. Today: `AddVoter` and
-  `RemoveServer`. Exposed over both transports as
-  `POST /v1/admin/voters` + `DELETE /v1/admin/voters/{id}` (HTTP) and
-  the TCP `cluster add-voter` / `cluster remove-voter` commands.
-  Auth-gated by a **separate** admin token (`--admin-token` /
+  `RemoveServer`. Exposed over HTTP as `POST /v1/admin/voters` and
+  `DELETE /v1/admin/voters/{id}`. Auth-gated by a **separate** admin
+  token (`--admin-token` /
   `DFLOCKD_ADMIN_TOKEN`) — distinct from the regular auth token so
   read/write client credentials don't carry reconfiguration authority.
 - **Admin token** — Static secret in `--admin-token` /
@@ -207,13 +208,12 @@ references and quoted in the "See also" line where helpful.
   (default-deny — admin must be explicitly enabled).
 - **`X-Dflockd-Admin`** — HTTP header carrying the admin token on
   admin endpoints. Body: `{"node_id": ..., "raft_addr": ..., "client_addr": ...}`.
-- **ReadIndex (public API)** — `client.ReadIndex(ctx)` and `GET
-  /v1/readindex`. The leader proposes a no-op-equivalent barrier
-  through Raft; once committed and applied, the response means: every
-  preceding write that committed on the leader is reflected in the
-  state a subsequent read against this same leader will return.
-  Backed by [[Barrier]]. Not a snapshot read on followers — followers
-  return 503 `not_leader`.
+- **ReadIndex (public API)** — `GET /v1/readindex`, the TCP `barrier`
+  command, `client.Barrier(conn)`, and `(*client.Cluster).Barrier(ctx)`.
+  The leader proposes a barrier through Raft; once committed and
+  applied, every preceding write committed on that leader is reflected
+  in a subsequent read against the same leader. Followers return
+  `not_leader`.
 - **Counter metric** — A `# TYPE counter` Prometheus series that is
   monotonic for the lifetime of the process. New ones in this pass:
   `dflockd_raft_leader_changes_total`,
@@ -221,13 +221,8 @@ references and quoted in the "See also" line where helpful.
   `dflockd_raft_proposals_failed_total`,
   `dflockd_raft_apply_total`,
   `dflockd_raft_apply_failed_total`,
+  `dflockd_raft_apply_nanos_total`,
   `dflockd_raft_admin_changes_total{op}`.
-- **Stable client ref** — Not implemented in v1. Future mechanism by
-  which a client supplies an opaque identifier on `enqueue`/`wait`,
-  so its queue position survives a leader failover + reconnect.
-  Tracked as PLAN.md §4.7 follow-on. Today the only failover-safe
-  primitive is already-granted tokens.
-
 ## Cluster client + soak harness (2026-05-17 production-hardening pass 2)
 
 - **Cluster-aware client** — `client.Cluster`: a wrapper over the
@@ -240,7 +235,8 @@ references and quoted in the "See also" line where helpful.
   and is not failover-aware).
 - **Leader cache** — On a `*NotLeaderError` the client records the
   hinted leader address. Subsequent operations dial the cache first.
-  Process-local; no persistence; expires on the next miss.
+  Process-local and not persisted. Only hints naming an operator-supplied
+  member are accepted; failed attempts rotate through known members.
 - **Retry budget** — Hard cap on dial/operation attempts per operation
   (default 3). Prevents an attacker-controlled redirect from looping
   forever. The terminal error matches `ErrTooManyRedirects` and wraps
@@ -263,14 +259,12 @@ references and quoted in the "See also" line where helpful.
 
 ## FIFO failover + dynamic-join (2026-05-17 production-hardening pass 3)
 
-- **Stable client ref (PR-3)** — Opaque caller-supplied identifier
-  carried on `enqueue` / `wait`. Distinct from the `connID` (which
-  identifies a TCP conn). Used to re-attach across a leader failover:
-  on a new connection from the same caller, the FSM recognizes the
-  ref and resumes its existing waiter/holder slot. The protocol field
-  is optional — empty ref preserves today's strict
-  `CleanupConn-removes-everything` semantic for non-failover-aware
-  callers.
+- **Stable client ref (PR-4/PR-5)** — Opaque caller-supplied identifier set
+  by the TCP `stable-ref` command before acquire/enqueue/wait. Distinct
+  from the `connID` (which identifies one TCP connection). On a new
+  connection after failover, the FSM recognizes the ref and resumes its
+  existing waiter/holder slot. The command is optional; omitting it
+  preserves strict `CleanupConn-removes-everything` behavior.
 - **Orphaned waiter** — A waiter whose TCP connection went away
   while the FSM still recognizes its stable ref. Marked with an
   `AbandonedAt` timestamp in the FSM state; a reconnect with the same
@@ -278,7 +272,8 @@ references and quoted in the "See also" line where helpful.
   OrphanTTL`, the EvictExpired sweep removes it. Deterministic across
   replicas because the timestamp is the leader's `Now` stamp on the
   CleanupConn entry, and the TTL is config.
-- **Orphan TTL** — `--orphan-ttl` (default 30s). Bounds how long the
+- **Orphan TTL** — `--orphan-ttl` (default 0/off; 30s is the documented
+  starting point when opting in). Bounds how long the
   FSM retains an orphaned waiter / holder waiting for the original
   client to reconnect. Set conservatively: too long → orphaned slots
   pile up if a client crashes; too short → a slow client misses its

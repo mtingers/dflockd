@@ -16,7 +16,7 @@ profile. Cluster mode is layered additively under `internal/raft/`,
 ## Topology
 
 ```
-                 ┌──── clients (TCP) ────┐
+                 ┌── clients (TCP / HTTP) ──┐
                  │  follow error_not_leader │
                  └──────────┬────────────┘
                             ▼
@@ -71,6 +71,19 @@ mode requires Unix-style advisory file locking (refused on Windows).
 fsyncs are issued before any RPC reply that depends on the just-written
 state.
 
+## Transport security
+
+Every Raft connection requires the same high-entropy shared secret
+(`--raft-auth-token-file`, direct flag, or environment). A fresh-nonce
+HMAC-SHA256 challenge-response authenticates the peer and derives
+directional AES-GCM keys; sequence numbers reject replayed secure
+frames. Optional mTLS additionally verifies the issuing CA and requires
+each certificate Common Name to exactly equal its Raft node ID.
+
+The authenticated-encryption handshake uses the `raft.v3` protocol
+marker. Upgrading from an older plaintext Raft build requires an
+all-node restart; mixed protocol versions refuse the connection.
+
 ## Determinism
 
 The FSM apply path takes the **leader's wall-clock time** from each
@@ -88,9 +101,9 @@ nodes with identical state produce identical snapshot bytes.
 | One follower lost | Leader keeps committing (still has a quorum); follower catches up on rejoin via AppendEntries or InstallSnapshot. |
 | Leader lost | A new election begins. A follower wins (Raft §5.4 election restriction guarantees its log is up-to-date) and serves writes. Clients see one or more `error_not_leader` redirects and retry. |
 | Full restart | Each node recovers its HardState + WAL + latest snapshot from `--raft-dir`. Once a quorum is alive an election runs. State is intact. |
-| Partition into a minority | Minority cannot commit (no quorum). Reads of the minority's lock manager are stale by design — clients see `error_not_leader` and retry against the majority. |
-| Client connection drops mid-`acquire` | The holder entry, if granted, stays in the FSM until its lease expires. The client retries; if the leader changed, FIFO position is not preserved (v1 caveat — see PLAN.md §4.7). |
-| Node disk fills | The HardState write fails; the node logs + steps down rather than acknowledging a write it can't make durable. |
+| Partition into a minority | Minority cannot commit (no quorum). Its local `stats` view may be stale; mutating clients see `error_not_leader` and retry against the majority. |
+| Client connection drops mid-`acquire` | Default connection-scoped refs lose blocked FIFO position after leader failure; a hard-failed leader's granted holder expires by lease. TCP stable refs with `--orphan-ttl` can re-attach to the same waiter or holder after the old owner is provably gone. HTTP sessions cannot opt in. |
+| Node disk fills | A failure on any durable HardState, WAL, or snapshot mutation logs the error and fail-stops the node before it can acknowledge non-durable state. |
 
 ## Clock-skew posture
 

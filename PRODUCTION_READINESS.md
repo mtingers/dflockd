@@ -11,10 +11,12 @@ Cluster mode is **GA-eligible for static-bootstrap workloads.** FIFO
 across a leader failover — once the headline gap — is now available to
 TCP clients as an opt-in (stable client refs; see below). HTTP sessions
 cannot opt into stable refs and lose blocked queue positions on
-failover. Two known gaps remain (an HTTP stable-ref equivalent and a
-long-horizon multi-host soak harness); everything else from the original
-§7 checklist is either implemented or N/A. The production-hardening
-passes reflected here:
+failover. Three follow-ons remain: an HTTP stable-ref equivalent,
+fail-stop handling for an unexpected internal FSM `Apply` panic, and a
+long-horizon multi-host soak harness. Validated client commands have no
+known panicking apply path; everything else from the original §7
+checklist is implemented or N/A. The production-hardening passes
+reflected here:
 
 - **PR-1** (the alpha → beta lift): admin endpoints, default-deny
   admin token, counter metrics, public ReadIndex/Barrier API,
@@ -29,6 +31,12 @@ passes reflected here:
   single-phase `Acquire` path (not just two-phase `Enqueue`), and the
   `--orphan-ttl` flag itself (PR-4 left it unwired). Proven end-to-end
   by `TestE2EStableRefReAttachAcrossFailover`.
+- **Post-review P1-P3 audit**: closed per-peer snapshot gating, fatal
+  storage-fault handling, asynchronous local snapshot persistence,
+  lock-free leadership reads, post-commit membership publication,
+  stable-ref indexing, idle-maintenance suppression, binary Raft RPCs,
+  authenticated/encrypted Raft transport, and cluster-client retry
+  diagnostics.
 
 **You can run this in production today if:**
 
@@ -56,6 +64,9 @@ passes reflected here:
 
 - HTTP callers must preserve FIFO position or re-attach to an
   unobserved grant across a leader failover.
+- Your operating standard requires the node to fail-stop after an
+  unexpected internal FSM `Apply` panic. The panic is logged and
+  returned to the local proposer today, but the node continues.
 - You need a multi-host soak harness in CI for safety-critical
   workloads. All in-process safety invariants are validated by
   `cmd/cluster-soak`.
@@ -106,8 +117,10 @@ passes reflected here:
   outbound RPCs in `context.WithTimeout(rpcTimeout=ElectionTimeoutMax)`).
 - ✅ Election timeouts randomized; `Config.Validate` enforces
   `HeartbeatInterval*3 ≤ ElectionTimeoutMin`.
-- ✅ Disk-full / IO-error on the HardState path → node steps down
-  (`Node.persistHardState` on err logs + sets `role = roleFollower`).
+- ✅ Disk-full / IO-error on any durable mutation path → node stops
+  (`Node.failStorage` logs, publishes follower state, and closes the
+  node); it cannot continue voting or acknowledging from non-durable
+  state.
 - ✅ `--raft-dir` flock'd; second open refused
   (`TestFileStorageDirLockRefusesSecondOpen`). Non-Unix platforms
   are refused at construction.
@@ -218,29 +231,27 @@ passes reflected here:
 - ✅ Every exported symbol in the new `internal/raft` and
   `internal/cluster` packages has a doc comment. New admin handlers
   documented.
-- ⏳ Fuzz targets for the Raft frame codec + the cluster Command codec
-  — single-node `internal/protocol` has them; cluster codecs do not
-  yet. Cheap follow-on.
+- ✅ Fuzz targets cover the Raft RPC frame, authenticated handshake,
+  secure frame, and cluster Command decoders.
 
-## Test coverage (per package, after PR-2)
+## Test coverage (2026-07-24 short-mode snapshot)
 
 | Package | Coverage | Notes |
 |---|---|---|
-| `internal/protocol` | 91.7% | `barrier` framing + `error_not_leader`. |
-| `internal/config` | 89.8% | Includes `--admin-token` resolution. |
-| `internal/lock` | 82.6% | Existing path + Apply* + Snapshot/Restore + constant-time compare. |
-| `internal/raft` | 82.1% | Storage + node + transport + FSM apply + membership + counters + frame-codec fuzz. |
-| `internal/cluster` | 82.1% | FSM raft adapter + admin counters + Command codec fuzz. |
-| `cmd/cluster-soak` | 78.2% | Soak harness; long-running tests gated on `!testing.Short()`. |
-| `internal/httpapi` | 73.4% | Admin endpoints (10 tests), readindex, CORS middleware, cluster-counter metrics. |
-| `client` | 70.9% | Adds `Cluster` (8 dispatch/redirect tests including the unknown-hint clamp). |
-| `internal/server` | 69.4% | Cluster handlers + 9 tests for Cluster{Barrier,AddVoter,RemoveVoter,MetricsSnapshot}. |
+| `internal/config` | 90.0% | Includes cluster security, admin, and orphan-TTL resolution. |
+| `internal/protocol` | 88.5% | Barrier, stable-ref, and not-leader framing. |
+| `internal/cluster` | 86.0% | FSM adapter, maintenance, admin counters, and command codec. |
+| `internal/lock` | 84.5% | Direct + Apply paths, ref indexes, snapshots, and constant-time compare. |
+| `internal/raft` | 83.1% | Storage, node, secure transport, membership, snapshots, and counters. |
+| `internal/httpapi` | 73.9% | Admin endpoints, readindex, CORS, and cluster metrics. |
+| `client` | 69.9% | Eleven cluster-client tests cover routing, diagnostics, and hint clamping. |
+| `internal/server` | 69.3% | Cluster handlers, stable refs, barrier, admin, and metrics. |
+| `cmd/cluster-soak` | 4.4% | The actual soak loop is intentionally skipped by `-short`. |
 
 Five of nine packages clear ≥ 80%. The four under it are weighted by
-long-tail HTTP error paths, the cmd/dflockd cluster-cleanup branches
-unit tests can't easily reach, and (for `client.Cluster`) the
-many one-line wrapper methods that mirror the underlying one-shot
-API but aren't each individually exercised by a redirect test.
+the short-mode soak skip, long-tail HTTP/server error paths, and the
+many `client.Cluster` wrapper methods that mirror the underlying
+one-shot API but are not each exercised by a redirect test.
 
 ## What's NOT done (deferred follow-ons)
 
@@ -285,6 +296,12 @@ Still open:
    `--orphan-ttl` does not change that. Already-observed tokens remain
    valid for `renew` / `release` on the new leader. HTTP callers that
    require FIFO failover should use the TCP client until this ships.
+3. **Fail-stop on unexpected FSM `Apply` panic.** `fsmApplySafely`
+   recovers, logs, increments the failed-apply counter, and resolves the
+   local proposal with an error. It does not currently stop the node,
+   so a hypothetical internal panic could leave that replica's FSM
+   behind its committed index. No validated command is known to trigger
+   this path; fail-stop behavior remains defense in depth.
 
 ## How to verify
 
@@ -357,14 +374,15 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 
 ## Bottom line
 
-Cluster mode is **beta-plus / GA-eligible.** After PR-5, every cluster
-safety item from the original §7 checklist is implemented and tested.
+Cluster mode is **beta-plus / GA-eligible.** The post-review P1-P3 audit
+closed every identified externally reachable safety defect and added
+regression coverage.
 Static-bootstrap, dynamic-join (`AddVoter` → cold node), and TCP
 FIFO-across-leader-failover (via `--orphan-ttl` +
 `client.WithClusterStableRef`) are all validated end-to-end — the last
 now including a hard-crash regression guard over real TCP. HTTP sessions
 remain node-local and cannot opt into stable refs. The remaining
-follow-ons are an HTTP stable-ref equivalent and a long-horizon
-multi-host soak harness. The whole tree passes `make test-race` cleanly;
-`go.sum` stays empty; the non-cluster single-node binary is
-byte-identical to v2.1.x.
+follow-ons are an HTTP stable-ref equivalent, fail-stop handling for an
+unexpected internal FSM panic, and a long-horizon multi-host soak
+harness. The whole tree passes `make test-race` cleanly; `go.sum` stays
+empty; the non-cluster single-node binary is byte-identical to v2.1.x.

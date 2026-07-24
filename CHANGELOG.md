@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **HA roadmap and readiness docs now match the shipped tree.** `PLAN.md`
+  records the actual `client.Cluster`, voter admin endpoints, cold-node
+  snapshot join, stable-ref behavior, authenticated Raft v3 transport,
+  in-process soak scope, and shipped metric set. The Phase 15 checklist
+  now carries current verdicts instead of pre-implementation boxes.
+  `PRODUCTION_READINESS.md` records the completed P1-P3 hardening audit
+  and retains the three real follow-ons: HTTP stable refs, multi-host
+  fault-injection soak, and fail-stop handling for an unexpected FSM
+  `Apply` panic.
 - `lock.NewLockManager` and `internal/server.Server` gain non-breaking additions: `SetCluster(c)` enables the cluster-mode handler path; mutating commands on a follower return `error_not_leader <addr>`; the per-conn cleanup proposes `CleanupConn` through the cluster; the lock manager's lease-expiry / GC loops are suppressed in cluster mode (a leader-driven `EvictExpired` / `GC` sweep through Raft replaces them).
 - Semaphore `limit` is now capped at 1,048,576 (`MaxSemaphoreLimit`) at parse time — far above any real use; the bound just keeps the value within the cluster snapshot's fixed-width encoding.
 

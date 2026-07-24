@@ -157,12 +157,12 @@ follower the HTTP returns `503 not_leader` and the TCP returns
   quorum is back, an election runs and writes resume.
 - **Disk wipe on one node** — start it with an empty `--raft-dir`
   and the same `--node-id`; the leader will detect divergence and
-  install a fresh snapshot. (Note: dynamic-join is a follow-on; for
-  v1 the simpler path is to remove + re-add the node id.)
+  install a fresh snapshot. A brand-new node ID follows the dynamic-
+  join flow above: add the voter, then start it with empty storage.
 - **Lost a majority** — the cluster cannot make progress until a
   majority is restored. There is no automatic single-survivor recovery
-  in v1; the operator should restart enough members or, as a last
-  resort, force-reconfigure (manual, unsafe).
+  or force-reconfigure tooling; restore enough original members, with
+  their existing `--raft-dir` contents, to regain quorum.
 - **Graceful leader restart** — shutting down the leader (SIGTERM)
   first hands leadership to a caught-up follower via `TimeoutNow`, so
   the successor is elected within a round trip rather than after an
@@ -182,7 +182,8 @@ follower the HTTP returns `503 not_leader` and the TCP returns
   `dflockd_raft_is_leader`, `dflockd_raft_term`,
   `dflockd_raft_commit_index`, `dflockd_raft_last_log_index`,
   `dflockd_raft_snapshot_index`, and `dflockd_raft_voters` alongside the
-  usual `dflockd_*` gauges.
+  usual `dflockd_*` gauges. It also exposes leader-change, proposal,
+  apply, cumulative apply-time, and admin-change counters.
 - A follower also reveals the leader via the `error_not_leader <addr>`
   TCP redirect (or the `503 {"error":"not_leader"}` HTTP response with
   an `X-Dflockd-Leader` header) on any mutating command.
