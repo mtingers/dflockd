@@ -84,7 +84,7 @@ func (lm *LockManager) evictHolder(sh *shard, st *ResourceState, key string, con
 	lm.log.Warn("lease expired", "key", key, "conn", connID)
 	sh.removeOwned(connID, key, token)
 	dropMatchingEnqueued(sh, connID, key, token)
-	delete(st.Holders, token)
+	st.removeHolder(token)
 }
 
 // gcOnce performs one GC pass across all shards.

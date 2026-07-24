@@ -95,11 +95,112 @@ type ResourceState struct {
 	Waiters      []*waiter
 	WaiterHead   int // index of first active waiter (rest are nil-tombstones)
 	LastActivity time.Time
+	indexRefs    bool
+	refs         map[string]*resourceRefState
+}
+
+// resourceRefState is a derived index over one stable ref's holders and
+// waiters. Waiters remain in FIFO order; removal scans only entries sharing
+// the same ref rather than the resource's full queue.
+type resourceRefState struct {
+	holders map[string]*holder
+	waiters []*waiter
+}
+
+func (lm *LockManager) newResourceState(limit int, now time.Time) *ResourceState {
+	return &ResourceState{
+		Limit:        limit,
+		Holders:      make(map[string]*holder),
+		LastActivity: now,
+		indexRefs:    lm.cfg.OrphanTTL > 0,
+	}
 }
 
 // waiterCount returns the number of active waiters, excluding head tombstones.
 func (rs *ResourceState) waiterCount() int {
 	return len(rs.Waiters) - rs.WaiterHead
+}
+
+func (rs *ResourceState) refState(ref string) *resourceRefState {
+	if rs.refs == nil {
+		rs.refs = make(map[string]*resourceRefState)
+	}
+	state := rs.refs[ref]
+	if state == nil {
+		state = &resourceRefState{}
+		rs.refs[ref] = state
+	}
+	return state
+}
+
+func (rs *ResourceState) addHolder(token string, h *holder) {
+	if old := rs.Holders[token]; old != nil {
+		rs.unindexHolder(token, old)
+	}
+	rs.Holders[token] = h
+	if h.ref == "" || !rs.indexRefs {
+		return
+	}
+	state := rs.refState(h.ref)
+	if state.holders == nil {
+		state.holders = make(map[string]*holder)
+	}
+	state.holders[token] = h
+}
+
+func (rs *ResourceState) removeHolder(token string) {
+	h := rs.Holders[token]
+	if h == nil {
+		return
+	}
+	delete(rs.Holders, token)
+	rs.unindexHolder(token, h)
+}
+
+func (rs *ResourceState) unindexHolder(token string, h *holder) {
+	if h.ref == "" || !rs.indexRefs || rs.refs == nil {
+		return
+	}
+	state := rs.refs[h.ref]
+	if state == nil {
+		return
+	}
+	delete(state.holders, token)
+	rs.deleteRefStateIfEmpty(h.ref, state)
+}
+
+func (rs *ResourceState) appendWaiter(w *waiter) {
+	rs.Waiters = append(rs.Waiters, w)
+	if w.ref == "" || !rs.indexRefs {
+		return
+	}
+	state := rs.refState(w.ref)
+	state.waiters = append(state.waiters, w)
+}
+
+func (rs *ResourceState) unindexWaiter(w *waiter) {
+	if w == nil || w.ref == "" || !rs.indexRefs || rs.refs == nil {
+		return
+	}
+	state := rs.refs[w.ref]
+	if state == nil {
+		return
+	}
+	for i, indexed := range state.waiters {
+		if indexed == w {
+			copy(state.waiters[i:], state.waiters[i+1:])
+			state.waiters[len(state.waiters)-1] = nil
+			state.waiters = state.waiters[:len(state.waiters)-1]
+			break
+		}
+	}
+	rs.deleteRefStateIfEmpty(w.ref, state)
+}
+
+func (rs *ResourceState) deleteRefStateIfEmpty(ref string, state *resourceRefState) {
+	if len(state.holders) == 0 && len(state.waiters) == 0 {
+		delete(rs.refs, ref)
+	}
 }
 
 // compactWaiters reclaims dead head-tombstone slots when more than half
@@ -120,6 +221,7 @@ func (rs *ResourceState) compactWaiters() {
 func (rs *ResourceState) removeWaiter(target *waiter) {
 	for i := rs.WaiterHead; i < len(rs.Waiters); i++ {
 		if rs.Waiters[i] == target {
+			rs.unindexWaiter(target)
 			copy(rs.Waiters[i:], rs.Waiters[i+1:])
 			rs.Waiters[len(rs.Waiters)-1] = nil
 			rs.Waiters = rs.Waiters[:len(rs.Waiters)-1]
@@ -137,6 +239,7 @@ func (rs *ResourceState) removeWaitersByConn(connID uint64, closed map[chan stri
 	for i := rs.WaiterHead; i < len(rs.Waiters); i++ {
 		w := rs.Waiters[i]
 		if w.connID == connID {
+			rs.unindexWaiter(w)
 			if _, already := closed[w.ch]; !already {
 				close(w.ch)
 				closed[w.ch] = struct{}{}

@@ -91,7 +91,7 @@ func (lm *LockManager) applyAcquireLocked(sh *shard, key string, limit int, ref 
 	if !lm.waiterCapAvailable(st) {
 		return nil, applyErr(ErrMaxWaiters), pre, nil
 	}
-	st.Waiters = append(st.Waiters, &waiter{ref: ref, connID: connID, leaseTTL: leaseTTL, salt: salt})
+	st.appendWaiter(&waiter{ref: ref, connID: connID, leaseTTL: leaseTTL, salt: salt})
 	return st, ApplyResult{Status: StatusQueued}, pre, nil
 }
 
@@ -274,10 +274,14 @@ func (lm *LockManager) evictDeadConn(sh *shard, oldConnID, newConnID uint64, key
 // (pathologically) more than one matches. Returns ("", nil) when none
 // match — including when the only match is a live connection's.
 func findHolderByRef(st *ResourceState, ref string, newConnID uint64) (string, *holder) {
+	state := st.refs[ref]
+	if state == nil {
+		return "", nil
+	}
 	var bestTok string
 	var best *holder
-	for tok, h := range st.Holders {
-		if h.ref != ref || !reclaimableBy(h.abandonedAtNanos, h.connID, newConnID) {
+	for tok, h := range state.holders {
+		if !reclaimableBy(h.abandonedAtNanos, h.connID, newConnID) {
 			continue
 		}
 		if best == nil || tok < bestTok {
@@ -290,9 +294,12 @@ func findHolderByRef(st *ResourceState, ref string, newConnID uint64) (string, *
 // findWaiterByRef returns the first waiter (by queue position) on st
 // whose ref matches and which newConnID is allowed to reclaim, or nil.
 func findWaiterByRef(st *ResourceState, ref string, newConnID uint64) *waiter {
-	for i := st.WaiterHead; i < len(st.Waiters); i++ {
-		w := st.Waiters[i]
-		if w != nil && w.ref == ref && reclaimableBy(w.abandonedAtNanos, w.connID, newConnID) {
+	state := st.refs[ref]
+	if state == nil {
+		return nil
+	}
+	for _, w := range state.waiters {
+		if reclaimableBy(w.abandonedAtNanos, w.connID, newConnID) {
 			return w
 		}
 	}
@@ -313,7 +320,7 @@ func (lm *LockManager) applyEnqueueOnto(sh *shard, st *ResourceState, eqKey conn
 		return applyErr(ErrMaxWaiters), pre, nil
 	}
 	w := &waiter{ref: ref, connID: connID, leaseTTL: leaseTTL, salt: salt}
-	st.Waiters = append(st.Waiters, w)
+	st.appendWaiter(w)
 	sh.setEnqueued(eqKey, &enqueuedState{waiter: w, leaseTTL: leaseTTL})
 	return ApplyResult{Status: StatusQueued}, pre, nil
 }
@@ -469,6 +476,7 @@ func (lm *LockManager) orphanOrRemoveWaitersByConn(st *ResourceState, connID uin
 			close(w.ch)
 			closed[w.ch] = struct{}{}
 		}
+		st.unindexWaiter(w)
 	}
 	for i := n; i < len(st.Waiters); i++ {
 		st.Waiters[i] = nil
@@ -615,7 +623,7 @@ func (lm *LockManager) getOrCreateAt(sh *shard, key string, limit int, now time.
 			break
 		}
 	}
-	st := &ResourceState{Limit: limit, Holders: map[string]*holder{}, LastActivity: now}
+	st := lm.newResourceState(limit, now)
 	sh.resources[key] = st
 	return st, nil
 }
@@ -661,6 +669,7 @@ func (lm *LockManager) evictExpiredOrphanWaiters(st *ResourceState, now time.Tim
 			continue
 		}
 		if lm.orphanPastTTL(w.abandonedAtNanos, now) {
+			st.unindexWaiter(w)
 			removed = true
 			continue
 		}
@@ -684,6 +693,7 @@ func (lm *LockManager) grantNextAt(sh *shard, key string, st *ResourceState, now
 		w := st.Waiters[st.WaiterHead]
 		st.Waiters[st.WaiterHead] = nil
 		st.WaiterHead++
+		st.unindexWaiter(w)
 		token, err := lm.mintFSMToken(w.salt)
 		if err != nil {
 			st.compactWaiters()
@@ -701,7 +711,7 @@ func (lm *LockManager) promoteWaiter(sh *shard, st *ResourceState, key string, w
 		es.waiter = nil
 		es.token = token
 	}
-	st.Holders[token] = &holder{connID: w.connID, leaseExpires: now.Add(w.leaseTTL), ref: w.ref}
+	st.addHolder(token, &holder{connID: w.connID, leaseExpires: now.Add(w.leaseTTL), ref: w.ref})
 	st.LastActivity = now
 	sh.addOwned(w.connID, key, token)
 	return Grant{Key: key, Ref: w.ref, Token: token, LeaseSec: secondsOf(w.leaseTTL), ConnID: w.connID}
@@ -715,14 +725,14 @@ func (lm *LockManager) dropHolder(sh *shard, st *ResourceState, key, token strin
 	if es, ok := sh.connEnqueued[eqKey]; ok && constantTimeTokenEqual(es.token, token) {
 		sh.removeEnqueued(eqKey)
 	}
-	delete(st.Holders, token)
+	st.removeHolder(token)
 	st.LastActivity = now
 }
 
 // recordHolder installs (token, holder) in st with a lease of leaseTTL
 // from now, and updates the per-conn owned index.
 func (lm *LockManager) recordHolder(sh *shard, st *ResourceState, key, ref string, connID uint64, token string, now time.Time, leaseTTL time.Duration) {
-	st.Holders[token] = &holder{connID: connID, leaseExpires: now.Add(leaseTTL), ref: ref}
+	st.addHolder(token, &holder{connID: connID, leaseExpires: now.Add(leaseTTL), ref: ref})
 	st.LastActivity = now
 	sh.addOwned(connID, key, token)
 }

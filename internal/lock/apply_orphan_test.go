@@ -122,6 +122,13 @@ func TestSnapshotRoundTripPreservesOrphanState(t *testing.T) {
 	if !dst.HasOrphanedWaiterForTest("lock:k", "ref-B") {
 		t.Fatalf("after Restore: ref-B should still be orphaned (abandonedAtNanos lost in codec)")
 	}
+	res, _, err := dst.ApplyEnqueue(at(103), "lock:k", 1, "ref-B", 99, 30*time.Second, saltOf(77))
+	if err != nil || res.Status != StatusQueued {
+		t.Fatalf("re-adopt after Restore = %+v, %v; want queued", res, err)
+	}
+	if n := dst.CountWaitersForTest("lock:k"); n != 1 {
+		t.Fatalf("waiters after restored re-adopt = %d, want 1", n)
+	}
 }
 
 // TestEvictExpiredRemovesOrphanPastTTL: an orphaned waiter past

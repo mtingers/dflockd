@@ -284,7 +284,7 @@ func (lm *LockManager) restoreOneResource(r io.Reader, ver byte) error {
 	if err != nil {
 		return err
 	}
-	st := &ResourceState{Limit: int(limit), Holders: map[string]*holder{}, LastActivity: timeFromNanos(lastActivity)}
+	st := lm.newResourceState(int(limit), timeFromNanos(lastActivity))
 	return lm.restoreResourceBody(r, key, st, ver)
 }
 
@@ -340,7 +340,7 @@ func readOneHolder(r io.Reader, st *ResourceState, ver byte) error {
 			return err
 		}
 	}
-	st.Holders[token] = &holder{connID: connID, leaseExpires: timeFromNanos(leaseExpiresNanos), ref: ref, abandonedAtNanos: abandoned}
+	st.addHolder(token, &holder{connID: connID, leaseExpires: timeFromNanos(leaseExpiresNanos), ref: ref, abandonedAtNanos: abandoned})
 	return nil
 }
 
@@ -354,7 +354,7 @@ func readWaiters(r io.Reader, st *ResourceState, ver byte) error {
 		if err != nil {
 			return err
 		}
-		st.Waiters = append(st.Waiters, w)
+		st.appendWaiter(w)
 	}
 	return nil
 }
