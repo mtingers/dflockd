@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc64"
+	"sort"
 )
 
 // crcTable is the polynomial used for all on-disk and on-wire integrity
@@ -69,14 +70,19 @@ const maxConfigBytes = 1 << 20
 
 func encodeConfig(dst []byte, c Configuration) []byte {
 	dst = be.AppendUint32(dst, uint32(len(c.Voters)))
-	for id, addr := range c.Voters {
+	ids := c.IDs()
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
 		dst = appendString16(dst, string(id))
-		dst = appendString16(dst, addr)
+		dst = appendString16(dst, c.Voters[id])
 	}
 	return dst
 }
 
 func decodeConfig(b []byte) (Configuration, error) {
+	if len(b) > maxConfigBytes {
+		return Configuration{}, fmt.Errorf("raft: config length %d exceeds max %d", len(b), maxConfigBytes)
+	}
 	if len(b) < 4 {
 		return Configuration{}, fmt.Errorf("raft: config truncated")
 	}
@@ -85,7 +91,7 @@ func decodeConfig(b []byte) (Configuration, error) {
 }
 
 func decodeConfigVoters(b []byte, n int) (Configuration, error) {
-	if n < 0 || n > len(b) { // every voter is ≥4 bytes (two empty string16s)
+	if n < 0 || n > len(b)/4 { // every voter is >=4 bytes (two empty string16s)
 		return Configuration{}, fmt.Errorf("raft: config voter count %d implausible for %d bytes", n, len(b))
 	}
 	c := Configuration{Voters: make(map[NodeID]string)} // no capacity hint: n is attacker-influenced
@@ -98,8 +104,14 @@ func decodeConfigVoters(b []byte, n int) (Configuration, error) {
 		if err != nil {
 			return Configuration{}, err
 		}
+		if _, exists := c.Voters[NodeID(id)]; exists {
+			return Configuration{}, fmt.Errorf("raft: duplicate voter %q", id)
+		}
 		c.Voters[NodeID(id)] = addr
 		b = rest2
+	}
+	if len(b) != 0 {
+		return Configuration{}, fmt.Errorf("raft: config has %d trailing bytes", len(b))
 	}
 	return c, nil
 }

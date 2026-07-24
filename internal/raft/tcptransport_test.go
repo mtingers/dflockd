@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -169,26 +170,41 @@ func TestTCPTransportFrameRoundTrip(t *testing.T) {
 	cases := []Message{
 		&RequestVoteReq{Term: 5, CandidateID: "c", LastLogIndex: 3, LastLogTerm: 2, PreVote: true},
 		&RequestVoteResp{Term: 5, VoteGranted: true, PreVote: true},
-		&AppendEntriesReq{Term: 7, LeaderID: "L", PrevLogIndex: 4, PrevLogTerm: 3, Entries: []Entry{{Index: 5, Term: 7, Type: EntryNormal, Data: []byte("x")}}, LeaderCommit: 4},
-		&AppendEntriesResp{Term: 7, Success: true, MatchIndex: 5},
-		&InstallSnapshotReq{Term: 9, LeaderID: "L", Meta: SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 8}, Data: []byte("snap")},
+		&AppendEntriesReq{
+			Term: 7, LeaderID: "L", PrevLogIndex: 4, PrevLogTerm: 3, LeaderCommit: 5,
+			Entries: []Entry{
+				{Index: 5, Term: 7, Type: EntryNormal, Data: []byte("x")},
+				{Index: 6, Term: 7, Type: EntryConfig, Data: []byte("y")},
+			},
+		},
+		&AppendEntriesResp{Term: 7, Success: true, MatchIndex: 5, ConflictIndex: 4, ConflictTerm: 3},
+		&InstallSnapshotReq{
+			Term: 9, LeaderID: "L",
+			Meta: SnapshotMeta{
+				LastIncludedIndex: 10, LastIncludedTerm: 8,
+				Configuration: Configuration{Voters: map[NodeID]string{"L": "host:1", "F": "host:2"}},
+			},
+			Data: []byte("snap"),
+		},
 		&InstallSnapshotResp{Term: 9, LastIndex: 10},
 		&TimeoutNowReq{Term: 11, LeaderID: "L"},
 		&TimeoutNowResp{Term: 11},
 	}
-	for _, m := range cases {
-		body, err := encodeRPC(frameRequest, 42, m)
+	for i, m := range cases {
+		kind := frameRequest
+		if i%2 == 1 {
+			kind = frameResponse
+		}
+		body, err := encodeRPC(kind, 42, m)
 		if err != nil {
 			t.Fatalf("encode(%T): %v", m, err)
 		}
-		kind, reqID, got, err := decodeRPC(body)
-		if err != nil || kind != frameRequest || reqID != 42 {
-			t.Fatalf("decode(%T) = %d %d %v", m, kind, reqID, err)
+		gotKind, reqID, got, err := decodeRPC(body)
+		if err != nil || gotKind != kind || reqID != 42 {
+			t.Fatalf("decode(%T) = %d %d %v", m, gotKind, reqID, err)
 		}
-		// Compare terms to keep this loose (json marshal/unmarshal of
-		// embedded byte slices is exact; we just spot-check).
-		if got.messageTerm() != m.messageTerm() {
-			t.Fatalf("term roundtrip for %T: got %d want %d", m, got.messageTerm(), m.messageTerm())
+		if !reflect.DeepEqual(got, m) {
+			t.Fatalf("roundtrip %T:\n got  %#v\n want %#v", m, got, m)
 		}
 	}
 }

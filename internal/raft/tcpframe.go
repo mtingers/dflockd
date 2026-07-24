@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -14,11 +13,11 @@ import (
 //	u8  frameKind (hello / request / response)
 //	payload (kind-specific)
 //
-// Hello payload:    u16 idLen, id; u32 versionLen, version
-// Request payload:  u64 reqID, u8 msgTag, u32 jsonLen, json
-// Response payload: u64 reqID, u8 msgTag, u32 jsonLen, json
+// Hello payload:    u16 idLen, id; u16 versionLen, version
+// Request payload:  u64 reqID, u8 msgTag, u32 payloadLen, binary payload
+// Response payload: u64 reqID, u8 msgTag, u32 payloadLen, binary payload
 //
-// The msgTag picks the concrete Message struct to JSON-unmarshal into.
+// The msgTag picks the concrete binary Message payload codec.
 
 const (
 	frameHello    uint8 = 0
@@ -29,7 +28,7 @@ const (
 	// in production but dflockd's FSM is small; 64 MiB is a generous cap.
 	maxTCPFrameBytes = 64 << 20
 
-	tcpProtoVersion = "raft.v1"
+	tcpProtoVersion = "raft.v2"
 )
 
 const (
@@ -67,48 +66,25 @@ const (
 
 // msgTag returns the wire tag for one Message; ok=false on an unknown type.
 func msgTag(m Message) (uint8, bool) {
-	switch m.(type) {
+	switch m := m.(type) {
 	case *RequestVoteReq:
-		return tagRequestVoteReq, true
+		return tagRequestVoteReq, m != nil
 	case *RequestVoteResp:
-		return tagRequestVoteResp, true
+		return tagRequestVoteResp, m != nil
 	case *AppendEntriesReq:
-		return tagAppendEntriesReq, true
+		return tagAppendEntriesReq, m != nil
 	case *AppendEntriesResp:
-		return tagAppendEntriesResp, true
+		return tagAppendEntriesResp, m != nil
 	case *InstallSnapshotReq:
-		return tagInstallSnapshotReq, true
+		return tagInstallSnapshotReq, m != nil
 	case *InstallSnapshotResp:
-		return tagInstallSnapshotResp, true
+		return tagInstallSnapshotResp, m != nil
 	case *TimeoutNowReq:
-		return tagTimeoutNowReq, true
+		return tagTimeoutNowReq, m != nil
 	case *TimeoutNowResp:
-		return tagTimeoutNowResp, true
+		return tagTimeoutNowResp, m != nil
 	}
 	return 0, false
-}
-
-// newMessageOf returns a fresh pointer of the Message type the tag names.
-func newMessageOf(tag uint8) (Message, bool) {
-	switch tag {
-	case tagRequestVoteReq:
-		return &RequestVoteReq{}, true
-	case tagRequestVoteResp:
-		return &RequestVoteResp{}, true
-	case tagAppendEntriesReq:
-		return &AppendEntriesReq{}, true
-	case tagAppendEntriesResp:
-		return &AppendEntriesResp{}, true
-	case tagInstallSnapshotReq:
-		return &InstallSnapshotReq{}, true
-	case tagInstallSnapshotResp:
-		return &InstallSnapshotResp{}, true
-	case tagTimeoutNowReq:
-		return &TimeoutNowReq{}, true
-	case tagTimeoutNowResp:
-		return &TimeoutNowResp{}, true
-	}
-	return nil, false
 }
 
 // writeFrameTo writes one frame to a net.Conn under a write deadline so
@@ -204,40 +180,42 @@ func encodeRPC(kind uint8, reqID uint64, m Message) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("raft: unknown message type %T", m)
 	}
-	js, err := json.Marshal(m)
+	payload, err := encodeRPCPayload(m)
 	if err != nil {
-		return nil, fmt.Errorf("raft: marshal: %w", err)
+		return nil, fmt.Errorf("raft: encode %T: %w", m, err)
 	}
-	return assembleRPCBody(kind, reqID, tag, js), nil
+	if len(payload) > maxTCPFrameBytes-rpcHeaderBytes {
+		return nil, fmt.Errorf("raft: rpc payload too large (%d bytes)", len(payload))
+	}
+	return assembleRPCBody(kind, reqID, tag, payload), nil
 }
 
-func assembleRPCBody(kind uint8, reqID uint64, tag uint8, js []byte) []byte {
-	body := make([]byte, 0, 1+8+1+4+len(js))
+const rpcHeaderBytes = 1 + 8 + 1 + 4
+
+func assembleRPCBody(kind uint8, reqID uint64, tag uint8, payload []byte) []byte {
+	body := make([]byte, 0, rpcHeaderBytes+len(payload))
 	body = append(body, kind)
 	body = be.AppendUint64(body, reqID)
 	body = append(body, tag)
-	body = be.AppendUint32(body, uint32(len(js)))
-	return append(body, js...)
+	body = be.AppendUint32(body, uint32(len(payload)))
+	return append(body, payload...)
 }
 
 // decodeRPC parses a request or response body.
 func decodeRPC(body []byte) (kind uint8, reqID uint64, msg Message, err error) {
-	if len(body) < 1+8+1+4 {
+	if len(body) < rpcHeaderBytes {
 		return 0, 0, nil, fmt.Errorf("raft: rpc body truncated (%d bytes)", len(body))
 	}
 	kind = body[0]
 	reqID = be.Uint64(body[1:9])
 	tag := body[9]
-	jsLen := be.Uint32(body[10:14])
-	if 14+int(jsLen) != len(body) {
-		return 0, 0, nil, fmt.Errorf("raft: rpc json length mismatch: hdr=%d body=%d", jsLen, len(body)-14)
+	payloadLen := be.Uint32(body[10:14])
+	if rpcHeaderBytes+int(payloadLen) != len(body) {
+		return 0, 0, nil, fmt.Errorf("raft: rpc payload length mismatch: hdr=%d body=%d", payloadLen, len(body)-rpcHeaderBytes)
 	}
-	msg, ok := newMessageOf(tag)
-	if !ok {
-		return 0, 0, nil, fmt.Errorf("raft: unknown msg tag %d", tag)
-	}
-	if err := json.Unmarshal(body[14:], msg); err != nil {
-		return 0, 0, nil, fmt.Errorf("raft: unmarshal: %w", err)
+	msg, err = decodeRPCPayload(tag, body[rpcHeaderBytes:])
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("raft: decode msg tag %d: %w", tag, err)
 	}
 	return kind, reqID, msg, nil
 }

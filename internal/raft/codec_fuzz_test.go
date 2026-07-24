@@ -1,12 +1,13 @@
 package raft
 
 import (
+	"reflect"
 	"testing"
 )
 
 // FuzzRaftFrameDecode runs decodeRPC against arbitrary bytes and
 // asserts (a) it never panics, (b) if the decode succeeds, re-encoding
-// the message under the same (kind, reqID) round-trips byte-identically.
+// the message under the same (kind, reqID) preserves every decoded field.
 //
 // Seeds: representative AppendEntries, RequestVote (incl. PreVote
 // variant), and InstallSnapshot frames built via encodeRPC.
@@ -25,12 +26,15 @@ func FuzzRaftFrameDecode(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-encode failed for decoded frame: %v", err)
 		}
-		kind2, reqID2, _, err := decodeRPC(again)
+		kind2, reqID2, msg2, err := decodeRPC(again)
 		if err != nil {
 			t.Fatalf("re-decode failed: %v", err)
 		}
 		if kind != kind2 || reqID != reqID2 {
 			t.Fatalf("round-trip drift: (kind, reqID) %d/%d -> %d/%d", kind, reqID, kind2, reqID2)
+		}
+		if !reflect.DeepEqual(msg, msg2) {
+			t.Fatalf("message round-trip drift: %#v -> %#v", msg, msg2)
 		}
 	})
 }
