@@ -170,7 +170,7 @@ func (s *Server) clusterDoAcquire(ctx context.Context, c Cluster, req *protocol.
 	// Register the listener BEFORE proposing so a synchronous-grant
 	// promotion (e.g. an Evict that frees the slot just before our
 	// Acquire commits) doesn't slip past us.
-	grants, cancel := s.lm.WatchGrants(ref)
+	grants, cancel := s.lm.WatchGrantsFor(ref, requestKey(req))
 	defer cancel()
 	leaseTTL := req.LeaseTTL
 	result, err := c.ProposeAcquire(ctx, requestKey(req), requestLimit(req), ref, cid, leaseTTL, salt)
@@ -220,7 +220,7 @@ func (s *Server) clusterEnqueue(ctx context.Context, c Cluster, req *protocol.Re
 	// connection: a promotion can land between this Enqueue's commit and
 	// the client's Wait, and without a live listener that grant is lost
 	// (the holder then leaks until its lease expires).
-	ch, cancel := s.lm.WatchGrants(ref)
+	ch, cancel := s.lm.WatchGrantsFor(ref, requestKey(req))
 	result, err := c.ProposeEnqueue(ctx, requestKey(req), requestLimit(req), ref, cid, req.LeaseTTL, salt)
 	if err != nil {
 		cancel()
@@ -256,7 +256,9 @@ func (s *Server) clusterWait(ctx context.Context, c Cluster, req *protocol.Reque
 		defer pg.cancel()
 		return s.clusterWaitForGrant(ctx, pg.ch, req.AcquireTimeout)
 	}
-	grants, cancel := s.lm.WatchGrants(s.clusterRef(connID))
+	// No stashed listener (a Wait without its Enqueue, or after a
+	// reconnect): watch the ref this connection actually proposes under.
+	grants, cancel := s.lm.WatchGrantsFor(s.effectiveRef(connID, s.clusterConnID(connID)), requestKey(req))
 	defer cancel()
 	return s.clusterWaitForGrant(ctx, grants, req.AcquireTimeout)
 }

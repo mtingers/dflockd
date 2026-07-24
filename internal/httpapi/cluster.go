@@ -95,7 +95,7 @@ func (h *httpServer) runWaitCluster(w http.ResponseWriter, r *http.Request, s *S
 	srv := h.sessions.Server()
 	ctx, cancel := s.RequestContext(r.Context())
 	defer cancel()
-	res, err := srv.ClusterWait(ctx, s.ConnID, durSeconds(timeoutS))
+	res, err := srv.ClusterWait(ctx, prefixedKey, s.ConnID, durSeconds(timeoutS))
 	if h.handleClusterNotLeader(w, srv, err) {
 		return
 	}

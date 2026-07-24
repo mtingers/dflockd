@@ -87,7 +87,7 @@ func (s *Server) ClusterAcquire(ctx context.Context, key string, limit int, conn
 	}
 	cid := s.clusterConnID(connID)
 	ref := s.effectiveRef(connID, cid)
-	grants, cancel := s.lm.WatchGrants(ref)
+	grants, cancel := s.lm.WatchGrantsFor(ref, key)
 	defer cancel()
 	result, err := c.ProposeAcquire(ctx, key, limit, ref, cid, leaseTTL, salt)
 	if err != nil {
@@ -114,7 +114,7 @@ func (s *Server) ClusterEnqueue(ctx context.Context, key string, limit int, conn
 	}
 	cid := s.clusterConnID(connID)
 	ref := s.effectiveRef(connID, cid)
-	ch, cancel := s.lm.WatchGrants(ref)
+	ch, cancel := s.lm.WatchGrantsFor(ref, key)
 	result, err := c.ProposeEnqueue(ctx, key, limit, ref, cid, leaseTTL, salt)
 	if err != nil {
 		cancel()
@@ -130,9 +130,9 @@ func (s *Server) ClusterEnqueue(ctx context.Context, key string, limit int, conn
 
 // ClusterWait is phase 2 of the two-phase enqueue/wait flow in cluster
 // mode. Consumes the listener stashed by ClusterEnqueue (or, as a
-// fallback, opens a fresh one keyed by the cluster ref) and blocks
-// up to acquireTimeout for the grant to land.
-func (s *Server) ClusterWait(ctx context.Context, connID uint64, acquireTimeout time.Duration) (lock.ApplyResult, error) {
+// fallback, opens a fresh one for this connection's ref and key) and
+// blocks up to acquireTimeout for the grant to land.
+func (s *Server) ClusterWait(ctx context.Context, key string, connID uint64, acquireTimeout time.Duration) (lock.ApplyResult, error) {
 	if _, err := s.clusterLeaderOrErr(); err != nil {
 		return lock.ApplyResult{}, err
 	}
@@ -140,7 +140,8 @@ func (s *Server) ClusterWait(ctx context.Context, connID uint64, acquireTimeout 
 		defer pg.cancel()
 		return s.waitGrantResult(ctx, pg.ch, acquireTimeout)
 	}
-	grants, cancel := s.lm.WatchGrants(s.clusterRef(connID))
+	ref := s.effectiveRef(connID, s.clusterConnID(connID))
+	grants, cancel := s.lm.WatchGrantsFor(ref, key)
 	defer cancel()
 	return s.waitGrantResult(ctx, grants, acquireTimeout)
 }

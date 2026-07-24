@@ -39,7 +39,7 @@ func TestClusterOps_LeaderAndFollower(t *testing.T) {
 	for _, call := range []func() error{
 		func() error { _, e := s.ClusterAcquire(ctx, "lock:k", 1, 1, time.Second, time.Second); return e },
 		func() error { _, e := s.ClusterEnqueue(ctx, "lock:k", 1, 1, time.Second); return e },
-		func() error { _, e := s.ClusterWait(ctx, 1, time.Second); return e },
+		func() error { _, e := s.ClusterWait(ctx, "lock:k", 1, time.Second); return e },
 		func() error { _, e := s.ClusterRelease(ctx, "lock:k", "tk"); return e },
 		func() error { _, e := s.ClusterRenew(ctx, "lock:k", "tk", time.Second); return e },
 	} {
@@ -70,7 +70,7 @@ func TestClusterOps_EnqueueStashesGrantListener(t *testing.T) {
 		t.Fatalf("queued enqueue should have stashed a grant listener for connID 5")
 	}
 	// Wait consumes it.
-	if _, err := s.ClusterWait(context.Background(), 5, 0); err != nil {
+	if _, err := s.ClusterWait(context.Background(), "lock:k", 5, 0); err != nil {
 		t.Fatalf("ClusterWait: %v", err)
 	}
 	if _, ok := s.pendingGrants.Load(uint64(5)); ok {

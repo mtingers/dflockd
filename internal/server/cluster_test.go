@@ -63,21 +63,22 @@ func (f *fakeCluster) ProposeAcquire(ctx context.Context, key string, limit int,
 		return lock.ApplyResult{}, f.proposeErr
 	}
 	if f.promotion != nil {
-		f.schedulePromotion(ref)
+		f.schedulePromotion(ref, key)
 	}
 	return f.acquireResult, nil
 }
 
-// schedulePromotion routes a follow-on grant for `ref` (the ref the
-// server actually registered its listener under) after the configured
-// delay.
-func (f *fakeCluster) schedulePromotion(ref string) {
+// schedulePromotion routes a follow-on grant for (ref, key) — the pair
+// the server actually registered its listener under — after the
+// configured delay. Key matters: the real FSM stamps every Grant with
+// the resource it promoted, and listeners are scoped to it.
+func (f *fakeCluster) schedulePromotion(ref, key string) {
 	p := f.promotion
 	go func() {
 		if p.delay > 0 {
 			time.Sleep(p.delay)
 		}
-		f.lm.RouteGrants([]lock.Grant{{Ref: ref, Token: p.token, LeaseSec: p.leaseSec}})
+		f.lm.RouteGrants([]lock.Grant{{Key: key, Ref: ref, Token: p.token, LeaseSec: p.leaseSec}})
 	}()
 }
 
@@ -86,7 +87,7 @@ func (f *fakeCluster) ProposeEnqueue(ctx context.Context, key string, limit int,
 		return lock.ApplyResult{}, f.proposeErr
 	}
 	if f.promotion != nil {
-		f.schedulePromotion(ref)
+		f.schedulePromotion(ref, key)
 	}
 	return f.enqueueResult, nil
 }
