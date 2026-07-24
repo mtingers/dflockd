@@ -166,8 +166,9 @@ type NodeStatus struct {
 
 // peerProgress tracks one follower's replication state (leader-only).
 type peerProgress struct {
-	nextIndex  Index
-	matchIndex Index
+	nextIndex        Index
+	matchIndex       Index
+	snapshotInFlight bool
 }
 
 // rpcRequest is an inbound RPC handed to the run loop with a reply channel.
@@ -180,6 +181,7 @@ type rpcRequest struct {
 // rpcReply is the result of an RPC this node sent, fed back to the run loop.
 type rpcReply struct {
 	from NodeID
+	req  Message
 	msg  Message
 	err  error
 }
@@ -591,7 +593,7 @@ func (n *Node) doSendRPC(to NodeID, req Message) {
 	defer cancel()
 	resp, err := n.transport.Send(ctx, to, req)
 	select {
-	case n.rpcReplyc <- rpcReply{from: to, msg: resp, err: err}:
+	case n.rpcReplyc <- rpcReply{from: to, req: req, msg: resp, err: err}:
 	case <-n.stopc:
 	}
 }

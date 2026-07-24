@@ -43,6 +43,7 @@ func (n *Node) dispatchRPC(from NodeID, msg Message) Message {
 // are no longer running is discarded; otherwise the reply-specific
 // handler runs.
 func (n *Node) onRPCReply(rep rpcReply) {
+	n.finishSnapshotSend(rep)
 	if rep.err != nil || rep.msg == nil {
 		return // treated as "no reply"; timers/heartbeats will retry
 	}
@@ -53,6 +54,20 @@ func (n *Node) onRPCReply(rep rpcReply) {
 		return
 	}
 	n.dispatchRPCReply(rep)
+}
+
+// finishSnapshotSend releases a current-term snapshot gate on every terminal
+// outcome, including transport errors and timeouts where there is no response
+// message to identify the RPC. A reply from an older leadership term must not
+// release a snapshot started by the current leader.
+func (n *Node) finishSnapshotSend(rep rpcReply) {
+	req, ok := rep.req.(*InstallSnapshotReq)
+	if !ok || req.Term != n.term {
+		return
+	}
+	if p := n.progress[rep.from]; p != nil {
+		p.snapshotInFlight = false
+	}
 }
 
 // stepDownForReply applies the step-down-on-higher-term rule to a reply

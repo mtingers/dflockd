@@ -131,11 +131,22 @@ func TestStaleTermAppendRespIsIgnored(t *testing.T) {
 func TestStaleTermInstallSnapshotRespIsIgnored(t *testing.T) {
 	n, _ := newUnstartedNode(t, "a", "a", "b", "c")
 	n.role, n.term = roleLeader, 9
-	n.progress = map[NodeID]*peerProgress{"a": {nextIndex: 1}, "b": {nextIndex: 1}, "c": {nextIndex: 1}}
+	n.progress = map[NodeID]*peerProgress{
+		"a": {nextIndex: 1},
+		"b": {nextIndex: 1, snapshotInFlight: true},
+		"c": {nextIndex: 1},
+	}
 
-	n.onRPCReply(rpcReply{from: "b", msg: &InstallSnapshotResp{Term: 4, LastIndex: 77}})
+	n.onRPCReply(rpcReply{
+		from: "b",
+		req:  &InstallSnapshotReq{Term: 4},
+		msg:  &InstallSnapshotResp{Term: 4, LastIndex: 77},
+	})
 
 	if got := n.progress["b"].matchIndex; got != 0 {
 		t.Fatalf("matchIndex = %d, want 0 (stale reply ignored)", got)
+	}
+	if !n.progress["b"].snapshotInFlight {
+		t.Fatal("stale reply cleared the current term's snapshot gate")
 	}
 }

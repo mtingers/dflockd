@@ -236,17 +236,24 @@ func (n *Node) advanceFollowerCommit(leaderCommit, lastNew Index) {
 // ---------------------------------------------------------------------------
 
 func (n *Node) sendInstallSnapshot(to NodeID) {
+	p := n.progress[to]
+	if p == nil || p.snapshotInFlight {
+		return
+	}
 	meta, ok := n.log.storage.SnapshotMeta()
 	if !ok {
 		return // nothing to send yet
 	}
+	p.snapshotInFlight = true
 	rc, err := n.log.storage.OpenSnapshot()
 	if err != nil {
+		p.snapshotInFlight = false
 		n.logger.Error("open snapshot for send failed", "err", err)
 		return
 	}
 	data, err := readAllAndClose(rc)
 	if err != nil {
+		p.snapshotInFlight = false
 		n.logger.Error("read snapshot for send failed", "err", err)
 		return
 	}
