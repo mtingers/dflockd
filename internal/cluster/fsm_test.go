@@ -88,17 +88,13 @@ func TestSetDeleteMember(t *testing.T) {
 	n := tc.nodes["n1"]
 
 	n.setMember("n9", Member{RaftAddr: "127.0.0.1:9999", ClientAddr: "127.0.0.1:8888"})
-	n.membersMu.Lock()
-	m, ok := n.cfg.Members["n9"]
-	n.membersMu.Unlock()
+	m, ok := n.member("n9")
 	if !ok || m.RaftAddr != "127.0.0.1:9999" || m.ClientAddr != "127.0.0.1:8888" {
 		t.Fatalf("setMember: got %+v, ok=%v", m, ok)
 	}
 
 	n.deleteMember("n9")
-	n.membersMu.Lock()
-	_, ok = n.cfg.Members["n9"]
-	n.membersMu.Unlock()
+	_, ok = n.member("n9")
 	if ok {
 		t.Fatal("deleteMember did not remove the entry")
 	}

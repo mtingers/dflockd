@@ -395,3 +395,38 @@ func TestLeaderClientAddrFromMembers(t *testing.T) {
 		}
 	}
 }
+
+func TestFailedAddVoterDoesNotPublishMember(t *testing.T) {
+	tc := newCluster(t, "n1", "n2", "n3")
+	defer tc.stopAll()
+	leader := tc.waitLeader()
+	original, ok := tc.nodes[leader].member(leader)
+	if !ok {
+		t.Fatalf("leader %s missing from member map", leader)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := tc.nodes[leader].AddVoter(ctx, leader, "bogus-raft", "bogus-client")
+	if err == nil {
+		t.Fatal("adding the existing leader unexpectedly succeeded")
+	}
+	if got, ok := tc.nodes[leader].member(leader); !ok || got != original {
+		t.Fatalf("failed add changed leader member: got %+v, ok=%v; want %+v", got, ok, original)
+	}
+
+	var follower raft.NodeID
+	for _, id := range tc.ids {
+		if id != leader {
+			follower = id
+			break
+		}
+	}
+	err = tc.nodes[follower].AddVoter(ctx, "ghost", "ghost-raft", "ghost-client")
+	if err == nil {
+		t.Fatal("follower AddVoter unexpectedly succeeded")
+	}
+	if ghost, ok := tc.nodes[follower].member("ghost"); ok {
+		t.Fatalf("failed follower add published ghost member: %+v", ghost)
+	}
+}

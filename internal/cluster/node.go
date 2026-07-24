@@ -218,9 +218,7 @@ func (n *Node) LeaderClientAddr() (string, bool) {
 	if id == "" {
 		return "", false
 	}
-	n.membersMu.Lock()
-	m, ok := n.cfg.Members[id]
-	n.membersMu.Unlock()
+	m, ok := n.member(id)
 	if !ok {
 		return "", false
 	}
@@ -366,9 +364,9 @@ func (n *Node) Barrier(ctx context.Context) error {
 // transport address. The change is durable and takes effect on append
 // (the new node starts being counted toward quorum immediately). It is
 // the caller's responsibility to start the new node and to make sure
-// the leader's transport can reach it.
+// the leader's transport can reach it. The client-facing address is not
+// published until the change commits.
 func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAddr string) error {
-	n.setMember(id, Member{RaftAddr: raftAddr, ClientAddr: clientAddr})
 	fut, err := n.raft.AddVoter(ctx, id, raftAddr)
 	if err != nil {
 		n.adminAddFailed.Add(1)
@@ -378,6 +376,7 @@ func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAdd
 		n.adminAddFailed.Add(1)
 		return err
 	}
+	n.setMember(id, Member{RaftAddr: raftAddr, ClientAddr: clientAddr})
 	n.adminAdds.Add(1)
 	return nil
 }
@@ -416,6 +415,13 @@ func (n *Node) setMember(id raft.NodeID, m Member) {
 	n.membersMu.Lock()
 	n.cfg.Members[id] = m
 	n.membersMu.Unlock()
+}
+
+func (n *Node) member(id raft.NodeID) (Member, bool) {
+	n.membersMu.Lock()
+	defer n.membersMu.Unlock()
+	m, ok := n.cfg.Members[id]
+	return m, ok
 }
 
 func (n *Node) deleteMember(id raft.NodeID) {
