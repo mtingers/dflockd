@@ -2,7 +2,6 @@ package client
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -10,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // pipeFakeServer is a mini in-process dflockd server. Each instance has a
@@ -153,8 +151,8 @@ func TestClusterDialsCachedLeaderFirst(t *testing.T) {
 }
 
 // TestClusterExhaustsBudget: every member redirects in a cycle; the
-// client should surface ErrTooManyRedirects within budget+1 attempts
-// and not loop forever.
+// client should surface ErrTooManyRedirects within the configured attempts,
+// preserve the final redirect, and not loop forever.
 func TestClusterExhaustsBudget(t *testing.T) {
 	a := &pipeFakeServer{respond: always("error_not_leader 127.0.0.1:9002")}
 	b := &pipeFakeServer{respond: always("error_not_leader 127.0.0.1:9001")}
@@ -167,6 +165,59 @@ func TestClusterExhaustsBudget(t *testing.T) {
 	_, _, err := cl.Acquire(context.Background(), "k", 0)
 	if !errors.Is(err, ErrTooManyRedirects) {
 		t.Fatalf("err = %v, want ErrTooManyRedirects", err)
+	}
+	var nle *NotLeaderError
+	if !errors.As(err, &nle) || nle.Leader != "127.0.0.1:9002" {
+		t.Fatalf("err = %v, want wrapped final NotLeaderError for 127.0.0.1:9002", err)
+	}
+	if got := a.count.Load() + b.count.Load(); got != 3 {
+		t.Fatalf("attempts = %d, want budget 3", got)
+	}
+}
+
+func TestClusterFollowsRedirectTargetImmediately(t *testing.T) {
+	a := &pipeFakeServer{respond: always("error_not_leader 127.0.0.1:9003")}
+	b := &pipeFakeServer{respond: always(validTokenLine)}
+	c := &pipeFakeServer{respond: always(validTokenLine)}
+	cl, _ := NewCluster([]string{"127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"},
+		withClusterDial(dialerFor(t, map[string]*pipeFakeServer{
+			"127.0.0.1:9001": a,
+			"127.0.0.1:9002": b,
+			"127.0.0.1:9003": c,
+		})))
+
+	if _, _, err := cl.Acquire(context.Background(), "k", 0); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if b.count.Load() != 0 || c.count.Load() != 1 {
+		t.Fatalf("redirect hit intermediate=%d target=%d, want 0,1", b.count.Load(), c.count.Load())
+	}
+}
+
+func TestClusterDialFailuresRotateFromCachedLeaderAndWrapCause(t *testing.T) {
+	dialErr := errors.New("connection refused")
+	var attempts []string
+	cl, _ := NewCluster(
+		[]string{"127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"},
+		WithClusterRedirectBudget(3),
+		withClusterDial(func(addr string) (*Conn, error) {
+			attempts = append(attempts, addr)
+			return nil, dialErr
+		}),
+	)
+	cl.updateLeaderHint("127.0.0.1:9002")
+
+	_, _, err := cl.Acquire(context.Background(), "k", 0)
+	if !errors.Is(err, ErrTooManyRedirects) || !errors.Is(err, dialErr) {
+		t.Fatalf("err = %v, want ErrTooManyRedirects wrapping dial error", err)
+	}
+	got := strings.Join(attempts, ",")
+	want := "127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9001"
+	if got != want {
+		t.Fatalf("dial order = %q, want %q", got, want)
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1:9001") {
+		t.Fatalf("err = %v, want final attempted address", err)
 	}
 }
 
@@ -266,7 +317,3 @@ func TestClusterIsConcurrencySafe(t *testing.T) {
 		}
 	}
 }
-
-// hush silences unused-import warnings if I trim test cases later.
-var _ = bytes.Compare
-var _ = time.Now

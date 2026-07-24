@@ -298,7 +298,10 @@ follows `*NotLeaderError` redirects up to the configured budget. The
 cache only honors hints that name an address in the operator-supplied
 members list — a hostile or stale `error_not_leader evil:6388` does
 not cause the client to dial an arbitrary host. An exhausted budget
-surfaces `client.ErrTooManyRedirects`.
+surfaces an error matching `client.ErrTooManyRedirects` and wrapping
+the final dial or `*client.NotLeaderError` cause. Use `errors.Is` /
+`errors.As` to inspect both the retry exhaustion and its terminal
+diagnostic.
 
 The single-`*Conn` package-level API (`client.Acquire(conn, …)`) is
 unchanged and still works against any node — callers that need to

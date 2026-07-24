@@ -241,11 +241,12 @@ references and quoted in the "See also" line where helpful.
 - **Leader cache** — On a `*NotLeaderError` the client records the
   hinted leader address. Subsequent operations dial the cache first.
   Process-local; no persistence; expires on the next miss.
-- **Retry budget** — Hard cap on consecutive redirects per operation
+- **Retry budget** — Hard cap on dial/operation attempts per operation
   (default 3). Prevents an attacker-controlled redirect from looping
-  forever. Surface error: `ErrTooManyRedirects`. The budget is per
-  operation, not per `Cluster` instance, so legitimate cluster
-  reconfigurations during a long-running client don't bleed budget.
+  forever. The terminal error matches `ErrTooManyRedirects` and wraps
+  the final dial or `NotLeaderError` cause. The budget is per operation,
+  not per `Cluster` instance, so legitimate cluster reconfigurations
+  during a long-running client don't bleed budget.
 - **Soak harness** — `cmd/cluster-soak`: spins up an N-node in-process
   raft cluster on a `MemTransport`, drives sustained writes from K
   worker goroutines, periodically kills the leader by calling

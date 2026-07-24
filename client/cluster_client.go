@@ -3,13 +3,15 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
 
 // ErrTooManyRedirects is returned when a Cluster operation exhausted
-// its redirect budget without finding the leader. This bounds an
-// attacker-controlled redirect loop and a long partition.
+// its attempt budget without finding the leader. The returned error
+// also wraps the final dial or NotLeaderError cause for diagnostics.
+// This bounds an attacker-controlled redirect loop and a long partition.
 var ErrTooManyRedirects = errors.New("dflockd: too many leader redirects")
 
 // ErrNoMembers is returned by NewCluster when the members slice is
@@ -132,38 +134,52 @@ func (cl *Cluster) LeaderHint() string {
 // against it. On *NotLeaderError it records the hint (only if the
 // hinted address is in the operator-supplied members list — an
 // attacker-controlled server cannot point us at an arbitrary host)
-// and retries against the new target. Returns ErrTooManyRedirects
-// once the budget is exhausted.
+// and retries against the new target. Returns an error wrapping both
+// ErrTooManyRedirects and the final dial/redirect cause once the budget
+// is exhausted.
 func (cl *Cluster) dispatch(ctx context.Context, op func(c *Conn) error) error {
-	for attempt := 0; attempt <= cl.cfg.budget; attempt++ {
+	addr := cl.firstAddr()
+	var lastErr error
+	for attempt := 0; attempt < cl.cfg.budget; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		addr := cl.nextAddr(attempt)
 		conn, err := cl.cfg.dial(addr)
 		if err != nil {
+			lastErr = fmt.Errorf("dflockd: cluster: dial %s: %w", addr, err)
+			addr = cl.nextAddr(addr)
 			continue
 		}
 		opErr := cl.runOnConn(conn, op)
 		if redirected, target := redirectTarget(opErr); redirected {
-			cl.updateLeaderHint(target)
+			lastErr = opErr
+			if cl.updateLeaderHint(target) && target != addr {
+				addr = target
+			} else {
+				addr = cl.nextAddr(addr)
+			}
 			continue
 		}
 		return opErr
 	}
-	return ErrTooManyRedirects
+	if lastErr == nil {
+		return ErrTooManyRedirects
+	}
+	return fmt.Errorf("%w: last attempt: %w", ErrTooManyRedirects, lastErr)
 }
 
 // updateLeaderHint records a hint only if it names an address in the
 // operator-supplied members list. An attacker-controlled response
 // pointing at `evil.example.com:6388` is rejected — we'll keep
-// rotating through the known members instead.
-func (cl *Cluster) updateLeaderHint(target string) {
+// rotating through the known members instead. The return reports
+// whether target was accepted.
+func (cl *Cluster) updateLeaderHint(target string) bool {
 	if target == "" || !cl.isKnownMember(target) {
 		cl.leader.Store(nil)
-		return
+		return false
 	}
 	cl.leader.Store(&target)
+	return true
 }
 
 // isKnownMember reports whether addr appears in the configured
@@ -194,19 +210,24 @@ func (cl *Cluster) runOnConn(conn *Conn, op func(c *Conn) error) error {
 	return op(conn)
 }
 
-// nextAddr picks the address for attempt n. Attempt 0 = cached
-// leader if any, else members[0]. Attempt 1..N rotate through the
-// member list starting after the cached leader.
-func (cl *Cluster) nextAddr(attempt int) string {
-	hint := cl.LeaderHint()
-	if attempt == 0 && hint != "" {
+// firstAddr picks the cached leader when available, otherwise the first
+// configured member.
+func (cl *Cluster) firstAddr() string {
+	if hint := cl.LeaderHint(); hint != "" {
 		return hint
 	}
-	off := attempt
-	if hint == "" {
-		off = attempt
+	return cl.members[0]
+}
+
+// nextAddr returns the configured member after current, wrapping at
+// the end. An unknown current address restarts at the first member.
+func (cl *Cluster) nextAddr(current string) string {
+	for i, member := range cl.members {
+		if member == current {
+			return cl.members[(i+1)%len(cl.members)]
+		}
 	}
-	return cl.members[off%len(cl.members)]
+	return cl.members[0]
 }
 
 // redirectTarget reports whether err is a *NotLeaderError and, if so,

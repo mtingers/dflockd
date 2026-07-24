@@ -351,7 +351,9 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
   the client-server link in any sane deployment).
 - **Cluster client retry budget defaults to 3.** Each `*NotLeaderError`
   or dial failure costs one. After budget exhaustion the call returns
-  `ErrTooManyRedirects` — no unbounded loops.
+  an error matching `ErrTooManyRedirects` and wrapping the final dial
+  or redirect cause — no unbounded loops and no lost terminal
+  diagnostic.
 
 ## Bottom line
 
