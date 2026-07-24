@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // FileStorage is the durable Storage: a directory holding a write-ahead
@@ -25,6 +26,8 @@ type FileStorage struct {
 	hs       *hardStateFile
 	snaps    snapshotStore
 	hard     HardState
+
+	snapshotMu sync.Mutex // serializes canonical snapshot-file writers
 }
 
 const (
@@ -36,6 +39,16 @@ const (
 )
 
 var _ Storage = (*FileStorage)(nil)
+var _ asyncSnapshotStorage = (*FileStorage)(nil)
+
+type fileSnapshotPreparation struct {
+	owner     *FileStorage
+	meta      SnapshotMeta
+	walPath   string
+	nextIndex Index
+}
+
+func (*fileSnapshotPreparation) isPreparedSnapshot() {}
 
 // OpenFileStorage opens (creating if absent) a durable Storage rooted at
 // dir. It fails if the platform lacks exclusive file locking or if
@@ -216,11 +229,126 @@ func (s *FileStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if err := s.snaps.save(meta, fsm); err != nil {
+	s.snapshotMu.Lock()
+	err = s.snaps.save(meta, fsm)
+	s.snapshotMu.Unlock()
+	if err != nil {
 		return err
 	}
 	s.memLog.applySnapshot(meta)
 	return s.wal.rewrite(s.memLog.entries)
+}
+
+// prepareSnapshot writes the new snapshot generation and a compacted WAL
+// candidate without touching the live memLog or WAL handle.
+func (s *FileStorage) prepareSnapshot(meta SnapshotMeta, data []byte, tail []Entry) (preparedSnapshot, error) {
+	if len(data) > maxSnapshotFileBytes {
+		return nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotFileBytes)
+	}
+	if len(tail) > 0 {
+		if err := checkContiguous(tail, meta.LastIncludedIndex+1); err != nil {
+			return nil, fmt.Errorf("raft: prepare snapshot tail: %w", err)
+		}
+	}
+	if err := s.writePreparedSnapshot(meta, data); err != nil {
+		return nil, err
+	}
+	path, err := writePreparedWAL(s.dir, tail)
+	if err != nil {
+		return nil, err
+	}
+	next := meta.LastIncludedIndex + 1
+	if len(tail) > 0 {
+		next = tail[len(tail)-1].Index + 1
+	}
+	return &fileSnapshotPreparation{owner: s, meta: meta, walPath: path, nextIndex: next}, nil
+}
+
+func (s *FileStorage) writePreparedSnapshot(meta SnapshotMeta, data []byte) error {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	current, _, ok, err := s.snaps.loadLatest()
+	if err != nil {
+		return err
+	}
+	if ok && current.LastIncludedIndex > meta.LastIncludedIndex {
+		return errSnapshotSuperseded
+	}
+	if ok && current.LastIncludedIndex == meta.LastIncludedIndex {
+		if current.LastIncludedTerm != meta.LastIncludedTerm {
+			return fmt.Errorf("raft: snapshot index %d has conflicting terms %d and %d",
+				meta.LastIncludedIndex, current.LastIncludedTerm, meta.LastIncludedTerm)
+		}
+		return nil
+	}
+	_, err = s.snaps.write(meta, data)
+	return err
+}
+
+func writePreparedWAL(dir string, entries []Entry) (path string, err error) {
+	f, err := os.CreateTemp(dir, ".wal-snapshot-*")
+	if err != nil {
+		return "", fmt.Errorf("create prepared wal: %w", err)
+	}
+	path = f.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(path)
+		}
+	}()
+	err = f.Chmod(walFilePerm)
+	if err == nil {
+		err = writeAllThenSync(f, encodeWALRecords(nil, entries))
+	}
+	err = errOr(err, f.Close())
+	if err != nil {
+		return "", fmt.Errorf("write prepared wal: %w", err)
+	}
+	return path, nil
+}
+
+func (s *FileStorage) commitPreparedSnapshot(prepared preparedSnapshot, delta []Entry) error {
+	p, ok := prepared.(*fileSnapshotPreparation)
+	if !ok || p.owner != s {
+		return fmt.Errorf("raft: invalid prepared snapshot")
+	}
+	if len(delta) > 0 {
+		if err := checkContiguous(delta, p.nextIndex); err != nil {
+			return fmt.Errorf("raft: commit snapshot delta: %w", err)
+		}
+	}
+	if err := appendPreparedWAL(p.walPath, delta); err != nil {
+		return err
+	}
+	if err := s.wal.replacePrepared(p.walPath); err != nil {
+		return err
+	}
+	p.walPath = ""
+	s.memLog.applySnapshot(p.meta)
+	return s.snaps.deleteAllExcept(snapshotName(p.meta))
+}
+
+func appendPreparedWAL(path string, entries []Entry) (err error) {
+	if len(entries) == 0 {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, walFilePerm)
+	if err != nil {
+		return fmt.Errorf("open prepared wal: %w", err)
+	}
+	defer func() { err = errOr(err, f.Close()) }()
+	if err = writeAllThenSync(f, encodeWALRecords(nil, entries)); err != nil {
+		return fmt.Errorf("append prepared wal: %w", err)
+	}
+	return nil
+}
+
+func (s *FileStorage) abortPreparedSnapshot(prepared preparedSnapshot) {
+	p, ok := prepared.(*fileSnapshotPreparation)
+	if ok && p.owner == s && p.walPath != "" {
+		_ = os.Remove(p.walPath)
+		p.walPath = ""
+	}
 }
 
 // readSnapshotData reads the FSM bytes, refusing anything larger than
@@ -252,12 +380,9 @@ func (s *FileStorage) OpenSnapshot() (io.ReadCloser, error) {
 	if !s.hasSnapshot() {
 		return nil, ErrNoSnapshot
 	}
-	_, fsm, ok, err := s.snaps.loadLatest()
+	fsm, err := s.snaps.load(s.memLog.snap)
 	if err != nil {
 		return nil, err
-	}
-	if !ok {
-		return nil, ErrNoSnapshot
 	}
 	return io.NopCloser(bytes.NewReader(fsm)), nil
 }

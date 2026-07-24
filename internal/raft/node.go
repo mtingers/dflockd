@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -90,7 +89,8 @@ type Node struct {
 	// rpcWG joins every goroutine sendRPC spawns. Close waits on it so
 	// no in-flight RPC outlives the node — this also gives TSAN clean
 	// happens-before edges between successive RPCs that reuse memory.
-	rpcWG sync.WaitGroup
+	rpcWG      sync.WaitGroup
+	snapshotWG sync.WaitGroup
 
 	// channels into the run loop
 	tickc       chan struct{}
@@ -103,10 +103,14 @@ type Node struct {
 	controlc  chan func()
 	applyc    chan applyReq    // run loop → apply goroutine
 	snapSavec chan snapSaveReq // apply goroutine → run loop
+	snapDonec chan snapshotPrepareResult
 	stopc     chan struct{}
 	donec     chan struct{}
 	applyDone chan struct{} // closed when the apply goroutine exits
 	stopOnce  sync.Once     // Close and fatal storage faults share stopc
+
+	snapshotInFlight bool         // run-loop-owned local snapshot preparation
+	pendingSnapshot  *snapSaveReq // newest capture waiting behind preparation
 
 	// counters records monotonic operational metrics (proposals, applies,
 	// leader-change count). Updated from many goroutines under atomics;
@@ -125,11 +129,19 @@ type confChange struct {
 }
 
 // snapSaveReq asks the run loop to persist a snapshot that the apply
-// goroutine has already captured + serialized. All storage writes happen
-// on the run loop so the embedded memLog stays single-threaded.
+// goroutine has already captured + serialized.
 type snapSaveReq struct {
 	meta SnapshotMeta
 	data []byte
+}
+
+type snapshotPrepareResult struct {
+	store    asyncSnapshotStorage
+	req      snapSaveReq
+	prepared preparedSnapshot
+	baseTail []Entry
+	through  Index
+	err      error
 }
 
 // proposal pairs an unappended-to-the-log payload with the Future that
@@ -243,6 +255,7 @@ func newNode(cfg Config, fsm FSM, rl *raftLog, transport Transport, config Confi
 		controlc:    make(chan func()),
 		applyc:      make(chan applyReq, cfg.ApplyChanDepth),
 		snapSavec:   make(chan snapSaveReq, 1),
+		snapDonec:   make(chan snapshotPrepareResult),
 		stopc:       make(chan struct{}),
 		donec:       make(chan struct{}),
 		applyDone:   make(chan struct{}),
@@ -328,6 +341,7 @@ func (n *Node) Close() error {
 	<-n.donec
 	<-n.applyDone
 	n.rpcWG.Wait()
+	n.snapshotWG.Wait()
 	return nil
 }
 
@@ -383,18 +397,12 @@ func (n *Node) run() {
 			fn()
 		case s := <-n.snapSavec:
 			n.onSnapshotSave(s)
+		case result := <-n.snapDonec:
+			n.onSnapshotPrepared(result)
 		}
 		if n.stopping() {
 			return
 		}
-	}
-}
-
-// onSnapshotSave persists a snapshot the apply goroutine captured. It is
-// the only writer of storage's snapshot file outside of installSnapshot.
-func (n *Node) onSnapshotSave(s snapSaveReq) {
-	if err := n.log.storage.SaveSnapshot(s.meta, bytes.NewReader(s.data)); err != nil {
-		n.failStorage("save snapshot", err)
 	}
 }
 

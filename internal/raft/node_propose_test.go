@@ -210,41 +210,55 @@ func TestEntriesPersistAcrossRestart(t *testing.T) {
 }
 
 func TestSnapshotTriggersAndCompactsLog(t *testing.T) {
-	// Set the threshold low so a handful of proposals triggers a
-	// snapshot; then check that storage no longer holds the old entries.
-	net := NewMemNetwork()
-	conf := configFor([]NodeID{"only"})
-	cfg := fastConfigID("only")
-	cfg.SnapshotThresholdEntries = 3
-	st := NewMemStorage()
-	fsm := newRecordingFSM()
-	n, err := NewNode(cfg, fsm, st, net.Transport("only"), conf, nil)
-	if err != nil {
-		t.Fatalf("NewNode: %v", err)
+	storages := []struct {
+		name string
+		open func(*testing.T) Storage
+	}{
+		{name: "mem", open: func(*testing.T) Storage { return NewMemStorage() }},
+		{name: "file", open: func(t *testing.T) Storage { return mustOpenFileStorage(t, t.TempDir()) }},
 	}
-	n.Start()
-	defer n.Close()
-	if _, ok := pollUntil(t, 2*time.Second, func() (struct{}, bool) { return struct{}{}, n.IsLeader() }); !ok {
-		t.Fatalf("did not become leader")
-	}
+	for _, storage := range storages {
+		t.Run(storage.name, func(t *testing.T) {
+			// Set the threshold low so a handful of proposals triggers a
+			// snapshot; then check that storage no longer holds the old entries.
+			net := NewMemNetwork()
+			conf := configFor([]NodeID{"only"})
+			cfg := fastConfigID("only")
+			cfg.SnapshotThresholdEntries = 3
+			st := storage.open(t)
+			defer st.Close()
+			fsm := newRecordingFSM()
+			transport := net.Transport("only")
+			defer transport.Close()
+			n, err := NewNode(cfg, fsm, st, transport, conf, nil)
+			if err != nil {
+				t.Fatalf("NewNode: %v", err)
+			}
+			n.Start()
+			defer n.Close()
+			if _, ok := pollUntil(t, 2*time.Second, func() (struct{}, bool) {
+				return struct{}{}, n.IsLeader()
+			}); !ok {
+				t.Fatal("did not become leader")
+			}
 
-	// Propose enough entries that the apply loop crosses the threshold.
-	for i := 0; i < 5; i++ {
-		f, _ := n.Propose(context.Background(), []byte(fmt.Sprintf("e%d", i)))
-		if _, err := mustWait(t, f, 2*time.Second); err != nil {
-			t.Fatalf("Wait %d: %v", i, err)
-		}
-	}
+			// Propose enough entries that the apply loop crosses the threshold.
+			for i := 0; i < 5; i++ {
+				f, _ := n.Propose(context.Background(), []byte(fmt.Sprintf("e%d", i)))
+				if _, err := mustWait(t, f, 2*time.Second); err != nil {
+					t.Fatalf("Wait %d: %v", i, err)
+				}
+			}
 
-	// Eventually a snapshot should be taken; we observe it through the
-	// node's Status() (run-loop-mediated) to avoid touching storage from
-	// the test goroutine concurrently with the run loop.
-	if _, ok := pollUntil(t, 2*time.Second, func() (struct{}, bool) {
-		s := n.Status()
-		return struct{}{}, s.LastSnapshotIndex > 0 && s.LogFirstIndex > 1
-	}); !ok {
-		s := n.Status()
-		t.Fatalf("expected a snapshot: snapshotIdx=%d firstIndex=%d", s.LastSnapshotIndex, s.LogFirstIndex)
+			// Observe through Status to avoid touching storage concurrently.
+			if _, ok := pollUntil(t, 2*time.Second, func() (struct{}, bool) {
+				s := n.Status()
+				return struct{}{}, s.LastSnapshotIndex > 0 && s.LogFirstIndex > 1
+			}); !ok {
+				s := n.Status()
+				t.Fatalf("expected a snapshot: snapshotIdx=%d firstIndex=%d",
+					s.LastSnapshotIndex, s.LogFirstIndex)
+			}
+		})
 	}
-	_ = st // intentionally unused after switching to Status()-based polling
 }

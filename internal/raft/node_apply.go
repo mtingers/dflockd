@@ -70,9 +70,8 @@ func (n *Node) fsmApplySafely(e Entry) (result any, err error) {
 }
 
 // maybeSnapshot triggers a snapshot if enough entries have accumulated
-// past the last one captured. The capture itself happens here (in the
-// apply goroutine, off the run loop); the durable write is delegated to
-// the run loop via snapSavec so the Storage stays single-threaded.
+// past the last one captured. Capture happens on the apply goroutine; storage
+// implementations that support preparation do durable work off the Raft loop.
 func (n *Node) maybeSnapshot(req applyReq) {
 	if !n.snapshotThresholdReached(req) {
 		return

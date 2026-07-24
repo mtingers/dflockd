@@ -103,14 +103,25 @@ func decodeSnapshotFSM(raw []byte, meta SnapshotMeta, off int) (SnapshotMeta, []
 type snapshotStore struct{ dir string }
 
 func (s snapshotStore) save(meta SnapshotMeta, fsm []byte) error {
-	if err := os.MkdirAll(s.dir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", s.dir, err)
-	}
-	name := snapshotName(meta)
-	if err := writeFileAtomic(filepath.Join(s.dir, name), encodeSnapshotFile(meta, fsm), snapshotFilePerm); err != nil {
+	name, err := s.write(meta, fsm)
+	if err != nil {
 		return err
 	}
 	return s.deleteAllExcept(name)
+}
+
+// write persists one snapshot without deleting the snapshot currently used by
+// the live log. Asynchronous preparation uses this so OpenSnapshot can keep
+// reading the old generation until the Raft loop publishes the new one.
+func (s snapshotStore) write(meta SnapshotMeta, fsm []byte) (string, error) {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", s.dir, err)
+	}
+	name := snapshotName(meta)
+	if err := writeFileAtomic(filepath.Join(s.dir, name), encodeSnapshotFile(meta, fsm), snapshotFilePerm); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 func (s snapshotStore) deleteAllExcept(keep string) error {
@@ -154,6 +165,22 @@ func (s snapshotStore) loadLatest() (SnapshotMeta, []byte, bool, error) {
 		return SnapshotMeta{}, nil, false, err
 	}
 	return s.pickBest(names)
+}
+
+func (s snapshotStore) load(meta SnapshotMeta) ([]byte, error) {
+	name := snapshotName(meta)
+	raw, err := readSnapshotFile(filepath.Join(s.dir, name))
+	if err != nil {
+		return nil, err
+	}
+	got, fsm, err := decodeSnapshotFile(raw)
+	if err != nil {
+		return nil, fmt.Errorf("raft: snapshot %s is corrupt: %w", name, err)
+	}
+	if got.LastIncludedIndex != meta.LastIncludedIndex || got.LastIncludedTerm != meta.LastIncludedTerm {
+		return nil, fmt.Errorf("raft: snapshot %s metadata mismatch", name)
+	}
+	return fsm, nil
 }
 
 // pickBest tries snapshot files in descending-index order and returns

@@ -195,6 +195,26 @@ func (w *walFile) rewrite(es []Entry) error {
 	return w.openAppendTruncated(int64(len(body)))
 }
 
+// replacePrepared atomically installs an already-fsynced WAL generation.
+// The current append handle remains usable until the rename succeeds.
+func (w *walFile) replacePrepared(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat prepared wal %s: %w", path, err)
+	}
+	if err := os.Rename(path, w.path); err != nil {
+		return fmt.Errorf("replace wal %s: %w", w.path, err)
+	}
+	if err := fsyncDir(w.path); err != nil {
+		return err
+	}
+	if err := w.f.Close(); err != nil {
+		return fmt.Errorf("close wal before reopen: %w", err)
+	}
+	w.f = nil
+	return w.openAppendTruncated(info.Size())
+}
+
 func (w *walFile) close() error {
 	if w.f == nil {
 		return nil

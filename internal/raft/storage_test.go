@@ -276,6 +276,113 @@ func TestFileStoragePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestFileStoragePreparedSnapshotCommitsConcurrentTail(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	appendN(t, s, 1, 1, 5)
+
+	meta := SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 1}
+	tail, err := s.Entries(4, 6)
+	if err != nil {
+		t.Fatalf("Entries for prepared tail: %v", err)
+	}
+	prepared, err := s.prepareSnapshot(meta, []byte("prepared"), tail)
+	if err != nil {
+		t.Fatalf("prepareSnapshot: %v", err)
+	}
+	appendN(t, s, 6, 2, 1)
+	delta, err := s.Entries(6, 7)
+	if err != nil {
+		t.Fatalf("Entries for prepared delta: %v", err)
+	}
+	if err := s.commitPreparedSnapshot(prepared, delta); err != nil {
+		t.Fatalf("commitPreparedSnapshot: %v", err)
+	}
+	if s.FirstIndex() != 4 || s.LastIndex() != 6 {
+		t.Fatalf("committed: first=%d last=%d, want 4/6", s.FirstIndex(), s.LastIndex())
+	}
+	if got := string(readSnapshot(t, s)); got != "prepared" {
+		t.Fatalf("committed snapshot data = %q, want prepared", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s2 := mustOpenFileStorage(t, dir)
+	defer s2.Close()
+	if s2.FirstIndex() != 4 || s2.LastIndex() != 6 {
+		t.Fatalf("reopened: first=%d last=%d, want 4/6", s2.FirstIndex(), s2.LastIndex())
+	}
+	entries, err := s2.Entries(4, 7)
+	if err != nil || len(entries) != 3 || entries[2].Index != 6 || entries[2].Term != 2 {
+		t.Fatalf("reopened entries = %+v, %v; want indexes 4..6 with term(6)=2", entries, err)
+	}
+}
+
+func TestFileStoragePreparedSnapshotIsCrashRecoverableBeforeCommit(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	appendN(t, s, 1, 1, 5)
+
+	meta := SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 1}
+	tail, err := s.Entries(4, 6)
+	if err != nil {
+		t.Fatalf("Entries for prepared tail: %v", err)
+	}
+	prepared, err := s.prepareSnapshot(meta, []byte("prepared"), tail)
+	if err != nil {
+		t.Fatalf("prepareSnapshot: %v", err)
+	}
+	s.abortPreparedSnapshot(prepared)
+	if _, ok := s.SnapshotMeta(); ok {
+		t.Fatal("prepared snapshot became live before commit")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s2 := mustOpenFileStorage(t, dir)
+	defer s2.Close()
+	if got, ok := s2.SnapshotMeta(); !ok || got.LastIncludedIndex != 3 {
+		t.Fatalf("recovered snapshot = %+v, %v; want index 3", got, ok)
+	}
+	if got := string(readSnapshot(t, s2)); got != "prepared" {
+		t.Fatalf("recovered snapshot data = %q, want prepared", got)
+	}
+	entries, err := s2.Entries(4, 6)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("recovered entries = %+v, %v; want indexes 4..5", entries, err)
+	}
+}
+
+func TestFileStoragePreparedSnapshotDoesNotReplaceLiveReader(t *testing.T) {
+	s := mustOpenFileStorage(t, t.TempDir())
+	defer s.Close()
+	appendN(t, s, 1, 1, 5)
+	mustSaveSnap(t, s, SnapshotMeta{LastIncludedIndex: 2, LastIncludedTerm: 1}, []byte("live"))
+
+	tail, err := s.Entries(5, 6)
+	if err != nil {
+		t.Fatalf("Entries for prepared tail: %v", err)
+	}
+	prepared, err := s.prepareSnapshot(
+		SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 1},
+		[]byte("prepared"),
+		tail,
+	)
+	if err != nil {
+		t.Fatalf("prepareSnapshot: %v", err)
+	}
+	defer s.abortPreparedSnapshot(prepared)
+
+	if got, ok := s.SnapshotMeta(); !ok || got.LastIncludedIndex != 2 {
+		t.Fatalf("live snapshot = %+v, %v; want index 2", got, ok)
+	}
+	if got := string(readSnapshot(t, s)); got != "live" {
+		t.Fatalf("live snapshot data = %q, want live", got)
+	}
+}
+
 func mustSaveHard(t *testing.T, s Storage, hs HardState) {
 	t.Helper()
 	if err := s.SaveHardState(hs); err != nil {

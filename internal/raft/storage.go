@@ -72,7 +72,25 @@ var (
 	// ErrNonContiguous means an Append's entries are not contiguous or do
 	// not start at LastIndex+1.
 	ErrNonContiguous = errors.New("raft: non-contiguous append")
+
+	// errSnapshotSuperseded is internal control flow for an asynchronous
+	// local snapshot overtaken by a newer installed snapshot.
+	errSnapshotSuperseded = errors.New("raft: snapshot superseded")
 )
+
+// preparedSnapshot is an opaque, storage-owned snapshot preparation.
+// Implementations create it off the Raft loop and finalize it on the loop.
+type preparedSnapshot interface{ isPreparedSnapshot() }
+
+// asyncSnapshotStorage is an optional optimization for local snapshots.
+// prepareSnapshot performs expensive durable I/O without mutating live log
+// state. commitPreparedSnapshot atomically publishes the prepared generation
+// after the Node supplies entries appended while preparation was in flight.
+type asyncSnapshotStorage interface {
+	prepareSnapshot(meta SnapshotMeta, data []byte, tail []Entry) (preparedSnapshot, error)
+	commitPreparedSnapshot(preparedSnapshot, []Entry) error
+	abortPreparedSnapshot(preparedSnapshot)
+}
 
 // ---------------------------------------------------------------------------
 // memLog — the in-memory log + snapshot bookkeeping shared by MemStorage and
