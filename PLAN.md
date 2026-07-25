@@ -24,10 +24,6 @@ Run dflockd as an **N-node (odd; 3 or 5) highly-available cluster**:
 
 - **Multi-Raft / sharded clusters.** One Raft group owns all keys. Horizontal
   scale-out via independent shards remains a "run more clusters" story.
-- **Failover-stable HTTP sessions.** TCP callers can opt into stable refs with
-  `--orphan-ttl` + `client.WithClusterStableRef`, preserving queue position and
-  held tokens across leadership changes. HTTP sessions are node-local and have
-  no stable-ref field; they must create a new session and re-enqueue.
 - **Cross-WAN / geo deployments.** Assumes a low-latency LAN between members and
   roughly NTP-synced clocks (lease deadlines are absolute wall-clock times — §4.6).
 - **Witness/arbiter-only nodes.** Every member is a full voting Raft member.
@@ -189,8 +185,9 @@ entry; it waits on the listener registered by `Enqueue`.
 
 The default client ref is the decimal form of a connection ID with a random
 per-process epoch in its high bits. TCP callers may instead send
-`stable-ref <opaque-id>` before their first operation. With
-`--orphan-ttl > 0`, reconnecting with that ref can reclaim the same
+`stable-ref <opaque-id>` before their first operation; HTTP callers may supply
+`stable_ref` when creating a session. With `--orphan-ttl > 0`, reconnecting or
+creating a replacement node-local session with that ref can reclaim the same
 waiter/holder after failover.
 
 ### 4.4 Who can mutate; client routing
@@ -279,12 +276,12 @@ waiter/holder after failover.
     connID check — §2 note) → seamless.
   - With the default connection-derived ref, a waiter re-enqueues at the back
     and a promoted-but-unobserved holder expires by lease.
-  - With `--orphan-ttl > 0` and a TCP stable ref, `ApplyAcquire` /
+  - With `--orphan-ttl > 0` and a stable ref, `ApplyAcquire` /
     `ApplyEnqueue` re-adopt the existing `(key, ref)` slot when the previous
     owner is provably gone (abandoned stamp or a different server-process
     connID epoch). FIFO position, salt, and any minted token are preserved.
-  - HTTP sessions have no stable-ref equivalent; after failover they create a
-    new node-local session and follow the default-ref behavior above.
+    TCP uses `client.WithClusterStableRef`; HTTP creates a replacement
+    node-local session with the same optional `stable_ref`.
 - `trySendGrant` semantics carry over: a notice that can't be delivered
   (full/closed/absent channel) is dropped; the holder entry persists; lease
   expiry is the backstop. This is already how the single-node code behaves on a
@@ -549,8 +546,8 @@ note staged. Phases are ordered so each builds on tested foundations.
 - `POST /v1/admin/voters` and `DELETE /v1/admin/voters/{id}` expose
   add/remove membership behind the separate default-deny admin token.
 - Handler, auth, route-parity, and OpenAPI synchronization tests shipped.
-- Done with one explicit limitation: HTTP sessions are node-local and cannot
-  opt into TCP stable-ref failover re-attachment.
+- Done: HTTP session IDs remain node-local, while optional `stable_ref`
+  preserves the replicated holder/waiter identity across replacement sessions.
 
 ### Phase 12 — dynamic membership changes
 - `cluster.Node.AddVoter(id, raftAddr, advertiseAddr)` and
@@ -576,7 +573,7 @@ note staged. Phases are ordered so each builds on tested foundations.
 - `docs/architecture/cluster.md`: the model, the diagram, the failure modes, the
   clock-skew posture, the FIFO-across-failover caveat, the persistence layout.
 - `docs/operations/cluster.md`: bootstrap a 3-node cluster; add/remove a node;
-  security, recovery, stable refs, HTTP limitations, and monitoring.
+  security, recovery, TCP/HTTP stable refs, failover behavior, and monitoring.
 - `docs/server.md`: the new flags table.
 - `docs/architecture/protocol.md`: `error_not_leader <addr>`.
 - README: a short "High availability" section pointing to the docs.
@@ -685,7 +682,7 @@ green; race-clean; docs complete.
 | FSM non-determinism (the silent killer — divergence). | `now`-in-command + `salt`-in-command + `FenceCounter`-in-state; a determinism property test; a grep-gate against `time.Now`/`rand` in the apply package. |
 | Cluster FSM work regresses single-node behaviour. | The direct methods remain the standalone path over shared resource structures; the existing `lock_test.go` suite is the regression guard. |
 | Lease semantics + clock skew. | Absolute deadlines in the FSM; leader-only sweep via `EvictExpired`; documented NTP assumption; renew-at-TTL/2 leaves margin for small skew. |
-| FIFO across failover. | TCP stable refs + `--orphan-ttl` preserve waiter/holder identity across reconnect; HTTP's lack of a stable-ref field remains explicit. |
+| FIFO across failover. | TCP and HTTP stable refs + `--orphan-ttl` preserve waiter/holder identity across reconnect; hard-failover regression tests assert the same token is returned. |
 | Scope creep / one giant unmergeable change. | Phased; each phase is independently green and reviewable; cluster code is wholly behind opt-in flags so it can land incrementally without affecting the shipped single-node server. |
 | Import cycles (`lock` ↔ `cluster`, `server` ↔ `cluster`). | `internal/raft` is application-agnostic; `cluster` imports `lock` + `raft`; `server` depends on its own `Cluster` interface; `cmd/dflockd` wires the concrete node. |
 
@@ -749,7 +746,8 @@ partial (sub-deliverable deferred — see note), `❌` = not shipped.*
       retries, member-clamped leader cache, terminal diagnostics, stable refs)
 - [x] Phase 11 — HTTP cluster awareness + admin endpoints ✅
       (`503 not_leader` + leader header, `/v1/readindex`, voter add/remove;
-      node-local sessions remain a documented limitation)
+      optional session `stable_ref` preserves replicated identity across
+      replacement node-local sessions)
 - [x] Phase 12 — dynamic membership changes ✅ (`AddVoter` /
       `RemoveServer`, admin surface, post-commit member publication,
       cold-node snapshot catch-up)
@@ -762,4 +760,4 @@ partial (sub-deliverable deferred — see note), `❌` = not shipped.*
 - [x] Phase 15 — production-readiness review ✅
       ([PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) +
       post-review P1-P3 hardening, authenticated Raft transport, and explicit
-      remaining follow-ons)
+      remaining multi-host soak follow-on)

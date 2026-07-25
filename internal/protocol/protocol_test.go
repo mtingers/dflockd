@@ -55,6 +55,31 @@ func TestParseRequest_Auth(t *testing.T) {
 	}
 }
 
+func TestValidateStableRef(t *testing.T) {
+	valid := []string{"worker-1", "tenant A / worker 7", strings.Repeat("x", MaxStableRefLen)}
+	for _, ref := range valid {
+		if err := ValidateStableRef(ref); err != nil {
+			t.Errorf("ValidateStableRef(%q): %v", ref, err)
+		}
+	}
+	invalid := []string{"", strings.Repeat("x", MaxStableRefLen+1), "line\nbreak", "snowman-\u2603"}
+	for _, ref := range invalid {
+		if err := ValidateStableRef(ref); err == nil {
+			t.Errorf("ValidateStableRef(%q) succeeded, want error", ref)
+		}
+	}
+}
+
+func TestParseRequest_StableRefTrimsOuterWhitespace(t *testing.T) {
+	req, err := parseRequest(CmdStableRef, "  worker A  ", "_", time.Second)
+	if err != nil {
+		t.Fatalf("stable-ref: %v", err)
+	}
+	if req.StableRef != "worker A" {
+		t.Fatalf("stable ref = %q, want %q", req.StableRef, "worker A")
+	}
+}
+
 func TestParseRequest_Acquire(t *testing.T) {
 	req, err := parseRequest("l", "key1", "10", 33*time.Second)
 	if err != nil {

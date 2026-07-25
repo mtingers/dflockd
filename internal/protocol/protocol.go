@@ -80,6 +80,23 @@ const (
 // more than enough for a UUID + a small prefix.
 const MaxStableRefLen = 64
 
+// ValidateStableRef applies the format shared by the TCP stable-ref
+// command and transport-specific adapters such as the HTTP API.
+func ValidateStableRef(ref string) error {
+	if ref == "" {
+		return errors.New("empty")
+	}
+	if len(ref) > MaxStableRefLen {
+		return fmt.Errorf("too long (%d > %d)", len(ref), MaxStableRefLen)
+	}
+	for _, r := range ref {
+		if r < 0x20 || r > 0x7e {
+			return errors.New("non-printable byte")
+		}
+	}
+	return nil
+}
+
 // Status values returned in responses.
 const (
 	StatusOK                   = "ok"
@@ -252,16 +269,8 @@ func parseAuthCommand(cmd, _, arg string, _ time.Duration) (*Request, error) {
 // must be non-empty and printable ASCII.
 func parseStableRefCommand(cmd, key, _ string, _ time.Duration) (*Request, error) {
 	ref := strings.TrimSpace(key)
-	if ref == "" {
-		return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: "stable-ref: empty"}
-	}
-	if len(ref) > MaxStableRefLen {
-		return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: fmt.Sprintf("stable-ref: too long (%d > %d)", len(ref), MaxStableRefLen)}
-	}
-	for _, r := range ref {
-		if r < 0x20 || r > 0x7e {
-			return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: "stable-ref: non-printable byte"}
-		}
+	if err := ValidateStableRef(ref); err != nil {
+		return nil, &ProtocolError{Code: ErrCodeInvalidArg, Message: "stable-ref: " + err.Error()}
 	}
 	return &Request{Cmd: cmd, StableRef: ref}, nil
 }

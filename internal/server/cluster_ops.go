@@ -238,7 +238,8 @@ func (s *Server) CleanupConnID(connID uint64) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
 	defer cancel()
-	_, err := c.ProposeCleanupConn(ctx, s.clusterRef(connID), s.clusterConnID(connID))
+	cid := s.clusterConnID(connID)
+	_, err := c.ProposeCleanupConn(ctx, s.effectiveRef(connID, cid), cid)
 	return err
 }
 

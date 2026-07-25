@@ -27,6 +27,8 @@ type fakeCluster struct {
 	leader        bool
 	leaderAddr    string
 	cleanupCalls  int
+	cleanupRef    string
+	cleanupConnID uint64
 	proposeErr    error
 	acquireResult lock.ApplyResult
 	releaseResult lock.ApplyResult
@@ -109,6 +111,8 @@ func (f *fakeCluster) ProposeRenew(ctx context.Context, key, token string, lease
 func (f *fakeCluster) ProposeCleanupConn(ctx context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
 	f.mu.Lock()
 	f.cleanupCalls++
+	f.cleanupRef = ref
+	f.cleanupConnID = connID
 	f.mu.Unlock()
 	return lock.ApplyResult{Status: lock.StatusOK}, nil
 }
@@ -312,6 +316,9 @@ func TestClusterCleanupOnConnTeardown(t *testing.T) {
 	s, _ := newTestServer(t)
 	fc := &fakeCluster{leader: true}
 	s.SetCluster(fc)
+	if !s.BindStableRef(7, "tcp-worker") {
+		t.Fatal("bind stable ref")
+	}
 	cliConn, srvConn := net.Pipe()
 	defer cliConn.Close()
 	defer srvConn.Close()
@@ -319,6 +326,14 @@ func TestClusterCleanupOnConnTeardown(t *testing.T) {
 	if got := atomicCleanupCount(fc); got != 1 {
 		t.Fatalf("cleanupCalls = %d, want 1", got)
 	}
+	ref, connID := cleanupIdentity(fc)
+	if ref != "tcp-worker" || uint32(connID) != 7 {
+		t.Fatalf("cleanup identity = (%q, %d), want stable ref and raw conn id 7", ref, connID)
+	}
+	if !s.BindStableRef(7, "binding-was-cleared") {
+		t.Fatal("TCP teardown did not clear the stable-ref binding")
+	}
+	s.ClearStableRef(7)
 }
 
 func TestClusterCleanupSkippedOnFollower(t *testing.T) {
@@ -338,6 +353,12 @@ func atomicCleanupCount(f *fakeCluster) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cleanupCalls
+}
+
+func cleanupIdentity(f *fakeCluster) (string, uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleanupRef, f.cleanupConnID
 }
 
 func TestFormatNotLeaderEmitsExtra(t *testing.T) {

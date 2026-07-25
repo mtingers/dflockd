@@ -85,7 +85,7 @@ func (s *Server) teardownConn(conn net.Conn, peer string, connID uint64, cancelC
 	} else if err := s.lm.CleanupConnection(connID); err != nil {
 		s.log.Error("connection cleanup failed", "peer", peer, "conn_id", connID, "err", err)
 	}
-	s.clearStableRef(connID)
+	s.ClearStableRef(connID)
 	s.log.Debug("client closed", "peer", peer, "conn_id", connID)
 }
 
@@ -96,7 +96,8 @@ func (s *Server) teardownConnClustered(c Cluster, peer string, connID uint64) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
 	defer cancel()
-	if _, err := c.ProposeCleanupConn(ctx, s.clusterRef(connID), s.clusterConnID(connID)); err != nil {
+	cid := s.clusterConnID(connID)
+	if _, err := c.ProposeCleanupConn(ctx, s.effectiveRef(connID, cid), cid); err != nil {
 		s.log.Warn("cluster cleanup propose failed", "peer", peer, "conn_id", connID, "err", err)
 	}
 }
@@ -361,7 +362,7 @@ func (s *Server) handleStableRef(req *protocol.Request, connID uint64) *protocol
 	if req.StableRef == "" {
 		return &protocol.Ack{Status: protocol.StatusError, Extra: "stable_ref_empty"}
 	}
-	if !s.setStableRef(connID, req.StableRef) {
+	if !s.BindStableRef(connID, req.StableRef) {
 		return &protocol.Ack{Status: protocol.StatusError, Extra: "stable_ref_already_set"}
 	}
 	return &protocol.Ack{Status: protocol.StatusOK}

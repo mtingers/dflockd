@@ -126,6 +126,7 @@ var (
 	ErrMaxSessions      = errors.New("max sessions reached")
 	ErrMaxSessionsPerIP = errors.New("max sessions per IP reached")
 	ErrShuttingDown     = errors.New("shutting down")
+	errStableRefBound   = errors.New("stable ref already bound")
 )
 
 // NewSessionStore creates a store and starts its idle sweeper.
@@ -175,6 +176,12 @@ func (st *SessionStore) Shutdown() {
 // Create mints a new session for ownerIP. Returns ErrShuttingDown,
 // ErrMaxSessions, or ErrMaxSessionsPerIP on failure.
 func (st *SessionStore) Create(ownerIP string) (*Session, error) {
+	return st.CreateWithStableRef(ownerIP, "")
+}
+
+// CreateWithStableRef mints a session whose cluster operations use
+// stableRef instead of its node-local connID-derived ref.
+func (st *SessionStore) CreateWithStableRef(ownerIP, stableRef string) (*Session, error) {
 	if st.ctx.Err() != nil {
 		return nil, ErrShuttingDown
 	}
@@ -182,8 +189,13 @@ func (st *SessionStore) Create(ownerIP string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	if stableRef != "" && !st.srv.BindStableRef(s.ConnID, stableRef) {
+		s.cancel()
+		return nil, errStableRefBound
+	}
 	installed, err := st.installSession(s, ownerIP)
 	if err != nil {
+		st.srv.ClearStableRef(s.ConnID)
 		s.cancel() // session never reached the map; release its ctx resources
 		return nil, err
 	}
@@ -366,6 +378,7 @@ func (st *SessionStore) closeSession(s *Session) error {
 }
 
 func (st *SessionStore) cleanupSession(s *Session) error {
+	defer st.srv.ClearStableRef(s.ConnID)
 	if st.cleanupConn == nil {
 		return nil
 	}

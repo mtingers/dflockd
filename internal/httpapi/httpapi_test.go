@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/protocol"
 	"github.com/mtingers/dflockd/internal/server"
 )
 
@@ -629,6 +631,40 @@ func TestHTTP_Sessions(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestHTTP_CreateSessionAcceptsStableRef(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+	c := newClient(t, base)
+
+	resp := c.post("/v1/sessions", createSessionRequest{StableRef: stringPtr("  worker A  ")})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create stable session: %d %s", resp.StatusCode, body)
+	}
+	var v createSessionResponse
+	decode(t, resp, &v)
+	if !IsValidSessionID(v.SessionID) {
+		t.Fatalf("session id = %q", v.SessionID)
+	}
+}
+
+func TestHTTP_CreateSessionRejectsInvalidStableRef(t *testing.T) {
+	base, stop := startHTTP(t)
+	defer stop()
+	c := newClient(t, base)
+
+	for _, ref := range []string{"", strings.Repeat("x", protocol.MaxStableRefLen+1), "line\nbreak", "snowman-\u2603"} {
+		resp := c.post("/v1/sessions", createSessionRequest{StableRef: stringPtr(ref)})
+		if resp.StatusCode != http.StatusBadRequest {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("stable_ref %q: status = %d, want 400; body=%s", ref, resp.StatusCode, body)
+		}
+		resp.Body.Close()
+	}
+}
+
+func stringPtr(s string) *string { return &s }
+
 // ---------------------------------------------------------------------------
 // Acquire / release
 // ---------------------------------------------------------------------------
@@ -1191,6 +1227,28 @@ func TestHTTP_MaxSessionsEnforced(t *testing.T) {
 	if e.Error != "max_sessions" {
 		t.Errorf("error = %q, want max_sessions", e.Error)
 	}
+}
+
+func TestSessionStore_StableRefCapFailureClearsBinding(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.HTTPMaxSessions = 1
+	log := discardLogger()
+	srv := testTCPServer(t, cfg, log)
+	store := NewSessionStore(context.Background(), srv, cfg.HTTPSessionIdleTimeout, cfg.HTTPMaxSessions, 0, log)
+	defer store.Shutdown()
+
+	first, err := store.Create("127.0.0.1")
+	if err != nil {
+		t.Fatalf("first session: %v", err)
+	}
+	failedConnID := first.ConnID + 1
+	if _, err := store.CreateWithStableRef("127.0.0.1", "rejected-by-cap"); !errors.Is(err, ErrMaxSessions) {
+		t.Fatalf("second session error = %v, want ErrMaxSessions", err)
+	}
+	if !srv.BindStableRef(failedConnID, "binding-was-cleared") {
+		t.Fatal("failed session creation leaked its stable-ref binding")
+	}
+	srv.ClearStableRef(failedConnID)
 }
 
 // TestHTTP_MaxSessionsPerIPEnforced exercises the per-IP cap. All

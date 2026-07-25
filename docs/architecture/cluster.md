@@ -102,7 +102,7 @@ nodes with identical state produce identical snapshot bytes.
 | Leader lost | A new election begins. A follower wins (Raft §5.4 election restriction guarantees its log is up-to-date) and serves writes. Clients see one or more `error_not_leader` redirects and retry. |
 | Full restart | Each node recovers its HardState + WAL + latest snapshot from `--raft-dir`. Once a quorum is alive an election runs. State is intact. |
 | Partition into a minority | Minority cannot commit (no quorum). Its local `stats` view may be stale; mutating clients see `error_not_leader` and retry against the majority. |
-| Client connection drops mid-`acquire` | Default connection-scoped refs lose blocked FIFO position after leader failure; a hard-failed leader's granted holder expires by lease. TCP stable refs with `--orphan-ttl` can re-attach to the same waiter or holder after the old owner is provably gone. HTTP sessions cannot opt in. |
+| Client connection drops mid-`acquire` | Default connection-scoped refs lose blocked FIFO position after leader failure; a hard-failed leader's granted holder expires by lease. TCP connections and replacement HTTP sessions using a stable ref with `--orphan-ttl` can re-attach to the same waiter or holder after the old owner is provably gone. |
 | Node disk fills | A failure on any durable HardState, WAL, or snapshot mutation logs the error and fail-stops the node before it can acknowledge non-durable state. |
 
 ## Clock-skew posture

@@ -23,8 +23,9 @@ identity that survives across requests. That identity is a
 LockManager.
 
 ```
-POST   /v1/sessions               → 200 {"session_id":"...","idle_timeout_s":20}
-DELETE /v1/sessions/{id}          → 204 (releases anything held; 503 if cleanup cannot advance fences)
+POST   /v1/sessions               body: empty or {"stable_ref":"..."}
+                                    → 200 {"session_id":"...","idle_timeout_s":20}
+DELETE /v1/sessions/{id}          → 204 (cleans up or orphans state; see below)
 POST   /v1/sessions/{id}/ping     → 204 (refreshes idle timer)
 ```
 
@@ -32,18 +33,37 @@ Carry the session ID on every lock-modifying request via
 `X-Dflockd-Session: <id>`. A request without the header gets HTTP
 400; an unknown or expired session gets HTTP 410 (`session_gone`).
 
-An HTTP session is node-local, not a failover-stable client identity.
-The HTTP API has no equivalent of the TCP `stable-ref` command. After
-a cluster leader failure, create a session on the new leader and retry;
-any blocked FIFO position is lost. `--orphan-ttl` does not preserve HTTP
-sessions. Tokens already returned to the caller remain valid for
-`renew` and `release` on the new leader.
+Session IDs are node-local. In cluster mode, callers can separately opt
+into failover-stable FSM identity by creating the session with a
+caller-generated printable ASCII `stable_ref` of at most 64 bytes:
+
+```bash
+curl -sS -X POST http://node-a:6389/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"stable_ref":"worker-01-6f1b7e8c"}'
+```
+
+Set `--orphan-ttl > 0` identically on every member. After a leader
+failure or redirect, create a new node-local session on the new leader
+with the **same** `stable_ref`, then retry `acquire` or `enqueue`. The
+FSM re-attaches the original holder or waiter: a held token and a
+waiter's FIFO position are preserved. The empty-body create request
+remains supported and uses the default, failover-unstable identity.
+
+Stable refs are caller-supplied identifiers, not authentication
+credentials. Generate them randomly, do not log or share them, and
+treat them like session tokens. One ref identifies one logical session;
+do not use it concurrently from multiple live sessions.
 
 Sessions die in three ways:
 
-1. **Explicit `DELETE`.** Synchronous; held tokens are released
-   before the response returns. If cleanup cannot allocate a fence for
-   the next waiter, the response is `503 fence_persistence`.
+1. **Explicit `DELETE`.** Synchronous. Default sessions release held
+   tokens before the response returns. In an orphan-enabled cluster,
+   stable-ref session slots are marked abandoned for re-attachment and
+   expire after `--orphan-ttl`. Release known tokens before deletion
+   when the logical session is finished. If immediate cleanup cannot
+   allocate a fence for the next waiter, the response is
+   `503 fence_persistence`.
 2. **Idle timeout.** A background sweeper reaps any session whose
    `lastSeen` falls behind 2× `--http-session-idle-timeout`.
    In-flight handlers are immune for the duration of the request.

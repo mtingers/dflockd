@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTTP stable refs.** `POST /v1/sessions` now accepts an optional
+  `{"stable_ref":"..."}` body. With `--orphan-ttl > 0`, recreating a
+  node-local session on the new leader with the same printable
+  64-byte ref lets a retried `acquire` or `enqueue` re-attach the
+  replicated holder/waiter slot, preserving its token or FIFO position.
+  Empty-body session creation remains backward compatible. Stable refs
+  are bound before session publication, cleared after cleanup, and use
+  the same validation and FSM identity path as TCP. A shared-FSM
+  leader-change regression test asserts that HTTP re-attachment returns
+  the original held token.
 - **PR-5: failover re-attach actually closes — hard crash + the primary Acquire path + the `--orphan-ttl` flag.** PR-4 shipped the stable-ref mechanism but left three gaps that meant the headline promise didn't hold for the case that matters. PR-5 closes them. (1) **Hard crash.** The re-adopt finders required `abandonedAtNanos != 0` — a stamp set *only* by the graceful `ApplyCleanupConn` path. On a hard leader crash (`kill -9`, partition) no `CleanupConn` is replicated, so the slot the new leader inherits still has `abandonedAtNanos == 0` and the old finders skipped it — i.e. the actual failover scenario didn't re-attach. Re-adopt now matches by `(key, ref)` alone (`findHolderByRef` / `findWaiterByRef`), so a reconnect reclaims its slot whether the previous connection closed gracefully or vanished. (2) **The primary API.** Re-adopt was wired only into the two-phase `ApplyEnqueue`; the single-phase `ApplyAcquire` (what `client.Acquire` / `cl.Acquire` use — the common blocking-lock path) had no re-adopt at all, so a reconnecting holder queued behind its own orphan and timed out. Re-adopt now runs in both paths via a shared `reAttachByRef` helper. (3) **Dead-conn cleanup.** On re-adopt the previous connection's stale `connOwned` / `connEnqueued` index entries are now evicted (`evictDeadConn`), so a hard-crashed conn id can't later corrupt the re-adopted slot or leak. (4) **The flag.** `--orphan-ttl` (and `DFLOCKD_ORPHAN_TTL_S`) is now actually wired — PR-4 added the `Config.OrphanTTL` field but no flag/env parser, so the feature could never be enabled in a real deployment. The loader rejects `--orphan-ttl > 0` outside cluster mode (it's a no-op there). New regression guard `internal/cluster.TestE2EStableRefReAttachAcrossFailover` proves end-to-end over real TCP that a held lock survives a hard leader crash and returns the same token on reconnect (it times out without the `ApplyAcquire` fix). Default `OrphanTTL = 0` still preserves byte-identical legacy behavior.
 - **PR-4: FIFO across leader failover via stable client refs.** Introduces the stable-ref mechanism (completed in PR-5 — see above). New mechanism: when `--orphan-ttl > 0` is set on every node, the FSM's `ApplyCleanupConn` marks ref-tagged waiters and holders "orphaned" (stamps `AbandonedAtNanos`) instead of removing them on TCP disconnect. A reconnect with matching `(key, ref)` re-adopts the existing FSM slot via `ApplyEnqueue`, preserving the original salt + queue position + minted token. The `EvictExpired` sweep retires orphans past `OrphanTTL`. Wire protocol: new `stable-ref <ref>` TCP command (`protocol.CmdStableRef`) locks the caller-supplied opaque identifier onto the connection; subsequent acquire/enqueue/wait use it as the FSM ref instead of the connID-derived default. Go client: `client.SetStableRef(conn, ref)` and `client.WithClusterStableRef(ref)` opt callers into the failover-safe path. Snapshot codec bumped to v2 (the new `abandonedAtNanos` field on holder + waiter); v1 snapshots are still readable (the field defaults to 0). Default `OrphanTTL = 0` preserves byte-identical pre-PR-4 behavior — operators opt in by setting it. Security: refs are caller-supplied opaque identifiers, NOT authenticated credentials; treat them like session tokens (generate randomly, don't log, don't share). The `--auth-token` mechanism, when set, auth-gates the connection before the ref is accepted.
 - **PR-3: dynamic-join with InstallSnapshot validated.** A new integration test (`internal/cluster.TestDynamicJoinColdNodeCatchesUpViaSnapshot`) brings up a 3-node cluster with a low snapshot threshold, drives enough commits to force a snapshot, calls `AddVoter("n4")`, then starts n4 with empty `MemStorage`. n4 catches up via the leader's `sendAppendEntries → sendInstallSnapshot` fallback; the test asserts `LastSnapshotIndex > 0` on n4 to prove the InstallSnapshot path was traversed (not just AppendEntries). Closes PR-2 deferred item 3 (Gap 2). No production code change required — the mechanism was already wired; PR-3 supplies the test.
@@ -41,8 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-process soak scope, and shipped metric set. The Phase 15 checklist
   now carries current verdicts instead of pre-implementation boxes.
   `PRODUCTION_READINESS.md` records the completed P1-P3 hardening audit
-  and retains the two real follow-ons: HTTP stable refs and multi-host
-  fault-injection soak.
+  and retains the remaining multi-host fault-injection soak follow-on.
 - `lock.NewLockManager` and `internal/server.Server` gain non-breaking additions: `SetCluster(c)` enables the cluster-mode handler path; mutating commands on a follower return `error_not_leader <addr>`; the per-conn cleanup proposes `CleanupConn` through the cluster; the lock manager's lease-expiry / GC loops are suppressed in cluster mode (a leader-driven `EvictExpired` / `GC` sweep through Raft replaces them).
 - Semaphore `limit` is now capped at 1,048,576 (`MaxSemaphoreLimit`) at parse time — far above any real use; the bound just keeps the value within the cluster snapshot's fixed-width encoding.
 
@@ -100,10 +109,12 @@ Resolved in this release:
   writes and periodic in-process leader kills.
 - ~~Unexpected `FSM.Apply` panic leaves the node running~~ → Apply
   panics and installed-snapshot Restore failures now fail-stop.
+- ~~HTTP sessions cannot opt into stable-ref failover re-attachment~~ →
+  optional `stable_ref` on session creation reuses the replicated
+  identity across replacement node-local sessions.
 
 Still open (tracked in `PRODUCTION_READINESS.md`):
 
-- HTTP sessions cannot opt into stable-ref failover re-attachment.
 - Long-horizon multi-host partition and clock-skew soak remains outside CI.
 
 ## [v2.1.1] - 2026-05-11

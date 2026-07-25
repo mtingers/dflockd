@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mtingers/dflockd/internal/config"
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/raft"
 	"github.com/mtingers/dflockd/internal/server"
@@ -26,6 +28,8 @@ type httpFakeCluster struct {
 	releaseResult lock.ApplyResult
 	renewResult   lock.ApplyResult
 	cleanupCalls  int
+	cleanupRef    string
+	cleanupConnID uint64
 }
 
 var _ server.Cluster = (*httpFakeCluster)(nil)
@@ -56,9 +60,11 @@ func (f *httpFakeCluster) ProposeRelease(_ context.Context, _, _ string) (lock.A
 func (f *httpFakeCluster) ProposeRenew(_ context.Context, _, _ string, _ time.Duration) (lock.ApplyResult, error) {
 	return f.renewResult, nil
 }
-func (f *httpFakeCluster) ProposeCleanupConn(_ context.Context, _ string, _ uint64) (lock.ApplyResult, error) {
+func (f *httpFakeCluster) ProposeCleanupConn(_ context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
 	f.mu.Lock()
 	f.cleanupCalls++
+	f.cleanupRef = ref
+	f.cleanupConnID = connID
 	f.mu.Unlock()
 	return lock.ApplyResult{Status: lock.StatusOK}, nil
 }
@@ -259,7 +265,7 @@ func TestHTTPCluster_MetricsHasRaftGauges(t *testing.T) {
 func TestHTTPCluster_SessionDeleteProposesCleanup(t *testing.T) {
 	fc := &httpFakeCluster{leader: true}
 	hs := newClusterHTTPTest(t, fc)
-	s, err := hs.sessions.Create("127.0.0.1")
+	s, err := hs.sessions.CreateWithStableRef("127.0.0.1", "worker-delete")
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -270,8 +276,176 @@ func TestHTTPCluster_SessionDeleteProposesCleanup(t *testing.T) {
 	}
 	fc.mu.Lock()
 	got := fc.cleanupCalls
+	ref := fc.cleanupRef
+	connID := fc.cleanupConnID
 	fc.mu.Unlock()
 	if got != 1 {
 		t.Fatalf("ProposeCleanupConn called %d times, want 1", got)
 	}
+	if ref != "worker-delete" || connID == 0 {
+		t.Fatalf("cleanup identity = (%q, %d), want stable ref + non-zero connID", ref, connID)
+	}
+	if !hs.sessions.Server().BindStableRef(s.ConnID, "reused-after-delete") {
+		t.Fatal("stable-ref binding was not cleared after session deletion")
+	}
+	hs.sessions.Server().ClearStableRef(s.ConnID)
+}
+
+type applyHTTPCluster struct {
+	*httpFakeCluster
+	lm         *lock.LockManager
+	acquireRef string
+	acquireCID uint64
+	enqueueRef string
+	enqueueCID uint64
+}
+
+func (f *applyHTTPCluster) ProposeAcquire(_ context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error) {
+	f.mu.Lock()
+	f.acquireRef = ref
+	f.acquireCID = connID
+	f.mu.Unlock()
+	result, grants, err := f.lm.ApplyAcquire(time.Now(), key, limit, ref, connID, leaseTTL, salt)
+	f.lm.RouteGrants(grants)
+	return result, err
+}
+
+func (f *applyHTTPCluster) ProposeEnqueue(_ context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error) {
+	f.mu.Lock()
+	f.enqueueRef = ref
+	f.enqueueCID = connID
+	f.mu.Unlock()
+	result, grants, err := f.lm.ApplyEnqueue(time.Now(), key, limit, ref, connID, leaseTTL, salt)
+	f.lm.RouteGrants(grants)
+	return result, err
+}
+
+func (f *applyHTTPCluster) ProposeCleanupConn(_ context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
+	result, grants, err := f.lm.ApplyCleanupConn(time.Now(), ref, connID)
+	f.lm.RouteGrants(grants)
+	return result, err
+}
+
+func TestHTTPCluster_StableRefReattachesAcrossLeaderChange(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.OrphanTTL = time.Minute
+	log := discardLogger()
+	lm, err := lock.NewLockManager(cfg, log)
+	if err != nil {
+		t.Fatalf("NewLockManager: %v", err)
+	}
+	defer lm.Close()
+
+	clusterA := &applyHTTPCluster{httpFakeCluster: &httpFakeCluster{leader: true}, lm: lm}
+	clusterB := &applyHTTPCluster{httpFakeCluster: &httpFakeCluster{leader: false}, lm: lm}
+	hsA := newHTTPServerForSharedFSM(t, cfg, log, lm, clusterA)
+	hsB := newHTTPServerForSharedFSM(t, cfg, log, lm, clusterB)
+	defer shutdownTestHTTPServer(hsA)
+	defer shutdownTestHTTPServer(hsB)
+
+	sessionA := createStableSession(t, hsA, "worker-failover")
+	first := acquireViaClusterHTTP(t, hsA, sessionA, "failover-key")
+	clusterA.mu.Lock()
+	refA, cidA := clusterA.acquireRef, clusterA.acquireCID
+	clusterA.mu.Unlock()
+	blockerA := createStableSession(t, hsA, "queue-blocker")
+	acquireViaClusterHTTP(t, hsA, blockerA, "queued-key")
+	waiterA := createStableSession(t, hsA, "queued-worker")
+	if queued := enqueueViaClusterHTTP(t, hsA, waiterA, "queued-key"); queued.Status != "queued" {
+		t.Fatalf("initial enqueue status = %q, want queued", queued.Status)
+	}
+
+	clusterA.setLeader(false)
+	clusterB.setLeader(true)
+	sessionB := createStableSession(t, hsB, "worker-failover")
+	second := acquireViaClusterHTTP(t, hsB, sessionB, "failover-key")
+	waiterB := createStableSession(t, hsB, "queued-worker")
+	if queued := enqueueViaClusterHTTP(t, hsB, waiterB, "queued-key"); queued.Status != "queued" {
+		t.Fatalf("re-attached enqueue status = %q, want queued", queued.Status)
+	}
+
+	if first.Token == "" || second.Token != first.Token {
+		t.Fatalf("re-attached token = %q, want original %q", second.Token, first.Token)
+	}
+	clusterB.mu.Lock()
+	refB, cidB := clusterB.acquireRef, clusterB.acquireCID
+	clusterB.mu.Unlock()
+	if refA != "worker-failover" || refB != refA {
+		t.Fatalf("acquire refs = (%q, %q), want stable ref on both leaders", refA, refB)
+	}
+	if cidA>>32 == cidB>>32 {
+		t.Fatalf("server epochs unexpectedly match: cidA=%d cidB=%d", cidA, cidB)
+	}
+	clusterB.mu.Lock()
+	enqueueRef, enqueueCID := clusterB.enqueueRef, clusterB.enqueueCID
+	clusterB.mu.Unlock()
+	if enqueueRef != "queued-worker" || !lm.HasActiveWaiterForTest("lock:queued-key", enqueueRef, enqueueCID) {
+		t.Fatalf("queued waiter was not rebound: ref=%q cid=%d", enqueueRef, enqueueCID)
+	}
+	if got := lm.CountWaitersForTest("lock:queued-key"); got != 1 {
+		t.Fatalf("queued-key waiters = %d, want 1 re-attached slot", got)
+	}
+}
+
+func newHTTPServerForSharedFSM(t *testing.T, cfg *config.Config, log *slog.Logger, lm *lock.LockManager, cluster server.Cluster) *httpServer {
+	t.Helper()
+	srv := server.New(lm, cfg, log)
+	srv.SetCluster(cluster)
+	hs, _ := buildHTTPServer(context.Background(), srv, cfg, log)
+	return hs
+}
+
+func shutdownTestHTTPServer(hs *httpServer) {
+	hs.limiter.Stop()
+	hs.sessions.Shutdown()
+}
+
+func createStableSession(t *testing.T, hs *httpServer, ref string) *Session {
+	t.Helper()
+	body, err := json.Marshal(createSessionRequest{StableRef: &ref})
+	if err != nil {
+		t.Fatalf("marshal session request: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	hs.handleCreateSession(rec, httptest.NewRequest(http.MethodPost, "/v1/sessions", strings.NewReader(string(body))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create stable session: status=%d body=%s", rec.Code, rec.Body)
+	}
+	var response createSessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode session response: %v", err)
+	}
+	session, err := hs.sessions.Lookup(response.SessionID)
+	if err != nil {
+		t.Fatalf("lookup session: %v", err)
+	}
+	return session
+}
+
+func acquireViaClusterHTTP(t *testing.T, hs *httpServer, session *Session, key string) opResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	hs.runAcquireCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/"+key, nil), session, key, lock.LockPrefix, 1, 0, 30)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("acquire: status=%d body=%s", rec.Code, rec.Body)
+	}
+	var response opResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode acquire response: %v", err)
+	}
+	return response
+}
+
+func enqueueViaClusterHTTP(t *testing.T, hs *httpServer, session *Session, key string) opResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	hs.runEnqueueCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/"+key+"/enqueue", nil), session, key, lock.LockPrefix, 1, 30)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enqueue: status=%d body=%s", rec.Code, rec.Body)
+	}
+	var response opResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode enqueue response: %v", err)
+	}
+	return response
 }

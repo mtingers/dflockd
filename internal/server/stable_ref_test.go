@@ -9,10 +9,10 @@ import (
 // to an error response).
 func TestSetStableRefOnceOnly(t *testing.T) {
 	srv, _ := newTestServer(t)
-	if !srv.setStableRef(7, "alice") {
+	if !srv.BindStableRef(7, "alice") {
 		t.Fatalf("first SetStableRef: want true (fresh), got false")
 	}
-	if srv.setStableRef(7, "mallory") {
+	if srv.BindStableRef(7, "mallory") {
 		t.Fatalf("second SetStableRef on same connID: want false (locked), got true")
 	}
 	if got := srv.stableRefFor(7); got != "alice" {
@@ -28,23 +28,23 @@ func TestEffectiveRefFallsBackToConnID(t *testing.T) {
 	if got := srv.effectiveRef(1, 42); got != "42" {
 		t.Fatalf("no stable ref: effectiveRef = %q, want %q", got, "42")
 	}
-	srv.setStableRef(1, "session-abc")
+	srv.BindStableRef(1, "session-abc")
 	if got := srv.effectiveRef(1, 42); got != "session-abc" {
 		t.Fatalf("with stable ref: effectiveRef = %q, want %q", got, "session-abc")
 	}
 }
 
-// TestClearStableRefReleasesSlot: clearStableRef must drop the entry
-// so a future setStableRef on the same connID succeeds (this matters
+// TestClearStableRefReleasesSlot: ClearStableRef must drop the entry
+// so a future BindStableRef on the same connID succeeds (this matters
 // in tests / single-conn-id reuse; in prod connIDs are monotonic).
 func TestClearStableRefReleasesSlot(t *testing.T) {
 	srv, _ := newTestServer(t)
-	_ = srv.setStableRef(9, "first")
-	srv.clearStableRef(9)
+	_ = srv.BindStableRef(9, "first")
+	srv.ClearStableRef(9)
 	if got := srv.stableRefFor(9); got != "" {
 		t.Fatalf("stableRefFor after clear = %q, want empty", got)
 	}
-	if !srv.setStableRef(9, "second") {
+	if !srv.BindStableRef(9, "second") {
 		t.Fatalf("re-set after clear: want true, got false")
 	}
 }

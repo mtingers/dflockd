@@ -203,27 +203,36 @@ rather than blindly following the header. Read-only endpoints
 (`/health`, `/ready`, `/v1/stats`, `/metrics`, `/openapi.json`) work on
 any node.
 
-HTTP session IDs are node-local and there is no HTTP equivalent of the
-TCP `stable-ref` command. After a leader failure, an HTTP caller must
-create a session on the new leader and retry; a blocked acquisition
-re-enters at the back of the queue. `--orphan-ttl` does not preserve
-HTTP sessions. A token the caller already observed remains valid for
-`renew` or `release` on the new leader.
+HTTP session IDs remain node-local. `POST /v1/sessions` accepts an
+optional body containing a caller-generated stable identity:
+
+```json
+{"stable_ref":"worker-01-6f1b7e8c"}
+```
+
+With `--orphan-ttl > 0`, recreate the session on the new leader with the
+same `stable_ref`, then retry `acquire` or `enqueue`. The new session
+re-attaches the replicated holder or waiter, preserving its token or
+FIFO position. Empty-body session creation keeps the default behavior:
+after failover the caller creates a new session and re-enters at the
+back. A token the caller already observed remains valid for `renew` or
+`release` either way.
 
 ## FIFO across leader failover (stable client refs)
 
-A TCP caller holding — or blocked waiting on — a lock when the leader
-fails ordinarily loses its place (the holder/waiter slot is keyed by
-TCP connection id, which the new leader doesn't recognize). **Stable
-client refs** fix this for TCP clients. HTTP sessions cannot opt in; see
-"HTTP API in cluster mode" above.
+A caller holding — or blocked waiting on — a lock when the leader fails
+ordinarily loses its place because the holder/waiter slot is keyed by a
+node-local connection id. **Stable client refs** give TCP connections
+and HTTP replacement sessions the same replicated identity.
 
 1. Set `--orphan-ttl 30` (seconds; or `DFLOCKD_ORPHAN_TTL_S`) on every
    node so the FSM retains a ref-tagged holder/waiter that long after
    its connection drops. The value must be identical on every member —
    it's read in the replicated apply path — and cluster-mode only (the
    loader rejects `--orphan-ttl > 0` without `--raft-dir`).
-2. The Go client opts in via `client.WithClusterStableRef("session-X")`.
+2. A Go TCP client opts in via
+   `client.WithClusterStableRef("session-X")`. An HTTP caller supplies
+   `{"stable_ref":"session-X"}` when creating each replacement session.
 
 ```go
 cl, _ := client.NewCluster(members,
@@ -274,11 +283,11 @@ connection closed. Treat refs like session tokens: generate randomly
 `--auth-token` mechanism, when set, gates the connection before the ref
 is accepted.
 
-**One ref, one connection.** A ref identifies a single client session.
-Do not share one across concurrent operations — two operations on the
-same key under one ref are two claims on the same slot, and `Cluster`
-dials a fresh connection per call, so give each concurrent worker its
-own `Cluster` (or its own ref).
+**One ref, one logical session.** Do not share one across concurrent
+TCP connections or HTTP sessions. Two operations on the same key under
+one ref are two claims on the same slot, and `Cluster` dials a fresh
+connection per call, so give each concurrent worker its own `Cluster`
+(or its own ref).
 
 ## Using the cluster-aware Go client
 
@@ -330,8 +339,9 @@ pre-release smoke; a long-horizon, multi-host harness is a follow-on.
   Already-granted tokens survive seamlessly (the client can `renew` /
   `release` them against the new leader). To preserve queue position
   and re-attach to a held lock across failover — including a
-  hard-crashed leader — enable stable client refs (`--orphan-ttl` +
-  `WithClusterStableRef`); see "FIFO across leader failover" above.
+  hard-crashed leader — enable stable client refs (`--orphan-ttl` plus
+  `WithClusterStableRef` for TCP or `stable_ref` at HTTP session
+  creation); see "FIFO across leader failover" above.
 - **Dynamic-join with snapshot transfer** to a node started with
   empty `--raft-dir` works as of PR-3. Operator flow: `AddVoter` on
   the leader, then start the new node with empty storage and

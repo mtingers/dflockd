@@ -106,8 +106,20 @@ type createSessionResponse struct {
 	IdleTimeoutS int    `json:"idle_timeout_s"`
 }
 
+type createSessionRequest struct {
+	StableRef *string `json:"stable_ref,omitempty"`
+}
+
 func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	s, err := h.sessions.Create(remoteIPFromAddr(r.RemoteAddr))
+	var req createSessionRequest
+	if !decodeJSONBody(w, r, &req, true) {
+		return
+	}
+	stableRef, ok := validateCreateSession(w, req)
+	if !ok {
+		return
+	}
+	s, err := h.sessions.CreateWithStableRef(remoteIPFromAddr(r.RemoteAddr), stableRef)
 	if err != nil {
 		h.writeCreateSessionErr(w, err)
 		return
@@ -115,6 +127,18 @@ func (h *httpServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, createSessionResponse{
 		SessionID: s.ID, IdleTimeoutS: int(h.sessions.IdleTimeout().Seconds()),
 	})
+}
+
+func validateCreateSession(w http.ResponseWriter, req createSessionRequest) (string, bool) {
+	if req.StableRef == nil {
+		return "", true
+	}
+	ref := strings.TrimSpace(*req.StableRef)
+	if err := protocol.ValidateStableRef(ref); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "stable_ref: "+err.Error())
+		return "", false
+	}
+	return ref, true
 }
 
 // writeCreateSessionErr maps Create errors to HTTP responses. Known

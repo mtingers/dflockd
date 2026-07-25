@@ -44,8 +44,8 @@ type Server struct {
 	// disconnect cleanup) can consume/cancel it — closing the lost-
 	// wakeup window between the Enqueue's commit and the client's Wait.
 	pendingGrants sync.Map // uint64 connID → *pendingGrant
-	// stableRefs maps connID → caller-supplied stable ref (set by the
-	// stable-ref TCP command). When non-empty, the ref overrides the
+	// stableRefs maps connID → caller-supplied stable ref. TCP and HTTP
+	// callers can opt in; when non-empty, the ref overrides the
 	// connID-derived ref in cluster-mode propose calls so a reconnect
 	// after leader failover re-attaches to the original FSM slot.
 	stableRefs sync.Map // uint64 connID → string
@@ -76,17 +76,17 @@ func (s *Server) stableRefFor(connID uint64) string {
 	return r
 }
 
-// setStableRef records ref for connID. Returns false if a ref was
-// already set (the stable-ref command is once-per-connection).
-func (s *Server) setStableRef(connID uint64, ref string) bool {
+// BindStableRef records ref for connID. Returns false if a ref was
+// already bound. A transport must bind at most once per connection or
+// virtual connection, before it performs any cluster lock operation.
+func (s *Server) BindStableRef(connID uint64, ref string) bool {
 	_, loaded := s.stableRefs.LoadOrStore(connID, ref)
 	return !loaded
 }
 
-// clearStableRef drops the stable ref entry for connID. Called from
-// the per-conn teardown path so an exiting connection releases the
-// map slot.
-func (s *Server) clearStableRef(connID uint64) {
+// ClearStableRef drops the stable ref entry for connID. Transports call
+// it after cleanup so an exiting connection releases the map slot.
+func (s *Server) ClearStableRef(connID uint64) {
 	s.stableRefs.Delete(connID)
 }
 

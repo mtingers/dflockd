@@ -9,12 +9,10 @@ partial / caveated; `⏳` = not yet, with a pointer to the follow-on.
 
 Cluster mode is **GA-eligible for static-bootstrap workloads.** FIFO
 across a leader failover — once the headline gap — is now available to
-TCP clients as an opt-in (stable client refs; see below). HTTP sessions
-cannot opt into stable refs and lose blocked queue positions on
-failover. Two follow-ons remain: an HTTP stable-ref equivalent and a
-long-horizon multi-host soak harness. Everything else from the original
-§7 checklist is implemented or N/A. The production-hardening passes
-reflected here:
+TCP and HTTP clients as an opt-in (stable client refs; see below).
+One follow-on remains: a long-horizon multi-host soak harness.
+Everything else from the original §7 checklist is implemented or N/A.
+The production-hardening passes reflected here:
 
 - **PR-1** (the alpha → beta lift): admin endpoints, default-deny
   admin token, counter metrics, public ReadIndex/Barrier API,
@@ -29,6 +27,10 @@ reflected here:
   single-phase `Acquire` path (not just two-phase `Enqueue`), and the
   `--orphan-ttl` flag itself (PR-4 left it unwired). Proven end-to-end
   by `TestE2EStableRefReAttachAcrossFailover`.
+- **HTTP stable refs**: `POST /v1/sessions` accepts an optional
+  `stable_ref`; replacement node-local sessions reuse it to re-attach
+  replicated holders and waiters. A shared-FSM leader-change regression
+  guard asserts that HTTP receives the original held token.
 - **Post-review P1-P3 audit**: closed per-peer snapshot gating, fatal
   storage-fault handling, asynchronous local snapshot persistence,
   lock-free leadership reads, post-commit membership publication,
@@ -43,15 +45,13 @@ reflected here:
   (every member listed before bootstrap), with `AddVoter` /
   `RemoveServer` reserved for grow/shrink against a node whose
   `--cluster-peers` already lists the cluster.
-- Your TCP callers either enable stable client refs (`--orphan-ttl` +
-  `client.WithClusterStableRef`) to keep their queue slot / held lock
-  across a failover, or tolerate a "lost queue slot" outcome when a
-  leader fails *while they were blocked* in `acquire` / `wait` —
-  already-granted tokens (`renew`, `release`) survive seamlessly
-  either way.
-- Your HTTP callers tolerate recreating their node-local session and
-  losing any blocked queue position after a leader failure. HTTP has no
-  stable-ref field; `--orphan-ttl` alone does not preserve its session.
+- Callers either enable stable client refs (`--orphan-ttl` plus
+  `client.WithClusterStableRef` for TCP or `stable_ref` when creating
+  HTTP sessions) to keep their queue slot / held lock across a failover,
+  or tolerate a "lost queue slot" outcome when a leader fails while
+  they were blocked in `acquire` / `wait`. HTTP callers recreate their
+  node-local session with the same ref. Already-granted tokens
+  (`renew`, `release`) survive seamlessly either way.
 - Operations include `--admin-token`, mandatory `--raft-auth-token-file`,
   optional mTLS on the Raft transport
   (`--raft-tls-cert/-key/-ca`), and standard scrape of `/metrics` for
@@ -290,13 +290,7 @@ Still open:
    and clock skew (PLAN.md §6's full fault-injection set), run for
    hours rather than seconds, is the last step before declaring "GA
    across all workloads".
-2. **HTTP API: stable-ref equivalent.** The TCP `stable-ref` command
-   ships in PR-4; the HTTP API has no equivalent header or per-session
-   field. Its session IDs are node-local, so after a leader failure a
-   caller must create a new session and re-enqueue at the back. Setting
-   `--orphan-ttl` does not change that. Already-observed tokens remain
-   valid for `renew` / `release` on the new leader. HTTP callers that
-   require FIFO failover should use the TCP client until this ships.
+
 ## How to verify
 
 ```bash
@@ -371,12 +365,11 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 Cluster mode is **beta-plus / GA-eligible.** The post-review P1-P3 audit
 closed every identified externally reachable safety defect and added
 regression coverage.
-Static-bootstrap, dynamic-join (`AddVoter` → cold node), and TCP
-FIFO-across-leader-failover (via `--orphan-ttl` +
-`client.WithClusterStableRef`) are all validated end-to-end — the last
-now including a hard-crash regression guard over real TCP. HTTP sessions
-remain node-local and cannot opt into stable refs. The remaining
-follow-ons are an HTTP stable-ref equivalent and a long-horizon
-multi-host soak harness. The whole tree passes `make test-race` cleanly;
-`go.sum` stays empty; the non-cluster single-node binary is
-byte-identical to v2.1.x.
+Static-bootstrap, dynamic-join (`AddVoter` → cold node), and
+FIFO-across-leader-failover (via `--orphan-ttl` plus TCP or HTTP stable
+refs) are validated — including hard-crash regression coverage over
+real TCP and same-token HTTP re-attachment across server epochs. HTTP
+session IDs remain node-local; callers recreate them with the same ref.
+The remaining follow-on is a long-horizon multi-host soak harness. The
+whole tree passes `make test-race` cleanly; `go.sum` stays empty; the
+non-cluster single-node binary is byte-identical to v2.1.x.

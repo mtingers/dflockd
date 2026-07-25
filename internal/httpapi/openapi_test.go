@@ -168,6 +168,7 @@ func isHTTPMethod(method string) bool {
 }
 
 var requestSchemaNames = []string{
+	"CreateSessionRequest",
 	"AcquireRequest",
 	"SemAcquireRequest",
 	"ReleaseRequest",
