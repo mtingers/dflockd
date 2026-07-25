@@ -49,6 +49,7 @@ func (n *Node) dispatchRPC(from NodeID, msg Message) Message {
 // are no longer running is discarded; otherwise the reply-specific
 // handler runs.
 func (n *Node) onRPCReply(rep rpcReply) {
+	n.finishAppendSend(rep)
 	n.finishSnapshotSend(rep)
 	if rep.err != nil || rep.msg == nil {
 		return // treated as "no reply"; timers/heartbeats will retry
@@ -60,6 +61,18 @@ func (n *Node) onRPCReply(rep rpcReply) {
 		return
 	}
 	n.dispatchRPCReply(rep)
+}
+
+// finishAppendSend releases a current-term AppendEntries gate on every
+// terminal outcome. An older leadership round cannot clear a current send.
+func (n *Node) finishAppendSend(rep rpcReply) {
+	req, ok := rep.req.(*AppendEntriesReq)
+	if !ok || req.Term != n.term {
+		return
+	}
+	if p := n.progress[rep.from]; p != nil {
+		p.appendInFlight = false
+	}
 }
 
 // finishSnapshotSend releases a current-term snapshot gate on every terminal

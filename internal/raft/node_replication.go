@@ -28,7 +28,7 @@ func (n *Node) broadcastHeartbeat() {
 // is at or before our log start, an InstallSnapshot is sent instead.
 func (n *Node) sendAppendEntries(to NodeID) {
 	p := n.progress[to]
-	if p == nil {
+	if p == nil || p.appendInFlight {
 		return
 	}
 	if p.nextIndex < n.log.firstIndex() {
@@ -40,6 +40,7 @@ func (n *Node) sendAppendEntries(to NodeID) {
 		n.sendInstallSnapshot(to)
 		return
 	}
+	p.appendInFlight = true
 	n.sendRPC(to, req)
 }
 
@@ -82,6 +83,9 @@ func (n *Node) onAppendSuccess(from NodeID, p *peerProgress, matchIndex Index) {
 		p.nextIndex = next
 	}
 	n.maybeAdvanceCommit()
+	if p.nextIndex <= n.log.lastIndex() {
+		n.sendAppendEntries(from)
+	}
 }
 
 func (n *Node) onAppendConflict(from NodeID, p *peerProgress, resp *AppendEntriesResp) {

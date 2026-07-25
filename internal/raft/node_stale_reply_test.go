@@ -117,12 +117,23 @@ func TestPreVoteGrantEchoesCandidateTerm(t *testing.T) {
 func TestStaleTermAppendRespIsIgnored(t *testing.T) {
 	n, _ := newUnstartedNode(t, "a", "a", "b", "c")
 	n.role, n.term = roleLeader, 9
-	n.progress = map[NodeID]*peerProgress{"a": {nextIndex: 1}, "b": {nextIndex: 1}, "c": {nextIndex: 1}}
+	n.progress = map[NodeID]*peerProgress{
+		"a": {nextIndex: 1},
+		"b": {nextIndex: 1, appendInFlight: true},
+		"c": {nextIndex: 1},
+	}
 
-	n.onRPCReply(rpcReply{from: "b", msg: &AppendEntriesResp{Term: 3, Success: true, MatchIndex: 42}})
+	n.onRPCReply(rpcReply{
+		from: "b",
+		req:  &AppendEntriesReq{Term: 3},
+		msg:  &AppendEntriesResp{Term: 3, Success: true, MatchIndex: 42},
+	})
 
 	if got := n.progress["b"].matchIndex; got != 0 {
 		t.Fatalf("matchIndex = %d, want 0 (stale reply ignored)", got)
+	}
+	if !n.progress["b"].appendInFlight {
+		t.Fatal("stale reply cleared the current term's AppendEntries gate")
 	}
 }
 

@@ -192,6 +192,7 @@ type leadershipState struct {
 type peerProgress struct {
 	nextIndex        Index
 	matchIndex       Index
+	appendInFlight   bool
 	snapshotInFlight bool
 }
 

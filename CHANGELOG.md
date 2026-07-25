@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raft replication now permits only one in-flight `AppendEntries` RPC per
+  follower. Successful replies immediately chain the next bounded batch while
+  transport errors defer retry to the next heartbeat, avoiding repeated
+  serialization and transmission of the same unacknowledged entries.
 - The mutual-TLS cluster smoke now generates ephemeral RSA-2048 certificates,
   avoiding ECDSA private-key parsing incompatibilities between OpenSSL 3.6 and
   Go 1.26.
