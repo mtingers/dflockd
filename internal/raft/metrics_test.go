@@ -68,4 +68,29 @@ func TestCounters_NegativeDurationIgnored(t *testing.T) {
 	if s.ApplyNanosTotal != 0 {
 		t.Errorf("ApplyNanosTotal should be 0 for non-positive durations, got %d", s.ApplyNanosTotal)
 	}
+	if s.ApplyDurationBuckets[0] != 2 {
+		t.Errorf("non-positive durations should enter first bucket, got %v", s.ApplyDurationBuckets)
+	}
+}
+
+func TestCounters_ApplyDurationBuckets(t *testing.T) {
+	c := &Counters{}
+	bounds := ApplyDurationBounds()
+	c.IncApply(bounds[0])
+	c.IncApply(bounds[0] + time.Nanosecond)
+	c.IncApply(bounds[len(bounds)-1] + time.Nanosecond)
+	s := c.Snapshot()
+	if s.ApplyDurationBuckets[0] != 1 || s.ApplyDurationBuckets[1] != 1 {
+		t.Fatalf("finite buckets = %v", s.ApplyDurationBuckets)
+	}
+	if s.ApplyDurationBuckets[len(s.ApplyDurationBuckets)-1] != 1 {
+		t.Fatalf("+Inf bucket = %d, want 1", s.ApplyDurationBuckets[len(s.ApplyDurationBuckets)-1])
+	}
+	var observations uint64
+	for _, count := range s.ApplyDurationBuckets {
+		observations += count
+	}
+	if observations != s.Applies {
+		t.Fatalf("bucket observations = %d, applies = %d", observations, s.Applies)
+	}
 }

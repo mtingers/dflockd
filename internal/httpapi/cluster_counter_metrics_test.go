@@ -10,19 +10,22 @@ import (
 )
 
 // TestMetrics_EmitsClusterCounters verifies the /metrics handler writes
-// the new dflockd_raft_*_total counters when the server is in cluster
-// mode. RED until writeClusterMetrics is extended to render them.
+// the Raft counters and apply-latency histogram in cluster mode.
 func TestMetrics_EmitsClusterCounters(t *testing.T) {
 	fc := &counterFakeCluster{httpFakeCluster: httpFakeCluster{leader: true}}
+	raftCounters := raft.CountersSnapshot{
+		Proposals:       42,
+		ProposalsFailed: 3,
+		Applies:         40,
+		AppliesFailed:   0,
+		ApplyNanosTotal: 1_000_000,
+		LeaderChanges:   1,
+	}
+	raftCounters.ApplyDurationBuckets[0] = 10
+	raftCounters.ApplyDurationBuckets[1] = 20
+	raftCounters.ApplyDurationBuckets[len(raftCounters.ApplyDurationBuckets)-1] = 10
 	fc.counters = raft.ClusterMetrics{
-		Raft: raft.CountersSnapshot{
-			Proposals:       42,
-			ProposalsFailed: 3,
-			Applies:         40,
-			AppliesFailed:   0,
-			ApplyNanosTotal: 1_000_000,
-			LeaderChanges:   1,
-		},
+		Raft:              raftCounters,
 		AdminAddVoter:     2,
 		AdminAddVoterFail: 1,
 		AdminRemoveServer: 1,
@@ -40,6 +43,11 @@ func TestMetrics_EmitsClusterCounters(t *testing.T) {
 		"dflockd_raft_proposals_failed_total 3",
 		"dflockd_raft_apply_total 40",
 		"dflockd_raft_apply_failed_total 0",
+		`dflockd_raft_apply_duration_seconds_bucket{le="0.00005"} 10`,
+		`dflockd_raft_apply_duration_seconds_bucket{le="0.0001"} 30`,
+		`dflockd_raft_apply_duration_seconds_bucket{le="+Inf"} 40`,
+		"dflockd_raft_apply_duration_seconds_sum 0.001",
+		"dflockd_raft_apply_duration_seconds_count 40",
 		"dflockd_raft_leader_changes_total 1",
 		`dflockd_raft_admin_changes_total{op="add_voter"} 2`,
 		`dflockd_raft_admin_changes_total{op="add_voter_failed"} 1`,

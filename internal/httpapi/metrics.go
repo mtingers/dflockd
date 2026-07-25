@@ -213,6 +213,7 @@ func writeClusterCounters(b *strings.Builder, m raft.ClusterMetrics) {
 	writeCounter(b, "dflockd_raft_apply_total", "Committed entries this node has applied to its FSM.", m.Raft.Applies)
 	writeCounter(b, "dflockd_raft_apply_failed_total", "FSM applies that returned an error or panicked.", m.Raft.AppliesFailed)
 	writeCounter(b, "dflockd_raft_apply_nanos_total", "Cumulative FSM apply time (nanoseconds). Divide by apply_total for mean latency.", m.Raft.ApplyNanosTotal)
+	writeApplyDurationHistogram(b, m.Raft)
 	writeCounter(b, "dflockd_raft_leader_changes_total", "Times this node has become leader.", m.Raft.LeaderChanges)
 	b.WriteString("# HELP dflockd_raft_admin_changes_total Cluster admin operations partitioned by op.\n")
 	b.WriteString("# TYPE dflockd_raft_admin_changes_total counter\n")
@@ -220,6 +221,38 @@ func writeClusterCounters(b *strings.Builder, m raft.ClusterMetrics) {
 	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "add_voter_failed", m.AdminAddVoterFail)
 	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "remove_server", m.AdminRemoveServer)
 	fmt.Fprintf(b, "dflockd_raft_admin_changes_total{op=%q} %d\n", "remove_server_failed", m.AdminRemoveFail)
+}
+
+func writeApplyDurationHistogram(b *strings.Builder, m raft.CountersSnapshot) {
+	const name = "dflockd_raft_apply_duration_seconds"
+	fmt.Fprintf(b, "# HELP %s Successful FSM apply latency in seconds.\n", name)
+	fmt.Fprintf(b, "# TYPE %s histogram\n", name)
+	count := writeApplyDurationBuckets(b, name, m.ApplyDurationBuckets)
+	writeApplyDurationSummary(b, name, m.ApplyNanosTotal, count)
+}
+
+func writeApplyDurationBuckets(b *strings.Builder, name string, buckets [raft.ApplyDurationBucketCount]uint64) uint64 {
+	var cumulative uint64
+	for i, bound := range raft.ApplyDurationBounds() {
+		cumulative += buckets[i]
+		writeApplyDurationBucket(b, name, formatDurationSeconds(bound), cumulative)
+	}
+	cumulative += buckets[len(buckets)-1]
+	writeApplyDurationBucket(b, name, "+Inf", cumulative)
+	return cumulative
+}
+
+func writeApplyDurationBucket(b *strings.Builder, name, bound string, count uint64) {
+	fmt.Fprintf(b, "%s_bucket{le=%q} %d\n", name, bound, count)
+}
+
+func writeApplyDurationSummary(b *strings.Builder, name string, nanos, count uint64) {
+	fmt.Fprintf(b, "%s_sum %.9g\n", name, float64(nanos)/float64(time.Second))
+	fmt.Fprintf(b, "%s_count %d\n", name, count)
+}
+
+func formatDurationSeconds(d time.Duration) string {
+	return strconv.FormatFloat(d.Seconds(), 'f', -1, 64)
 }
 
 func writeCounter(b *strings.Builder, name, help string, v uint64) {

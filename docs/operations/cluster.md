@@ -183,7 +183,16 @@ follower the HTTP returns `503 not_leader` and the TCP returns
   `dflockd_raft_commit_index`, `dflockd_raft_last_log_index`,
   `dflockd_raft_snapshot_index`, and `dflockd_raft_voters` alongside the
   usual `dflockd_*` gauges. It also exposes leader-change, proposal,
-  apply, cumulative apply-time, and admin-change counters.
+  apply, cumulative apply-time, and admin-change counters, plus the
+  `dflockd_raft_apply_duration_seconds` apply-latency histogram. A p99
+  query across scraped nodes is:
+
+  ```promql
+  histogram_quantile(
+    0.99,
+    sum by (le) (rate(dflockd_raft_apply_duration_seconds_bucket[5m]))
+  )
+  ```
 - A follower also reveals the leader via the `error_not_leader <addr>`
   TCP redirect (or the `503 {"error":"not_leader"}` HTTP response with
   an `X-Dflockd-Leader` header) on any mutating command.

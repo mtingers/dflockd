@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Raft FSM apply-latency histogram.** Cluster `/metrics` now exposes
+  `dflockd_raft_apply_duration_seconds` with fixed buckets from 50 µs
+  through 5 s plus `+Inf`, alongside `_sum` and `_count`. Observation
+  selects one atomic bucket with zero allocations; existing
+  `dflockd_raft_apply_nanos_total` remains for compatibility and mean
+  calculations.
 - **Long-horizon external cluster fault soak.** `cmd/cluster-soak`
   now accepts real `id=clientHost:port` targets and an executable fault
   hook. Workers use unique stable refs while checking global token

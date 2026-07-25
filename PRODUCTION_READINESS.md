@@ -201,7 +201,7 @@ The production-hardening passes reflected here:
 
 - ✅ Gauges: `dflockd_raft_state`, `_is_leader`, `_term`,
   `_commit_index`, `_last_log_index`, `_snapshot_index`, `_voters`.
-- ✅ **Counters (new this release):**
+- ✅ **Counters and apply-latency histogram:**
   - `dflockd_raft_proposals_total`,
     `dflockd_raft_proposals_failed_total` — propose attempt
     success/failure.
@@ -210,12 +210,16 @@ The production-hardening passes reflected here:
   - `dflockd_raft_apply_nanos_total` — cumulative apply latency.
     Divide by `apply_total` for a mean; rate over a window for p~mean
     over that window.
+  - `dflockd_raft_apply_duration_seconds` — fixed-bucket Prometheus
+    histogram for quantiles. Buckets span 50 µs through 5 s plus
+    `+Inf`.
   - `dflockd_raft_leader_changes_total` — `becomeLeader` invocations.
     Rising fast means election instability.
   - `dflockd_raft_admin_changes_total{op=...}` — `AddVoter` /
     `RemoveServer` successes and failures, labelled by op.
-- ✅ Counters use `sync/atomic.Uint64`; zero allocations on the hot
-  path, no mutex contention with the run loop.
+- ✅ Counters and histogram buckets use `sync/atomic.Uint64`; each
+  successful apply adds to one selected bucket with zero allocations
+  and no mutex contention with the run loop.
 - ✅ `stats` (TCP + `GET /v1/stats`) carries the `"cluster"` block
   (role, term, leader, indices, voters).
 - ✅ Audit log on every admin reconfig request.
@@ -359,8 +363,8 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 - **Counter metrics are atomic.Uint64s** — no contention with the run
   loop; emission cost is one atomic load per counter per scrape.
 - **`_apply_nanos_total / _apply_total`** gives a mean apply latency.
-  For p99 latency you still need an external histogram (e.g.
-  Prometheus rate-of-rate); the in-process histogram is a follow-on.
+  `dflockd_raft_apply_duration_seconds` supplies fixed buckets for
+  `histogram_quantile`, including p99 over a rate window.
 - **`client.Cluster` clamps leader hints to known members.** A server
   returning `error_not_leader evil.example.com:6388` will not cause
   the client to dial `evil.example.com` — the client clears its cache
