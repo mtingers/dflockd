@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
@@ -336,7 +335,3 @@ func fmtSeconds(s int) string {
 	}
 	return fmt.Sprintf("%d", s)
 }
-
-// avoid an unused-import warning on internal/atomic when the build is
-// stripped down for early phases.
-var _ atomic.Pointer[Cluster]

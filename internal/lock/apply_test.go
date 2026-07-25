@@ -2,7 +2,10 @@ package lock
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +36,28 @@ func saltOf(b byte) [8]byte {
 		s[i] = b
 	}
 	return s
+}
+
+func TestApplyFenceCounterExhaustion(t *testing.T) {
+	lm := newApplyTestLM(t)
+	lm.fsmFenceCounter = math.MaxUint64 - 1
+	result, _, err := lm.ApplyAcquire(at(100), "lock:last", 1, "A", 1, time.Minute, saltOf(1))
+	if err != nil {
+		t.Fatalf("last fence: %v", err)
+	}
+	if !strings.HasPrefix(result.Token, strings.Repeat("f", 16)) {
+		t.Fatalf("last token = %q, want max fence prefix", result.Token)
+	}
+	_, grants, err := lm.ApplyAcquire(at(101), "lock:overflow", 1, "B", 2, time.Minute, saltOf(2))
+	if !errors.Is(err, ErrFencePersistence) {
+		t.Fatalf("overflow error = %v, want ErrFencePersistence", err)
+	}
+	if len(grants) != 0 || lm.fsmFenceCounter != math.MaxUint64 {
+		t.Fatalf("overflow mutated grant state: grants=%v counter=%d", grants, lm.fsmFenceCounter)
+	}
+	if holders := lm.DebugHolderTokens("lock:overflow"); len(holders) != 0 {
+		t.Fatalf("overflow created holders: %v", holders)
+	}
 }
 
 // --- ApplyAcquire ---

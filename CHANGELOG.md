@@ -80,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (cluster mode)
 
+- **The replicated FSM fence counter now refuses `uint64` exhaustion.**
+  Attempting to mint after fence `ffffffffffffffff` returns
+  `ErrFencePersistence` without wrapping to zero or issuing a duplicate,
+  lower fencing token.
 - **Unexpected FSM faults now fail-stop the Raft node.** A panic in
   `FSM.Apply` is recovered, logged with its stack, returned to the
   proposing caller, and immediately stops the node before another

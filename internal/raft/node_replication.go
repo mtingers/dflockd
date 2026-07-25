@@ -158,6 +158,7 @@ func kthLargest(xs []Index, k int) Index {
 }
 
 func sortIndicesDesc(xs []Index) {
+	// Voter sets are small; insertion sort keeps this allocation-free.
 	for i := 1; i < len(xs); i++ {
 		for j := i; j > 0 && xs[j-1] < xs[j]; j-- {
 			xs[j-1], xs[j] = xs[j], xs[j-1]

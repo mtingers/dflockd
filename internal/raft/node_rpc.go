@@ -140,10 +140,9 @@ func (n *Node) dispatchRPCReply(rep rpcReply) {
 
 // staleReply builds a "rejected, here's my term" reply matching req's type.
 func staleReply(req Message, term Term) Message {
-	switch req.(type) {
+	switch m := req.(type) {
 	case *RequestVoteReq:
-		rv := req.(*RequestVoteReq)
-		return &RequestVoteResp{Term: term, VoteGranted: false, PreVote: rv.PreVote}
+		return &RequestVoteResp{Term: term, VoteGranted: false, PreVote: m.PreVote}
 	case *AppendEntriesReq:
 		return &AppendEntriesResp{Term: term, Success: false}
 	case *InstallSnapshotReq:

@@ -18,6 +18,8 @@ package lock
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"sort"
 	"time"
 )
@@ -57,11 +59,10 @@ func (lm *LockManager) ApplyAcquire(now time.Time, key string, limit int, ref st
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	st, res, grants, err := lm.applyAcquireLocked(sh, key, limit, ref, connID, leaseTTL, salt, now)
+	_, res, grants, err := lm.applyAcquireLocked(sh, key, limit, ref, connID, leaseTTL, salt, now)
 	if err != nil {
 		return ApplyResult{}, nil, err
 	}
-	_ = st
 	return res, grants, nil
 }
 
@@ -741,6 +742,9 @@ func (lm *LockManager) recordHolder(sh *shard, st *ResourceState, key, ref strin
 // called with the relevant shard mutex held (so updates are linearised
 // against other state mutations).
 func (lm *LockManager) mintFSMToken(salt [8]byte) (string, error) {
+	if lm.fsmFenceCounter == math.MaxUint64 {
+		return "", fmt.Errorf("%w: FSM counter exhausted", ErrFencePersistence)
+	}
 	lm.fsmFenceCounter++
 	return encodeToken(lm.fsmFenceCounter, salt), nil
 }
