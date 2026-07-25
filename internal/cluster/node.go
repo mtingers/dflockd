@@ -23,6 +23,10 @@ type Config struct {
 	// SweepInterval is how often the leader proposes a lease-expiry sweep
 	// (and, less often, an idle-resource GC). Zero → defaultSweepInterval.
 	SweepInterval time.Duration
+	// Now supplies proposal and maintenance wall-clock time. Production
+	// leaves it nil (time.Now); fault-injection harnesses can provide an
+	// offset clock without changing the host clock.
+	Now func() time.Time
 }
 
 const (
@@ -90,6 +94,9 @@ type Node struct {
 func NewNode(cfg Config, lm *lock.LockManager, storage raft.Storage, transport raft.Transport, logger *slog.Logger) (*Node, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -233,7 +240,7 @@ func (n *Node) LeaderClientAddr() (string, bool) {
 // and returns the resulting ApplyResult. ErrNotLeader if not leader at
 // submission time; ErrLeadershipLost if we lost leadership mid-flight.
 func (n *Node) Propose(ctx context.Context, cmd Command) (lock.ApplyResult, error) {
-	cmd.NowNanos = time.Now().UnixNano()
+	cmd.NowNanos = n.cfg.Now().UnixNano()
 	data, err := cmd.Encode()
 	if err != nil {
 		return lock.ApplyResult{}, err
@@ -328,7 +335,7 @@ func (n *Node) sweepLoop() {
 func (n *Node) runOneSweep(budget time.Duration, alsoGC bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	now := time.Now()
+	now := n.cfg.Now()
 	if n.lm.EvictionDue(now) {
 		if _, err := n.ProposeEvictExpired(ctx); err != nil {
 			n.logSweepErr("evict-expired", err)

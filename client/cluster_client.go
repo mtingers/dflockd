@@ -150,7 +150,7 @@ func (cl *Cluster) dispatch(ctx context.Context, op func(c *Conn) error) error {
 			addr = cl.nextAddr(addr)
 			continue
 		}
-		opErr := cl.runOnConn(conn, op)
+		opErr := cl.runOnConn(ctx, conn, op)
 		if redirected, target := redirectTarget(opErr); redirected {
 			lastErr = opErr
 			if cl.updateLeaderHint(target) && target != addr {
@@ -195,19 +195,28 @@ func (cl *Cluster) isKnownMember(addr string) bool {
 
 // runOnConn handles auth+stable-ref+op+close so dispatch stays under
 // the cyclo ceiling.
-func (cl *Cluster) runOnConn(conn *Conn, op func(c *Conn) error) error {
+func (cl *Cluster) runOnConn(ctx context.Context, conn *Conn, op func(c *Conn) error) error {
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	if cl.cfg.authToken != "" {
 		if err := Authenticate(conn, cl.cfg.authToken); err != nil {
-			return err
+			return preferContextErr(ctx, err)
 		}
 	}
 	if cl.cfg.stableRef != "" {
 		if err := SetStableRef(conn, cl.cfg.stableRef); err != nil {
-			return err
+			return preferContextErr(ctx, err)
 		}
 	}
-	return op(conn)
+	return preferContextErr(ctx, op(conn))
+}
+
+func preferContextErr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 // firstAddr picks the cached leader when available, otherwise the first

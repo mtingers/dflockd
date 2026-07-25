@@ -187,3 +187,10 @@ ingress. See:
 - [operations/cluster.md](operations/cluster.md) — runbook: bootstrap
   a 3-node cluster, add/remove members, leadership transfer, backup
   and recovery, monitoring, common ops.
+
+The test-only `DFLOCKD_UNSAFE_TEST_CLOCK_OFFSET` environment variable
+accepts a Go duration within `+/- 24h` and offsets the wall-clock values
+placed in replicated cluster commands. It exists only for the external
+fault-injection soak harness. Do not set it in normal deployments; the
+bundled hook scopes it to a systemd drop-in and removes it after the
+test phase without changing the host clock.

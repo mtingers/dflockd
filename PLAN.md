@@ -74,7 +74,7 @@ single node; cluster awareness is opt-in (`client.Cluster` or explicit
 | `internal/protocol` | Adds `error_not_leader` plus the TCP `barrier` and `stable-ref` commands; existing commands retain their standalone behavior. |
 | `internal/httpapi` | Maps follower mutations to `503 {"error":"not_leader"}` + `X-Dflockd-Leader`; exposes `GET /v1/readindex`, `POST /v1/admin/voters`, `DELETE /v1/admin/voters/{id}`, cluster status, and metrics. |
 | `cmd/dflockd` | Wires `cluster.Node` when configured; graceful SIGINT/SIGTERM shutdown calls `cluster.Node.Close`, which attempts leadership transfer; fatal on storage-init failure. |
-| `cmd/cluster-soak` | In-process N-node correctness-under-load harness with periodic leader kills. A multi-host partition/clock-skew harness remains a follow-on. |
+| `cmd/cluster-soak` | In-process N-node harness with periodic leader kills plus an external real-cluster mode with pluggable partition, restart, and process-clock-skew hooks. |
 | `client` | Adds the standalone, failover-aware `client.Cluster` wrapper. It caches a leader address, follows member-clamped redirects, rotates after dial failures, bounds attempts, and optionally sets auth + stable refs on each fresh connection. Existing `Lock`/`Semaphore` APIs remain unchanged. |
 
 ### Relationship to the existing `feat/replication` branch
@@ -331,10 +331,11 @@ the new leader → they ride lease expiry, as intended).
   assert follower redirect, leader acquire/release, hard leader failure,
   `client.Cluster` retry, re-election, and stable-ref re-attachment.
 - **Race**: `go test -race ./...` is the gate (the project already runs it).
-- **`cmd/cluster-soak`**: N workers doing acquire/release loops against an
-  in-process cluster, with optional periodic leader kills and token/fence
-  invariants. Multi-host partitions, restarts, clock skew, and a recorded-history
-  linearizability checker remain outside this CI-sized harness.
+- **`cmd/cluster-soak`**: N workers doing acquire/release loops against either
+  an in-process cluster or real client endpoints, with token/fence invariants.
+  In-process mode kills leaders; external mode drives pluggable partition,
+  restart, and process-clock-skew hooks. A general recorded-history
+  linearizability checker remains outside the harness's focused invariants.
 - **Complexity gate**: `make complexity` stays green; new functions target the
   house style (short, low cyclomatic complexity, table-driven dispatch over
   switch ladders). Run `go run ./tools/complexity -prod -top 30` before each
@@ -565,9 +566,12 @@ note staged. Phases are ordered so each builds on tested foundations.
   persistence, snapshot catch-up, and stable-ref hard-crash re-attachment.
 - `cmd/cluster-soak` drives concurrent writes with periodic in-process leader
   kills and asserts token uniqueness + per-key fence monotonicity.
+- External mode drives real cluster endpoints while a strict executable hook
+  injects Raft-only partitions, service restarts, and process-local clock skew;
+  `tools/cluster-soak/ssh-linux.sh` supplies a Linux/systemd implementation.
 - Run `go test -race ./...` and `make complexity` as the bar.
-- Partial: the CI-sized harness is shipped; long-horizon multi-host partition
-  and clock-skew injection remains a follow-on.
+- Done: CI-sized and long-horizon multi-host harnesses are shipped. A recorded
+  multi-hour campaign remains deployment evidence, not an implementation gap.
 
 ### Phase 14 — docs + changelog
 - `docs/architecture/cluster.md`: the model, the diagram, the failure modes, the
@@ -751,13 +755,13 @@ partial (sub-deliverable deferred — see note), `❌` = not shipped.*
 - [x] Phase 12 — dynamic membership changes ✅ (`AddVoter` /
       `RemoveServer`, admin surface, post-commit member publication,
       cold-node snapshot catch-up)
-- [ ] Phase 13 — integration & soak tests 🟡 (`internal/cluster/e2e3_test.go`
+- [x] Phase 13 — integration & soak tests ✅ (`internal/cluster/e2e3_test.go`
       + real-TCP failover tests + `tools/cluster-smoke` +
-      `cmd/cluster-soak` shipped; long-horizon multi-host partition/clock-skew
-      harness deferred — see PRODUCTION_READINESS.md item 1)
+      `cmd/cluster-soak` in-process and external fault modes +
+      `tools/cluster-soak/ssh-linux.sh`)
 - [x] Phase 14 — docs + changelog + metrics ✅ (cluster/operator/server/
       protocol docs, OpenAPI, gauges, and counter metrics shipped)
 - [x] Phase 15 — production-readiness review ✅
       ([PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) +
-      post-review P1-P3 hardening, authenticated Raft transport, and explicit
-      remaining multi-host soak follow-on)
+      post-review P1-P3 hardening, authenticated Raft transport, and external
+      multi-host fault-soak tooling)

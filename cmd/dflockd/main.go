@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/mtingers/dflockd/internal/cluster"
 	"github.com/mtingers/dflockd/internal/config"
@@ -23,6 +24,11 @@ import (
 
 // version is set by the release tooling via -ldflags="-X main.version=...".
 var version = "dev"
+
+const (
+	unsafeTestClockOffsetEnv = "DFLOCKD_UNSAFE_TEST_CLOCK_OFFSET"
+	maxTestClockOffset       = 24 * time.Hour
+)
 
 func main() {
 	cfg := mustLoadConfig()
@@ -122,12 +128,34 @@ func buildClusterNode(cfg *config.Config, lm *lock.LockManager, storage raft.Sto
 	members := membersFromConfig(cfg)
 	rcfg := raft.DefaultConfig()
 	rcfg.ID = raft.NodeID(cfg.NodeID)
+	now, err := clusterClockFromEnv(log)
+	if err != nil {
+		return nil, err
+	}
 	ccfg := cluster.Config{
 		Raft: rcfg, Members: members,
 		AdvertiseAddr: cfg.EffectiveAdvertiseAddr(),
 		SweepInterval: cfg.LeaseSweepInterval,
+		Now:           now,
 	}
 	return cluster.NewNode(ccfg, lm, storage, transport, log)
+}
+
+func clusterClockFromEnv(log *slog.Logger) (func() time.Time, error) {
+	raw := os.Getenv(unsafeTestClockOffsetEnv)
+	if raw == "" {
+		return time.Now, nil
+	}
+	offset, err := time.ParseDuration(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", unsafeTestClockOffsetEnv, err)
+	}
+	if offset < -maxTestClockOffset || offset > maxTestClockOffset {
+		return nil, fmt.Errorf("%s must be within +/- %s", unsafeTestClockOffsetEnv, maxTestClockOffset)
+	}
+	log.Warn("UNSAFE fault-injection clock offset enabled",
+		"env", unsafeTestClockOffsetEnv, "offset", offset)
+	return func() time.Time { return time.Now().Add(offset) }, nil
 }
 
 func membersFromConfig(cfg *config.Config) map[raft.NodeID]cluster.Member {

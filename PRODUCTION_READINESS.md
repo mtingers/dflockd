@@ -1,17 +1,20 @@
-# Production-readiness review — cluster mode (beta)
+# Production-readiness review — cluster mode (release candidate)
 
 Phase 15 of [`PLAN.md`](PLAN.md) plus the production-hardening pass
 landed on `raft-replication` after it. Each line is the §7 checklist
 item, the verdict, and where the evidence lives. `✅` = passes; `🟡` =
-partial / caveated; `⏳` = not yet, with a pointer to the follow-on.
+partial or environment-dependent.
 
 ## Posture
 
 Cluster mode is **GA-eligible for static-bootstrap workloads.** FIFO
 across a leader failover — once the headline gap — is now available to
 TCP and HTTP clients as an opt-in (stable client refs; see below).
-One follow-on remains: a long-horizon multi-host soak harness.
-Everything else from the original §7 checklist is implemented or N/A.
+The long-horizon multi-host partition/restart/clock-skew harness now
+ships. A recorded multi-hour campaign on the target deployment class is
+still required evidence before declaring that deployment GA; it was not
+possible to execute a multi-host campaign in this repository workspace.
+Everything from the original §7 checklist is implemented or N/A.
 The production-hardening passes reflected here:
 
 - **PR-1** (the alpha → beta lift): admin endpoints, default-deny
@@ -38,6 +41,11 @@ The production-hardening passes reflected here:
   authenticated/encrypted Raft transport, and cluster-client retry
   diagnostics. The final FSM fault pass made unexpected `Apply` panics
   and indeterminate installed-snapshot restores fail-stop.
+- **External fault soak**: `cmd/cluster-soak --targets` drives real
+  endpoints with stable refs and a pluggable partition/restart/skew
+  hook. `tools/cluster-soak/ssh-linux.sh` provides Raft-only Linux
+  partitions and process-local clock offsets without changing host
+  clocks.
 
 **You can run this in production today if:**
 
@@ -61,11 +69,9 @@ The production-hardening passes reflected here:
 
 **You should wait if:**
 
-- HTTP callers must preserve FIFO position or re-attach to an
-  unobserved grant across a leader failover.
-- You need a multi-host soak harness in CI for safety-critical
-  workloads. All in-process safety invariants are validated by
-  `cmd/cluster-soak`.
+- Your release bar requires a recorded long-horizon campaign and you
+  have not run `cmd/cluster-soak --targets` against representative
+  multi-host infrastructure.
 
 ## Raft safety
 
@@ -254,7 +260,7 @@ the short-mode soak skip, long-tail HTTP/server error paths, and the
 many `client.Cluster` wrapper methods that mirror the underlying
 one-shot API but are not each exercised by a redirect test.
 
-## What's NOT done (deferred follow-ons)
+## Environment-dependent validation
 
 PR-4 + PR-5 closed: stable-client-ref FIFO failover (was PR-3 gap 1).
 PR-4 introduced the mechanism — `ApplyCleanupConn` marks ref-tagged
@@ -282,14 +288,17 @@ PR-2 closed: cluster-aware client, soak harness, cluster codec fuzz.
 
 PR-1 closed: admin endpoints, counter metrics, ReadIndex public API.
 
-Still open:
+The long-horizon harness is implemented. `cmd/cluster-soak --targets`
+drives real client endpoints and calls an operator-supplied executable
+for leader partitions, healing, service restarts, follower clock skew,
+and skew removal. The bundled `tools/cluster-soak/ssh-linux.sh` hook
+uses dedicated `iptables` chains and a systemd environment drop-in.
 
-1. **Long-horizon multi-host soak.** `cmd/cluster-soak` is a
-   CI-friendly in-process harness covering the safety invariants under
-   leader kills. A separate multi-host harness with injected partitions
-   and clock skew (PLAN.md §6's full fault-injection set), run for
-   hours rather than seconds, is the last step before declaring "GA
-   across all workloads".
+What this repository cannot supply is deployment evidence: run a
+multi-hour campaign on representative hosts and retain its clean final
+report and node logs before declaring that deployment GA. The local
+real-process smoke validates external routing through a crashed member,
+but is not a substitute for that campaign.
 
 ## How to verify
 
@@ -309,6 +318,11 @@ make test-race
 
 # Soak with leader kills (in-process, 30s)
 go run ./cmd/cluster-soak --duration 30s --kill-interval 5s
+
+# Long-horizon external soak (environment setup in docs/operations/cluster.md)
+go run ./cmd/cluster-soak \
+  --targets a=10.0.0.1:6388,b=10.0.0.2:6388,c=10.0.0.3:6388 \
+  --duration 8h --fault-hook ./tools/cluster-soak/ssh-linux.sh
 
 # Fuzz the wire codecs for a few seconds
 go test -fuzz=^FuzzRaftFrameDecode$ -fuzztime=10s ./internal/raft
@@ -362,7 +376,8 @@ curl http://localhost:6388/metrics | grep dflockd_raft_proposals_total
 
 ## Bottom line
 
-Cluster mode is **beta-plus / GA-eligible.** The post-review P1-P3 audit
+Cluster mode is **release-candidate / GA-eligible.** The post-review
+P1-P3 audit
 closed every identified externally reachable safety defect and added
 regression coverage.
 Static-bootstrap, dynamic-join (`AddVoter` → cold node), and
@@ -370,6 +385,7 @@ FIFO-across-leader-failover (via `--orphan-ttl` plus TCP or HTTP stable
 refs) are validated — including hard-crash regression coverage over
 real TCP and same-token HTTP re-attachment across server epochs. HTTP
 session IDs remain node-local; callers recreate them with the same ref.
-The remaining follow-on is a long-horizon multi-host soak harness. The
-whole tree passes `make test-race` cleanly; `go.sum` stays empty; the
-non-cluster single-node binary is byte-identical to v2.1.x.
+The multi-host fault-soak mechanism now ships; a representative
+multi-hour run remains required deployment evidence. The whole tree
+passes `make test-race` cleanly; `go.sum` stays empty; the non-cluster
+single-node binary is byte-identical to v2.1.x.

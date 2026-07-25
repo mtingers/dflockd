@@ -1,11 +1,8 @@
-// Package main implements cluster-soak: an in-process N-node Raft
-// cluster driven by K worker goroutines, with periodic leader-kill,
-// asserting fence-token monotonicity and that no granted-then-released
-// token is ever re-issued. Exits 0 on clean completion (the duration
-// elapsed and no invariant fired) and non-zero on the first violation.
-//
-// This is a CI-friendly soak — no networking, no extra processes.
-// A long-horizon, multi-host soak harness is a follow-on.
+// Package main implements cluster-soak. Its default mode runs an
+// in-process N-node Raft cluster with periodic leader termination. Its
+// external mode drives real cluster members and delegates partitions,
+// restarts, and process-local clock offsets to an operator-supplied hook.
+// Both modes assert fence monotonicity and token uniqueness.
 package main
 
 import (
@@ -17,8 +14,10 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mtingers/dflockd/client"
@@ -37,7 +36,18 @@ type soakOpts struct {
 	Duration     time.Duration
 	KillInterval time.Duration
 	Seed         int64
+
+	Targets        string
+	AuthTokenFile  string
+	FaultHook      string
+	FaultInterval  time.Duration
+	FaultHold      time.Duration
+	ClockSkew      time.Duration
+	LeaseTTL       time.Duration
+	RedirectBudget int
 }
+
+const maxExternalClockSkew = 24 * time.Hour
 
 // soakReport is the harness's output. Violations is the list of
 // invariant failures; empty means a clean run.
@@ -46,6 +56,10 @@ type soakReport struct {
 	Successes  int
 	NotLeader  int
 	Killed     int
+	Failures   int
+	Partitions int
+	Restarts   int
+	Skews      int
 	Violations []string
 	Duration   time.Duration
 }
@@ -53,6 +67,12 @@ type soakReport struct {
 // runSoak runs the cluster-soak workload to completion and returns a
 // report. It does not call os.Exit — callers (main / tests) decide.
 func runSoak(ctx context.Context, opts soakOpts, _ io.Writer, log *slog.Logger) (soakReport, error) {
+	if err := validateSoakOpts(opts); err != nil {
+		return soakReport{}, err
+	}
+	if opts.Targets != "" {
+		return runExternalSoak(ctx, opts, log)
+	}
 	h, err := newSoakHarness(opts, log)
 	if err != nil {
 		return soakReport{}, err
@@ -380,16 +400,70 @@ func (h *soakHarness) report() soakReport {
 
 func parseSoakFlags(args []string) (soakOpts, error) {
 	fs := flag.NewFlagSet("cluster-soak", flag.ContinueOnError)
-	o := soakOpts{Nodes: 3, Workers: 4, Duration: 30 * time.Second, KillInterval: 5 * time.Second, Seed: 1}
+	o := soakOpts{
+		Nodes: 3, Workers: 4, Duration: 30 * time.Second, KillInterval: 5 * time.Second, Seed: 1,
+		FaultInterval: 2 * time.Minute, FaultHold: 30 * time.Second,
+		ClockSkew: 2 * time.Second, LeaseTTL: 10 * time.Second, RedirectBudget: 6,
+	}
 	fs.IntVar(&o.Nodes, "nodes", o.Nodes, "Number of raft nodes")
 	fs.IntVar(&o.Workers, "workers", o.Workers, "Number of writer goroutines")
 	fs.DurationVar(&o.Duration, "duration", o.Duration, "Total soak run time")
 	fs.DurationVar(&o.KillInterval, "kill-interval", o.KillInterval, "How often to kill the leader (0 disables)")
 	fs.Int64Var(&o.Seed, "seed", o.Seed, "Random seed for workload generation")
+	fs.StringVar(&o.Targets, "targets", "", "Real cluster members as id=clientHost:port,... (enables external mode)")
+	fs.StringVar(&o.AuthTokenFile, "auth-token-file", "", "Client auth token file for external mode")
+	fs.StringVar(&o.FaultHook, "fault-hook", "", "Executable implementing partition/heal/restart/skew/unskew")
+	fs.DurationVar(&o.FaultInterval, "fault-interval", o.FaultInterval, "Delay between external fault phases (0 disables)")
+	fs.DurationVar(&o.FaultHold, "fault-hold", o.FaultHold, "How long to hold each Raft partition")
+	fs.DurationVar(&o.ClockSkew, "clock-skew", o.ClockSkew, "Absolute external node clock offset")
+	fs.DurationVar(&o.LeaseTTL, "lease-ttl", o.LeaseTTL, "Lease TTL used by external workers")
+	fs.IntVar(&o.RedirectBudget, "redirect-budget", o.RedirectBudget, "External client attempts per operation")
 	if err := fs.Parse(args); err != nil {
 		return soakOpts{}, err
 	}
+	if err := validateSoakOpts(o); err != nil {
+		return soakOpts{}, err
+	}
 	return o, nil
+}
+
+func validateSoakOpts(o soakOpts) error {
+	if o.Duration <= 0 || o.Workers < 1 {
+		return fmt.Errorf("soak: duration must be >0 and workers must be >=1")
+	}
+	if o.Targets == "" {
+		return validateInProcessSoakOpts(o)
+	}
+	return validateExternalSoakOpts(o)
+}
+
+func validateInProcessSoakOpts(o soakOpts) error {
+	if o.Nodes < 1 || o.KillInterval < 0 {
+		return fmt.Errorf("soak: nodes must be >=1 and kill-interval must be >=0")
+	}
+	return nil
+}
+
+func validateExternalSoakOpts(o soakOpts) error {
+	if _, err := parseExternalMembers(o.Targets); err != nil {
+		return err
+	}
+	if !externalRangesValid(o) {
+		return fmt.Errorf("soak: external durations/budget are out of range")
+	}
+	if o.LeaseTTL%time.Second != 0 {
+		return fmt.Errorf("soak: lease-ttl must be a whole number of seconds")
+	}
+	if o.FaultInterval > 0 && o.FaultHook == "" {
+		return fmt.Errorf("soak: --fault-hook is required when --fault-interval is enabled")
+	}
+	return nil
+}
+
+func externalRangesValid(o soakOpts) bool {
+	return o.FaultInterval >= 0 && o.FaultHold >= 0 &&
+		o.ClockSkew >= 0 && o.ClockSkew <= maxExternalClockSkew &&
+		o.LeaseTTL >= time.Second && o.RedirectBudget >= 1
 }
 
 func main() {
@@ -399,7 +473,9 @@ func main() {
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	ctx, cancel := context.WithTimeout(context.Background(), opts.Duration+opts.KillInterval+10*time.Second)
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(signalCtx, opts.Duration+opts.FaultHold+30*time.Second)
 	defer cancel()
 	report, err := runSoak(ctx, opts, os.Stdout, log)
 	if err != nil {
@@ -413,6 +489,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	fmt.Printf("soak: clean run: writes=%d successes=%d not_leader=%d killed=%d duration=%s\n",
-		report.Writes, report.Successes, report.NotLeader, report.Killed, report.Duration)
+	fmt.Printf("soak: clean run: writes=%d successes=%d failures=%d not_leader=%d killed=%d partitions=%d restarts=%d skews=%d duration=%s\n",
+		report.Writes, report.Successes, report.Failures, report.NotLeader, report.Killed,
+		report.Partitions, report.Restarts, report.Skews, report.Duration)
 }

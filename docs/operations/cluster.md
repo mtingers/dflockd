@@ -319,17 +319,74 @@ handle redirects themselves can use it directly with `client.IsNotLeader`.
 
 ## Soak testing
 
-`cmd/cluster-soak` runs an in-process N-node soak with optional
-periodic leader-kill, asserting fence-token monotonicity per key and
-no duplicate token across the run:
+`cmd/cluster-soak` has two modes. The default is a CI-sized in-process
+N-node soak with optional periodic leader termination:
 
 ```bash
 go run ./cmd/cluster-soak --nodes 3 --workers 4 --duration 30s --kill-interval 5s
-# soak: clean run: writes=… successes=… not_leader=… killed=… duration=…
+# soak: clean run: writes=... successes=... killed=... duration=...
 ```
 
-Exit code is non-zero on the first invariant violation. Intended for
-pre-release smoke; a long-horizon, multi-host harness is a follow-on.
+External mode drives an already-running odd-sized cluster through every
+member's client address. Each worker uses a unique stable ref, so every
+node must run with the same positive `--orphan-ttl` and that TTL should
+cover the expected fault and reconnect window. Use `--fault-interval 0`
+for workload-only validation:
+
+```bash
+go run ./cmd/cluster-soak \
+  --targets a=10.0.0.1:6388,b=10.0.0.2:6388,c=10.0.0.3:6388 \
+  --workers 8 --duration 10m --fault-interval 0 --lease-ttl 10s
+```
+
+For a long-horizon campaign, `--fault-hook` names an executable that
+accepts one of these argument forms:
+
+```text
+HOOK partition NODE
+HOOK heal NODE
+HOOK restart NODE
+HOOK skew NODE OFFSET
+HOOK unskew NODE
+```
+
+The driver repeatedly partitions the writable leader, heals it, applies
+an alternating clock offset to a follower, restarts the writable leader,
+then removes the offset. It probes all client addresses with a
+linearizable `barrier`, tracks token uniqueness and per-key fencing
+monotonicity, and exits non-zero on the first violation. The hook is
+executed directly, never through a shell.
+
+`tools/cluster-soak/ssh-linux.sh` is a hook for dedicated Linux/systemd
+hosts. It isolates only Raft ports with dedicated `iptables` chains,
+restarts the configured service, and injects clock skew through the
+process-local `DFLOCKD_UNSAFE_TEST_CLOCK_OFFSET` setting. It does not
+change host clocks.
+
+```bash
+export DFLOCKD_SOAK_SSH_TARGETS='a=ops@host-a,b=ops@host-b,c=ops@host-c'
+export DFLOCKD_SOAK_RAFT_ADDRS='a=10.0.0.1:7000,b=10.0.0.2:7000,c=10.0.0.3:7000'
+export DFLOCKD_SOAK_SERVICE='dflockd.service'
+
+go run ./cmd/cluster-soak \
+  --targets a=10.0.0.1:6388,b=10.0.0.2:6388,c=10.0.0.3:6388 \
+  --workers 16 --duration 8h \
+  --fault-hook ./tools/cluster-soak/ssh-linux.sh \
+  --fault-interval 2m --fault-hold 30s --clock-skew 2s \
+  --lease-ttl 10s --redirect-budget 8
+```
+
+Run the bundled hook only against disposable IPv4 hosts. The SSH user
+must have non-interactive SSH access and permission to run
+`sudo -n bash`. Normal cancellation heals the active partition and
+removes an active offset. If the driver itself is killed ungracefully,
+invoke `heal NODE` and `unskew NODE` manually for any affected node.
+
+When session authentication is enabled, pass `--auth-token-file`.
+Exit code is non-zero on a workload invariant, an unavailable writable
+leader, or a failed fault action. Operation failures during expected
+failover are counted in the final report but are not themselves safety
+violations.
 
 ## v1 caveats
 

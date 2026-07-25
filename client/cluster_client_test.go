@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // pipeFakeServer is a mini in-process dflockd server. Each instance has a
@@ -237,6 +238,35 @@ func TestClusterRespectsContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "canceled") {
 		t.Fatalf("err = %v, want context.Canceled or similar", err)
 	}
+}
+
+func TestClusterCancellationClosesBlockedOperation(t *testing.T) {
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	srv := &pipeFakeServer{respond: func(_, _, _ string) string {
+		close(entered)
+		<-unblock
+		return validTokenLine
+	}}
+	cl, _ := NewCluster([]string{"127.0.0.1:9001"},
+		withClusterDial(dialerFor(t, map[string]*pipeFakeServer{"127.0.0.1:9001": srv})))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cl.Acquire(ctx, "k", time.Second)
+		done <- err
+	}()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Acquire error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked operation did not stop after context cancellation")
+	}
+	close(unblock)
 }
 
 // TestClusterReleasePassesThrough: a successful Release on the leader

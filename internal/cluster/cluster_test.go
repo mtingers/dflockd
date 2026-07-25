@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,10 @@ func newCluster(t *testing.T, ids ...raft.NodeID) *testCluster {
 }
 
 func newClusterWithSweep(t *testing.T, sweep time.Duration, ids ...raft.NodeID) *testCluster {
+	return newClusterWithClock(t, sweep, nil, ids...)
+}
+
+func newClusterWithClock(t *testing.T, sweep time.Duration, now func() time.Time, ids ...raft.NodeID) *testCluster {
 	t.Helper()
 	tc := &testCluster{
 		t: t, net: raft.NewMemNetwork(), ids: ids, sweep: sweep,
@@ -40,15 +45,18 @@ func newClusterWithSweep(t *testing.T, sweep time.Duration, ids ...raft.NodeID) 
 		members[id] = Member{RaftAddr: "raft-" + string(id), ClientAddr: "client-" + string(id) + ":0"}
 	}
 	for _, id := range ids {
-		tc.startNode(id, members)
+		tc.startNode(id, members, now)
 	}
 	return tc
 }
 
-func (tc *testCluster) startNode(id raft.NodeID, members map[raft.NodeID]Member) {
+func (tc *testCluster) startNode(id raft.NodeID, members map[raft.NodeID]Member, now func() time.Time) {
 	tc.t.Helper()
 	rcfg := fastRaftConfig(id)
-	cfg := Config{Raft: rcfg, Members: members, AdvertiseAddr: members[id].ClientAddr, SweepInterval: tc.sweep}
+	cfg := Config{
+		Raft: rcfg, Members: members, AdvertiseAddr: members[id].ClientAddr,
+		SweepInterval: tc.sweep, Now: now,
+	}
 	lm := newClusterLM(tc.t)
 	tr := tc.net.Transport(id)
 	st := raft.NewMemStorage()
@@ -377,6 +385,32 @@ func TestSweepLoopEvictsExpiredHolder(t *testing.T) {
 		if !pollUntil(t, time.Second, func() bool { return len(holderTokens(tc.lms[id], "ephemeral")) == 0 }) {
 			t.Fatalf("node %s: expired holder not reclaimed by the sweep loop", id)
 		}
+	}
+}
+
+func TestInjectedClockDrivesProposalsAndSweeps(t *testing.T) {
+	var nowNanos atomic.Int64
+	start := time.Now()
+	nowNanos.Store(start.UnixNano())
+	now := func() time.Time { return time.Unix(0, nowNanos.Load()) }
+	tc := newClusterWithClock(t, 10*time.Millisecond, now, "n1")
+	defer tc.stopAll()
+	leader := tc.waitLeader()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if r, err := tc.nodes[leader].ProposeAcquire(
+		ctx, "lock:clock", 1, "A", 1, time.Hour, saltOf(1),
+	); err != nil || r.Status != lock.StatusOK {
+		t.Fatalf("ProposeAcquire = %+v, %v", r, err)
+	}
+	if got := holderTokens(tc.lms[leader], "clock"); len(got) != 1 {
+		t.Fatalf("holders before jump = %d, want 1", len(got))
+	}
+	nowNanos.Store(start.Add(2 * time.Hour).UnixNano())
+	if !pollUntil(t, time.Second, func() bool {
+		return len(holderTokens(tc.lms[leader], "clock")) == 0
+	}) {
+		t.Fatal("injected clock jump did not trigger lease eviction")
 	}
 }
 

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Long-horizon external cluster fault soak.** `cmd/cluster-soak`
+  now accepts real `id=clientHost:port` targets and an executable fault
+  hook. Workers use unique stable refs while checking global token
+  uniqueness and per-key fence monotonicity. The fault scheduler cycles
+  through Raft leader partitions/heals, follower process-clock offsets,
+  and leader service restarts. `tools/cluster-soak/ssh-linux.sh`
+  provides a dedicated-host Linux/systemd hook using Raft-only
+  `iptables` chains; it never changes host clocks. The local real-binary
+  smoke now validates the external workload through a crashed member.
 - **HTTP stable refs.** `POST /v1/sessions` now accepts an optional
   `{"stable_ref":"..."}` body. With `--orphan-ttl > 0`, recreating a
   node-local session on the new leader with the same printable
@@ -50,8 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot join, stable-ref behavior, authenticated Raft v3 transport,
   in-process soak scope, and shipped metric set. The Phase 15 checklist
   now carries current verdicts instead of pre-implementation boxes.
-  `PRODUCTION_READINESS.md` records the completed P1-P3 hardening audit
-  and retains the remaining multi-host fault-injection soak follow-on.
+  `PRODUCTION_READINESS.md` records the completed P1-P3 hardening audit,
+  the shipped multi-host fault harness, and the environment-dependent
+  multi-hour campaign still required as deployment evidence.
 - `lock.NewLockManager` and `internal/server.Server` gain non-breaking additions: `SetCluster(c)` enables the cluster-mode handler path; mutating commands on a follower return `error_not_leader <addr>`; the per-conn cleanup proposes `CleanupConn` through the cluster; the lock manager's lease-expiry / GC loops are suppressed in cluster mode (a leader-driven `EvictExpired` / `GC` sweep through Raft replaces them).
 - Semaphore `limit` is now capped at 1,048,576 (`MaxSemaphoreLimit`) at parse time — far above any real use; the bound just keeps the value within the cluster snapshot's fixed-width encoding.
 
@@ -66,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same fail-stop path instead of leaving the follower running with
   indeterminate state. Shutdown now publishes follower state so a
   stopped node cannot continue reporting itself as leader.
+- **Canceled `client.Cluster` operations now unblock immediately.**
+  Canceling an operation context closes its in-flight connection, so a
+  server that stopped responding during a partition cannot hold the
+  caller beyond its deadline.
 - **Raft TCP connections no longer self-recycle ~5 s after they're established.** The handshake's read deadline was never cleared, so every connection died and was redialed every ~5 s — harmless on loopback (so tests/smoke missed it) but on a real network it caused constant churn, spurious RPC failures, and, with aggressive election timers, spurious leader elections. The steady-state read loops now use a 60 s idle deadline (a dead/partitioned peer is reaped, an idle-by-design conn is recycled), writes have a 10 s deadline, every conn enables TCP keepalive, and a 250 ms per-peer dial backoff stops continuous heartbeats from hammering a downed peer.
 - **Lease expiry and idle GC now actually run in cluster mode.** A leader-bound sweep loop proposes `EvictExpired` every `--lease-sweep-interval` (default 1 s) and `GC` every 30 ticks; previously neither ran, so a holder whose client crashed held its lock forever and idle resources accumulated unbounded.
 - **`CleanupConn` is now byte-deterministic across replicas** — a connection holding multiple contended keys had its waiters promoted (and tokens minted) in Go map-iteration order, which could differ per replica and diverge the FSM. The cleanup now processes owned keys in sorted order.
@@ -112,10 +126,9 @@ Resolved in this release:
 - ~~HTTP sessions cannot opt into stable-ref failover re-attachment~~ →
   optional `stable_ref` on session creation reuses the replicated
   identity across replacement node-local sessions.
-
-Still open (tracked in `PRODUCTION_READINESS.md`):
-
-- Long-horizon multi-host partition and clock-skew soak remains outside CI.
+- ~~No long-horizon multi-host fault harness~~ → external soak mode
+  plus the Linux SSH hook cover partitions, restarts, and process-local
+  clock skew. A representative campaign remains operator evidence.
 
 ## [v2.1.1] - 2026-05-11
 

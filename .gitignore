@@ -15,7 +15,7 @@ wheels/
 
 site/
 
-dflockd
+/dflockd
 /bench
 /bench-redis
 /complexity

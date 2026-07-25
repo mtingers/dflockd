@@ -11,6 +11,7 @@
 #      leader.
 #   4. Hard-crash the leader with kill -9; another node must take over.
 #   5. Acquire + Release on the new leader.
+#   6. Run the external cluster-soak workload through all three targets.
 #
 # Run from the repo root: bash tools/cluster-smoke/smoke.sh
 # Set DFLOCKD_SMOKE_TLS=1 to run the same scenario with mutual TLS on
@@ -18,6 +19,7 @@
 set -uo pipefail
 
 BIN=/tmp/dflockd-smoke
+SOAK_BIN=/tmp/dflockd-cluster-soak-smoke
 DIR=/tmp/dflockd-smoke-data
 LOGS=/tmp/dflockd-smoke-logs
 
@@ -27,13 +29,14 @@ cleanup() {
   if [[ -n "$pids" ]]; then kill -9 $pids 2>/dev/null || true; fi
   # Belt-and-suspenders: kill any leftover smoke processes by name.
   pkill -9 -f "$BIN" 2>/dev/null || true
-  rm -rf "$DIR" "$BIN"
+  rm -rf "$DIR" "$BIN" "$SOAK_BIN"
   # Logs are left in $LOGS for inspection.
 }
 trap cleanup EXIT
 
 echo "==> building dflockd"
 go build -o "$BIN" ./cmd/dflockd || { echo "build failed"; exit 1; }
+go build -o "$SOAK_BIN" ./cmd/cluster-soak || { echo "cluster-soak build failed"; exit 1; }
 echo "    binary: $BIN ($(wc -c <"$BIN") bytes)"
 
 A_RAFT=17101 A_CLIENT=17201
@@ -73,7 +76,8 @@ start_node() {
   "$BIN" --raft-dir "$DIR/$id" --node-id "$id" \
     --raft-addr "127.0.0.1:$raft" --advertise-addr "127.0.0.1:$client" \
     --raft-auth-token-file "$RAFT_SECRET_FILE" \
-    --port "$client" --host 127.0.0.1 --cluster-peers "$PEERS" --default-lease-ttl 60 \
+    --port "$client" --host 127.0.0.1 --cluster-peers "$PEERS" \
+    --default-lease-ttl 60 --orphan-ttl 10 \
     ${tls_args[@]+"${tls_args[@]}"} \
     >"$LOGS/$id.log" 2>&1 &
   echo $!
@@ -199,5 +203,11 @@ r2 = rpc("r", "kPost", tok)
 assert r2 == "ok", f"release post-failover: {r2}"
 print(f"    post-failover acquire ok (token {tok[:16]}...), release ok")
 PYEOF
+
+echo "==> step 6: external soak workload routes around the crashed member"
+"$SOAK_BIN" \
+  --targets "a=127.0.0.1:$A_CLIENT,b=127.0.0.1:$B_CLIENT,c=127.0.0.1:$C_CLIENT" \
+  --workers 2 --duration 2s --fault-interval 0 --lease-ttl 5s --redirect-budget 6 ||
+  { echo "FAIL: external cluster soak"; exit 1; }
 
 echo "==> ALL SMOKE STEPS PASSED"
