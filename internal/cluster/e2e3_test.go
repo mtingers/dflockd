@@ -2,11 +2,8 @@ package cluster
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -497,9 +494,3 @@ func TestE2EStableRefReAttachAcrossFailover(t *testing.T) {
 		}
 	}
 }
-
-// hush a couple of unused-import gripes when the test file is the only
-// reader of these packages during partial builds.
-var _ = errors.Is
-var _ = strconv.Atoi
-var _ = fmt.Sprint
