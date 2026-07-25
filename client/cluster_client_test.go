@@ -69,7 +69,7 @@ func readLineFake(rd *bufio.Reader) (string, error) {
 // matching *Conn, using net.Pipe under the hood. Unknown addresses
 // return net.ErrClosed.
 func dialerFor(t *testing.T, mp map[string]*pipeFakeServer) dialFunc {
-	return func(addr string) (*Conn, error) {
+	return func(_ context.Context, addr string) (*Conn, error) {
 		srv, ok := mp[addr]
 		if !ok {
 			return nil, errors.New("dialerFor: no fake server registered for " + addr)
@@ -201,7 +201,7 @@ func TestClusterDialFailuresRotateFromCachedLeaderAndWrapCause(t *testing.T) {
 	cl, _ := NewCluster(
 		[]string{"127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"},
 		WithClusterRedirectBudget(3),
-		withClusterDial(func(addr string) (*Conn, error) {
+		withClusterDial(func(_ context.Context, addr string) (*Conn, error) {
 			attempts = append(attempts, addr)
 			return nil, dialErr
 		}),
@@ -267,6 +267,32 @@ func TestClusterCancellationClosesBlockedOperation(t *testing.T) {
 		t.Fatal("blocked operation did not stop after context cancellation")
 	}
 	close(unblock)
+}
+
+func TestClusterCancellationStopsBlockedDial(t *testing.T) {
+	entered := make(chan struct{})
+	cl, _ := NewCluster([]string{"127.0.0.1:9001"},
+		withClusterDial(func(ctx context.Context, _ string) (*Conn, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cl.Acquire(ctx, "k", time.Second)
+		done <- err
+	}()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Acquire error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked dial did not stop after context cancellation")
+	}
 }
 
 // TestClusterReleasePassesThrough: a successful Release on the leader

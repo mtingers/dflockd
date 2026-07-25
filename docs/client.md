@@ -186,6 +186,10 @@ closes the underlying connection, which interrupts the in-flight
 server I/O. A token granted as the ctx fires is best-effort released
 back to the server before `Acquire` returns ctx.Err().
 
+For `client.Cluster`, the same context also controls TCP connection
+establishment and the redirect retry loop. A blackholed member cannot
+extend an operation beyond the caller's context deadline.
+
 ## Dial timeouts and TLS
 
 ```go

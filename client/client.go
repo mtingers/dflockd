@@ -17,6 +17,7 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
@@ -102,8 +103,13 @@ type Conn struct {
 
 // Dial connects to a dflockd server (host:port).
 func Dial(addr string) (*Conn, error) {
+	return dialContext(context.Background(), addr)
+}
+
+// dialContext is Dial with a caller-controlled connection context.
+func dialContext(ctx context.Context, addr string) (*Conn, error) {
 	dialer := &net.Dialer{Timeout: DefaultDialTimeout, KeepAlive: defaultKeepAlive}
-	conn, err := dialer.Dial("tcp", addr)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}

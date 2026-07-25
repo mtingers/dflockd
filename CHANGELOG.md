@@ -77,9 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indeterminate state. Shutdown now publishes follower state so a
   stopped node cannot continue reporting itself as leader.
 - **Canceled `client.Cluster` operations now unblock immediately.**
-  Canceling an operation context closes its in-flight connection, so a
-  server that stopped responding during a partition cannot hold the
-  caller beyond its deadline.
+  The operation context now controls both TCP connection establishment
+  and in-flight I/O. Canceling it interrupts a blocked dial or closes an
+  established connection, so an unreachable or non-responsive member
+  cannot hold the caller beyond its deadline.
 - **Raft TCP connections no longer self-recycle ~5 s after they're established.** The handshake's read deadline was never cleared, so every connection died and was redialed every ~5 s — harmless on loopback (so tests/smoke missed it) but on a real network it caused constant churn, spurious RPC failures, and, with aggressive election timers, spurious leader elections. The steady-state read loops now use a 60 s idle deadline (a dead/partitioned peer is reaped, an idle-by-design conn is recycled), writes have a 10 s deadline, every conn enables TCP keepalive, and a 250 ms per-peer dial backoff stops continuous heartbeats from hammering a downed peer.
 - **Lease expiry and idle GC now actually run in cluster mode.** A leader-bound sweep loop proposes `EvictExpired` every `--lease-sweep-interval` (default 1 s) and `GC` every 30 ticks; previously neither ran, so a holder whose client crashed held its lock forever and idle resources accumulated unbounded.
 - **`CleanupConn` is now byte-deterministic across replicas** — a connection holding multiple contended keys had its waiters promoted (and tokens minted) in Go map-iteration order, which could differ per replica and diverge the FSM. The cleanup now processes owned keys in sorted order.

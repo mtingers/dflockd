@@ -23,9 +23,8 @@ var ErrNoMembers = errors.New("dflockd: cluster: no members configured")
 // then 1 each to the two other members of a typical 3-node cluster.
 const defaultRedirectBudget = 3
 
-// dialFunc is the connection factory injected at construction. The
-// default is the package-level Dial. Tests inject a fake.
-type dialFunc func(addr string) (*Conn, error)
+// dialFunc is the context-aware connection factory. Tests inject a fake.
+type dialFunc func(context.Context, string) (*Conn, error)
 
 // clusterCfg is the resolved set of options for a Cluster.
 type clusterCfg struct {
@@ -110,7 +109,7 @@ func NewCluster(members []string, opts ...ClusterOption) (*Cluster, error) {
 	if len(members) == 0 {
 		return nil, ErrNoMembers
 	}
-	cfg := clusterCfg{budget: defaultRedirectBudget, dial: Dial}
+	cfg := clusterCfg{budget: defaultRedirectBudget, dial: dialContext}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -144,8 +143,11 @@ func (cl *Cluster) dispatch(ctx context.Context, op func(c *Conn) error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		conn, err := cl.cfg.dial(addr)
+		conn, err := cl.cfg.dial(ctx, addr)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			lastErr = fmt.Errorf("dflockd: cluster: dial %s: %w", addr, err)
 			addr = cl.nextAddr(addr)
 			continue

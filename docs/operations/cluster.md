@@ -311,7 +311,8 @@ not cause the client to dial an arbitrary host. An exhausted budget
 surfaces an error matching `client.ErrTooManyRedirects` and wrapping
 the final dial or `*client.NotLeaderError` cause. Use `errors.Is` /
 `errors.As` to inspect both the retry exhaustion and its terminal
-diagnostic.
+diagnostic. The operation context bounds connection establishment,
+authentication, request I/O, and the complete retry loop.
 
 The single-`*Conn` package-level API (`client.Acquire(conn, …)`) is
 unchanged and still works against any node — callers that need to
