@@ -45,7 +45,8 @@ The production-hardening passes reflected here:
   endpoints with stable refs and a pluggable partition/restart/skew
   hook. `tools/cluster-soak/ssh-linux.sh` provides Raft-only Linux
   partitions and process-local clock offsets without changing host
-  clocks.
+  clocks. Contended-key histories receive bounded exact linearizability
+  checking in addition to full-run token and fence invariants.
 
 **You can run this in production today if:**
 
@@ -257,7 +258,7 @@ The production-hardening passes reflected here:
 | `internal/httpapi` | 73.9% | Admin endpoints, readindex, CORS, and cluster metrics. |
 | `client` | 69.9% | Eleven cluster-client tests cover routing, diagnostics, and hint clamping. |
 | `internal/server` | 69.3% | Cluster handlers, stable refs, barrier, admin, and metrics. |
-| `cmd/cluster-soak` | 4.4% | The actual soak loop is intentionally skipped by `-short`. |
+| `cmd/cluster-soak` | 49.2% | Exact history checking, flags, and fault scheduling are covered; the actual soak loop is intentionally skipped by `-short`. |
 
 Five of nine packages clear ≥ 80%. The four under it are weighted by
 the short-mode soak skip, long-tail HTTP/server error paths, and the
@@ -295,8 +296,11 @@ PR-1 closed: admin endpoints, counter metrics, ReadIndex public API.
 The long-horizon harness is implemented. `cmd/cluster-soak --targets`
 drives real client endpoints and calls an operator-supplied executable
 for leader partitions, healing, service restarts, follower clock skew,
-and skew removal. The bundled `tools/cluster-soak/ssh-linux.sh` hook
-uses dedicated `iptables` chains and a systemd environment drop-in.
+and skew removal. It checks a bounded recorded prefix per contended key
+exactly for acquire/release linearizability while retaining token uniqueness
+and fencing monotonicity checks for the full campaign. The bundled
+`tools/cluster-soak/ssh-linux.sh` hook uses dedicated `iptables` chains and a
+systemd environment drop-in.
 
 What this repository cannot supply is deployment evidence: run a
 multi-hour campaign on representative hosts and retain its clean final
@@ -326,7 +330,8 @@ go run ./cmd/cluster-soak --duration 30s --kill-interval 5s
 # Long-horizon external soak (environment setup in docs/operations/cluster.md)
 go run ./cmd/cluster-soak \
   --targets a=10.0.0.1:6388,b=10.0.0.2:6388,c=10.0.0.3:6388 \
-  --duration 8h --fault-hook ./tools/cluster-soak/ssh-linux.sh
+  --workers 16 --keys 2 --history-limit 32 --duration 8h \
+  --fault-hook ./tools/cluster-soak/ssh-linux.sh
 
 # Fuzz the wire codecs for a few seconds
 go test -fuzz=^FuzzRaftFrameDecode$ -fuzztime=10s ./internal/raft
@@ -390,6 +395,7 @@ refs) are validated — including hard-crash regression coverage over
 real TCP and same-token HTTP re-attachment across server epochs. HTTP
 session IDs remain node-local; callers recreate them with the same ref.
 The multi-host fault-soak mechanism now ships; a representative
-multi-hour run remains required deployment evidence. The whole tree
-passes `make test-race` cleanly; `go.sum` stays empty; the non-cluster
-single-node binary is byte-identical to v2.1.x.
+multi-hour run remains required deployment evidence. Its bounded contended-key
+histories are checked exactly at shutdown while token/fence invariants cover
+the whole run. The whole tree passes `make test-race` cleanly; `go.sum` stays
+empty; the non-cluster single-node binary is byte-identical to v2.1.x.

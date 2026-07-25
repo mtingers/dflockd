@@ -338,15 +338,17 @@ go run ./cmd/cluster-soak --nodes 3 --workers 4 --duration 30s --kill-interval 5
 ```
 
 External mode drives an already-running odd-sized cluster through every
-member's client address. Each worker uses a unique stable ref, so every
-node must run with the same positive `--orphan-ttl` and that TTL should
-cover the expected fault and reconnect window. Use `--fault-interval 0`
-for workload-only validation:
+member's client address. Each worker uses a unique stable ref and workers
+share a bounded pool of contended keys (`--keys`, default `1`), so every node
+must run with the same positive `--orphan-ttl` and that TTL should cover the
+expected fault and reconnect window. Use `--fault-interval 0` for
+workload-only validation:
 
 ```bash
 go run ./cmd/cluster-soak \
   --targets a=10.0.0.1:6388,b=10.0.0.2:6388,c=10.0.0.3:6388 \
-  --workers 8 --duration 10m --fault-interval 0 --lease-ttl 10s
+  --workers 8 --keys 2 --duration 10m \
+  --fault-interval 0 --lease-ttl 10s
 ```
 
 For a long-horizon campaign, `--fault-hook` names an executable that
@@ -364,7 +366,20 @@ The driver repeatedly partitions the writable leader, heals it, applies
 an alternating clock offset to a follower, restarts the writable leader,
 then removes the offset. It probes all client addresses with a
 linearizable `barrier`, tracks token uniqueness and per-key fencing
-monotonicity, and exits non-zero on the first violation. The hook is
+monotonicity for the full run, and records the first `--history-limit`
+invocations per key (default and maximum `32`). It also records the first
+release attempt for each successful acquire in that initial set, closing the
+history at no more than `64` operations per key. At shutdown it uses exact
+state-space search to check each history against real-time ordering, stable-ref
+reattachment, ambiguous lost release replies, and the earliest lease expiry
+permitted by the configured clock skew.
+
+`--lease-ttl` must exceed twice `--clock-skew` when fault injection is enabled,
+leaving a positive client-observable validity interval for the checker.
+Failed acquires may be omitted because their effects are unobserved; a failed
+release is checked both as unapplied and as committed before its reply was
+lost. The final clean report includes `history_ops=...`. Any online invariant
+or final history violation makes the command exit non-zero. The hook is
 executed directly, never through a shell.
 
 `tools/cluster-soak/ssh-linux.sh` is a hook for dedicated Linux/systemd
@@ -381,6 +396,7 @@ export DFLOCKD_SOAK_SERVICE='dflockd.service'
 go run ./cmd/cluster-soak \
   --targets a=10.0.0.1:6388,b=10.0.0.2:6388,c=10.0.0.3:6388 \
   --workers 16 --duration 8h \
+  --keys 2 --history-limit 32 \
   --fault-hook ./tools/cluster-soak/ssh-linux.sh \
   --fault-interval 2m --fault-hold 30s --clock-skew 2s \
   --lease-ttl 10s --redirect-budget 8

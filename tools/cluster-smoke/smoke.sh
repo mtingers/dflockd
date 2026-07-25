@@ -55,7 +55,7 @@ chmod 600 "$RAFT_SECRET_FILE"
 if [[ "${DFLOCKD_SMOKE_TLS:-}" == "1" ]]; then
   echo "==> generating per-node certs for mutual TLS"
   for id in a b c; do
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    openssl req -x509 -newkey rsa:2048 \
       -keyout "$DIR/$id-key.pem" -out "$DIR/$id-cert.pem" -nodes -days 1 \
       -subj "/CN=$id" \
       -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \

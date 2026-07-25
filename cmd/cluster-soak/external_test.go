@@ -44,6 +44,7 @@ func TestParseExternalFlagsWorkloadOnly(t *testing.T) {
 	opts, err := parseSoakFlags([]string{
 		"--targets=a=127.0.0.1:1,b=127.0.0.1:2,c=127.0.0.1:3",
 		"--fault-interval=0",
+		"--lease-ttl=1s",
 		"--duration=1s",
 	})
 	if err != nil {
@@ -103,6 +104,7 @@ func TestGrantLedgerInvariants(t *testing.T) {
 	var ledger grantLedger
 	ledger.tokens = map[string]grantRecord{}
 	ledger.maxByKey = map[string]uint64{}
+	ledger.activeByKey = map[string]string{}
 	if got := ledger.recordGrant(1, "key", token10); got != "" {
 		t.Fatalf("first grant: %s", got)
 	}
@@ -122,6 +124,55 @@ func TestGrantLedgerInvariants(t *testing.T) {
 	}
 	if got := ledger.recordGrant(2, "key", token11); !strings.Contains(got, "token reused") {
 		t.Fatalf("cross-worker reuse = %q", got)
+	}
+}
+
+func TestGrantLedgerRejectsHistoricalReattach(t *testing.T) {
+	token10 := soakToken(10, 1)
+	token11 := soakToken(11, 2)
+	ledger := grantLedger{
+		tokens: map[string]grantRecord{}, maxByKey: map[string]uint64{},
+		activeByKey: map[string]string{},
+	}
+	if got := ledger.recordGrant(1, "key", token10); got != "" {
+		t.Fatal(got)
+	}
+	if got := ledger.recordGrant(2, "key", token11); got != "" {
+		t.Fatal(got)
+	}
+	if got := ledger.recordGrant(1, "key", token10); !strings.Contains(got, "token reused") {
+		t.Fatalf("historical reattach = %q", got)
+	}
+}
+
+func TestParseExternalHistoryFlags(t *testing.T) {
+	opts, err := parseSoakFlags([]string{
+		"--targets=a=127.0.0.1:1,b=127.0.0.1:2,c=127.0.0.1:3",
+		"--workers=4", "--keys=2", "--history-limit=32",
+		"--fault-interval=0", "--duration=1s",
+	})
+	if err != nil {
+		t.Fatalf("parseSoakFlags: %v", err)
+	}
+	if opts.Keys != 2 || opts.HistoryLimit != 32 {
+		t.Fatalf("history options = %+v", opts)
+	}
+}
+
+func TestParseExternalHistoryFlagsRejectUnsafeBounds(t *testing.T) {
+	tests := [][]string{
+		{"--workers=2", "--keys=3"},
+		{"--history-limit=33"},
+		{"--lease-ttl=4s", "--clock-skew=2s", "--fault-interval=1s", "--fault-hook=hook"},
+	}
+	for _, args := range tests {
+		allArgs := append([]string{
+			"--targets=a=127.0.0.1:1,b=127.0.0.1:2,c=127.0.0.1:3",
+			"--fault-interval=0", "--duration=1s",
+		}, args...)
+		if _, err := parseSoakFlags(allArgs); err == nil {
+			t.Fatalf("parseSoakFlags(%v) succeeded", allArgs)
+		}
 	}
 }
 

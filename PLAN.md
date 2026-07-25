@@ -334,8 +334,10 @@ the new leader → they ride lease expiry, as intended).
 - **`cmd/cluster-soak`**: N workers doing acquire/release loops against either
   an in-process cluster or real client endpoints, with token/fence invariants.
   In-process mode kills leaders; external mode drives pluggable partition,
-  restart, and process-clock-skew hooks. A general recorded-history
-  linearizability checker remains outside the harness's focused invariants.
+  restart, and process-clock-skew hooks. External workers contend on a bounded
+  key pool; an exact per-key checker validates recorded acquire/release
+  histories, including ambiguous release replies and skew-adjusted lease
+  expiry.
 - **Complexity gate**: `make complexity` stays green; new functions target the
   house style (short, low cyclomatic complexity, table-driven dispatch over
   switch ladders). Run `go run ./tools/complexity -prod -top 30` before each
@@ -569,6 +571,9 @@ note staged. Phases are ordered so each builds on tested foundations.
 - External mode drives real cluster endpoints while a strict executable hook
   injects Raft-only partitions, service restarts, and process-local clock skew;
   `tools/cluster-soak/ssh-linux.sh` supplies a Linux/systemd implementation.
+- The first bounded invocation prefix per contended key is checked exactly for
+  linearizability at shutdown; full-run token uniqueness and fencing
+  monotonicity remain online invariants.
 - Run `go test -race ./...` and `make complexity` as the bar.
 - Done: CI-sized and long-horizon multi-host harnesses are shipped. A recorded
   multi-hour campaign remains deployment evidence, not an implementation gap.
@@ -758,6 +763,7 @@ partial (sub-deliverable deferred — see note), `❌` = not shipped.*
 - [x] Phase 13 — integration & soak tests ✅ (`internal/cluster/e2e3_test.go`
       + real-TCP failover tests + `tools/cluster-smoke` +
       `cmd/cluster-soak` in-process and external fault modes +
+      exact recorded-history checking +
       `tools/cluster-soak/ssh-linux.sh`)
 - [x] Phase 14 — docs + changelog + metrics ✅ (cluster/operator/server/
       protocol docs, OpenAPI, gauges, and counter metrics shipped)

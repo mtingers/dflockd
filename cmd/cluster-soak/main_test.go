@@ -19,6 +19,9 @@ func TestParseSoakFlagsDefaults(t *testing.T) {
 	if o.Nodes != 3 || o.Workers != 4 {
 		t.Fatalf("defaults wrong: nodes=%d workers=%d", o.Nodes, o.Workers)
 	}
+	if o.Keys != 1 || o.HistoryLimit != maxHistoryLimit {
+		t.Fatalf("history defaults wrong: keys=%d limit=%d", o.Keys, o.HistoryLimit)
+	}
 	if o.Duration <= 0 || o.KillInterval <= 0 {
 		t.Fatalf("defaults wrong: duration=%s kill=%s", o.Duration, o.KillInterval)
 	}

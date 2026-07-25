@@ -45,6 +45,8 @@ type soakOpts struct {
 	ClockSkew      time.Duration
 	LeaseTTL       time.Duration
 	RedirectBudget int
+	Keys           int
+	HistoryLimit   int
 }
 
 const maxExternalClockSkew = 24 * time.Hour
@@ -60,6 +62,7 @@ type soakReport struct {
 	Partitions int
 	Restarts   int
 	Skews      int
+	HistoryOps int
 	Violations []string
 	Duration   time.Duration
 }
@@ -404,6 +407,7 @@ func parseSoakFlags(args []string) (soakOpts, error) {
 		Nodes: 3, Workers: 4, Duration: 30 * time.Second, KillInterval: 5 * time.Second, Seed: 1,
 		FaultInterval: 2 * time.Minute, FaultHold: 30 * time.Second,
 		ClockSkew: 2 * time.Second, LeaseTTL: 10 * time.Second, RedirectBudget: 6,
+		Keys: 1, HistoryLimit: maxHistoryLimit,
 	}
 	fs.IntVar(&o.Nodes, "nodes", o.Nodes, "Number of raft nodes")
 	fs.IntVar(&o.Workers, "workers", o.Workers, "Number of writer goroutines")
@@ -418,6 +422,8 @@ func parseSoakFlags(args []string) (soakOpts, error) {
 	fs.DurationVar(&o.ClockSkew, "clock-skew", o.ClockSkew, "Absolute external node clock offset")
 	fs.DurationVar(&o.LeaseTTL, "lease-ttl", o.LeaseTTL, "Lease TTL used by external workers")
 	fs.IntVar(&o.RedirectBudget, "redirect-budget", o.RedirectBudget, "External client attempts per operation")
+	fs.IntVar(&o.Keys, "keys", o.Keys, "Contended keys shared by external workers")
+	fs.IntVar(&o.HistoryLimit, "history-limit", o.HistoryLimit, "Initial recorded invocations per external key")
 	if err := fs.Parse(args); err != nil {
 		return soakOpts{}, err
 	}
@@ -454,10 +460,33 @@ func validateExternalSoakOpts(o soakOpts) error {
 	if o.LeaseTTL%time.Second != 0 {
 		return fmt.Errorf("soak: lease-ttl must be a whole number of seconds")
 	}
+	if err := validateExternalHistoryOpts(o); err != nil {
+		return err
+	}
 	if o.FaultInterval > 0 && o.FaultHook == "" {
 		return fmt.Errorf("soak: --fault-hook is required when --fault-interval is enabled")
 	}
 	return nil
+}
+
+func validateExternalHistoryOpts(o soakOpts) error {
+	if o.Keys < 1 || o.Keys > o.Workers {
+		return fmt.Errorf("soak: keys must be between 1 and workers")
+	}
+	if o.HistoryLimit < 1 || o.HistoryLimit > maxHistoryLimit {
+		return fmt.Errorf("soak: history-limit must be between 1 and %d", maxHistoryLimit)
+	}
+	if o.LeaseTTL <= 2*externalHistoryClockSkew(o) {
+		return fmt.Errorf("soak: lease-ttl must exceed twice clock-skew for history checking")
+	}
+	return nil
+}
+
+func externalHistoryClockSkew(o soakOpts) time.Duration {
+	if o.FaultInterval == 0 {
+		return 0
+	}
+	return o.ClockSkew
 }
 
 func externalRangesValid(o soakOpts) bool {
@@ -489,7 +518,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	fmt.Printf("soak: clean run: writes=%d successes=%d failures=%d not_leader=%d killed=%d partitions=%d restarts=%d skews=%d duration=%s\n",
+	fmt.Printf("soak: clean run: writes=%d successes=%d failures=%d not_leader=%d killed=%d partitions=%d restarts=%d skews=%d history_ops=%d duration=%s\n",
 		report.Writes, report.Successes, report.Failures, report.NotLeader, report.Killed,
-		report.Partitions, report.Restarts, report.Skews, report.Duration)
+		report.Partitions, report.Restarts, report.Skews, report.HistoryOps, report.Duration)
 }

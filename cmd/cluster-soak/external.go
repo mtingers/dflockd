@@ -35,6 +35,7 @@ type externalHarness struct {
 	runID   string
 	cancel  context.CancelFunc
 	ledger  grantLedger
+	history *historyRecorder
 
 	writes     atomic.Int64
 	successes  atomic.Int64
@@ -133,7 +134,11 @@ func newExternalHarness(opts soakOpts, log logger, hook faultController) (*exter
 	return &externalHarness{
 		opts: opts, log: log, members: members, addrs: addrs, auth: auth,
 		hook: hook, probe: probeWritableLeader, runID: strconv.FormatInt(time.Now().UnixNano(), 36),
-		ledger: grantLedger{tokens: map[string]grantRecord{}, maxByKey: map[string]uint64{}},
+		ledger: grantLedger{
+			tokens: map[string]grantRecord{}, maxByKey: map[string]uint64{},
+			activeByKey: map[string]string{},
+		},
+		history: newHistoryRecorder(opts.HistoryLimit),
 	}, nil
 }
 
@@ -210,7 +215,7 @@ func readOptionalSecret(path string) (string, error) {
 
 func (h *externalHarness) workerLoop(ctx context.Context, worker int) {
 	ref := fmt.Sprintf("soak-%s-w%d", h.runID, worker)
-	key := fmt.Sprintf("soak:%s:%d", h.runID, worker)
+	key := fmt.Sprintf("soak:%s:%d", h.runID, worker%h.opts.Keys)
 	options := []client.ClusterOption{
 		client.WithClusterRedirectBudget(h.opts.RedirectBudget),
 		client.WithClusterStableRef(ref),
@@ -232,7 +237,7 @@ func (h *externalHarness) runWorkerState(ctx context.Context, worker int, key st
 	for ctx.Err() == nil {
 		if token == "" {
 			token, acquired = h.acquireOnce(ctx, worker, key, cl)
-		} else if h.releaseOnce(ctx, key, token, cl) {
+		} else if h.releaseOnce(ctx, worker, key, token, cl) {
 			token = ""
 		} else if time.Since(acquired) > h.abandonAfter() {
 			token = ""
@@ -245,10 +250,16 @@ func (h *externalHarness) runWorkerState(ctx context.Context, worker int, key st
 
 func (h *externalHarness) acquireOnce(ctx context.Context, worker int, key string, cl *client.Cluster) (string, time.Time) {
 	h.writes.Add(1)
+	record := h.history.begin(worker, historyAcquire, key, "")
 	opCtx, cancel := context.WithTimeout(ctx, externalOpTimeout)
 	defer cancel()
-	token, _, err := cl.Acquire(opCtx, key, time.Second,
+	token, leaseSeconds, err := cl.Acquire(opCtx, key, time.Second,
 		client.WithLeaseTTL(int(h.opts.LeaseTTL/time.Second)))
+	h.history.finish(record, token, time.Duration(leaseSeconds)*time.Second, err == nil)
+	return h.completeAcquire(ctx, worker, key, token, err)
+}
+
+func (h *externalHarness) completeAcquire(ctx context.Context, worker int, key, token string, err error) (string, time.Time) {
 	if err != nil {
 		h.recordOperationError(ctx, err)
 		return "", time.Time{}
@@ -260,10 +271,17 @@ func (h *externalHarness) acquireOnce(ctx context.Context, worker int, key strin
 	return token, time.Now()
 }
 
-func (h *externalHarness) releaseOnce(ctx context.Context, key, token string, cl *client.Cluster) bool {
+func (h *externalHarness) releaseOnce(ctx context.Context, worker int, key, token string, cl *client.Cluster) bool {
+	record := h.history.begin(worker, historyRelease, key, token)
 	opCtx, cancel := context.WithTimeout(ctx, externalOpTimeout)
 	defer cancel()
-	if err := cl.Release(opCtx, key, token); err != nil {
+	err := cl.Release(opCtx, key, token)
+	h.history.finish(record, token, 0, err == nil)
+	return h.completeRelease(ctx, token, err)
+}
+
+func (h *externalHarness) completeRelease(ctx context.Context, token string, err error) bool {
+	if err != nil {
 		h.recordOperationError(ctx, err)
 		return false
 	}
@@ -298,6 +316,17 @@ func (h *externalHarness) verifyFinalState() {
 	if h.successes.Load() == 0 {
 		h.ledger.addViolation("soak: workload completed no acquire/release cycles")
 	}
+	h.verifyHistory()
+	h.verifyLeader()
+}
+
+func (h *externalHarness) verifyHistory() {
+	for _, violation := range h.history.violations(externalHistoryClockSkew(h.opts)) {
+		h.ledger.addViolation(violation)
+	}
+}
+
+func (h *externalHarness) verifyLeader() {
 	ctx, cancel := context.WithTimeout(context.Background(), externalOpTimeout)
 	defer cancel()
 	if _, err := h.probe(ctx, h.members, h.auth); err != nil {
@@ -311,6 +340,7 @@ func (h *externalHarness) report() soakReport {
 		Failures: int(h.failures.Load()), NotLeader: int(h.notLeader.Load()),
 		Partitions: int(h.partitions.Load()), Restarts: int(h.restarts.Load()),
 		Skews: int(h.skews.Load()), Violations: h.ledger.violationsCopy(),
+		HistoryOps: h.history.count(),
 	}
 }
 
@@ -321,10 +351,11 @@ type grantRecord struct {
 }
 
 type grantLedger struct {
-	mu         sync.Mutex
-	tokens     map[string]grantRecord
-	maxByKey   map[string]uint64
-	violations []string
+	mu          sync.Mutex
+	tokens      map[string]grantRecord
+	maxByKey    map[string]uint64
+	activeByKey map[string]string
+	violations  []string
 }
 
 func (l *grantLedger) recordGrant(worker int, key, token string) string {
@@ -335,7 +366,8 @@ func (l *grantLedger) recordGrant(worker int, key, token string) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if previous, ok := l.tokens[token]; ok {
-		if !previous.retired && previous.worker == worker && previous.key == key {
+		if !previous.retired && previous.worker == worker && previous.key == key &&
+			l.activeByKey[key] == token {
 			return ""
 		}
 		return "token reused: " + token
@@ -345,6 +377,7 @@ func (l *grantLedger) recordGrant(worker int, key, token string) string {
 	}
 	l.tokens[token] = grantRecord{worker: worker, key: key}
 	l.maxByKey[key] = fence
+	l.activeByKey[key] = token
 	return ""
 }
 
@@ -353,6 +386,9 @@ func (l *grantLedger) recordRelease(token string) {
 	record := l.tokens[token]
 	record.retired = true
 	l.tokens[token] = record
+	if l.activeByKey[record.key] == token {
+		delete(l.activeByKey, record.key)
+	}
 	l.mu.Unlock()
 }
 

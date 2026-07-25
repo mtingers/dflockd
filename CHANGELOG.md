@@ -18,9 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Long-horizon external cluster fault soak.** `cmd/cluster-soak`
   now accepts real `id=clientHost:port` targets and an executable fault
   hook. Workers use unique stable refs while checking global token
-  uniqueness and per-key fence monotonicity. The fault scheduler cycles
-  through Raft leader partitions/heals, follower process-clock offsets,
-  and leader service restarts. `tools/cluster-soak/ssh-linux.sh`
+  uniqueness and per-key fence monotonicity. Workers now share a
+  configurable contended key pool; the harness records a closed, bounded
+  acquire/release history per key and checks it exactly for linearizability,
+  including ambiguous release replies and skew-adjusted lease expiry
+  (`--keys`, `--history-limit`). The fault scheduler cycles through Raft
+  leader partitions/heals, follower process-clock offsets, and leader service
+  restarts. `tools/cluster-soak/ssh-linux.sh`
   provides a dedicated-host Linux/systemd hook using Raft-only
   `iptables` chains; it never changes host clocks. The local real-binary
   smoke now validates the external workload through a crashed member.
@@ -60,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The mutual-TLS cluster smoke now generates ephemeral RSA-2048 certificates,
+  avoiding ECDSA private-key parsing incompatibilities between OpenSSL 3.6 and
+  Go 1.26.
 - **HA roadmap and readiness docs now match the shipped tree.** `PLAN.md`
   records the actual `client.Cluster`, voter admin endpoints, cold-node
   snapshot join, stable-ref behavior, authenticated Raft v3 transport,
