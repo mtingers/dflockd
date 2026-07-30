@@ -78,6 +78,12 @@ func TestApplyPanicFailStopsRunningNode(t *testing.T) {
 	if n.IsLeader() {
 		t.Fatal("fail-stopped node still reports leader")
 	}
+	if n.Err() == nil || !strings.Contains(n.Err().Error(), "FSM apply") {
+		t.Fatalf("fatal cause = %v, want FSM apply", n.Err())
+	}
+	if n.Ready() {
+		t.Fatal("fail-stopped node reports ready")
+	}
 	if got := n.Counters().Snapshot().AppliesFailed; got != 1 {
 		t.Fatalf("failed apply count = %d, want 1", got)
 	}

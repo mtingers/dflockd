@@ -276,11 +276,12 @@ func TestRPCWithLowerTermIsRejected(t *testing.T) {
 	defer tc.stopAll()
 	leader := tc.waitLeader()
 	curTerm := tc.term(leader)
+	sender := otherIDs(tc.ids, leader)[0]
 
 	// A RequestVote stamped with a strictly lower term must be rejected
 	// and the reply must carry the leader's real term (so the stale
 	// sender learns it is behind). The leader itself must not step down.
-	resp := tc.nodes[leader].handleRPC("stranger", &RequestVoteReq{Term: 0, CandidateID: "stranger", LastLogIndex: 0, LastLogTerm: 0})
+	resp := tc.nodes[leader].handleRPC(sender, &RequestVoteReq{Term: 0, CandidateID: sender, LastLogIndex: 0, LastLogTerm: 0})
 	rv, ok := resp.(*RequestVoteResp)
 	if !ok || rv.VoteGranted || rv.Term != curTerm {
 		t.Fatalf("stale RequestVote handled wrong: %+v (leader term %d)", resp, curTerm)
@@ -295,10 +296,11 @@ func TestRPCWithHigherTermStepsLeaderDown(t *testing.T) {
 	defer tc.stopAll()
 	leader := tc.waitLeader()
 	curTerm := tc.term(leader)
+	sender := otherIDs(tc.ids, leader)[0]
 
-	// An RPC at a strictly higher term must step the leader down to
-	// follower and adopt the new term (Raft's universal rule).
-	tc.nodes[leader].handleRPC("stranger", &AppendEntriesReq{Term: curTerm + 5, LeaderID: "stranger"})
+	// An authenticated current voter at a strictly higher term must step the
+	// leader down to follower and advance the term.
+	tc.nodes[leader].handleRPC(sender, &AppendEntriesReq{Term: curTerm + 5, LeaderID: sender})
 	if _, ok := pollUntil(t, 1*time.Second, func() (struct{}, bool) {
 		s := tc.nodes[leader].Status()
 		return struct{}{}, s.Role != "leader" && s.Term >= curTerm+5

@@ -32,6 +32,12 @@ const (
 	// maxTCPFrameBytes bounds one received frame. Snapshots can be large
 	// in production but dflockd's FSM is small; 64 MiB is a generous cap.
 	maxTCPFrameBytes = 64 << 20
+	// maxHandshakeFrameBytes applies before cluster authentication, keeping an
+	// unauthenticated length prefix from forcing a large allocation.
+	maxHandshakeFrameBytes = 4 << 10
+	// maxRPCNodeIDBytes is the largest node ID that fits in a transport hello.
+	// The same limit is used by Config and every Raft RPC codec.
+	maxRPCNodeIDBytes = maxHandshakeFrameBytes - (1 + 2 + 2 + len(tcpProtoVersion) + 2*handshakeValueBytes)
 
 	tcpProtoVersion = "raft.v3"
 )
@@ -123,6 +129,14 @@ func writeFrame(w io.Writer, body []byte) error {
 // handshake) — otherwise an absolute deadline set once would make every
 // later read on the conn fail at that wall-clock time.
 func readFrame(r io.Reader, deadline time.Duration) ([]byte, error) {
+	return readFrameLimit(r, deadline, maxTCPFrameBytes)
+}
+
+func readHandshakeFrame(r io.Reader, deadline time.Duration) ([]byte, error) {
+	return readFrameLimit(r, deadline, maxHandshakeFrameBytes)
+}
+
+func readFrameLimit(r io.Reader, deadline time.Duration, maxBytes uint32) ([]byte, error) {
 	if c, ok := r.(net.Conn); ok {
 		if deadline > 0 {
 			_ = c.SetReadDeadline(time.Now().Add(deadline))
@@ -135,8 +149,8 @@ func readFrame(r io.Reader, deadline time.Duration) ([]byte, error) {
 		return nil, err
 	}
 	n := be.Uint32(hdr[:])
-	if n > maxTCPFrameBytes {
-		return nil, fmt.Errorf("raft: incoming frame too large: %d", n)
+	if n > maxBytes {
+		return nil, fmt.Errorf("raft: incoming frame too large: %d (max %d)", n, maxBytes)
 	}
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -198,13 +212,16 @@ func encodeRPC(kind uint8, reqID uint64, m Message) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("raft: encode %T: %w", m, err)
 	}
-	if len(payload) > maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes {
+	if len(payload) > maxRPCPayloadBytes {
 		return nil, fmt.Errorf("raft: rpc payload too large (%d bytes)", len(payload))
 	}
 	return assembleRPCBody(kind, reqID, tag, payload), nil
 }
 
-const rpcHeaderBytes = 1 + 8 + 1 + 4
+const (
+	rpcHeaderBytes     = 1 + 8 + 1 + 4
+	maxRPCPayloadBytes = maxTCPFrameBytes - secureFrameOverhead - rpcHeaderBytes
+)
 
 func assembleRPCBody(kind uint8, reqID uint64, tag uint8, payload []byte) []byte {
 	body := make([]byte, 0, rpcHeaderBytes+len(payload))

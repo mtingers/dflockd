@@ -23,12 +23,14 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{"ok", func(*Config) {}, ""},
 		{"missing id", func(c *Config) { c.ID = "" }, "ID is required"},
+		{"oversized id", func(c *Config) { c.ID = NodeID(strings.Repeat("x", maxRPCNodeIDBytes+1)) }, "ID length"},
 		{"zero heartbeat", func(c *Config) { c.HeartbeatInterval = 0 }, "HeartbeatInterval must be > 0"},
 		{"zero election min", func(c *Config) { c.ElectionTimeoutMin = 0 }, "ElectionTimeoutMin"},
 		{"max below min", func(c *Config) { c.ElectionTimeoutMax = c.ElectionTimeoutMin - time.Millisecond }, "ElectionTimeoutMin"},
 		{"heartbeat too big", func(c *Config) { c.HeartbeatInterval = c.ElectionTimeoutMin }, "too large vs ElectionTimeoutMin"},
 		{"zero max append", func(c *Config) { c.MaxAppendEntries = 0 }, "MaxAppendEntries must be > 0"},
 		{"zero max snapshot", func(c *Config) { c.MaxSnapshotBytes = 0 }, "MaxSnapshotBytes must be > 0"},
+		{"oversized max snapshot", func(c *Config) { c.MaxSnapshotBytes = maxSnapshotDataBytes + 1 }, "wire-safe max"},
 		{"zero apply depth", func(c *Config) { c.ApplyChanDepth = 0 }, "ApplyChanDepth must be > 0"},
 	}
 	for _, tc := range tests {
@@ -63,6 +65,15 @@ func TestConfigurationHelpers(t *testing.T) {
 	cl.Voters["d"] = "h:4"
 	if c.Has("d") {
 		t.Fatalf("Clone is not deep")
+	}
+	withMetadata := Configuration{
+		Voters:      map[NodeID]string{"a": "h:1"},
+		ClientAddrs: map[NodeID]string{"a": "c:1"},
+	}
+	metadataClone := withMetadata.Clone()
+	metadataClone.ClientAddrs["a"] = "changed"
+	if withMetadata.ClientAddrs["a"] != "c:1" {
+		t.Fatal("Clone did not copy client metadata")
 	}
 	five := Configuration{Voters: map[NodeID]string{"a": "", "b": "", "c": "", "d": "", "e": ""}}
 	if five.Quorum() != 3 {

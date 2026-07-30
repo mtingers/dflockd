@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 )
 
@@ -55,9 +56,15 @@ func (m *MemStorage) TruncateSuffix(from Index) error { return m.truncateSuffix(
 // (tests only use small payloads) and updates the snapshot bookkeeping
 // in-place.
 func (m *MemStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
-	raw, err := io.ReadAll(data)
+	if _, err := encodeRPCConfig(meta.Configuration); err != nil {
+		return fmt.Errorf("raft: snapshot config: %w", err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(data, int64(maxSnapshotDataBytes)+1))
 	if err != nil {
 		return err
+	}
+	if len(raw) > maxSnapshotDataBytes {
+		return fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotDataBytes)
 	}
 	m.snapData = raw
 	m.applySnapshot(meta)

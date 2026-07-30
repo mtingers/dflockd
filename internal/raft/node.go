@@ -54,8 +54,11 @@ type Node struct {
 	term     Term
 	votedFor NodeID
 	leaderID NodeID
-	config   Configuration
-	cfgIndex Index // log index of the EntryConfig in effect (0 = bootstrap)
+	// bootstrapConfig is immutable. Conflict truncation falls back to it
+	// when neither the surviving log nor a snapshot contains a config.
+	bootstrapConfig Configuration
+	config          Configuration
+	cfgIndex        Index // log index of the EntryConfig in effect (0 = bootstrap)
 
 	electionElapsed   int
 	heartbeatElapsed  int
@@ -68,6 +71,8 @@ type Node struct {
 	// leadership is a lock-free view for request-routing accessors. The run
 	// loop publishes it after every role/leader/term transition.
 	leadership atomic.Pointer[leadershipState]
+	lifecycle  atomic.Uint32
+	fatal      atomic.Pointer[fatalState]
 
 	// applyDispatched is the highest index already handed to the apply
 	// goroutine; the run loop uses it to decide which entries to ship on
@@ -118,14 +123,24 @@ type Node struct {
 	counters *Counters
 }
 
+type nodeLifecycle uint32
+
+const (
+	nodeCreated nodeLifecycle = iota
+	nodeRunning
+	nodeStopping
+	nodeStopped
+)
+
 // confChange is one membership change submitted to the run loop. It is
 // turned into an EntryConfig by onConfChange and the future is resolved
 // when the entry commits (or with ErrLeadershipLost on stepdown).
 type confChange struct {
-	add    bool // true = AddVoter; false = RemoveServer
-	id     NodeID
-	addr   string
-	future *Future
+	add        bool // true = AddVoter; false = RemoveServer
+	id         NodeID
+	addr       string
+	clientAddr string
+	future     *Future
 }
 
 // snapSaveReq asks the run loop to persist a snapshot that the apply
@@ -180,13 +195,17 @@ type NodeStatus struct {
 	LastLogIndex      Index
 	LastSnapshotIndex Index // 0 if no snapshot yet
 	Voters            []NodeID
+	Configuration     Configuration
 }
 
 type leadershipState struct {
 	role     role
 	term     Term
 	leaderID NodeID
+	voter    bool
 }
+
+type fatalState struct{ err error }
 
 // peerProgress tracks one follower's replication state (leader-only).
 type peerProgress struct {
@@ -245,7 +264,7 @@ func NewNode(cfg Config, fsm FSM, storage Storage, transport Transport, config C
 func newNode(cfg Config, fsm FSM, rl *raftLog, transport Transport, config Configuration, logger *slog.Logger) *Node {
 	return &Node{
 		cfg: cfg, log: rl, transport: transport, fsm: fsm, logger: logger.With("node", cfg.ID),
-		role: roleFollower, config: config.Clone(),
+		role: roleFollower, bootstrapConfig: config.Clone(), config: config.Clone(),
 		proposals:   map[Index]*proposal{},
 		rng:         rand.New(rand.NewSource(int64(crc([]byte(cfg.ID))) ^ time.Now().UnixNano())),
 		tickc:       make(chan struct{}, 1),
@@ -296,36 +315,23 @@ func (n *Node) recoverState(storage Storage) error {
 		return err
 	}
 	n.term, n.votedFor = hs.CurrentTerm, hs.VotedFor
-	if meta, ok := storage.SnapshotMeta(); ok && len(meta.Configuration.Voters) > 0 {
-		n.config = meta.Configuration.Clone()
-		n.cfgIndex = meta.LastIncludedIndex
+	cfg, idx, err := n.loadConfigurationAt(n.log.lastIndex())
+	if err != nil {
+		return err
 	}
-	return n.replayConfigEntries()
-}
-
-// replayConfigEntries adopts the last EntryConfig in the log (if any) —
-// configuration takes effect on append, so the most recent one wins.
-func (n *Node) replayConfigEntries() error {
-	for i := n.log.lastIndex(); i >= n.log.firstIndex(); i-- {
-		es, err := n.log.entries(i, i+1)
-		if err != nil || len(es) == 0 {
-			break
-		}
-		if es[0].Type == EntryConfig {
-			cfg, err := decodeConfig(es[0].Data)
-			if err != nil {
-				return fmt.Errorf("raft: decode persisted config at %d: %w", i, err)
-			}
-			n.config, n.cfgIndex = cfg, i
-			return nil
-		}
-	}
+	n.config, n.cfgIndex = n.withBootstrapClientMetadata(cfg), idx
 	return nil
 }
 
 // Start launches the run loop, the internal ticker, and the apply
 // goroutine. It returns immediately; the node begins as a follower.
-func (n *Node) Start() {
+func (n *Node) Start() error {
+	if !n.lifecycle.CompareAndSwap(uint32(nodeCreated), uint32(nodeRunning)) {
+		if nodeLifecycle(n.lifecycle.Load()) == nodeRunning {
+			return ErrAlreadyStarted
+		}
+		return ErrStopped
+	}
 	n.transport.SetHandler(n.handleRPC)
 	n.syncTransportPeers()
 	n.resetElectionTimer()
@@ -333,11 +339,19 @@ func (n *Node) Start() {
 	n.dispatchPendingApply() // kick off any entries already committed-but-unapplied from disk
 	go n.run()
 	go n.tickLoop()
+	return nil
 }
 
 // Close stops the run loop and the apply goroutine, waits for both to
 // exit, then joins every in-flight RPC goroutine. Idempotent.
 func (n *Node) Close() error {
+	if n.lifecycle.CompareAndSwap(uint32(nodeCreated), uint32(nodeStopped)) {
+		n.requestStop()
+		close(n.donec)
+		close(n.applyDone)
+		return nil
+	}
+	n.lifecycle.CompareAndSwap(uint32(nodeRunning), uint32(nodeStopping))
 	n.requestStop()
 	<-n.donec
 	<-n.applyDone
@@ -347,7 +361,43 @@ func (n *Node) Close() error {
 }
 
 func (n *Node) requestStop() {
+	n.lifecycle.CompareAndSwap(uint32(nodeRunning), uint32(nodeStopping))
 	n.stopOnce.Do(func() { close(n.stopc) })
+}
+
+func (n *Node) lifecycleErr() error {
+	switch nodeLifecycle(n.lifecycle.Load()) {
+	case nodeCreated:
+		return ErrNotStarted
+	case nodeRunning:
+		return nil
+	default:
+		return ErrStopped
+	}
+}
+
+// Done closes when the Raft run loop terminates.
+func (n *Node) Done() <-chan struct{} { return n.donec }
+
+// Err returns the fatal cause of an unexpected node termination. Graceful
+// Close and lifecycle misuse do not set it.
+func (n *Node) Err() error {
+	if state := n.fatal.Load(); state != nil {
+		return state.err
+	}
+	return nil
+}
+
+// Running reports whether the consensus engine is accepting work.
+func (n *Node) Running() bool {
+	return nodeLifecycle(n.lifecycle.Load()) == nodeRunning
+}
+
+// Ready reports whether the running node is a voter in its effective
+// configuration. Followers are ready; serving does not require leadership.
+func (n *Node) Ready() bool {
+	state := n.leadership.Load()
+	return n.Running() && state != nil && state.voter && n.Err() == nil
 }
 
 func (n *Node) stopping() bool {
@@ -418,6 +468,9 @@ func (n *Node) shutdownRunLoop() {
 // Status returns a snapshot of this node's consensus state. After Close
 // it returns the zero value.
 func (n *Node) Status() NodeStatus {
+	if n.lifecycleErr() != nil {
+		return NodeStatus{ID: n.cfg.ID}
+	}
 	replyc := make(chan NodeStatus, 1)
 	select {
 	case n.controlc <- func() { replyc <- n.snapshotStatus() }:
@@ -437,6 +490,7 @@ func (n *Node) snapshotStatus() NodeStatus {
 		ID: n.cfg.ID, Role: n.role.String(), Term: n.term, LeaderID: n.leaderID,
 		CommitIndex: n.log.committed, LogFirstIndex: n.log.firstIndex(),
 		LastLogIndex: n.log.lastIndex(), Voters: n.config.IDs(),
+		Configuration: n.config.Clone(),
 	}
 	if meta, ok := n.log.storage.SnapshotMeta(); ok {
 		st.LastSnapshotIndex = meta.LastIncludedIndex
@@ -461,7 +515,10 @@ func (n *Node) LeaderID() NodeID {
 }
 
 func (n *Node) publishLeadership() {
-	next := &leadershipState{role: n.role, term: n.term, leaderID: n.leaderID}
+	next := &leadershipState{
+		role: n.role, term: n.term, leaderID: n.leaderID,
+		voter: n.isVoter(n.cfg.ID),
+	}
 	if current := n.leadership.Load(); current != nil && *current == *next {
 		return
 	}
@@ -608,7 +665,32 @@ func (n *Node) failStorage(op string, err error) {
 	n.logger.Error("fatal storage failure; stopping node", "operation", op, "err", err)
 	n.role, n.leaderID, n.progress = roleFollower, "", nil
 	n.publishLeadership()
+	n.failFatal(op, err)
+}
+
+func (n *Node) failFatal(op string, err error) {
+	state := &fatalState{err: fmt.Errorf("raft: fatal %s: %w", op, err)}
+	n.fatal.CompareAndSwap(nil, state)
 	n.requestStop()
+}
+
+// withBootstrapClientMetadata upgrades a legacy configuration in memory when
+// the startup discovery map contains metadata for every effective voter. The
+// next configuration entry or snapshot makes the metadata durable.
+func (n *Node) withBootstrapClientMetadata(cfg Configuration) Configuration {
+	if cfg.ClientAddrs != nil || n.bootstrapConfig.ClientAddrs == nil {
+		return cfg
+	}
+	clientAddrs := make(map[NodeID]string, len(cfg.Voters))
+	for id := range cfg.Voters {
+		addr, ok := n.bootstrapConfig.ClientAddrs[id]
+		if !ok {
+			return cfg
+		}
+		clientAddrs[id] = addr
+	}
+	cfg.ClientAddrs = clientAddrs
+	return cfg
 }
 
 // ---------------------------------------------------------------------------

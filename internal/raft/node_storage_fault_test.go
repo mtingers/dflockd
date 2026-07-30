@@ -82,6 +82,9 @@ func TestAppendFailureStopsNodeAndFailsProposal(t *testing.T) {
 	if n.IsLeader() {
 		t.Fatal("storage-faulted node still reports itself as leader")
 	}
+	if !errors.Is(n.Err(), diskErr) {
+		t.Fatalf("fatal cause = %v, want %v", n.Err(), diskErr)
+	}
 	assertNodeStopping(t, n)
 }
 

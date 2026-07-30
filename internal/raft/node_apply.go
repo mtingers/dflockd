@@ -13,7 +13,10 @@ import (
 // ownership of each *proposal at dispatch time). It is the only writer
 // of FSM state. It exits when applyc is closed (run-loop shutdown).
 func (n *Node) runApply() {
-	defer close(n.applyDone)
+	defer func() {
+		close(n.applyDone)
+		n.lifecycle.Store(uint32(nodeStopped))
+	}()
 	failed := false
 	for req := range n.applyc {
 		if failed {
@@ -48,7 +51,7 @@ func (n *Node) applyBatch(req applyReq) bool {
 func (n *Node) restoreFSMFromBatch(req applyReq) bool {
 	if err := n.fsm.Restore(bytes.NewReader(req.restoreData)); err != nil {
 		n.logger.Error("fatal FSM Restore failure; stopping node", "at_index", req.restoreMeta.LastIncludedIndex, "err", err)
-		n.requestStop()
+		n.failFatal("FSM restore", err)
 		return false
 	}
 	return true
@@ -79,7 +82,7 @@ func (n *Node) fsmApplySafely(e Entry) (result any, err error) {
 			n.logger.Error("fatal FSM Apply panic; stopping node",
 				"index", e.Index, "term", e.Term, "recovered", r,
 				"stack", string(debug.Stack()))
-			n.requestStop()
+			n.failFatal("FSM apply", err)
 		}
 	}()
 	if e.Type != EntryNormal {
@@ -124,7 +127,7 @@ func (n *Node) captureAndQueueSnapshot(lastIdx Index, lastTerm Term, config Conf
 		return fmt.Errorf("FSM.Snapshot: %w", err)
 	}
 	defer snap.Release()
-	var buf bytes.Buffer
+	buf := snapshotCaptureBuffer{max: n.cfg.MaxSnapshotBytes}
 	if err := snap.Persist(&buf); err != nil {
 		return fmt.Errorf("FSMSnapshot.Persist: %w", err)
 	}
@@ -136,6 +139,18 @@ func (n *Node) captureAndQueueSnapshot(lastIdx Index, lastTerm Term, config Conf
 	case <-n.stopc:
 		return ErrStopped
 	}
+}
+
+type snapshotCaptureBuffer struct {
+	bytes.Buffer
+	max int
+}
+
+func (b *snapshotCaptureBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.max-b.Len() {
+		return 0, fmt.Errorf("raft: snapshot data exceeds configured max %d bytes", b.max)
+	}
+	return b.Buffer.Write(p)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,14 +165,20 @@ func (n *Node) dispatchPendingApply() {
 	}
 	entries, err := n.log.entries(n.applyDispatched+1, n.log.committed+1)
 	if err != nil {
-		n.logger.Error("dispatch apply: read entries failed", "err", err)
+		n.failStorage("read committed entries for apply", err)
 		return
 	}
 	n.shipApplyBatch(entries)
 }
 
 func (n *Node) shipApplyBatch(entries []Entry) {
-	req := applyReq{entries: entries, proposals: n.takeMatchingProposals(entries), configAtBatch: n.config.Clone()}
+	last := entries[len(entries)-1].Index
+	config, _, err := n.configurationAt(last)
+	if err != nil {
+		n.failStorage("resolve apply configuration", err)
+		return
+	}
+	req := applyReq{entries: entries, proposals: n.takeMatchingProposals(entries), configAtBatch: config}
 	for {
 		select {
 		case n.applyc <- req:

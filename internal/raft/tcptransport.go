@@ -45,12 +45,22 @@ type TCPTransport struct {
 	accepted      sync.Map                   // net.Conn → struct{} (open accepted conns)
 	lastDialFail  sync.Map                   // NodeID → time.Time (dial-failure cool-down)
 	dialMu        sync.Mutex                 // serialises dial-on-demand
+	lifecycleMu   sync.Mutex                 // guards wg.Add + connection publication against Close
+	handshakeSlot chan struct{}              // bounds unauthenticated handshake concurrency
 	log           *slog.Logger
 	wg            sync.WaitGroup
 	closed        atomic.Bool
 }
 
+const maxConcurrentHandshakes = 64
+
 var _ Transport = (*TCPTransport)(nil)
+var _ IdentityBoundTransport = (*TCPTransport)(nil)
+
+// PeerIdentityBound reports whether mutual TLS binds the hello NodeID to the
+// verified certificate identity. A shared cluster secret alone is common to
+// every member and therefore cannot safely support member removal.
+func (t *TCPTransport) PeerIdentityBound() bool { return t.tlsCfg != nil }
 
 // errTransportClosed is returned by Send once Close has been called.
 var errTransportClosed = errors.New("raft: transport closed")
@@ -98,6 +108,7 @@ func NewTCPTransport(id NodeID, listenAddr string, logger *slog.Logger, opts ...
 	t := &TCPTransport{
 		id: id, listener: lis, tlsCfg: o.tlsCfg,
 		clusterSecret: o.clusterSecret, log: logger.With("transport", id),
+		handshakeSlot: make(chan struct{}, maxConcurrentHandshakes),
 	}
 	t.wg.Add(1)
 	go t.acceptLoop()
@@ -108,8 +119,8 @@ func validateTCPOptions(id NodeID, o tcpOptions) error {
 	if id == "" {
 		return fmt.Errorf("raft: TCP transport node ID is required")
 	}
-	if len(id) >= maxString16 {
-		return fmt.Errorf("raft: TCP transport node ID exceeds %d bytes", maxString16-1)
+	if len(id) > maxRPCNodeIDBytes {
+		return fmt.Errorf("raft: TCP transport node ID exceeds %d bytes", maxRPCNodeIDBytes)
 	}
 	if len(o.clusterSecret) < minClusterSecretBytes {
 		return fmt.Errorf("raft: cluster secret must be at least %d bytes", minClusterSecretBytes)
@@ -132,12 +143,20 @@ func (t *TCPTransport) SetHandler(h func(from NodeID, req Message) Message) {
 
 // AddPeer implements raft.Transport. Updates the peer-id → address
 // map; the actual TCP connection is dialed lazily on first Send.
-func (t *TCPTransport) AddPeer(id NodeID, addr string) { t.addrs.Store(id, addr) }
+func (t *TCPTransport) AddPeer(id NodeID, addr string) {
+	t.dialMu.Lock()
+	defer t.dialMu.Unlock()
+	if !t.closed.Load() {
+		t.addrs.Store(id, addr)
+	}
+}
 
 // RemovePeer implements raft.Transport. Drops the address, clears the
 // dial-failure cool-down, and closes any open outbound connection to
 // the peer.
 func (t *TCPTransport) RemovePeer(id NodeID) {
+	t.dialMu.Lock()
+	defer t.dialMu.Unlock()
 	t.addrs.Delete(id)
 	t.lastDialFail.Delete(id)
 	t.dropOutbound(id)
@@ -148,7 +167,11 @@ func (t *TCPTransport) RemovePeer(id NodeID) {
 // background goroutines to exit. Idempotent — second and subsequent
 // calls return nil immediately.
 func (t *TCPTransport) Close() error {
+	t.dialMu.Lock()
+	t.lifecycleMu.Lock()
 	if !t.closed.CompareAndSwap(false, true) {
+		t.lifecycleMu.Unlock()
+		t.dialMu.Unlock()
 		return nil
 	}
 	_ = t.listener.Close()
@@ -160,6 +183,8 @@ func (t *TCPTransport) Close() error {
 		_ = k.(net.Conn).Close()
 		return true
 	})
+	t.lifecycleMu.Unlock()
+	t.dialMu.Unlock()
 	t.wg.Wait()
 	return nil
 }
@@ -195,20 +220,42 @@ func (t *TCPTransport) acceptLoop() {
 			_ = conn.Close() // accepted in the Close() race window
 			return
 		}
+		select {
+		case t.handshakeSlot <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
+		t.lifecycleMu.Lock()
+		if t.closed.Load() {
+			t.lifecycleMu.Unlock()
+			<-t.handshakeSlot
+			_ = conn.Close()
+			return
+		}
+		t.accepted.Store(conn, struct{}{})
 		t.wg.Add(1)
+		t.lifecycleMu.Unlock()
 		go t.serveAccepted(conn)
 	}
 }
 
 func (t *TCPTransport) serveAccepted(conn net.Conn) {
 	defer t.wg.Done()
+	handshaking := true
+	defer func() {
+		if handshaking {
+			<-t.handshakeSlot
+		}
+	}()
 	tuneConn(conn)
-	t.accepted.Store(conn, struct{}{})
 	defer func() { t.accepted.Delete(conn); _ = conn.Close() }()
 	if t.closed.Load() {
 		return // Close() may have already finished its accepted.Range
 	}
 	from, session, err := t.serverHandshake(conn)
+	<-t.handshakeSlot
+	handshaking = false
 	if err != nil {
 		t.log.Debug("inbound handshake failed", "err", err)
 		return
@@ -233,7 +280,7 @@ func (t *TCPTransport) serverHandshake(conn net.Conn) (NodeID, *secureSession, e
 }
 
 func (t *TCPTransport) readClientHello(conn net.Conn) (handshakeHello, error) {
-	body, err := readFrame(conn, handshakeTimeout)
+	body, err := readHandshakeFrame(conn, handshakeTimeout)
 	if err != nil {
 		return handshakeHello{}, fmt.Errorf("read hello: %w", err)
 	}
@@ -258,7 +305,7 @@ func (t *TCPTransport) exchangeServerProof(conn net.Conn, client handshakeHello)
 	if err := writeFrameTo(conn, encodeHello(server), handshakeTimeout); err != nil {
 		return handshakeHello{}, fmt.Errorf("write hello reply: %w", err)
 	}
-	body, err := readFrame(conn, handshakeTimeout)
+	body, err := readHandshakeFrame(conn, handshakeTimeout)
 	if err != nil {
 		return handshakeHello{}, fmt.Errorf("read client auth: %w", err)
 	}
@@ -398,9 +445,16 @@ func (t *TCPTransport) dialFresh(to NodeID) (*outboundConn, error) {
 	}
 	t.lastDialFail.Delete(to)
 	oc := newOutboundConn(conn, session, t)
+	t.lifecycleMu.Lock()
+	if t.closed.Load() {
+		t.lifecycleMu.Unlock()
+		oc.close()
+		return nil, errTransportClosed
+	}
 	t.outbound.Store(to, oc)
 	t.wg.Add(1)
 	go func() { defer t.wg.Done(); oc.runReader() }()
+	t.lifecycleMu.Unlock()
 	return oc, nil
 }
 
@@ -422,7 +476,7 @@ func (t *TCPTransport) clientHandshake(conn net.Conn, want NodeID) (*secureSessi
 	if err := writeFrameTo(conn, encodeHello(client), handshakeTimeout); err != nil {
 		return nil, fmt.Errorf("write hello: %w", err)
 	}
-	body, err := readFrame(conn, handshakeTimeout)
+	body, err := readHandshakeFrame(conn, handshakeTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("read hello reply: %w", err)
 	}

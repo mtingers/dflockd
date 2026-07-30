@@ -119,6 +119,10 @@ type MemTransport struct {
 	wg      sync.WaitGroup // joins every in-flight invoke goroutine
 }
 
+// PeerIdentityBound is true because MemNetwork supplies the sender ID from the
+// fixed transport endpoint; callers cannot choose another endpoint's ID.
+func (*MemTransport) PeerIdentityBound() bool { return true }
+
 var _ Transport = (*MemTransport)(nil)
 
 // LocalID implements raft.Transport.

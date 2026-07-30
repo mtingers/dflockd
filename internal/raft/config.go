@@ -31,9 +31,8 @@ type Config struct {
 	// entry-count-triggered snapshots.
 	SnapshotThresholdEntries uint64
 
-	// MaxSnapshotBytes bounds a single InstallSnapshot frame. A snapshot
-	// larger than this cannot be transferred (dflockd's state is tiny;
-	// the default is generous).
+	// MaxSnapshotBytes bounds the FSM payload of a snapshot. It may be lowered
+	// by an application but cannot exceed the package's wire-safe limit.
 	MaxSnapshotBytes int
 
 	// ApplyChanDepth is the buffer between the run loop and the apply
@@ -55,7 +54,7 @@ func DefaultConfig() Config {
 		ElectionTimeoutMax:       900 * time.Millisecond,
 		MaxAppendEntries:         256,
 		SnapshotThresholdEntries: 8192,
-		MaxSnapshotBytes:         64 << 20,
+		MaxSnapshotBytes:         maxSnapshotDataBytes,
 		ApplyChanDepth:           256,
 		PreVote:                  true,
 	}
@@ -86,6 +85,9 @@ func (c *Config) Validate() error {
 func validateID(c *Config) error {
 	if c.ID == "" {
 		return fmt.Errorf("raft: Config.ID is required")
+	}
+	if len(c.ID) > maxRPCNodeIDBytes {
+		return fmt.Errorf("raft: Config.ID length %d exceeds max %d", len(c.ID), maxRPCNodeIDBytes)
 	}
 	return nil
 }
@@ -123,6 +125,9 @@ func validateMaxAppendEntries(c *Config) error {
 func validateMaxSnapshotBytes(c *Config) error {
 	if c.MaxSnapshotBytes <= 0 {
 		return fmt.Errorf("raft: MaxSnapshotBytes must be > 0")
+	}
+	if c.MaxSnapshotBytes > maxSnapshotDataBytes {
+		return fmt.Errorf("raft: MaxSnapshotBytes %d exceeds wire-safe max %d", c.MaxSnapshotBytes, maxSnapshotDataBytes)
 	}
 	return nil
 }

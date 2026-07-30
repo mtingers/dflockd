@@ -96,6 +96,25 @@ func TestAppendReplicationChainsBatchesAfterSuccess(t *testing.T) {
 	n.rpcWG.Wait()
 }
 
+func TestAppendReplicationBatchesByEncodedBytes(t *testing.T) {
+	data := make([]byte, 100)
+	entries := make([]Entry, 4)
+	for i := range entries {
+		entries[i] = Entry{Index: Index(i + 1), Term: 2, Type: EntryNormal, Data: data}
+	}
+	budget := appendEntriesPayloadBaseBytes("a") + 3*(21+len(data))
+	selected := limitAppendEntriesByBudget(entries, "a", budget)
+	if got, want := len(selected), 3; got != want {
+		t.Fatalf("entry batch = %d, want %d", got, want)
+	}
+	req := &AppendEntriesReq{Term: 3, LeaderID: "a", Entries: selected}
+	if payload, err := encodeAppendEntriesReq(req); err != nil {
+		t.Fatalf("selected batch does not fit: %v", err)
+	} else if len(payload) != budget {
+		t.Fatalf("selected payload = %d, budget %d", len(payload), budget)
+	}
+}
+
 func newAppendTestNode(t *testing.T, maxEntries int) (*Node, *blockingAppendTransport) {
 	t.Helper()
 	transport := newBlockingAppendTransport()

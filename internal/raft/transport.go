@@ -31,6 +31,14 @@ type Transport interface {
 	Close() error
 }
 
+// IdentityBoundTransport reports whether an authenticated peer is
+// cryptographically or structurally unable to claim another NodeID. Dynamic
+// membership requires this property so a removed credential holder cannot
+// impersonate a remaining voter.
+type IdentityBoundTransport interface {
+	PeerIdentityBound() bool
+}
+
 // Message is the closed set of Raft RPCs and their replies. Each concrete
 // type carries the sender's term so a stale node can be detected and
 // stepped down regardless of which RPC it sent.

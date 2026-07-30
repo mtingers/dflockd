@@ -68,6 +68,8 @@ func finishDecodeEntry(b []byte, e Entry, dataLen int) (Entry, int, error) {
 // maxConfigBytes bounds an encoded Configuration.
 const maxConfigBytes = 1 << 20
 
+var configMetadataMagic = [4]byte{'d', 'f', 'm', '1'}
+
 func encodeConfig(dst []byte, c Configuration) []byte {
 	dst = be.AppendUint32(dst, uint32(len(c.Voters)))
 	ids := c.IDs()
@@ -75,6 +77,18 @@ func encodeConfig(dst []byte, c Configuration) []byte {
 	for _, id := range ids {
 		dst = appendString16(dst, string(id))
 		dst = appendString16(dst, c.Voters[id])
+	}
+	if c.ClientAddrs != nil {
+		dst = append(dst, configMetadataMagic[:]...)
+		dst = be.AppendUint32(dst, uint32(len(c.ClientAddrs)))
+		for _, id := range ids {
+			addr, ok := c.ClientAddrs[id]
+			if !ok {
+				continue
+			}
+			dst = appendString16(dst, string(id))
+			dst = appendString16(dst, addr)
+		}
 	}
 	return dst
 }
@@ -87,28 +101,69 @@ func decodeConfig(b []byte) (Configuration, error) {
 		return Configuration{}, fmt.Errorf("raft: config truncated")
 	}
 	n := be.Uint32(b[0:4])
-	return decodeConfigVoters(b[4:], int(n))
+	c, rest, err := decodeConfigVoters(b[4:], int(n))
+	if err != nil {
+		return Configuration{}, err
+	}
+	return decodeConfigMetadata(c, rest)
 }
 
-func decodeConfigVoters(b []byte, n int) (Configuration, error) {
+func decodeConfigVoters(b []byte, n int) (Configuration, []byte, error) {
 	if n < 0 || n > len(b)/4 { // every voter is >=4 bytes (two empty string16s)
-		return Configuration{}, fmt.Errorf("raft: config voter count %d implausible for %d bytes", n, len(b))
+		return Configuration{}, nil, fmt.Errorf("raft: config voter count %d implausible for %d bytes", n, len(b))
 	}
 	c := Configuration{Voters: make(map[NodeID]string)} // no capacity hint: n is attacker-influenced
 	for i := 0; i < n; i++ {
 		id, rest, err := takeString16(b)
 		if err != nil {
-			return Configuration{}, err
+			return Configuration{}, nil, err
 		}
 		addr, rest2, err := takeString16(rest)
 		if err != nil {
-			return Configuration{}, err
+			return Configuration{}, nil, err
 		}
 		if _, exists := c.Voters[NodeID(id)]; exists {
-			return Configuration{}, fmt.Errorf("raft: duplicate voter %q", id)
+			return Configuration{}, nil, fmt.Errorf("raft: duplicate voter %q", id)
 		}
 		c.Voters[NodeID(id)] = addr
 		b = rest2
+	}
+	return c, b, nil
+}
+
+func decodeConfigMetadata(c Configuration, b []byte) (Configuration, error) {
+	if len(b) == 0 {
+		return c, nil // legacy configuration without client metadata
+	}
+	if len(b) < len(configMetadataMagic)+4 ||
+		string(b[:len(configMetadataMagic)]) != string(configMetadataMagic[:]) {
+		return Configuration{}, fmt.Errorf("raft: config has %d invalid trailing bytes", len(b))
+	}
+	b = b[len(configMetadataMagic):]
+	n := int(be.Uint32(b[:4]))
+	b = b[4:]
+	if n != len(c.Voters) {
+		return Configuration{}, fmt.Errorf("raft: client metadata count %d does not match voter count %d", n, len(c.Voters))
+	}
+	c.ClientAddrs = make(map[NodeID]string)
+	for i := 0; i < n; i++ {
+		id, rest, err := takeString16(b)
+		if err != nil {
+			return Configuration{}, err
+		}
+		addr, rest, err := takeString16(rest)
+		if err != nil {
+			return Configuration{}, err
+		}
+		nodeID := NodeID(id)
+		if _, voter := c.Voters[nodeID]; !voter {
+			return Configuration{}, fmt.Errorf("raft: client metadata names non-voter %q", id)
+		}
+		if _, duplicate := c.ClientAddrs[nodeID]; duplicate {
+			return Configuration{}, fmt.Errorf("raft: duplicate client metadata for %q", id)
+		}
+		c.ClientAddrs[nodeID] = addr
+		b = rest
 	}
 	if len(b) != 0 {
 		return Configuration{}, fmt.Errorf("raft: config has %d trailing bytes", len(b))

@@ -5,6 +5,10 @@ import "fmt"
 const (
 	rpcFlagTrue    uint8 = 1 << 0
 	rpcFlagPreVote uint8 = 1 << 1
+
+	appendEntriesFixedBytes   = 8 + 2 + 8 + 8 + 8 + 4
+	installSnapshotFixedBytes = 8 + 2 + maxRPCNodeIDBytes + 8 + 8 + 4 + 4
+	maxSnapshotDataBytes      = maxRPCPayloadBytes - installSnapshotFixedBytes - maxConfigBytes
 )
 
 // Payload fields follow their Message declarations. Scalars are big-endian,
@@ -68,14 +72,14 @@ func encodeRequestVoteResp(m *RequestVoteResp) []byte {
 }
 
 func encodeAppendEntriesReq(m *AppendEntriesReq) ([]byte, error) {
-	size := 8 + 2 + len(m.LeaderID) + 8 + 8 + 8 + 4
+	size := appendEntriesPayloadBaseBytes(m.LeaderID)
 	for _, entry := range m.Entries {
 		if len(entry.Data) > maxEntryDataBytes {
 			return nil, fmt.Errorf("entry data length %d exceeds max %d", len(entry.Data), maxEntryDataBytes)
 		}
 		size += 21 + len(entry.Data)
-		if size > maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes {
-			return nil, fmt.Errorf("payload length exceeds max %d", maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes)
+		if size > maxRPCPayloadBytes {
+			return nil, fmt.Errorf("payload length exceeds max %d", maxRPCPayloadBytes)
 		}
 	}
 	dst := make([]byte, 0, size)
@@ -103,18 +107,21 @@ func encodeAppendEntriesResp(m *AppendEntriesResp) []byte {
 }
 
 func encodeInstallSnapshotReq(m *InstallSnapshotReq) ([]byte, error) {
-	if len(m.LeaderID) >= maxString16 {
-		return nil, fmt.Errorf("node ID length %d exceeds max %d", len(m.LeaderID), maxString16-1)
+	if len(m.LeaderID) > maxRPCNodeIDBytes {
+		return nil, fmt.Errorf("node ID length %d exceeds max %d", len(m.LeaderID), maxRPCNodeIDBytes)
 	}
 	cfg, err := encodeRPCConfig(m.Meta.Configuration)
 	if err != nil {
 		return nil, err
 	}
 	size := 8 + 2 + len(m.LeaderID) + 8 + 8 + 4 + len(cfg) + 4 + len(m.Data)
-	if size > maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes {
+	if len(m.Data) > maxSnapshotDataBytes {
+		return nil, fmt.Errorf("snapshot data length %d exceeds max %d", len(m.Data), maxSnapshotDataBytes)
+	}
+	if size > maxRPCPayloadBytes {
 		return nil, fmt.Errorf(
 			"payload length %d exceeds max %d",
-			size, maxTCPFrameBytes-secureFrameOverhead-rpcHeaderBytes,
+			size, maxRPCPayloadBytes,
 		)
 	}
 	dst := make([]byte, 0, size)
@@ -143,10 +150,30 @@ func encodeTimeoutNowResp(m *TimeoutNowResp) []byte {
 }
 
 func appendRPCNodeID(dst []byte, id NodeID) ([]byte, error) {
-	if len(id) >= maxString16 {
-		return nil, fmt.Errorf("node ID length %d exceeds max %d", len(id), maxString16-1)
+	if len(id) > maxRPCNodeIDBytes {
+		return nil, fmt.Errorf("node ID length %d exceeds max %d", len(id), maxRPCNodeIDBytes)
 	}
 	return appendString16(dst, string(id)), nil
+}
+
+func appendEntriesPayloadBaseBytes(leaderID NodeID) int {
+	return appendEntriesFixedBytes + len(leaderID)
+}
+
+func limitAppendEntriesByBytes(entries []Entry, leaderID NodeID) []Entry {
+	return limitAppendEntriesByBudget(entries, leaderID, maxRPCPayloadBytes)
+}
+
+func limitAppendEntriesByBudget(entries []Entry, leaderID NodeID, budget int) []Entry {
+	size := appendEntriesPayloadBaseBytes(leaderID)
+	for i, entry := range entries {
+		next := size + 21 + len(entry.Data)
+		if next > budget {
+			return entries[:i]
+		}
+		size = next
+	}
+	return entries
 }
 
 func encodeRPCConfig(c Configuration) ([]byte, error) {
@@ -156,6 +183,22 @@ func encodeRPCConfig(c Configuration) ([]byte, error) {
 		}
 		if len(addr) >= maxString16 {
 			return nil, fmt.Errorf("voter address length %d exceeds max %d", len(addr), maxString16-1)
+		}
+	}
+	if c.ClientAddrs != nil {
+		if len(c.ClientAddrs) != len(c.Voters) {
+			return nil, fmt.Errorf("client metadata count %d does not match voter count %d", len(c.ClientAddrs), len(c.Voters))
+		}
+		for id, addr := range c.ClientAddrs {
+			if _, ok := c.Voters[id]; !ok {
+				return nil, fmt.Errorf("client metadata names non-voter %q", id)
+			}
+			if len(id) >= maxString16 {
+				return nil, fmt.Errorf("client metadata ID length %d exceeds max %d", len(id), maxString16-1)
+			}
+			if len(addr) >= maxString16 {
+				return nil, fmt.Errorf("client address length %d exceeds max %d", len(addr), maxString16-1)
+			}
 		}
 	}
 	cfg := encodeConfig(nil, c)
@@ -357,7 +400,7 @@ func (d *rpcDecoder) installSnapshotReq() Message {
 	index := d.uint64()
 	snapshotTerm := d.uint64()
 	cfg := d.config()
-	data := d.bytes32()
+	data := d.bytes32Limit(maxSnapshotDataBytes)
 	return &InstallSnapshotReq{
 		Term: Term(term), LeaderID: id,
 		Meta: SnapshotMeta{
@@ -399,9 +442,13 @@ func (d *rpcDecoder) config() Configuration {
 	return cfg
 }
 
-func (d *rpcDecoder) bytes32() []byte {
+func (d *rpcDecoder) bytes32Limit(max int) []byte {
 	n := uint64(d.uint32())
 	if d.err != nil {
+		return nil
+	}
+	if n > uint64(max) {
+		d.failf("byte payload length %d exceeds max %d", n, max)
 		return nil
 	}
 	if n > uint64(len(d.b)) {

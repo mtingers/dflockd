@@ -298,6 +298,7 @@ func TestFileStoragePreparedSnapshotCommitsConcurrentTail(t *testing.T) {
 	if err := s.commitPreparedSnapshot(prepared, delta); err != nil {
 		t.Fatalf("commitPreparedSnapshot: %v", err)
 	}
+	mustSaveHard(t, s, HardState{CurrentTerm: 2, CommitIndex: 6})
 	if s.FirstIndex() != 4 || s.LastIndex() != 6 {
 		t.Fatalf("committed: first=%d last=%d, want 4/6", s.FirstIndex(), s.LastIndex())
 	}
@@ -333,6 +334,7 @@ func TestFileStoragePreparedSnapshotIsCrashRecoverableBeforeCommit(t *testing.T)
 	if err != nil {
 		t.Fatalf("prepareSnapshot: %v", err)
 	}
+	mustSaveHard(t, s, HardState{CurrentTerm: 1, CommitIndex: 5})
 	s.abortPreparedSnapshot(prepared)
 	if _, ok := s.SnapshotMeta(); ok {
 		t.Fatal("prepared snapshot became live before commit")
@@ -417,6 +419,7 @@ func TestFileStorageTornTailDiscarded(t *testing.T) {
 	dir := t.TempDir()
 	s := mustOpenFileStorage(t, dir)
 	appendN(t, s, 1, 1, 3)
+	mustSaveHard(t, s, HardState{CurrentTerm: 1, CommitIndex: 3})
 	s.Close()
 
 	// Corrupt the WAL: append garbage bytes after the last good record.
@@ -474,19 +477,174 @@ func TestFileStorageRejectsCorruptHardState(t *testing.T) {
 	mustSaveHard(t, s, HardState{CurrentTerm: 5, VotedFor: "n1", CommitIndex: 3})
 	s.Close()
 
-	// Flip a byte inside slot 1 (the one with seq=1). Slot 0 is still zero
-	// (never written) so it's "invalid" -> recovery should yield the zero
-	// HardState, not garbage.
+	// The first save writes both slots. Corrupt both copies so no valid
+	// durable state remains and startup must fail closed.
 	hsPath := filepath.Join(dir, hardStateFileName)
 	raw, _ := os.ReadFile(hsPath)
-	raw[hardStateSlotBytes+20] ^= 0xFF // corrupt currentTerm bytes in slot 1
+	raw[20] ^= 0xFF
+	raw[hardStateSlotBytes+20] ^= 0xFF
 	os.WriteFile(hsPath, raw, 0o600)
+
+	if s2, err := OpenFileStorage(dir); err == nil {
+		s2.Close()
+		t.Fatal("OpenFileStorage accepted HardState with no valid slot")
+	}
+}
+
+func TestFileStorageRejectsExistingAllZeroHardState(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	s.Close()
+
+	hsPath := filepath.Join(dir, hardStateFileName)
+	if err := os.WriteFile(hsPath, make([]byte, hardStateFileBytes), hardStateFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	if s2, err := OpenFileStorage(dir); err == nil {
+		s2.Close()
+		t.Fatal("OpenFileStorage accepted an existing all-zero HardState journal")
+	}
+}
+
+func TestFileStorageRejectsConflictingSameGenerationSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	defer s.Close()
+
+	meta := SnapshotMeta{
+		LastIncludedIndex: 2,
+		LastIncludedTerm:  1,
+		Configuration:     Configuration{Voters: map[NodeID]string{"n1": "r1"}, ClientAddrs: map[NodeID]string{"n1": "c1"}},
+	}
+	if err := s.SaveSnapshot(meta, bytes.NewReader([]byte("first"))); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	conflict := meta
+	conflict.Configuration = Configuration{Voters: map[NodeID]string{"n1": "r1"}, ClientAddrs: map[NodeID]string{"n1": "changed"}}
+	if _, err := s.prepareSnapshot(conflict, []byte("second"), nil); err == nil {
+		t.Fatal("prepareSnapshot accepted conflicting data and metadata at the same index/term")
+	}
+}
+
+func TestFileStorageRecoversPreviousHardStateSlot(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	first := HardState{CurrentTerm: 3, VotedFor: "n1"}
+	mustSaveHard(t, s, first)
+	mustSaveHard(t, s, HardState{CurrentTerm: 4, VotedFor: "n2"})
+	s.Close()
+
+	hsPath := filepath.Join(dir, hardStateFileName)
+	raw, err := os.ReadFile(hsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[hardStateSlotBytes+20] ^= 0xFF // seq=3 is in slot 1; slot 0 still contains seq=2
+	if err := os.WriteFile(hsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	s2 := mustOpenFileStorage(t, dir)
 	defer s2.Close()
-	if hs, _ := s2.LoadHardState(); hs != (HardState{}) {
-		t.Fatalf("corrupt-slot recovery = %+v, want zero HardState", hs)
+	if got, _ := s2.LoadHardState(); got != first {
+		t.Fatalf("recovered HardState = %+v, want %+v", got, first)
 	}
+}
+
+func TestFileStorageRejectsBothCorruptHardStateSlots(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	mustSaveHard(t, s, HardState{CurrentTerm: 3, VotedFor: "n1"})
+	mustSaveHard(t, s, HardState{CurrentTerm: 4, VotedFor: "n2"})
+	s.Close()
+
+	hsPath := filepath.Join(dir, hardStateFileName)
+	raw, err := os.ReadFile(hsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[20] ^= 0xFF
+	raw[hardStateSlotBytes+20] ^= 0xFF
+	if err := os.WriteFile(hsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s2, err := OpenFileStorage(dir); err == nil {
+		s2.Close()
+		t.Fatal("OpenFileStorage accepted two corrupt HardState slots")
+	}
+}
+
+func TestFileStorageRejectsCorruptCommittedWALWithoutTruncating(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	appendN(t, s, 1, 1, 3)
+	mustSaveHard(t, s, HardState{CurrentTerm: 1, CommitIndex: 3})
+	s.Close()
+
+	corrupt := corruptWALRecord(t, dir, 3)
+	if s2, err := OpenFileStorage(dir); err == nil {
+		s2.Close()
+		t.Fatal("OpenFileStorage accepted corruption at committed index 3")
+	}
+	after, err := os.ReadFile(filepath.Join(dir, walFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, corrupt) {
+		t.Fatal("failed recovery modified the WAL before validation")
+	}
+}
+
+func TestFileStorageTruncatesOnlyCorruptUncommittedWAL(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	appendN(t, s, 1, 1, 3)
+	mustSaveHard(t, s, HardState{CurrentTerm: 1, CommitIndex: 2})
+	s.Close()
+
+	corruptWALRecord(t, dir, 3)
+	s2 := mustOpenFileStorage(t, dir)
+	defer s2.Close()
+	if got := s2.LastIndex(); got != 2 {
+		t.Fatalf("LastIndex after uncommitted-tail recovery = %d, want 2", got)
+	}
+	appendN(t, s2, 3, 1, 1)
+}
+
+func TestNewRaftLogRejectsCommitBeyondAvailableState(t *testing.T) {
+	storage := NewMemStorage()
+	if err := storage.SaveHardState(HardState{CurrentTerm: 1, CommitIndex: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRaftLog(storage); err == nil {
+		t.Fatal("newRaftLog silently accepted commit index beyond the log")
+	}
+}
+
+func corruptWALRecord(t *testing.T, dir string, index Index) []byte {
+	t.Helper()
+	path := filepath.Join(dir, walFileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := 0
+	for off < len(raw) {
+		entry, n, ok := decodeWALRecord(raw[off:])
+		if !ok {
+			t.Fatalf("WAL was already invalid at byte %d", off)
+		}
+		if entry.Index == index {
+			raw[off+walRecordHeaderBytes] ^= 0xFF
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return append([]byte(nil), raw...)
+		}
+		off += n
+	}
+	t.Fatalf("WAL record %d not found", index)
+	return nil
 }
 
 // A snapshot file that exists but is corrupt must fail the open loudly —
@@ -544,5 +702,54 @@ func TestSnapshotKeepsOnlyLatest(t *testing.T) {
 	}
 	if m, _ := s.SnapshotMeta(); m.LastIncludedIndex != 7 {
 		t.Fatalf("latest snapshot index = %d, want 7", m.LastIncludedIndex)
+	}
+}
+
+func TestSnapshotPersistsClientMemberMetadata(t *testing.T) {
+	dir := t.TempDir()
+	s := mustOpenFileStorage(t, dir)
+	meta := SnapshotMeta{
+		LastIncludedIndex: 1,
+		LastIncludedTerm:  1,
+		Configuration: Configuration{
+			Voters:      map[NodeID]string{"a": "raft-a"},
+			ClientAddrs: map[NodeID]string{"a": "client-a"},
+		},
+	}
+	mustSaveSnap(t, s, meta, []byte("state"))
+	mustSaveHard(t, s, HardState{CurrentTerm: 1, CommitIndex: 1})
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened := mustOpenFileStorage(t, dir)
+	defer reopened.Close()
+	got, ok := reopened.SnapshotMeta()
+	if !ok || got.Configuration.ClientAddrs["a"] != "client-a" {
+		t.Fatalf("reopened metadata = %+v, ok=%v", got.Configuration.ClientAddrs, ok)
+	}
+}
+
+func TestSnapshotRejectsIncompleteClientMemberMetadata(t *testing.T) {
+	meta := SnapshotMeta{
+		LastIncludedIndex: 1,
+		LastIncludedTerm:  1,
+		Configuration: Configuration{
+			Voters:      map[NodeID]string{"a": "raft-a", "b": "raft-b"},
+			ClientAddrs: map[NodeID]string{"a": "client-a"},
+		},
+	}
+	impls := map[string]func(*testing.T) Storage{
+		"mem":  func(*testing.T) Storage { return NewMemStorage() },
+		"file": func(t *testing.T) Storage { return mustOpenFileStorage(t, t.TempDir()) },
+	}
+	for name, newStorage := range impls {
+		t.Run(name, func(t *testing.T) {
+			s := newStorage(t)
+			defer s.Close()
+			if err := s.SaveSnapshot(meta, bytes.NewReader(nil)); err == nil {
+				t.Fatal("SaveSnapshot accepted incomplete client metadata")
+			}
+		})
 	}
 }

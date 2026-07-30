@@ -1,8 +1,11 @@
 package raft
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"reflect"
@@ -14,6 +17,15 @@ import (
 )
 
 const testClusterSecret = "0123456789abcdef0123456789abcdef"
+
+func TestTCPTransportIdentityBindingRequiresTLS(t *testing.T) {
+	if (&TCPTransport{}).PeerIdentityBound() {
+		t.Fatal("shared-secret-only transport reports identity binding")
+	}
+	if !(&TCPTransport{tlsCfg: &tls.Config{}}).PeerIdentityBound() {
+		t.Fatal("mTLS transport does not report identity binding")
+	}
+}
 
 func newTestTCPTransport(id NodeID, addr string, logger *slog.Logger, opts ...TCPOption) (*TCPTransport, error) {
 	opts = append([]TCPOption{WithClusterSecret(testClusterSecret)}, opts...)
@@ -214,6 +226,175 @@ func TestTCPTransportFrameRoundTrip(t *testing.T) {
 		if !reflect.DeepEqual(got, m) {
 			t.Fatalf("roundtrip %T:\n got  %#v\n want %#v", m, got, m)
 		}
+	}
+}
+
+func TestHandshakeFrameRejectsLargeLengthBeforeAllocation(t *testing.T) {
+	var frame bytes.Buffer
+	var header [4]byte
+	be.PutUint32(header[:], maxHandshakeFrameBytes+1)
+	frame.Write(header[:])
+	if _, err := readHandshakeFrame(&frame, 0); err == nil {
+		t.Fatal("oversize unauthenticated handshake frame was accepted")
+	}
+}
+
+func TestTCPTransportBoundsConcurrentHandshakes(t *testing.T) {
+	tr, err := newTestTCPTransport("a", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTCPTransport: %v", err)
+	}
+	defer tr.Close()
+	conns := make([]net.Conn, 0, maxConcurrentHandshakes+16)
+	for i := 0; i < maxConcurrentHandshakes+16; i++ {
+		conn, err := net.Dial("tcp", tr.ListenAddr())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	if !waitFor(t, time.Second, func() bool {
+		return syncMapLen(&tr.accepted) == maxConcurrentHandshakes
+	}) {
+		t.Fatalf("accepted handshakes = %d, want bounded at %d", syncMapLen(&tr.accepted), maxConcurrentHandshakes)
+	}
+}
+
+func TestTCPTransportRemovePeerWinsPausedDial(t *testing.T) {
+	addr, paused, release, stop := pausedHandshakePeer(t, "b")
+	defer stop()
+	tr, err := newTestTCPTransport("a", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTCPTransport: %v", err)
+	}
+	defer tr.Close()
+	tr.AddPeer("b", addr)
+	sendDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := tr.Send(ctx, "b", &RequestVoteReq{Term: 1, CandidateID: "a"})
+		sendDone <- err
+	}()
+	<-paused
+	removeDone := make(chan struct{})
+	go func() {
+		tr.RemovePeer("b")
+		close(removeDone)
+	}()
+	select {
+	case <-removeDone:
+		t.Fatal("RemovePeer returned before the in-progress handshake was released")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	<-removeDone
+	if _, ok := tr.addrs.Load("b"); ok {
+		t.Fatal("removed peer address was republished")
+	}
+	if _, ok := tr.outbound.Load("b"); ok {
+		t.Fatal("removed peer outbound connection was republished")
+	}
+	if err := <-sendDone; err == nil {
+		t.Fatal("Send unexpectedly succeeded through removed peer")
+	}
+}
+
+func TestTCPTransportCloseWaitsForPausedDialWithoutPublicationRace(t *testing.T) {
+	addr, paused, release, stop := pausedHandshakePeer(t, "b")
+	defer stop()
+	tr, err := newTestTCPTransport("a", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTCPTransport: %v", err)
+	}
+	tr.AddPeer("b", addr)
+	sendDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := tr.Send(ctx, "b", &RequestVoteReq{Term: 1, CandidateID: "a"})
+		sendDone <- err
+	}()
+	<-paused
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- tr.Close() }()
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before the in-progress handshake was released")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-sendDone; err == nil {
+		t.Fatal("Send unexpectedly succeeded while transport closed")
+	}
+	if _, ok := tr.outbound.Load("b"); ok {
+		t.Fatal("outbound connection remained published after Close")
+	}
+}
+
+func syncMapLen(m *sync.Map) int {
+	count := 0
+	m.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func pausedHandshakePeer(t *testing.T, id NodeID) (addr string, paused <-chan struct{}, release chan struct{}, stop func()) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen paused peer: %v", err)
+	}
+	reached := make(chan struct{})
+	unblock := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		body, err := readHandshakeFrame(conn, time.Second)
+		if err != nil {
+			return
+		}
+		clientHello, err := decodeHello(body)
+		if err != nil {
+			return
+		}
+		close(reached)
+		<-unblock
+		serverHello, err := newServerHello([]byte(testClusterSecret), clientHello, id)
+		if err != nil {
+			return
+		}
+		if err := writeFrameTo(conn, encodeHello(serverHello), time.Second); err != nil {
+			return
+		}
+		_, _ = readHandshakeFrame(conn, time.Second)
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	var once sync.Once
+	return listener.Addr().String(), reached, unblock, func() {
+		once.Do(func() {
+			_ = listener.Close()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("paused handshake peer did not stop")
+			}
+		})
 	}
 }
 

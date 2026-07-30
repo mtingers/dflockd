@@ -15,8 +15,9 @@ import (
 // suffix-truncate and post-snapshot compaction rewrite the whole file
 // atomically (the inter-snapshot log is small, so rewriting it is cheap
 // and far simpler than mid-file truncation with an offset index). A torn
-// tail (partial write or bad CRC) is detected on open and discarded — it
-// was never acknowledged, so dropping it is safe; the leader re-sends.
+// tail (partial write or bad CRC) is detected on open. Recovery discards it
+// only after HardState proves every lost index was uncommitted; corruption
+// intersecting the committed prefix fails startup closed.
 
 const walRecordHeaderBytes = 12 // u32 len + u64 crc
 const walFilePerm = 0o600
@@ -33,23 +34,36 @@ type walFile struct {
 	f    *os.File // append handle, positioned at EOF
 }
 
-// openWAL opens (creating if absent) the WAL at path, replays it into a
-// slice of entries, truncates any torn tail, and leaves the file ready
-// for appends.
-func openWAL(path string) (*walFile, []Entry, error) {
+type walReplay struct {
+	entries    []Entry
+	validBytes int
+	tailErr    error
+}
+
+// inspectWAL parses the WAL without opening it for append or modifying it.
+// FileStorage validates the replay against snapshot and HardState before any
+// invalid suffix may be truncated.
+func inspectWAL(path string) (walReplay, error) {
 	raw, err := readWALFile(path)
 	if err != nil {
-		return nil, nil, err
+		return walReplay{}, err
 	}
-	entries, good := parseWALRecords(raw)
+	entries, good, tailErr := parseWALRecords(raw)
+	return walReplay{entries: entries, validBytes: good, tailErr: tailErr}, nil
+}
+
+// openWAL opens the already-inspected WAL and truncates only to the byte
+// boundary that FileStorage has proved safe.
+func openWAL(path string, replay walReplay) (*walFile, error) {
 	w := &walFile{path: path}
-	if err := w.openAppendTruncated(int64(good)); err != nil {
-		return nil, nil, err
+	if err := w.openAppendTruncated(int64(replay.validBytes)); err != nil {
+		return nil, err
 	}
 	if err := fsyncDir(path); err != nil { // make the dirent durable (file may be brand new)
-		return nil, nil, err
+		w.close()
+		return nil, err
 	}
-	return w, entries, nil
+	return w, nil
 }
 
 func readWALFile(path string) ([]byte, error) {
@@ -70,20 +84,21 @@ func readWALFile(path string) ([]byte, error) {
 	return raw, nil
 }
 
-// parseWALRecords decodes as many whole, CRC-valid records as it can and
-// returns the entries plus the byte offset just past the last good one
-// (everything after that is a torn tail to be discarded).
-func parseWALRecords(raw []byte) ([]Entry, int) {
+// parseWALRecords decodes every whole, CRC-valid record. A non-nil error
+// describes the invalid suffix; callers must decide from durable commit state
+// whether that suffix is safe to discard.
+func parseWALRecords(raw []byte) ([]Entry, int, error) {
 	var entries []Entry
 	off := 0
-	for {
+	for off < len(raw) {
 		e, n, ok := decodeWALRecord(raw[off:])
 		if !ok {
-			return entries, off
+			return entries, off, fmt.Errorf("raft: invalid WAL record at byte %d (%d trailing bytes)", off, len(raw)-off)
 		}
 		entries = append(entries, e)
 		off += n
 	}
+	return entries, off, nil
 }
 
 // decodeWALRecord parses one record from the front of b. ok is false on a

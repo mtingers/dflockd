@@ -98,6 +98,49 @@ func TestConfigurationCodecCanonicalAndStrict(t *testing.T) {
 	}
 }
 
+func TestConfigurationCodecReplicatesClientMetadataAndReadsLegacy(t *testing.T) {
+	first := Configuration{
+		Voters:      map[NodeID]string{"b": "raft-b", "a": "raft-a"},
+		ClientAddrs: map[NodeID]string{"a": "client-a", "b": "client-b"},
+	}
+	second := Configuration{
+		Voters:      map[NodeID]string{"a": "raft-a", "b": "raft-b"},
+		ClientAddrs: map[NodeID]string{"b": "client-b", "a": "client-a"},
+	}
+	a := encodeConfig(nil, first)
+	b := encodeConfig(nil, second)
+	if !bytes.Equal(a, b) {
+		t.Fatal("configuration metadata encoding is not canonical")
+	}
+	decoded, err := decodeConfig(a)
+	if err != nil {
+		t.Fatalf("decode metadata config: %v", err)
+	}
+	if decoded.ClientAddrs["a"] != "client-a" || decoded.ClientAddrs["b"] != "client-b" {
+		t.Fatalf("decoded client metadata = %v", decoded.ClientAddrs)
+	}
+
+	legacy := encodeConfig(nil, Configuration{Voters: map[NodeID]string{"a": "raft-a"}})
+	decoded, err = decodeConfig(legacy)
+	if err != nil {
+		t.Fatalf("decode legacy config: %v", err)
+	}
+	if decoded.ClientAddrs != nil {
+		t.Fatalf("legacy config acquired metadata: %v", decoded.ClientAddrs)
+	}
+
+	malformed := append([]byte(nil), a...)
+	magicOffset := bytes.Index(malformed, configMetadataMagic[:])
+	if magicOffset < 0 {
+		t.Fatal("encoded configuration lacks metadata marker")
+	}
+	countOffset := magicOffset + len(configMetadataMagic)
+	be.PutUint32(malformed[countOffset:countOffset+4], 1)
+	if _, err := decodeConfig(malformed); err == nil {
+		t.Fatal("accepted incomplete client metadata")
+	}
+}
+
 func TestTCPHelloRejectsLegacyProtocol(t *testing.T) {
 	body := []byte{frameHello}
 	body = appendString16(body, "peer")

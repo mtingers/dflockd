@@ -18,13 +18,28 @@ var (
 	// has exited).
 	ErrStopped = errors.New("raft: node stopped")
 
+	// ErrNotStarted is returned when an operation is submitted before Start.
+	ErrNotStarted = errors.New("raft: node not started")
+
+	// ErrAlreadyStarted is returned by a duplicate Start call.
+	ErrAlreadyStarted = errors.New("raft: node already started")
+
+	// ErrEntryTooLarge is returned before a proposal can be appended when its
+	// payload exceeds the durable and wire codec limit.
+	ErrEntryTooLarge = errors.New("raft: entry too large")
+
 	// ErrConfigChangeInProgress is returned by ProposeConfChange when an
 	// earlier configuration change has not yet committed.
 	ErrConfigChangeInProgress = errors.New("raft: configuration change in progress")
 
-	// ErrUnknownPeer is returned when a membership change names a node
-	// that isn't (for removal) or already is (for addition) a member.
+	// ErrAlreadyVoter is returned when an addition names a current voter.
+	ErrAlreadyVoter = errors.New("raft: already a voter")
+
+	// ErrUnknownPeer is returned when a removal names a non-member.
 	ErrUnknownPeer = errors.New("raft: unknown peer")
+
+	// ErrLastVoter is returned when a removal would leave no voters.
+	ErrLastVoter = errors.New("raft: cannot remove the last voter")
 
 	// ErrTimeout is returned when a context-less wait exceeds an internal
 	// deadline (used sparingly; most waits take a context).

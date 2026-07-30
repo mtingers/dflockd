@@ -5,12 +5,57 @@ package raft
 // applied first (except a PreVote, which is hypothetical and never moves
 // terms), then the message-specific handler builds the reply.
 func (n *Node) onRPC(req rpcRequest) {
+	if !n.authorizeInboundRPC(req.from, req.msg) {
+		if !n.stopping() {
+			req.reply <- staleReply(req.msg, n.term)
+		}
+		return
+	}
+	if !n.preflightInboundRPC(req.from, req.msg) {
+		if !n.stopping() {
+			req.reply <- staleReply(req.msg, n.term)
+		}
+		return
+	}
 	if !n.maybeStepDownForInbound(req.msg) {
 		return
 	}
 	reply := n.dispatchRPC(req.from, req.msg)
 	if !n.stopping() {
 		req.reply <- reply
+	}
+}
+
+// preflightInboundRPC rejects request bodies that violate node-local resource
+// limits before their term can affect local Raft state.
+func (n *Node) preflightInboundRPC(from NodeID, msg Message) bool {
+	req, ok := msg.(*InstallSnapshotReq)
+	if !ok || len(req.Data) <= n.cfg.MaxSnapshotBytes {
+		return true
+	}
+	n.logger.Warn("rejecting oversized snapshot", "from", from, "bytes", len(req.Data), "max", n.cfg.MaxSnapshotBytes)
+	return false
+}
+
+// authorizeInboundRPC binds the transport-authenticated peer ID to both the
+// effective voter set and the sender ID carried by the Raft message. This check
+// must run before the universal higher-term rule: removed peers are not allowed
+// to mutate term, vote, or leadership state.
+func (n *Node) authorizeInboundRPC(from NodeID, msg Message) bool {
+	if !n.isVoter(from) {
+		return false
+	}
+	switch m := msg.(type) {
+	case *RequestVoteReq:
+		return m.CandidateID == from
+	case *AppendEntriesReq:
+		return m.LeaderID == from
+	case *InstallSnapshotReq:
+		return m.LeaderID == from
+	case *TimeoutNowReq:
+		return m.LeaderID == from
+	default:
+		return false
 	}
 }
 
@@ -53,6 +98,9 @@ func (n *Node) onRPCReply(rep rpcReply) {
 	n.finishSnapshotSend(rep)
 	if rep.err != nil || rep.msg == nil {
 		return // treated as "no reply"; timers/heartbeats will retry
+	}
+	if !n.isVoter(rep.from) {
+		return // a peer removed while this RPC was in flight has no term authority
 	}
 	if n.stepDownForReply(rep.msg) {
 		return

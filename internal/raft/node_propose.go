@@ -11,6 +11,9 @@ import (
 // leader steps down before commit, ErrStopped on Close). The caller may
 // retry by calling Propose again on the new leader.
 func (n *Node) Propose(ctx context.Context, data []byte) (*Future, error) {
+	if len(data) > maxEntryDataBytes {
+		return nil, fmt.Errorf("raft: %w: %d bytes exceeds max %d", ErrEntryTooLarge, len(data), maxEntryDataBytes)
+	}
 	return n.submitProposal(ctx, &proposal{data: data, typ: EntryNormal, future: newFuture()})
 }
 
@@ -26,6 +29,9 @@ func (n *Node) submitProposal(ctx context.Context, p *proposal) (*Future, error)
 	// without this check the select races (both cases ready) and the call
 	// occasionally submits anyway.
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := n.lifecycleErr(); err != nil {
 		return nil, err
 	}
 	select {
@@ -49,6 +55,11 @@ func (n *Node) onPropose(p *proposal) {
 	if n.role != roleLeader {
 		n.counters.IncProposalsFailed()
 		p.future.resolve(nil, ErrNotLeader)
+		return
+	}
+	if len(p.data) > maxEntryDataBytes {
+		n.counters.IncProposalsFailed()
+		p.future.resolve(nil, fmt.Errorf("raft: %w: %d bytes exceeds max %d", ErrEntryTooLarge, len(p.data), maxEntryDataBytes))
 		return
 	}
 	entry := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: p.typ, Data: p.data}
@@ -88,6 +99,14 @@ func (n *Node) AddVoter(ctx context.Context, id NodeID, addr string) (*Future, e
 	return n.submitConfChange(ctx, &confChange{add: true, id: id, addr: addr, future: newFuture()})
 }
 
+// AddVoterWithMetadata adds a voter and replicates its client-facing address
+// in the same configuration entry.
+func (n *Node) AddVoterWithMetadata(ctx context.Context, id NodeID, addr, clientAddr string) (*Future, error) {
+	return n.submitConfChange(ctx, &confChange{
+		add: true, id: id, addr: addr, clientAddr: clientAddr, future: newFuture(),
+	})
+}
+
 // RemoveServer proposes removing node id from the cluster.
 func (n *Node) RemoveServer(ctx context.Context, id NodeID) (*Future, error) {
 	return n.submitConfChange(ctx, &confChange{add: false, id: id, future: newFuture()})
@@ -95,6 +114,9 @@ func (n *Node) RemoveServer(ctx context.Context, id NodeID) (*Future, error) {
 
 func (n *Node) submitConfChange(ctx context.Context, cc *confChange) (*Future, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := n.lifecycleErr(); err != nil {
 		return nil, err
 	}
 	select {
@@ -114,6 +136,9 @@ func (n *Node) submitConfChange(ctx context.Context, cc *confChange) (*Future, e
 // Returns ErrNotLeader if not leader, or an error if no follower is
 // caught up enough. It does not block for the successor to win.
 func (n *Node) TransferLeadership(ctx context.Context) error {
+	if err := n.lifecycleErr(); err != nil {
+		return err
+	}
 	done := make(chan error, 1)
 	select {
 	case n.controlc <- func() { n.onTransferLeadership(done) }:
@@ -179,12 +204,21 @@ func (n *Node) onConfChange(cc *confChange) {
 		cc.future.resolve(nil, ErrNotLeader)
 		return
 	}
+	if n.cfgIndex > n.log.committed {
+		cc.future.resolve(nil, ErrConfigChangeInProgress)
+		return
+	}
 	newCfg, err := buildNewConfig(n.config, cc)
 	if err != nil {
 		cc.future.resolve(nil, err)
 		return
 	}
-	entry := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: EntryConfig, Data: encodeConfig(nil, newCfg)}
+	data, err := encodeRPCConfig(newCfg)
+	if err != nil {
+		cc.future.resolve(nil, err)
+		return
+	}
+	entry := Entry{Index: n.log.lastIndex() + 1, Term: n.term, Type: EntryConfig, Data: data}
 	if err := n.log.append([]Entry{entry}); err != nil {
 		cc.future.resolve(nil, err)
 		n.failStorage("append configuration", err)
@@ -200,24 +234,55 @@ func (n *Node) onConfChange(cc *confChange) {
 // buildNewConfig applies cc to oldCfg and returns the result, or an
 // error if the change is a no-op (already present / already absent).
 func buildNewConfig(oldCfg Configuration, cc *confChange) (Configuration, error) {
+	if cc.id == "" {
+		return Configuration{}, fmt.Errorf("raft: voter ID is required")
+	}
 	newCfg := oldCfg.Clone()
 	if cc.add {
+		if cc.addr == "" {
+			return Configuration{}, fmt.Errorf("raft: voter address is required")
+		}
 		if _, exists := newCfg.Voters[cc.id]; exists {
-			return Configuration{}, fmt.Errorf("raft: %w: %q already a voter", ErrConfigChangeInProgress, cc.id)
+			return Configuration{}, fmt.Errorf("raft: %w: %q", ErrAlreadyVoter, cc.id)
+		}
+		for id, addr := range newCfg.Voters {
+			if addr == cc.addr {
+				return Configuration{}, fmt.Errorf("raft: voter address %q already belongs to %q", cc.addr, id)
+			}
 		}
 		newCfg.Voters[cc.id] = cc.addr
+		switch {
+		case newCfg.ClientAddrs != nil && cc.clientAddr == "":
+			return Configuration{}, fmt.Errorf("raft: client address required for voter %q", cc.id)
+		case newCfg.ClientAddrs != nil:
+			for id, addr := range newCfg.ClientAddrs {
+				if addr == cc.clientAddr {
+					return Configuration{}, fmt.Errorf("raft: client address %q already belongs to %q", cc.clientAddr, id)
+				}
+			}
+			newCfg.ClientAddrs[cc.id] = cc.clientAddr
+		case cc.clientAddr != "":
+			return Configuration{}, fmt.Errorf("raft: existing configuration has no replicated client metadata")
+		}
 		return newCfg, nil
 	}
 	if _, exists := newCfg.Voters[cc.id]; !exists {
 		return Configuration{}, fmt.Errorf("raft: %w: %q not a voter", ErrUnknownPeer, cc.id)
 	}
+	if len(newCfg.Voters) == 1 {
+		return Configuration{}, ErrLastVoter
+	}
 	delete(newCfg.Voters, cc.id)
+	if newCfg.ClientAddrs != nil {
+		delete(newCfg.ClientAddrs, cc.id)
+	}
 	return newCfg, nil
 }
 
 // adoptConfig installs newCfg as this node's effective Configuration.
 // Updates transport peers and (if leader) per-peer progress.
 func (n *Node) adoptConfig(newCfg Configuration, idx Index) {
+	newCfg = n.withBootstrapClientMetadata(newCfg)
 	old := n.config
 	n.config = newCfg.Clone()
 	n.cfgIndex = idx
@@ -225,6 +290,7 @@ func (n *Node) adoptConfig(newCfg Configuration, idx Index) {
 	if n.role == roleLeader {
 		n.refreshProgress(newCfg)
 	}
+	n.publishLeadership()
 }
 
 func (n *Node) syncTransportForConfig(old, new Configuration) {

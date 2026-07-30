@@ -71,7 +71,8 @@ type HardState struct {
 // Raft supports only single-server changes, so exactly one member is
 // added or removed per EntryConfig.
 type Configuration struct {
-	Voters map[NodeID]string // node id -> raft transport address
+	Voters      map[NodeID]string // node id -> raft transport address
+	ClientAddrs map[NodeID]string // optional replicated client address metadata
 }
 
 // Clone returns a deep copy so callers can mutate it without disturbing
@@ -80,6 +81,12 @@ func (c Configuration) Clone() Configuration {
 	out := Configuration{Voters: make(map[NodeID]string, len(c.Voters))}
 	for id, addr := range c.Voters {
 		out.Voters[id] = addr
+	}
+	if c.ClientAddrs != nil {
+		out.ClientAddrs = make(map[NodeID]string, len(c.ClientAddrs))
+		for id, addr := range c.ClientAddrs {
+			out.ClientAddrs[id] = addr
+		}
 	}
 	return out
 }

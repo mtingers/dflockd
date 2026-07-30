@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,13 +21,13 @@ import (
 // whole in memory.
 
 const (
-	snapshotFilePerm   = 0o600
-	snapshotNamePrefix = "snap-"
-	snapshotHeaderMin  = 8 + 8 + 8 + 4 // magic + idx + term + configLen
-	// maxSnapshotFileBytes bounds a snapshot file we'll read into memory.
-	// dflockd's FSM is small; a snapshot must also fit in one InstallSnapshot
-	// frame, so this is ≤ the wire frame cap.
-	maxSnapshotFileBytes = maxTCPFrameBytes // 64 MiB
+	snapshotFilePerm      = 0o600
+	snapshotNamePrefix    = "snap-"
+	snapshotHeaderMin     = 8 + 8 + 8 + 4             // magic + idx + term + configLen
+	snapshotEnvelopeBytes = snapshotHeaderMin + 8 + 8 // fsmLen + CRC
+	// A file carries configuration metadata in addition to the transferable
+	// FSM payload, so its cap is derived separately from the wire frame.
+	maxSnapshotFileBytes = snapshotEnvelopeBytes + maxConfigBytes + maxSnapshotDataBytes
 )
 
 var snapshotMagic = [8]byte{'d', 'f', 'l', 'r', 's', 'n', 'p', '1'}
@@ -96,6 +97,9 @@ func decodeSnapshotFSM(raw []byte, meta SnapshotMeta, off int) (SnapshotMeta, []
 	if end > len(raw)-8 {
 		return SnapshotMeta{}, nil, fmt.Errorf("raft: snapshot fsm length out of range")
 	}
+	if fsmLen > maxSnapshotDataBytes {
+		return SnapshotMeta{}, nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotDataBytes)
+	}
 	return meta, append([]byte(nil), raw[start:end]...), nil
 }
 
@@ -114,6 +118,12 @@ func (s snapshotStore) save(meta SnapshotMeta, fsm []byte) error {
 // the live log. Asynchronous preparation uses this so OpenSnapshot can keep
 // reading the old generation until the Raft loop publishes the new one.
 func (s snapshotStore) write(meta SnapshotMeta, fsm []byte) (string, error) {
+	if len(fsm) > maxSnapshotDataBytes {
+		return "", fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotDataBytes)
+	}
+	if _, err := encodeRPCConfig(meta.Configuration); err != nil {
+		return "", fmt.Errorf("raft: snapshot config: %w", err)
+	}
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", s.dir, err)
 	}
@@ -177,10 +187,17 @@ func (s snapshotStore) load(meta SnapshotMeta) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("raft: snapshot %s is corrupt: %w", name, err)
 	}
-	if got.LastIncludedIndex != meta.LastIncludedIndex || got.LastIncludedTerm != meta.LastIncludedTerm {
+	if got.LastIncludedIndex != meta.LastIncludedIndex || got.LastIncludedTerm != meta.LastIncludedTerm ||
+		!configurationsEqual(got.Configuration, meta.Configuration) {
 		return nil, fmt.Errorf("raft: snapshot %s metadata mismatch", name)
 	}
 	return fsm, nil
+}
+
+func configurationsEqual(a, b Configuration) bool {
+	aData, aErr := encodeRPCConfig(a)
+	bData, bErr := encodeRPCConfig(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aData, bData)
 }
 
 // pickBest tries snapshot files in descending-index order and returns
@@ -220,7 +237,7 @@ func readSnapshotFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err // caller distinguishes ENOENT
 	}
-	if fi.Size() > maxSnapshotFileBytes {
+	if fi.Size() > int64(maxSnapshotFileBytes) {
 		return nil, fmt.Errorf("raft: snapshot %s is %d bytes (max %d)", path, fi.Size(), maxSnapshotFileBytes)
 	}
 	raw, err := os.ReadFile(path)

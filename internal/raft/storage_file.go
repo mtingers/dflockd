@@ -89,16 +89,17 @@ func openFileStorageLocked(dir string, lf *os.File) (*FileStorage, error) {
 	return s, nil
 }
 
-// loadAll restores the in-memory state from disk: snapshot meta, then the
-// WAL entries that postdate it, then the HardState.
+// loadAll restores the in-memory state from disk. HardState is loaded before
+// the WAL so a malformed WAL suffix can be checked against the durable commit
+// index before any bytes are truncated.
 func (s *FileStorage) loadAll() error {
 	if err := s.loadSnapshotMeta(); err != nil {
 		return err
 	}
-	if err := s.loadWAL(); err != nil {
+	if err := s.loadHardState(); err != nil {
 		return err
 	}
-	return s.loadHardState()
+	return s.loadWAL()
 }
 
 func (s *FileStorage) loadSnapshotMeta() error {
@@ -113,26 +114,62 @@ func (s *FileStorage) loadSnapshotMeta() error {
 }
 
 func (s *FileStorage) loadWAL() error {
-	w, entries, err := openWAL(filepath.Join(s.dir, walFileName))
+	path := filepath.Join(s.dir, walFileName)
+	replay, err := inspectWAL(path)
+	if err != nil {
+		return err
+	}
+	kept, err := s.validateWALReplay(replay)
+	if err != nil {
+		return err
+	}
+	w, err := openWAL(path, replay)
 	if err != nil {
 		return err
 	}
 	s.wal = w
-	return s.adoptWALEntries(entries)
-}
-
-// adoptWALEntries keeps only the WAL entries past the snapshot point and
-// verifies they form a contiguous run starting at snapshotIndex+1.
-func (s *FileStorage) adoptWALEntries(entries []Entry) error {
-	kept := entriesAfter(entries, s.memLog.snap.LastIncludedIndex)
-	if len(kept) == 0 {
-		return nil
-	}
-	if err := checkContiguous(kept, s.memLog.firstIndex()); err != nil {
-		return fmt.Errorf("raft: WAL inconsistent with snapshot: %w", err)
-	}
 	s.memLog.entries = kept
 	return nil
+}
+
+// validateWALReplay proves both structural continuity and recovery safety.
+// In particular, a malformed suffix is discardable only when snapshot+valid
+// WAL still contain every index at or below HardState.CommitIndex.
+func (s *FileStorage) validateWALReplay(replay walReplay) ([]Entry, error) {
+	kept := entriesAfter(replay.entries, s.memLog.snap.LastIncludedIndex)
+	if len(kept) > 0 {
+		if err := checkContiguous(kept, s.memLog.firstIndex()); err != nil {
+			return nil, fmt.Errorf("raft: WAL inconsistent with snapshot: %w", err)
+		}
+	}
+	available := s.memLog.snap.LastIncludedIndex
+	lastTerm := s.memLog.snap.LastIncludedTerm
+	for _, entry := range kept {
+		if entry.Term < lastTerm {
+			return nil, fmt.Errorf("raft: WAL term regressed at index %d from %d to %d", entry.Index, lastTerm, entry.Term)
+		}
+		lastTerm = entry.Term
+		available = entry.Index
+	}
+	if s.hard.CommitIndex > available {
+		if replay.tailErr != nil {
+			return nil, fmt.Errorf(
+				"raft: WAL corruption removed committed index %d (available through %d): %w",
+				s.hard.CommitIndex, available, replay.tailErr,
+			)
+		}
+		return nil, fmt.Errorf(
+			"raft: durable commit index %d exceeds available log/snapshot index %d",
+			s.hard.CommitIndex, available,
+		)
+	}
+	if s.hard.CurrentTerm < lastTerm {
+		return nil, fmt.Errorf(
+			"raft: durable term %d is behind log/snapshot term %d",
+			s.hard.CurrentTerm, lastTerm,
+		)
+	}
+	return kept, nil
 }
 
 func entriesAfter(entries []Entry, thru Index) []Entry {
@@ -242,8 +279,8 @@ func (s *FileStorage) SaveSnapshot(meta SnapshotMeta, data io.Reader) error {
 // prepareSnapshot writes the new snapshot generation and a compacted WAL
 // candidate without touching the live memLog or WAL handle.
 func (s *FileStorage) prepareSnapshot(meta SnapshotMeta, data []byte, tail []Entry) (preparedSnapshot, error) {
-	if len(data) > maxSnapshotFileBytes {
-		return nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotFileBytes)
+	if len(data) > maxSnapshotDataBytes {
+		return nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotDataBytes)
 	}
 	if len(tail) > 0 {
 		if err := checkContiguous(tail, meta.LastIncludedIndex+1); err != nil {
@@ -278,6 +315,14 @@ func (s *FileStorage) writePreparedSnapshot(meta SnapshotMeta, data []byte) erro
 		if current.LastIncludedTerm != meta.LastIncludedTerm {
 			return fmt.Errorf("raft: snapshot index %d has conflicting terms %d and %d",
 				meta.LastIncludedIndex, current.LastIncludedTerm, meta.LastIncludedTerm)
+		}
+		currentData, err := s.snaps.load(current)
+		if err != nil {
+			return err
+		}
+		if !configurationsEqual(current.Configuration, meta.Configuration) || !bytes.Equal(currentData, data) {
+			return fmt.Errorf("raft: snapshot generation %d/%d has conflicting metadata or data",
+				meta.LastIncludedIndex, meta.LastIncludedTerm)
 		}
 		return nil
 	}
@@ -352,15 +397,15 @@ func (s *FileStorage) abortPreparedSnapshot(prepared preparedSnapshot) {
 }
 
 // readSnapshotData reads the FSM bytes, refusing anything larger than
-// maxSnapshotFileBytes (a corrupt InstallSnapshot payload, or an FSM
+// maxSnapshotDataBytes (a corrupt InstallSnapshot payload, or an FSM
 // that has outgrown what we can persist/transfer).
 func readSnapshotData(r io.Reader) ([]byte, error) {
-	fsm, err := io.ReadAll(io.LimitReader(r, maxSnapshotFileBytes+1))
+	fsm, err := io.ReadAll(io.LimitReader(r, int64(maxSnapshotDataBytes)+1))
 	if err != nil {
 		return nil, fmt.Errorf("raft: read snapshot data: %w", err)
 	}
-	if len(fsm) > maxSnapshotFileBytes {
-		return nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotFileBytes)
+	if len(fsm) > maxSnapshotDataBytes {
+		return nil, fmt.Errorf("raft: snapshot data exceeds %d bytes", maxSnapshotDataBytes)
 	}
 	return fsm, nil
 }

@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+func TestProposeRejectsOversizedEntryBeforeSubmission(t *testing.T) {
+	n := mustNewNode(t, fastConfigID("only"), NewMemStorage(), NewMemNetwork().Transport("only"), configFor([]NodeID{"only"}))
+	future, err := n.Propose(context.Background(), make([]byte, maxEntryDataBytes+1))
+	if !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("Propose error = %v, want ErrEntryTooLarge", err)
+	}
+	if future != nil {
+		t.Fatal("oversized proposal returned a future")
+	}
+	if got := n.log.lastIndex(); got != 0 {
+		t.Fatalf("last index = %d, want 0", got)
+	}
+}
+
 // Wait helper bounded by the test timeout.
 func mustWait(t *testing.T, f *Future, d time.Duration) (any, error) {
 	t.Helper()
@@ -105,8 +119,9 @@ func TestProposeAcrossLeadershipLossErrs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
-	resp := tc.nodes[leader].handleRPC("stranger", &AppendEntriesReq{
-		Term: tc.term(leader) + 10, LeaderID: "stranger",
+	sender := otherIDs(tc.ids, leader)[0]
+	resp := tc.nodes[leader].handleRPC(sender, &AppendEntriesReq{
+		Term: tc.term(leader) + 10, LeaderID: sender,
 	})
 	if r, ok := resp.(*AppendEntriesResp); !ok || !r.Success {
 		t.Fatalf("inject higher-term AppendEntries failed: %+v", resp)

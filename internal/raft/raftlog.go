@@ -1,6 +1,9 @@
 package raft
 
-import "bytes"
+import (
+	"bytes"
+	"fmt"
+)
 
 // raftLog wraps a Storage with the log queries and mutations the run loop
 // needs: the up-to-date check for elections, the consistency check and
@@ -13,25 +16,32 @@ type raftLog struct {
 	committed Index // highest log index known committed
 }
 
-// newRaftLog builds a raftLog, recovering committed from the persisted
-// HardState and clamping it to the available range.
+// newRaftLog builds a raftLog, recovering committed from persisted state.
+// A snapshot can raise the floor, but a commit beyond available durable state
+// is corruption and must never be silently clamped down.
 func newRaftLog(s Storage) (*raftLog, error) {
 	hs, err := s.LoadHardState()
 	if err != nil {
 		return nil, err
 	}
 	l := &raftLog{storage: s, committed: hs.CommitIndex}
-	l.clampCommitted()
+	if err := l.recoverCommitted(); err != nil {
+		return nil, err
+	}
 	return l, nil
 }
 
-func (l *raftLog) clampCommitted() {
+func (l *raftLog) recoverCommitted() error {
 	if floor := l.firstIndex() - 1; l.committed < floor {
 		l.committed = floor
 	}
 	if l.committed > l.lastIndex() {
-		l.committed = l.lastIndex()
+		return fmt.Errorf(
+			"raft: durable commit index %d exceeds available index %d",
+			l.committed, l.lastIndex(),
+		)
 	}
+	return nil
 }
 
 func (l *raftLog) firstIndex() Index { return l.storage.FirstIndex() }
@@ -128,17 +138,18 @@ func (l *raftLog) firstIndexOfTerm(at Index, term Term) Index {
 // — which is what the leader records as that follower's matchIndex. (The
 // follower may retain further uncommitted entries past that point; per the
 // algorithm those are only truncated when a later RPC carries a
-// conflicting entry at their index.)
-func (l *raftLog) appendFromLeader(prevLogIndex Index, entries []Entry) (Index, error) {
-	through := prevLogIndex + Index(len(entries))
+// conflicting entry at their index.) changedFrom is the first replaced or
+// newly appended index, or zero when every carried entry already matched.
+func (l *raftLog) appendFromLeader(prevLogIndex Index, entries []Entry) (through Index, changedFrom Index, err error) {
+	through = prevLogIndex + Index(len(entries))
 	keepFrom := l.firstDivergent(prevLogIndex, entries)
 	if keepFrom == len(entries) {
-		return through, nil // every carried entry already present
+		return through, 0, nil // every carried entry already present
 	}
 	if err := l.truncateAndAppend(entries[keepFrom:]); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return through, nil
+	return through, entries[keepFrom].Index, nil
 }
 
 // firstDivergent returns the index into entries of the first entry that

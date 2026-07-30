@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -106,6 +107,42 @@ func TestRemoveServerUnknownErrs(t *testing.T) {
 	}
 	if _, err := fut.Wait(ctx); err == nil {
 		t.Fatalf("RemoveServer for unknown peer should error")
+	}
+}
+
+func TestRemoveServerRejectsLastVoter(t *testing.T) {
+	tc := newTestCluster(t, "a")
+	defer tc.stopAll()
+	leader := tc.waitLeader()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	fut, err := tc.nodes[leader].RemoveServer(ctx, leader)
+	if err != nil {
+		t.Fatalf("RemoveServer submit: %v", err)
+	}
+	if _, err := fut.Wait(ctx); !errors.Is(err, ErrLastVoter) {
+		t.Fatalf("RemoveServer last voter = %v, want ErrLastVoter", err)
+	}
+	if got := tc.nodes[leader].Status().Voters; len(got) != 1 || got[0] != leader {
+		t.Fatalf("voters after rejected removal = %v", got)
+	}
+}
+
+func TestBuildNewConfigRejectsMalformedAddition(t *testing.T) {
+	old := Configuration{
+		Voters:      map[NodeID]string{"a": "raft-a"},
+		ClientAddrs: map[NodeID]string{"a": "client-a"},
+	}
+	for _, change := range []*confChange{
+		{add: true, id: "", addr: "b"},
+		{add: true, id: "b", addr: ""},
+		{add: true, id: "b", addr: "raft-a", clientAddr: "client-b"},
+		{add: true, id: "b", addr: "raft-b", clientAddr: "client-a"},
+	} {
+		if _, err := buildNewConfig(old, change); err == nil {
+			t.Fatalf("buildNewConfig accepted malformed change %+v", change)
+		}
 	}
 }
 

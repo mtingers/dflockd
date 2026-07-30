@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 )
 
@@ -22,28 +23,65 @@ const (
 var hardStateMagic = [8]byte{'d', 'f', 'l', 'r', 'f', 'h', 's', '1'}
 
 type hardStateFile struct {
-	path    string
-	f       *os.File
-	nextSeq uint64
+	path     string
+	f        *os.File
+	nextSeq  uint64
+	pristine bool
 }
 
-// openHardStateFile opens (creating if absent) the journal at path and
-// returns it along with the recovered HardState (the zero value if the
-// journal is empty or unreadable).
+// openHardStateFile opens (creating if absent) the journal at path. Creation
+// persists a valid zero-state sentinel; every existing file must contain a
+// valid slot, so total zeroing cannot masquerade as a new journal.
 func openHardStateFile(path string) (*hardStateFile, HardState, error) {
+	_, statErr := os.Stat(path)
+	created := os.IsNotExist(statErr)
+	if statErr != nil && !created {
+		return nil, HardState{}, fmt.Errorf("stat hardstate %s: %w", path, statErr)
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, hardStateFilePerm)
 	if err != nil {
 		return nil, HardState{}, fmt.Errorf("open hardstate %s: %w", path, err)
 	}
-	if err := ensureSize(f, hardStateFileBytes); err != nil {
+	if err := prepareHardStateSize(f); err != nil {
 		f.Close()
 		return nil, HardState{}, err
 	}
-	if err := fsyncDir(path); err != nil { // make the dirent durable (file may be brand new)
-		f.Close()
-		return nil, HardState{}, err
+	if created {
+		h := &hardStateFile{path: path, f: f, nextSeq: 1, pristine: true}
+		if err := h.writeSlot(0, HardState{}); err != nil {
+			f.Close()
+			return nil, HardState{}, err
+		}
+		if err := fsyncDir(path); err != nil {
+			f.Close()
+			return nil, HardState{}, err
+		}
+		return h, HardState{}, nil
 	}
 	return loadHardStateSlots(f, path)
+}
+
+func prepareHardStateSize(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", f.Name(), err)
+	}
+	if fi.Size() == hardStateFileBytes {
+		return nil
+	}
+	if fi.Size() > hardStateFileBytes {
+		return fmt.Errorf("raft: hardstate %s has unexpected size %d", f.Name(), fi.Size())
+	}
+	raw := make([]byte, fi.Size())
+	if len(raw) > 0 {
+		if _, err := f.ReadAt(raw, 0); err != nil {
+			return fmt.Errorf("read partial hardstate %s: %w", f.Name(), err)
+		}
+		if !allZero(raw) {
+			return fmt.Errorf("raft: hardstate %s is truncated with nonzero data", f.Name())
+		}
+	}
+	return ensureSize(f, hardStateFileBytes)
 }
 
 func loadHardStateSlots(f *os.File, path string) (*hardStateFile, HardState, error) {
@@ -52,22 +90,44 @@ func loadHardStateSlots(f *os.File, path string) (*hardStateFile, HardState, err
 		f.Close()
 		return nil, HardState{}, fmt.Errorf("read hardstate %s: %w", path, err)
 	}
-	hs, seq := bestHardStateSlot(buf)
-	return &hardStateFile{path: path, f: f, nextSeq: seq + 1}, hs, nil
+	hs, seq, ok := bestHardStateSlot(buf)
+	if !ok {
+		f.Close()
+		return nil, HardState{}, fmt.Errorf("raft: hardstate %s has no valid journal slot", path)
+	}
+	pristine := seq == 0
+	if pristine && (hs != (HardState{}) || !allZero(buf[hardStateSlotBytes:])) {
+		f.Close()
+		return nil, HardState{}, fmt.Errorf("raft: hardstate %s has a damaged pristine journal", path)
+	}
+	nextSeq := seq + 1
+	if seq == math.MaxUint64 {
+		nextSeq = math.MaxUint64
+	}
+	return &hardStateFile{path: path, f: f, nextSeq: nextSeq, pristine: pristine}, hs, nil
 }
 
-// bestHardStateSlot returns the HardState from the higher-sequence valid
-// slot and that sequence number (0 if neither slot is valid).
-func bestHardStateSlot(buf []byte) (HardState, uint64) {
+// bestHardStateSlot returns the HardState from the higher-sequence valid slot.
+func bestHardStateSlot(buf []byte) (HardState, uint64, bool) {
 	var best HardState
 	var bestSeq uint64
+	var found bool
 	for i := 0; i < 2; i++ {
 		slot := buf[i*hardStateSlotBytes : (i+1)*hardStateSlotBytes]
-		if hs, seq, ok := decodeHardStateSlot(slot); ok && seq > bestSeq {
-			best, bestSeq = hs, seq
+		if hs, seq, ok := decodeHardStateSlot(slot); ok && (!found || seq > bestSeq) {
+			best, bestSeq, found = hs, seq, true
 		}
 	}
-	return best, bestSeq
+	return best, bestSeq, found
+}
+
+func allZero(buf []byte) bool {
+	for _, b := range buf {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeHardStateSlot(slot []byte) (HardState, uint64, bool) {
@@ -93,7 +153,33 @@ func parseHardStateBody(slot []byte) (HardState, uint64, bool) {
 
 // save writes hs to the next slot and fsyncs.
 func (h *hardStateFile) save(hs HardState) error {
+	if h.pristine {
+		// The first real state replaces the pristine sentinel in two durable
+		// steps. After success, later corruption of either slot cannot roll a
+		// previously nonzero term/vote/commit all the way back to zero.
+		if err := h.writeSlot(h.nextSeq, hs); err != nil {
+			return err
+		}
+		h.nextSeq++
+		h.pristine = false
+		if err := h.writeSlot(h.nextSeq, hs); err != nil {
+			return err
+		}
+		h.nextSeq++
+		return nil
+	}
+	if h.nextSeq == math.MaxUint64 {
+		return fmt.Errorf("raft: hardstate journal sequence exhausted")
+	}
 	seq := h.nextSeq
+	if err := h.writeSlot(seq, hs); err != nil {
+		return err
+	}
+	h.nextSeq = seq + 1
+	return nil
+}
+
+func (h *hardStateFile) writeSlot(seq uint64, hs HardState) error {
 	slot, err := encodeHardStateSlot(seq, hs)
 	if err != nil {
 		return err
@@ -104,7 +190,6 @@ func (h *hardStateFile) save(hs HardState) error {
 	if err := fsyncFile(h.f); err != nil {
 		return err
 	}
-	h.nextSeq = seq + 1
 	return nil
 }
 

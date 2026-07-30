@@ -54,6 +54,7 @@ func (n *Node) buildAppendEntries(p *peerProgress) *AppendEntriesReq {
 	if err != nil {
 		return nil
 	}
+	entries = limitAppendEntriesByBytes(entries, n.cfg.ID)
 	return &AppendEntriesReq{Term: n.term, LeaderID: n.cfg.ID, PrevLogIndex: prev, PrevLogTerm: prevTerm, Entries: entries, LeaderCommit: n.log.committed}
 }
 
@@ -129,6 +130,18 @@ func (n *Node) maybeCommitTo(cand Index) {
 	}
 	n.dispatchPendingApply()
 	n.broadcastHeartbeat() // let followers learn the new commit promptly
+	n.stepDownIfRemoved()
+}
+
+// stepDownIfRemoved enforces the committed self-removal contract. Apply
+// dispatch has already transferred every committed proposal to the apply
+// goroutine, so becomeFollower fails only proposals that remain uncommitted.
+func (n *Node) stepDownIfRemoved() {
+	if n.role != roleLeader || n.cfgIndex > n.log.committed || n.isVoter(n.cfg.ID) {
+		return
+	}
+	n.logger.Info("stepping down after committed self-removal", "config_index", n.cfgIndex)
+	n.becomeFollower(n.term, "")
 }
 
 // quorumMatchIndex returns the largest index N such that a quorum of
@@ -196,33 +209,19 @@ func (n *Node) appendOrReject(req *AppendEntriesReq) *AppendEntriesResp {
 }
 
 func (n *Node) applyAppendEntries(req *AppendEntriesReq) *AppendEntriesResp {
-	through, err := n.log.appendFromLeader(req.PrevLogIndex, req.Entries)
+	through, changedFrom, err := n.log.appendFromLeader(req.PrevLogIndex, req.Entries)
 	if err != nil {
 		n.failStorage("append from leader", err)
 		return &AppendEntriesResp{Term: n.term, Success: false}
 	}
-	n.adoptConfigEntriesFromAppend(req.Entries)
+	if changedFrom != 0 {
+		if err := n.reconcileConfiguration(); err != nil {
+			n.failStorage("reconcile configuration", err)
+			return &AppendEntriesResp{Term: n.term, Success: false}
+		}
+	}
 	n.advanceFollowerCommit(req.LeaderCommit, through)
 	return &AppendEntriesResp{Term: n.term, Success: true, MatchIndex: through}
-}
-
-// adoptConfigEntriesFromAppend scans the just-installed entries for an
-// EntryConfig and adopts it locally. The last one wins (a batch is
-// already in log order). This is the follower side of "configurations
-// take effect on append."
-func (n *Node) adoptConfigEntriesFromAppend(entries []Entry) {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].Type != EntryConfig {
-			continue
-		}
-		cfg, err := decodeConfig(entries[i].Data)
-		if err != nil {
-			n.logger.Error("decode config entry", "index", entries[i].Index, "err", err)
-			return
-		}
-		n.adoptConfig(cfg, entries[i].Index)
-		return
-	}
 }
 
 func (n *Node) advanceFollowerCommit(leaderCommit, lastNew Index) {
@@ -266,11 +265,20 @@ func (n *Node) sendInstallSnapshot(to NodeID) {
 		n.logger.Error("read snapshot for send failed", "err", err)
 		return
 	}
+	if len(data) > n.cfg.MaxSnapshotBytes {
+		p.snapshotInFlight = false
+		n.logger.Error("snapshot exceeds configured transfer limit", "bytes", len(data), "max", n.cfg.MaxSnapshotBytes)
+		return
+	}
 	n.sendRPC(to, &InstallSnapshotReq{Term: n.term, LeaderID: n.cfg.ID, Meta: meta, Data: data})
 }
 
 func (n *Node) handleInstallSnapshot(from NodeID, req *InstallSnapshotReq) *InstallSnapshotResp {
 	if req.Term < n.term {
+		return &InstallSnapshotResp{Term: n.term}
+	}
+	if len(req.Data) > n.cfg.MaxSnapshotBytes {
+		n.logger.Warn("rejecting oversized snapshot", "from", from, "bytes", len(req.Data), "max", n.cfg.MaxSnapshotBytes)
 		return &InstallSnapshotResp{Term: n.term}
 	}
 	n.becomeFollower(req.Term, req.LeaderID)
@@ -287,6 +295,16 @@ func (n *Node) handleInstallSnapshot(from NodeID, req *InstallSnapshotReq) *Inst
 		return &InstallSnapshotResp{Term: n.term}
 	}
 	if !n.persistHardState() {
+		return &InstallSnapshotResp{Term: n.term}
+	}
+	// installSnapshot keeps a matching tail, so the log may still hold an
+	// EntryConfig above the snapshot index. Reconstructing from durable state
+	// picks that entry (§4.3: a configuration takes effect on append) and only
+	// falls back to the snapshot's configuration when no later one survives —
+	// adopting req.Meta.Configuration unconditionally would regress cfgIndex
+	// below a config entry this node still has in its log.
+	if err := n.reconcileConfiguration(); err != nil {
+		n.failStorage("reconcile configuration after snapshot", err)
 		return &InstallSnapshotResp{Term: n.term}
 	}
 	n.scheduleFSMRestore(req.Meta, req.Data)
