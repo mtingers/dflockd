@@ -8,8 +8,10 @@ import (
 
 // Sentinel errors.
 var (
-	ErrUnknownPeer = errors.New("cluster: unknown peer")
-	ErrNoLeader    = errors.New("cluster: no leader known")
+	ErrUnknownPeer                = errors.New("cluster: unknown peer")
+	ErrNoLeader                   = errors.New("cluster: no leader known")
+	ErrPolicyMismatch             = errors.New("cluster: replicated FSM policy mismatch")
+	ErrMembershipIdentityRequired = errors.New("cluster: dynamic membership requires identity-bound Raft transport")
 
 	errUnknownKind = errors.New("cluster: unknown command kind")
 )

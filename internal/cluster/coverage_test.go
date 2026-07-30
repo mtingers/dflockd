@@ -48,6 +48,27 @@ func TestProposeEnqueueEvictRenewCleanupGC(t *testing.T) {
 		t.Fatalf("ProposeCleanupConn: %v", err)
 	}
 
+	// Cancel a queued acquire through the replicated cancellation command.
+	blocker, err := tc.nodes["n1"].ProposeAcquire(ctx, "lock:k3", 1, "C", 10, 30*time.Second, saltOf(3))
+	if err != nil || blocker.Status != lock.StatusOK {
+		t.Fatalf("ProposeAcquire blocker: %+v %v", blocker, err)
+	}
+	queuedSalt := saltOf(4)
+	queued, err := tc.nodes["n1"].ProposeAcquire(ctx, "lock:k3", 1, "D", 11, 30*time.Second, queuedSalt)
+	if err != nil || queued.Status != lock.StatusQueued {
+		t.Fatalf("ProposeAcquire queued: %+v %v", queued, err)
+	}
+	attached, err := tc.nodes["n1"].ProposeAttach(ctx, "lock:k3", "D", 11)
+	if err != nil || attached.Status != lock.StatusQueued {
+		t.Fatalf("ProposeAttach: %+v %v", attached, err)
+	}
+	if _, err := tc.nodes["n1"].ProposeCancel(ctx, "lock:k3", "D", 11, queuedSalt, true); err != nil {
+		t.Fatalf("ProposeCancel: %v", err)
+	}
+	if got := tc.lms["n1"].CountWaitersForTest("lock:k3"); got != 0 {
+		t.Fatalf("waiters after ProposeCancel = %d, want 0", got)
+	}
+
 	// GC must succeed (no-op if everything is held; here all holders are
 	// gone, so future calls drop the resource).
 	if _, err := tc.nodes["n1"].ProposeGC(ctx); err != nil {

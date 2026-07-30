@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,10 @@ import (
 	"github.com/mtingers/dflockd/internal/lock"
 	"github.com/mtingers/dflockd/internal/raft"
 )
+
+type unboundMemTransport struct{ *raft.MemTransport }
+
+func (*unboundMemTransport) PeerIdentityBound() bool { return false }
 
 // --- harness ---
 
@@ -26,6 +31,30 @@ type testCluster struct {
 
 func newCluster(t *testing.T, ids ...raft.NodeID) *testCluster {
 	return newClusterWithSweep(t, 0, ids...)
+}
+
+func TestDynamicMembershipRequiresIdentityBoundTransport(t *testing.T) {
+	id := raft.NodeID("n1")
+	members := map[raft.NodeID]Member{
+		id: {RaftAddr: "raft-n1", ClientAddr: "client-n1:0"},
+	}
+	cfg := Config{Raft: fastRaftConfig(id), Members: members}
+	lm := newClusterLM(t)
+	base := raft.NewMemNetwork().Transport(id)
+	defer base.Close()
+	node, err := NewNode(cfg, lm, raft.NewMemStorage(), &unboundMemTransport{base}, slog.Default())
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	if err := node.AddVoter(context.Background(), "n2", "raft-n2", "client-n2:0"); !errors.Is(err, ErrMembershipIdentityRequired) {
+		t.Fatalf("AddVoter error = %v", err)
+	}
+	if err := node.RemoveServer(context.Background(), id); !errors.Is(err, ErrMembershipIdentityRequired) {
+		t.Fatalf("RemoveServer error = %v", err)
+	}
+	if got := node.raft.Status().LastLogIndex; got != 0 {
+		t.Fatalf("membership rejection appended log index %d", got)
+	}
 }
 
 func newClusterWithSweep(t *testing.T, sweep time.Duration, ids ...raft.NodeID) *testCluster {

@@ -2,6 +2,9 @@ package cluster
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"io"
 	"time"
 
@@ -15,7 +18,8 @@ import (
 // returned grants happens after each Apply (the listener registry
 // inside LockManager is goroutine-safe on its own).
 type fsm struct {
-	lm *lock.LockManager
+	lm     *lock.LockManager
+	policy *lock.FSMPolicy
 }
 
 var _ raft.FSM = (*fsm)(nil)
@@ -49,15 +53,41 @@ var fsmHandlers = map[Kind]func(*fsm, time.Time, Command) any{
 	KindCleanupConn:  (*fsm).applyCleanupConn,
 	KindGC:           func(f *fsm, now time.Time, _ Command) any { return f.lm.ApplyGC(now) },
 	KindEvictExpired: (*fsm).applyEvictExpired,
+	KindCancel:       (*fsm).applyCancel,
+	KindAttach:       (*fsm).applyAttach,
 	KindBarrier:      func(_ *fsm, _ time.Time, _ Command) any { return lock.ApplyResult{Status: lock.StatusOK} },
 }
 
 func (f *fsm) dispatch(cmd Command) any {
+	if err := f.ensurePolicy(cmd.Policy); err != nil {
+		return applyErrResult(err)
+	}
 	h, ok := fsmHandlers[cmd.Kind]
 	if !ok {
 		return applyErrResult(errUnknownKind)
 	}
 	return h(f, time.Unix(0, cmd.NowNanos), cmd)
+}
+
+func (f *fsm) ensurePolicy(proposed *lock.FSMPolicy) error {
+	if proposed == nil {
+		return nil // legacy command; retained for pre-policy log replay
+	}
+	if err := proposed.Validate(); err != nil {
+		return err
+	}
+	if f.policy != nil {
+		if *f.policy != *proposed {
+			return fmt.Errorf("%w: committed=%+v proposed=%+v", ErrPolicyMismatch, *f.policy, *proposed)
+		}
+		return nil
+	}
+	if err := f.lm.InstallFSMPolicy(*proposed); err != nil {
+		return err
+	}
+	copy := *proposed
+	f.policy = &copy
+	return nil
 }
 
 func (f *fsm) applyAcquire(now time.Time, cmd Command) any {
@@ -87,7 +117,7 @@ func (f *fsm) applyRelease(now time.Time, cmd Command) any {
 }
 
 func (f *fsm) applyRenew(now time.Time, cmd Command) any {
-	result, grants, err := f.lm.ApplyRenew(now, cmd.Key, cmd.Token, time.Duration(cmd.LeaseTTLNanos))
+	result, grants, err := f.lm.ApplyRenewOwned(now, cmd.Key, cmd.Token, cmd.Ref, cmd.ConnID, time.Duration(cmd.LeaseTTLNanos))
 	f.lm.RouteGrants(grants)
 	return resultOr(result, err)
 }
@@ -104,6 +134,22 @@ func (f *fsm) applyCleanupConn(now time.Time, cmd Command) any {
 	return resultOr(result, err)
 }
 
+func (f *fsm) applyCancel(now time.Time, cmd Command) any {
+	salt, err := DecodeSalt(cmd.SaltB64)
+	if err != nil {
+		return applyErrResult(err)
+	}
+	result, grants, err := f.lm.ApplyCancel(now, cmd.Key, cmd.Ref, cmd.ConnID, salt, cmd.SaltB64 != "")
+	f.lm.RouteGrants(grants)
+	return resultOr(result, err)
+}
+
+func (f *fsm) applyAttach(now time.Time, cmd Command) any {
+	result, grants, err := f.lm.ApplyAttach(now, cmd.Key, cmd.Ref, cmd.ConnID)
+	f.lm.RouteGrants(grants)
+	return resultOr(result, err)
+}
+
 func (f *fsm) applyEvictExpired(now time.Time, _ Command) any {
 	result, grants, err := f.lm.ApplyEvictExpired(now)
 	f.lm.RouteGrants(grants)
@@ -115,17 +161,95 @@ func (f *fsm) applyEvictExpired(now time.Time, _ Command) any {
 // later Apply calls — lock.LockManager's Snapshot copies state out
 // under shard locks, so the persisted bytes are stable.
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	var buf bytes.Buffer
-	if err := f.lm.Snapshot(&buf); err != nil {
+	var lockState bytes.Buffer
+	if err := f.lm.Snapshot(&lockState); err != nil {
 		return nil, err
 	}
-	return &fsmSnapshot{data: buf.Bytes()}, nil
+	data, err := encodeFSMSnapshot(f.policy, lockState.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return &fsmSnapshot{data: data}, nil
 }
 
 // Restore loads FSM state from r, replacing whatever the LockManager
 // currently holds. raft invokes this on startup (from a persisted
 // snapshot) and on follower InstallSnapshot.
-func (f *fsm) Restore(r io.Reader) error { return f.lm.Restore(r) }
+func (f *fsm) Restore(r io.Reader) error {
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	policy, lockState, legacy, err := decodeFSMSnapshot(raw)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		f.policy = nil
+		f.lm.ClearFSMPolicy()
+		return f.lm.Restore(bytes.NewReader(raw))
+	}
+	if policy == nil {
+		f.policy = nil
+		f.lm.ClearFSMPolicy()
+	} else {
+		if err := f.lm.InstallFSMPolicy(*policy); err != nil {
+			return err
+		}
+		copy := *policy
+		f.policy = &copy
+	}
+	return f.lm.Restore(bytes.NewReader(lockState))
+}
+
+var fsmSnapshotMagic = [8]byte{'d', 'f', 'l', 'c', 'f', 's', 'm', '2'}
+
+const maxFSMPolicyBytes = 64 << 10
+
+func encodeFSMSnapshot(policy *lock.FSMPolicy, lockState []byte) ([]byte, error) {
+	var policyData []byte
+	var err error
+	if policy != nil {
+		policyData, err = json.Marshal(policy)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: encode FSM policy: %w", err)
+		}
+	}
+	if len(policyData) > maxFSMPolicyBytes {
+		return nil, fmt.Errorf("cluster: FSM policy is too large: %d", len(policyData))
+	}
+	out := make([]byte, 0, len(fsmSnapshotMagic)+4+len(policyData)+len(lockState))
+	out = append(out, fsmSnapshotMagic[:]...)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(policyData)))
+	out = append(out, policyData...)
+	out = append(out, lockState...)
+	return out, nil
+}
+
+func decodeFSMSnapshot(raw []byte) (policy *lock.FSMPolicy, lockState []byte, legacy bool, err error) {
+	if len(raw) < len(fsmSnapshotMagic) || !bytes.Equal(raw[:len(fsmSnapshotMagic)], fsmSnapshotMagic[:]) {
+		return nil, nil, true, nil
+	}
+	header := len(fsmSnapshotMagic) + 4
+	if len(raw) < header {
+		return nil, nil, false, fmt.Errorf("cluster: truncated FSM snapshot header")
+	}
+	policyLen := int(binary.BigEndian.Uint32(raw[len(fsmSnapshotMagic):header]))
+	if policyLen > maxFSMPolicyBytes || policyLen > len(raw)-header {
+		return nil, nil, false, fmt.Errorf("cluster: invalid FSM policy length %d", policyLen)
+	}
+	if policyLen > 0 {
+		var decoded lock.FSMPolicy
+		if err := json.Unmarshal(raw[header:header+policyLen], &decoded); err != nil {
+			return nil, nil, false, fmt.Errorf("cluster: decode FSM policy: %w", err)
+		}
+		if err := decoded.Validate(); err != nil {
+			return nil, nil, false, err
+		}
+		policy = &decoded
+	}
+	return policy, raw[header+policyLen:], false, nil
+}
 
 // fsmSnapshot is an immutable bytes view of a LockManager snapshot,
 // owned by raft until Release. It is intentionally simple: the heavy

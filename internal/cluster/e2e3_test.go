@@ -414,34 +414,25 @@ func freeLoopback(t *testing.T) string {
 	return addr
 }
 
-// TestE2EStableRefReAttachAcrossFailover proves the headline failover
-// promise end-to-end over real TCP: a client holding a lock under a
-// stable ref, whose leader is HARD-crashed (no graceful CleanupConn),
-// reclaims the SAME lock token on reconnect to the freshly-elected
-// leader. This needs OrphanTTL > 0. Before the PR-5 re-adopt fix the
-// reconnect's single-phase Acquire would queue behind its own orphaned
-// holder and time out — so this test is the regression guard for the
-// gap PR-4 shipped but did not close.
-func TestE2EStableRefReAttachAcrossFailover(t *testing.T) {
-	c := startE2EClusterOrphan(t, 30*time.Second, "alpha", "beta", "gamma")
+// TestE2EClusterClientReattachesAcrossFailover proves the default public
+// Cluster client keeps one logical session over a hard leader failure. It
+// automatically reconnects, follows the new redirect, and reclaims the same
+// token without requiring OrphanTTL or an explicit stable-ref option.
+func TestE2EClusterClientReattachesAcrossFailover(t *testing.T) {
+	c := startE2ECluster(t, "alpha", "beta", "gamma")
 	defer c.stopAll()
 
 	leader := c.waitLeader(3 * time.Second)
-
-	// Acquire kA under a stable ref and KEEP the connection open. Closing
-	// it would gracefully orphan the holder (abandonedAtNanos set) — the
-	// case even the old finders matched. Holding it open until the crash
-	// is what makes this a true hard crash: stopOne tears the node down
-	// with cluster=nil, so no CleanupConn is ever replicated and the
-	// holder reaches the new leader with abandonedAtNanos == 0.
-	conn, err := client.Dial(c.clientAddrOf(leader))
+	members := make([]string, 0, len(c.ids))
+	for _, id := range c.ids {
+		members = append(members, c.clientAddrOf(id))
+	}
+	clusterClient, err := client.NewCluster(members)
 	if err != nil {
-		t.Fatalf("dial leader: %v", err)
+		t.Fatalf("NewCluster: %v", err)
 	}
-	if err := client.SetStableRef(conn, "worker-1"); err != nil {
-		t.Fatalf("SetStableRef: %v", err)
-	}
-	token, _, err := client.Acquire(conn, "kA", 2*time.Second)
+	defer clusterClient.Close()
+	token, _, err := clusterClient.Acquire(context.Background(), "kA", 2*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire kA: %v", err)
 	}
@@ -450,10 +441,28 @@ func TestE2EStableRefReAttachAcrossFailover(t *testing.T) {
 			t.Fatalf("node %s never observed the kA holder", id)
 		}
 	}
+	blockerClient, err := client.NewCluster(members)
+	if err != nil {
+		t.Fatalf("NewCluster blocker: %v", err)
+	}
+	defer blockerClient.Close()
+	waiterClient, err := client.NewCluster(members)
+	if err != nil {
+		t.Fatalf("NewCluster waiter: %v", err)
+	}
+	defer waiterClient.Close()
+	blockerToken, _, err := blockerClient.Acquire(context.Background(), "queued", 2*time.Second)
+	if err != nil {
+		t.Fatalf("blocker Acquire: %v", err)
+	}
+	status, _, _, err := waiterClient.Enqueue(context.Background(), "queued")
+	if err != nil || status != "queued" {
+		t.Fatalf("waiter Enqueue = %q, %v", status, err)
+	}
 
-	// HARD crash the leader, then close the now-dead socket.
+	// HARD crash the leader. The client's next operation first observes the
+	// dead transport, then rotates through known members to the new leader.
 	c.stopOne(leader)
-	_ = conn.Close()
 	rest := otherIDs(c.ids, leader)
 	newLeader := c.waitLeader(5*time.Second, rest...)
 	if newLeader == leader {
@@ -468,18 +477,7 @@ func TestE2EStableRefReAttachAcrossFailover(t *testing.T) {
 		}
 	}
 
-	// Reconnect to the new leader with the SAME stable ref and re-acquire.
-	// Without re-adopt this single-phase Acquire would queue behind the
-	// orphaned holder and time out; with it, the original token returns.
-	conn2, err := client.Dial(c.clientAddrOf(newLeader))
-	if err != nil {
-		t.Fatalf("dial new leader: %v", err)
-	}
-	defer conn2.Close()
-	if err := client.SetStableRef(conn2, "worker-1"); err != nil {
-		t.Fatalf("SetStableRef on reconnect: %v", err)
-	}
-	token2, _, err := client.Acquire(conn2, "kA", 2*time.Second)
+	token2, _, err := clusterClient.Acquire(context.Background(), "kA", 2*time.Second)
 	if err != nil {
 		t.Fatalf("re-acquire kA on new leader: %v", err)
 	}
@@ -492,5 +490,33 @@ func TestE2EStableRefReAttachAcrossFailover(t *testing.T) {
 		if len(toks) != 1 || toks[0] != token {
 			t.Fatalf("survivor %s kA holders = %v, want [%s] (one re-adopted holder)", id, toks, token)
 		}
+	}
+	waitResult := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	go func() {
+		waitToken, _, waitErr := waiterClient.Wait(context.Background(), "queued", 3*time.Second)
+		waitResult <- struct {
+			token string
+			err   error
+		}{token: waitToken, err: waitErr}
+	}()
+	if err := blockerClient.Release(context.Background(), "queued", blockerToken); err != nil {
+		t.Fatalf("blocker Release after failover: %v", err)
+	}
+	select {
+	case result := <-waitResult:
+		if result.err != nil || result.token == "" {
+			t.Fatalf("Wait after failover = %q, %v", result.token, result.err)
+		}
+		if err := waiterClient.Release(context.Background(), "queued", result.token); err != nil {
+			t.Fatalf("waiter Release after failover: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait after failover did not complete")
+	}
+	if err := clusterClient.Release(context.Background(), "kA", token); err != nil {
+		t.Fatalf("Release after failover: %v", err)
 	}
 }

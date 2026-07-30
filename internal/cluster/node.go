@@ -61,6 +61,14 @@ func (c *Config) Validate() error {
 	if _, ok := c.Members[c.Raft.ID]; !ok {
 		return fmt.Errorf("cluster: this node's ID %q is not in Members", c.Raft.ID)
 	}
+	for id, member := range c.Members {
+		if member.RaftAddr == "" {
+			return fmt.Errorf("cluster: member %q RaftAddr is required", id)
+		}
+		if member.ClientAddr == "" {
+			return fmt.Errorf("cluster: member %q ClientAddr is required", id)
+		}
+	}
 	return nil
 }
 
@@ -76,8 +84,6 @@ type Node struct {
 	lm        *lock.LockManager
 	fsm       *fsm
 	log       *slog.Logger
-
-	membersMu sync.Mutex // guards cfg.Members (mutated by AddVoter/RemoveServer, read by LeaderClientAddr)
 
 	sweepStop chan struct{}
 	sweepWG   sync.WaitGroup
@@ -116,18 +122,23 @@ func NewNode(cfg Config, lm *lock.LockManager, storage raft.Storage, transport r
 // raft.Configuration carries the per-member Raft transport address.
 func raftConfigFor(cfg Config) raft.Configuration {
 	voters := make(map[raft.NodeID]string, len(cfg.Members))
+	clientAddrs := make(map[raft.NodeID]string, len(cfg.Members))
 	for id, m := range cfg.Members {
 		voters[id] = m.RaftAddr
+		clientAddrs[id] = m.ClientAddr
 	}
-	return raft.Configuration{Voters: voters}
+	return raft.Configuration{Voters: voters, ClientAddrs: clientAddrs}
 }
 
 // Start launches the underlying raft node and the leader-driven sweep
 // loop (lease expiry + idle GC).
-func (n *Node) Start() {
-	n.raft.Start()
+func (n *Node) Start() error {
+	if err := n.raft.Start(); err != nil {
+		return err
+	}
 	n.sweepWG.Add(1)
 	go n.sweepLoop()
+	return nil
 }
 
 // Close gracefully hands off leadership if this node is the leader (so a
@@ -167,6 +178,16 @@ func (n *Node) LeaderID() raft.NodeID { return n.raft.LeaderID() }
 // Status exposes a snapshot of the raft node's state to callers
 // (typically the HTTP admin endpoint).
 func (n *Node) Status() raft.NodeStatus { return n.raft.Status() }
+
+// Done closes when the underlying consensus engine terminates.
+func (n *Node) Done() <-chan struct{} { return n.raft.Done() }
+
+// Err returns the fatal consensus-engine failure, if any.
+func (n *Node) Err() error { return n.raft.Err() }
+
+// Ready reports whether Raft is running and this node remains a voter.
+// Leadership is not required because followers can redirect clients.
+func (n *Node) Ready() bool { return n.raft.Ready() }
 
 // clusterStatusView is the JSON-friendly shape returned by StatusJSON.
 type clusterStatusView struct {
@@ -241,6 +262,8 @@ func (n *Node) LeaderClientAddr() (string, bool) {
 // submission time; ErrLeadershipLost if we lost leadership mid-flight.
 func (n *Node) Propose(ctx context.Context, cmd Command) (lock.ApplyResult, error) {
 	cmd.NowNanos = n.cfg.Now().UnixNano()
+	policy, _ := n.lm.ActiveFSMPolicy()
+	cmd.Policy = &policy
 	data, err := cmd.Encode()
 	if err != nil {
 		return lock.ApplyResult{}, err
@@ -271,7 +294,16 @@ func (n *Node) ProposeRelease(ctx context.Context, key, token string) (lock.Appl
 
 // ProposeRenew extends a held lease.
 func (n *Node) ProposeRenew(ctx context.Context, key, token string, leaseTTL time.Duration) (lock.ApplyResult, error) {
-	return n.Propose(ctx, Command{Kind: KindRenew, Key: key, Token: token, LeaseTTLNanos: int64(leaseTTL)})
+	return n.ProposeRenewOwned(ctx, key, token, "", 0, leaseTTL)
+}
+
+// ProposeRenewOwned renews a held lease and rebinds its replicated owner to
+// the connection that presented the token.
+func (n *Node) ProposeRenewOwned(ctx context.Context, key, token, ref string, connID uint64, leaseTTL time.Duration) (lock.ApplyResult, error) {
+	return n.Propose(ctx, Command{
+		Kind: KindRenew, Key: key, Token: token, Ref: ref, ConnID: connID,
+		LeaseTTLNanos: int64(leaseTTL),
+	})
 }
 
 // ProposeEnqueue is the two-phase phase-1 helper.
@@ -290,6 +322,23 @@ func (n *Node) ProposeEvict(ctx context.Context, key, token string) (lock.ApplyR
 // ProposeCleanupConn releases everything a (ref, connID) holds.
 func (n *Node) ProposeCleanupConn(ctx context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
 	return n.Propose(ctx, Command{Kind: KindCleanupConn, Ref: ref, ConnID: connID})
+}
+
+// ProposeCancel abandons one acquire/enqueue operation. matchSalt requires
+// the exact connection identity; false permits stable-ref recovery when the
+// original connection-local operation metadata is unavailable.
+func (n *Node) ProposeCancel(ctx context.Context, key, ref string, connID uint64, salt [8]byte, matchSalt bool) (lock.ApplyResult, error) {
+	cmd := Command{Kind: KindCancel, Key: key, Ref: ref, ConnID: connID}
+	if matchSalt {
+		cmd.SaltB64 = EncodeSalt(salt)
+	}
+	return n.Propose(ctx, cmd)
+}
+
+// ProposeAttach rebinds an existing two-phase waiter or raced promotion to a
+// reconnected stable session before Wait blocks.
+func (n *Node) ProposeAttach(ctx context.Context, key, ref string, connID uint64) (lock.ApplyResult, error) {
+	return n.Propose(ctx, Command{Kind: KindAttach, Key: key, Ref: ref, ConnID: connID})
 }
 
 // ProposeGC asks the cluster to drop idle resources.
@@ -376,7 +425,11 @@ func (n *Node) Barrier(ctx context.Context) error {
 // the leader's transport can reach it. The client-facing address is not
 // published until the change commits.
 func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAddr string) error {
-	fut, err := n.raft.AddVoter(ctx, id, raftAddr)
+	if !membershipIdentityBound(n.transport) {
+		n.adminAddFailed.Add(1)
+		return ErrMembershipIdentityRequired
+	}
+	fut, err := n.raft.AddVoterWithMetadata(ctx, id, raftAddr, clientAddr)
 	if err != nil {
 		n.adminAddFailed.Add(1)
 		return err
@@ -385,7 +438,6 @@ func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAdd
 		n.adminAddFailed.Add(1)
 		return err
 	}
-	n.setMember(id, Member{RaftAddr: raftAddr, ClientAddr: clientAddr})
 	n.adminAdds.Add(1)
 	return nil
 }
@@ -393,6 +445,10 @@ func (n *Node) AddVoter(ctx context.Context, id raft.NodeID, raftAddr, clientAdd
 // RemoveServer proposes removing a voter from the cluster. A leader
 // removing itself steps down once the entry commits.
 func (n *Node) RemoveServer(ctx context.Context, id raft.NodeID) error {
+	if !membershipIdentityBound(n.transport) {
+		n.adminRemoveFailed.Add(1)
+		return ErrMembershipIdentityRequired
+	}
 	fut, err := n.raft.RemoveServer(ctx, id)
 	if err != nil {
 		n.adminRemoveFailed.Add(1)
@@ -402,9 +458,13 @@ func (n *Node) RemoveServer(ctx context.Context, id raft.NodeID) error {
 		n.adminRemoveFailed.Add(1)
 		return err
 	}
-	n.deleteMember(id)
 	n.adminRemoves.Add(1)
 	return nil
+}
+
+func membershipIdentityBound(transport raft.Transport) bool {
+	bound, ok := transport.(raft.IdentityBoundTransport)
+	return ok && bound.PeerIdentityBound()
 }
 
 // MetricsSnapshot returns a flat read of every monotonic cluster
@@ -420,21 +480,16 @@ func (n *Node) MetricsSnapshot() raft.ClusterMetrics {
 	}
 }
 
-func (n *Node) setMember(id raft.NodeID, m Member) {
-	n.membersMu.Lock()
-	n.cfg.Members[id] = m
-	n.membersMu.Unlock()
-}
-
 func (n *Node) member(id raft.NodeID) (Member, bool) {
-	n.membersMu.Lock()
-	defer n.membersMu.Unlock()
+	effective := n.raft.Status().Configuration
+	if effective.ClientAddrs != nil {
+		raftAddr, voter := effective.Voters[id]
+		clientAddr, known := effective.ClientAddrs[id]
+		if !voter || !known {
+			return Member{}, false
+		}
+		return Member{RaftAddr: raftAddr, ClientAddr: clientAddr}, true
+	}
 	m, ok := n.cfg.Members[id]
 	return m, ok
-}
-
-func (n *Node) deleteMember(id raft.NodeID) {
-	n.membersMu.Lock()
-	delete(n.cfg.Members, id)
-	n.membersMu.Unlock()
 }

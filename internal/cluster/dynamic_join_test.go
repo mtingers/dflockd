@@ -47,6 +47,42 @@ func TestDynamicJoinColdNodeCatchesUpViaSnapshot(t *testing.T) {
 	if joinerSnap == 0 {
 		t.Fatalf("joiner caught up via AppendEntries only — InstallSnapshot path NOT exercised")
 	}
+	for id, node := range tc.nodes {
+		member, ok := node.member("n4")
+		if !ok || member.ClientAddr != "client-n4:0" {
+			t.Fatalf("%s metadata for n4 = %+v, ok=%v", id, member, ok)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := tc.nodes[leader].RemoveServer(ctx, leader); err != nil {
+		cancel()
+		t.Fatalf("remove leader: %v", err)
+	}
+	cancel()
+	if !pollUntil(t, time.Second, func() bool { return !tc.nodes[leader].IsLeader() }) {
+		t.Fatal("self-removed node did not step down")
+	}
+	nextLeader := waitDynJoinLeader(t, tc, 3*time.Second)
+	if nextLeader == leader {
+		t.Fatal("self-removed node remained leader")
+	}
+	wantAddr := "client-" + string(nextLeader) + ":0"
+	for id, node := range tc.nodes {
+		if id == leader {
+			continue
+		}
+		if !pollUntil(t, 2*time.Second, func() bool {
+			addr, ok := node.LeaderClientAddr()
+			return ok && addr == wantAddr
+		}) {
+			addr, ok := node.LeaderClientAddr()
+			t.Fatalf("%s redirect after failover = (%q, %v), want %q", id, addr, ok, wantAddr)
+		}
+		if _, present := node.raft.Status().Configuration.ClientAddrs[leader]; present {
+			t.Fatalf("%s retained removed member client metadata", id)
+		}
+	}
 }
 
 // newDynJoinCluster is the cluster_test.go newCluster with a low

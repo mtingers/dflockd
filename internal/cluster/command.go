@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/mtingers/dflockd/internal/lock"
 )
 
 // Kind discriminates Command's payload shape. Stable on the wire — never
@@ -22,6 +24,8 @@ const (
 	KindGC
 	KindBarrier      // no-op for ReadIndex-style fences; produces no FSM mutation
 	KindEvictExpired // sweep all holders past their lease deadline (leader-driven)
+	KindCancel       // abandon one acquire/enqueue operation, including a raced promotion
+	KindAttach       // rebind two-phase state to a reconnected stable session
 	// Append new kinds here only — values are stable on the wire.
 )
 
@@ -35,6 +39,8 @@ var kindNames = [...]string{
 	KindGC:           "gc",
 	KindBarrier:      "barrier",
 	KindEvictExpired: "evict_expired",
+	KindCancel:       "cancel",
+	KindAttach:       "attach",
 }
 
 // String returns the snake_case name of the kind, or "kind(N)" for an
@@ -51,15 +57,16 @@ func (k Kind) String() string {
 // and unambiguous to log; the codec is internal so we can swap to a
 // binary encoding later without affecting any caller.
 type Command struct {
-	Kind          Kind   `json:"k"`
-	NowNanos      int64  `json:"t"`
-	Key           string `json:"key,omitempty"`
-	Limit         int    `json:"limit,omitempty"`
-	Ref           string `json:"ref,omitempty"`
-	ConnID        uint64 `json:"cid,omitempty"`
-	LeaseTTLNanos int64  `json:"ttl,omitempty"`
-	SaltB64       string `json:"salt,omitempty"` // base64 of [8]byte
-	Token         string `json:"tok,omitempty"`
+	Kind          Kind            `json:"k"`
+	NowNanos      int64           `json:"t"`
+	Key           string          `json:"key,omitempty"`
+	Limit         int             `json:"limit,omitempty"`
+	Ref           string          `json:"ref,omitempty"`
+	ConnID        uint64          `json:"cid,omitempty"`
+	LeaseTTLNanos int64           `json:"ttl,omitempty"`
+	SaltB64       string          `json:"salt,omitempty"` // base64 of [8]byte
+	Token         string          `json:"tok,omitempty"`
+	Policy        *lock.FSMPolicy `json:"policy,omitempty"`
 }
 
 // Encode serializes c as JSON. The runtime fields (NowNanos, SaltB64)
@@ -114,8 +121,13 @@ func (c Command) Validate() error {
 	if c.Limit < 0 || c.Limit > maxCommandLimit {
 		return fmt.Errorf("cluster: implausible limit %d", c.Limit)
 	}
+	if c.Policy != nil {
+		if err := c.Policy.Validate(); err != nil {
+			return fmt.Errorf("cluster: invalid FSM policy: %w", err)
+		}
+	}
 	switch c.Kind {
-	case KindAcquire, KindEnqueue, KindRelease, KindRenew, KindEvict:
+	case KindAcquire, KindEnqueue, KindRelease, KindRenew, KindEvict, KindCancel, KindAttach:
 		if c.Key == "" {
 			return fmt.Errorf("cluster: %s command with empty key", c.Kind)
 		}
