@@ -116,6 +116,18 @@ func dialContext(ctx context.Context, addr string) (*Conn, error) {
 	return &Conn{conn: conn, reader: bufio.NewReader(conn)}, nil
 }
 
+func dialTLSContext(ctx context.Context, addr string, cfg *tls.Config) (*Conn, error) {
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: DefaultDialTimeout, KeepAlive: defaultKeepAlive},
+		Config:    cfg,
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return &Conn{conn: conn, reader: bufio.NewReader(conn)}, nil
+}
+
 // DialTLS connects to a dflockd server using TLS.
 func DialTLS(addr string, cfg *tls.Config) (*Conn, error) {
 	dialer := &net.Dialer{Timeout: DefaultDialTimeout, KeepAlive: defaultKeepAlive}

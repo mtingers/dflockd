@@ -3,13 +3,21 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mtingers/dflockd/internal/config"
+	"github.com/mtingers/dflockd/internal/lock"
+	"github.com/mtingers/dflockd/internal/protocol"
+	"github.com/mtingers/dflockd/internal/server"
 )
 
 // pipeFakeServer is a mini in-process dflockd server. Each instance has a
@@ -31,6 +39,30 @@ func newFakeConn(t *testing.T, srv *pipeFakeServer) *Conn {
 	return &Conn{conn: c1, reader: bufio.NewReader(c1)}
 }
 
+func newConnClosingOnFirstOperation(t *testing.T) *Conn {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	go func() {
+		defer serverConn.Close()
+		reader := bufio.NewReader(serverConn)
+		for i := 0; i < 3; i++ {
+			if _, err := readLineFake(reader); err != nil {
+				return
+			}
+		}
+		if _, err := serverConn.Write([]byte("ok\n")); err != nil {
+			return
+		}
+		for i := 0; i < 3; i++ {
+			if _, err := readLineFake(reader); err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = clientConn.Close(); _ = serverConn.Close() })
+	return &Conn{conn: clientConn, reader: bufio.NewReader(clientConn)}
+}
+
 // runFakeServer reads three-line dflockd requests (cmd, key, arg) and
 // writes one response line per request, until conn is closed.
 func runFakeServer(conn net.Conn, srv *pipeFakeServer) {
@@ -49,8 +81,11 @@ func runFakeServer(conn net.Conn, srv *pipeFakeServer) {
 		if err != nil {
 			return
 		}
-		srv.count.Add(1)
-		resp := srv.respond(cmd, key, arg)
+		resp := "ok"
+		if cmd != "stable-ref" {
+			srv.count.Add(1)
+			resp = srv.respond(cmd, key, arg)
+		}
 		if _, err := conn.Write([]byte(resp + "\n")); err != nil {
 			return
 		}
@@ -94,6 +129,181 @@ func TestNewClusterRejectsEmptyMembers(t *testing.T) {
 	_, err := NewCluster(nil)
 	if !errors.Is(err, ErrNoMembers) {
 		t.Fatalf("err = %v, want ErrNoMembers", err)
+	}
+}
+
+func TestNewClusterRejectsInvalidStableRef(t *testing.T) {
+	_, err := NewCluster([]string{"127.0.0.1:9001"}, WithClusterStableRef(""))
+	if !errors.Is(err, ErrInvalidStableRef) {
+		t.Fatalf("err = %v, want ErrInvalidStableRef", err)
+	}
+}
+
+func TestNewClusterAcceptsTLSWithInjectedDialer(t *testing.T) {
+	cl, err := NewCluster(
+		[]string{"127.0.0.1:9001"},
+		WithClusterTLS(&tls.Config{MinVersion: tls.VersionTLS13}),
+		withClusterDial(func(context.Context, string) (*Conn, error) {
+			return nil, errors.New("unused")
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewCluster: %v", err)
+	}
+	if cl.cfg.tlsConfig == nil || cl.cfg.tlsConfig.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("TLS config was not retained: %+v", cl.cfg.tlsConfig)
+	}
+}
+
+func TestNewClusterGeneratesStableIdentityByDefault(t *testing.T) {
+	a, err := NewCluster([]string{"127.0.0.1:9001"}, withClusterDial(func(context.Context, string) (*Conn, error) {
+		return nil, errors.New("unused")
+	}))
+	if err != nil {
+		t.Fatalf("NewCluster A: %v", err)
+	}
+	b, err := NewCluster([]string{"127.0.0.1:9001"}, withClusterDial(func(context.Context, string) (*Conn, error) {
+		return nil, errors.New("unused")
+	}))
+	if err != nil {
+		t.Fatalf("NewCluster B: %v", err)
+	}
+	if a.cfg.stableRef == "" || a.cfg.stableRef == b.cfg.stableRef {
+		t.Fatalf("generated refs = %q, %q", a.cfg.stableRef, b.cfg.stableRef)
+	}
+	if err := protocol.ValidateStableRef(a.cfg.stableRef); err != nil {
+		t.Fatalf("generated ref invalid: %v", err)
+	}
+}
+
+func TestClusterReusesPersistentLanesForAcquireAndRelease(t *testing.T) {
+	srv := &pipeFakeServer{respond: func(cmd, _, _ string) string {
+		if cmd == "l" {
+			return validTokenLine
+		}
+		return "ok"
+	}}
+	var dials atomic.Int64
+	cl, err := NewCluster([]string{"127.0.0.1:9001"}, withClusterDial(func(_ context.Context, _ string) (*Conn, error) {
+		dials.Add(1)
+		return newFakeConn(t, srv), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Acquire uses the session lane and Release the control lane, so the
+	// first pair dials both. Everything after that reuses them.
+	for i := 0; i < 3; i++ {
+		token, _, err := cl.Acquire(context.Background(), "k", 0)
+		if err != nil {
+			t.Fatalf("Acquire %d: %v", i, err)
+		}
+		if err := cl.Release(context.Background(), "k", token); err != nil {
+			t.Fatalf("Release %d: %v", i, err)
+		}
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dial count = %d, want 2 persistent lanes (session + control)", got)
+	}
+	if err := cl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, _, err := cl.Acquire(context.Background(), "k", 0); !errors.Is(err, ErrClusterClosed) {
+		t.Fatalf("Acquire after Close = %v, want ErrClusterClosed", err)
+	}
+}
+
+func TestClusterEnqueueAndWaitShareConnection(t *testing.T) {
+	srv := &pipeFakeServer{respond: func(cmd, _, _ string) string {
+		if cmd == "e" {
+			return "queued"
+		}
+		return validTokenLine
+	}}
+	var dials atomic.Int64
+	cl, err := NewCluster([]string{"127.0.0.1:9001"}, withClusterDial(func(_ context.Context, _ string) (*Conn, error) {
+		dials.Add(1)
+		return newFakeConn(t, srv), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _, _, err := cl.Enqueue(context.Background(), "k")
+	if err != nil || status != "queued" {
+		t.Fatalf("Enqueue = %q, %v", status, err)
+	}
+	token, _, err := cl.Wait(context.Background(), "k", time.Second)
+	if err != nil || token == "" {
+		t.Fatalf("Wait = %q, %v", token, err)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dial count = %d, want one shared connection", got)
+	}
+}
+
+func TestClusterPersistentSessionAgainstRealServer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	cfg := &config.Config{
+		MaxLocks: 128, DefaultLeaseTTL: time.Minute,
+		LeaseSweepInterval: 10 * time.Millisecond,
+		GCInterval:         time.Second, GCMaxIdleTime: time.Minute,
+		ReadTimeout: 25 * time.Millisecond, WriteTimeout: time.Second,
+		ShutdownTimeout: time.Second, AutoReleaseOnDisconnect: true,
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	lm, err := lock.NewLockManager(cfg, log)
+	if err != nil {
+		listener.Close()
+		t.Fatalf("NewLockManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	srv := server.New(lm, cfg, log)
+	go func() { done <- srv.RunOnListener(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("server did not stop")
+		}
+		_ = lm.Close()
+	})
+
+	owner, err := NewCluster([]string{listener.Addr().String()})
+	if err != nil {
+		t.Fatalf("NewCluster owner: %v", err)
+	}
+	defer owner.Close()
+	competitor, err := NewCluster([]string{listener.Addr().String()})
+	if err != nil {
+		t.Fatalf("NewCluster competitor: %v", err)
+	}
+	defer competitor.Close()
+
+	token, _, err := owner.Acquire(context.Background(), "persistent", 0)
+	if err != nil || token == "" {
+		t.Fatalf("owner Acquire = %q, %v", token, err)
+	}
+	if got := lm.DebugHolderTokens("lock:persistent"); len(got) != 1 || got[0] != token {
+		t.Fatalf("holder after owner acquire = %v, want %q", got, token)
+	}
+	time.Sleep(75 * time.Millisecond)
+	if _, _, err := competitor.Acquire(context.Background(), "persistent", 0); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("competitor acquired before release: %v", err)
+	}
+	if got := lm.DebugHolderTokens("lock:persistent"); len(got) != 1 || got[0] != token {
+		t.Fatalf("holder after competitor timeout = %v, want %q", got, token)
+	}
+	if err := owner.Release(context.Background(), "persistent", token); err != nil {
+		t.Fatalf("owner Release: %v", err)
+	}
+	token2, _, err := competitor.Acquire(context.Background(), "persistent", time.Second)
+	if err != nil || token2 == "" {
+		t.Fatalf("competitor Acquire after release = %q, %v", token2, err)
 	}
 }
 
@@ -192,6 +402,33 @@ func TestClusterFollowsRedirectTargetImmediately(t *testing.T) {
 	}
 	if b.count.Load() != 0 || c.count.Load() != 1 {
 		t.Fatalf("redirect hit intermediate=%d target=%d, want 0,1", b.count.Load(), c.count.Load())
+	}
+}
+
+func TestClusterRetriesTransportFailureOnAnotherMember(t *testing.T) {
+	leader := &pipeFakeServer{respond: always(validTokenLine)}
+	var first atomic.Bool
+	cl, err := NewCluster(
+		[]string{"127.0.0.1:9001", "127.0.0.1:9002"},
+		withClusterDial(func(_ context.Context, addr string) (*Conn, error) {
+			if addr == "127.0.0.1:9001" && !first.Swap(true) {
+				return newConnClosingOnFirstOperation(t), nil
+			}
+			if addr == "127.0.0.1:9002" {
+				return newFakeConn(t, leader), nil
+			}
+			return nil, errors.New("unexpected dial " + addr)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewCluster: %v", err)
+	}
+	token, _, err := cl.Acquire(context.Background(), "k", 0)
+	if err != nil || token == "" {
+		t.Fatalf("Acquire after transport failure = %q, %v", token, err)
+	}
+	if got := cl.LeaderHint(); got != "127.0.0.1:9002" {
+		t.Fatalf("LeaderHint = %q, want second member", got)
 	}
 }
 
