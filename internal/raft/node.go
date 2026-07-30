@@ -168,10 +168,10 @@ type proposal struct {
 }
 
 // applyReq is one item the run loop hands to the apply goroutine. It's
-// either a batch of committed entries (`entries != nil`) or an FSM
-// restore from a just-installed snapshot (`restoreData != nil`). They
-// are mutually exclusive; the apply goroutine handles each in FIFO order
-// so a restore correctly invalidates anything queued before it.
+// either a batch of committed entries or an FSM restore from a
+// just-installed snapshot (`restore`). They are mutually exclusive; the
+// apply goroutine handles each in FIFO order so a restore correctly
+// invalidates anything queued before it.
 type applyReq struct {
 	// applyEntries form
 	entries   []Entry
@@ -179,7 +179,11 @@ type applyReq struct {
 	// configAtBatch is the cluster configuration in effect after applying
 	// the batch; used to stamp snapshot meta if the batch triggers one.
 	configAtBatch Configuration
-	// applyRestore form
+	// applyRestore form. restore discriminates the two forms explicitly:
+	// sensing it from restoreData being non-nil would route a zero-length
+	// snapshot down the entries path, silently skipping FSM.Restore after
+	// storage and applyDispatched had already advanced past it.
+	restore     bool
 	restoreData []byte
 	restoreMeta SnapshotMeta
 }

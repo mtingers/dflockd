@@ -164,17 +164,34 @@ func limitAppendEntriesByBytes(entries []Entry, leaderID NodeID) []Entry {
 	return limitAppendEntriesByBudget(entries, leaderID, maxRPCPayloadBytes)
 }
 
+// limitAppendEntriesByBudget trims entries to what fits in one RPC payload.
+//
+// It never returns an empty slice for a non-empty input. Dropping the first
+// entry would ship an empty AppendEntries forever: the follower's matchIndex
+// could never pass that entry, and the leader would rebuild the identical
+// oversize batch on every retry. Returning it instead surfaces a loud encode
+// error. maxEntryFitsOneFrame below makes that case unreachable anyway; the
+// guard exists so a future limit change degrades noisily rather than wedging
+// replication.
 func limitAppendEntriesByBudget(entries []Entry, leaderID NodeID, budget int) []Entry {
 	size := appendEntriesPayloadBaseBytes(leaderID)
 	for i, entry := range entries {
 		next := size + 21 + len(entry.Data)
 		if next > budget {
+			if i == 0 {
+				return entries[:1]
+			}
 			return entries[:i]
 		}
 		size = next
 	}
 	return entries
 }
+
+// maxEntryFitsOneFrame fails compilation if a single maximum-size entry, sent
+// by a maximum-length node ID, could not fit one AppendEntries payload. If it
+// ever could, that entry would be unreplicable.
+const maxEntryFitsOneFrame = uint(maxRPCPayloadBytes - appendEntriesFixedBytes - maxRPCNodeIDBytes - 21 - maxEntryDataBytes)
 
 func encodeRPCConfig(c Configuration) ([]byte, error) {
 	for id, addr := range c.Voters {

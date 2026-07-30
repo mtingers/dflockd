@@ -137,6 +137,7 @@ func TestRestoreFailureFailStopsAndSkipsQueuedApply(t *testing.T) {
 	future := newFuture()
 	go n.runApply()
 	n.applyc <- applyReq{
+		restore:     true,
 		restoreData: []byte("snapshot"),
 		restoreMeta: SnapshotMeta{
 			LastIncludedIndex: 7,

@@ -5,11 +5,22 @@ import "fmt"
 // configurationAt returns the configuration effective at index. The live
 // configuration is a fast path unless it comes from a later, uncommitted log
 // entry; that case is why snapshots cannot simply use n.config.
+//
+// Both paths return the same canonical form. n.config has been through
+// withBootstrapClientMetadata (adoptConfig applies it), so without the same
+// treatment here two replicas at identical log state could stamp a snapshot at
+// the same index with and without client metadata — which diverges snapshot
+// bytes and makes writePreparedSnapshot reject a regenerated generation as
+// having conflicting metadata.
 func (n *Node) configurationAt(index Index) (Configuration, Index, error) {
 	if n.cfgIndex <= index {
 		return n.config.Clone(), n.cfgIndex, nil
 	}
-	return n.loadConfigurationAt(index)
+	cfg, idx, err := n.loadConfigurationAt(index)
+	if err != nil {
+		return Configuration{}, 0, err
+	}
+	return n.withBootstrapClientMetadata(cfg), idx, nil
 }
 
 // loadConfigurationAt reconstructs membership from durable state. The latest

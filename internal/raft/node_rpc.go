@@ -83,7 +83,7 @@ func (n *Node) dispatchRPC(from NodeID, msg Message) Message {
 	case *InstallSnapshotReq:
 		return n.handleInstallSnapshot(from, m)
 	case *TimeoutNowReq:
-		return n.handleTimeoutNow(m)
+		return n.handleTimeoutNow(from, m)
 	default:
 		return staleReply(msg, n.term)
 	}

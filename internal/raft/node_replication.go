@@ -317,7 +317,7 @@ func (n *Node) handleInstallSnapshot(from NodeID, req *InstallSnapshotReq) *Inst
 // to the snapshot index so subsequent dispatches start past it.
 func (n *Node) scheduleFSMRestore(meta SnapshotMeta, data []byte) {
 	select {
-	case n.applyc <- applyReq{restoreData: data, restoreMeta: meta}:
+	case n.applyc <- applyReq{restore: true, restoreData: data, restoreMeta: meta}:
 		if meta.LastIncludedIndex > n.applyDispatched {
 			n.applyDispatched = meta.LastIncludedIndex
 		}
@@ -340,9 +340,23 @@ func (n *Node) handleInstallSnapshotResp(from NodeID, resp *InstallSnapshotResp)
 // TimeoutNow — a leadership-transfer target campaigns at once.
 // ---------------------------------------------------------------------------
 
-func (n *Node) handleTimeoutNow(req *TimeoutNowReq) *TimeoutNowResp {
-	if req.Term >= n.term && n.isVoter(n.cfg.ID) {
+func (n *Node) handleTimeoutNow(from NodeID, req *TimeoutNowReq) *TimeoutNowResp {
+	if n.timeoutNowAuthorized(from, req) {
 		n.campaign()
 	}
 	return &TimeoutNowResp{Term: n.term}
+}
+
+// timeoutNowAuthorized reports whether this TimeoutNow may start an election.
+// Transport authorization already proves the sender is a current voter whose
+// identity matches the LeaderID it claims, but only the leader may hand off
+// leadership: otherwise any voter could force its peers to campaign and depose
+// a healthy leader at will. A node with no recognized leader accepts the
+// handoff, which keeps transfer working in the window after a higher term
+// cleared leaderID.
+func (n *Node) timeoutNowAuthorized(from NodeID, req *TimeoutNowReq) bool {
+	if req.Term < n.term || !n.isVoter(n.cfg.ID) {
+		return false
+	}
+	return n.leaderID == "" || n.leaderID == from
 }

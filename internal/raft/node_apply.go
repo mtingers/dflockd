@@ -31,7 +31,7 @@ func (n *Node) runApply() {
 // happens runApply drains later batches without touching the FSM so every
 // transferred proposal future still resolves during shutdown.
 func (n *Node) applyBatch(req applyReq) bool {
-	if req.restoreData != nil {
+	if req.restore {
 		return n.restoreFSMFromBatch(req)
 	}
 	for _, e := range req.entries {
