@@ -107,7 +107,7 @@ func NewNode(cfg Config, lm *lock.LockManager, storage raft.Storage, transport r
 	if logger == nil {
 		logger = slog.Default()
 	}
-	f := newFSM(lm)
+	f := newFSM(lm, logger)
 	rn, err := raft.NewNode(cfg.Raft, f, storage, transport, raftConfigFor(cfg), logger)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: build raft node: %w", err)

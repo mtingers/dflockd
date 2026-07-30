@@ -69,7 +69,7 @@ func TestFSMAdapterSnapshotPersistRestoreRoundTrip(t *testing.T) {
 func TestFSMReplicatedPolicyOverridesLocalConfigDeterministically(t *testing.T) {
 	lmA := newPolicyTestLM(t, 128, 64)
 	lmB := newPolicyTestLM(t, 1, 0)
-	fA, fB := newFSM(lmA), newFSM(lmB)
+	fA, fB := newFSM(lmA, nil), newFSM(lmB, nil)
 	policy := lmA.ConfiguredFSMPolicy()
 	cmd := Command{
 		Kind: KindAcquire, NowNanos: time.Unix(100, 0).UnixNano(),
@@ -94,7 +94,7 @@ func TestFSMReplicatedPolicyOverridesLocalConfigDeterministically(t *testing.T) 
 
 func TestFSMRejectsPolicyDriftBeforeMutation(t *testing.T) {
 	lm := newPolicyTestLM(t, 128, 64)
-	f := newFSM(lm)
+	f := newFSM(lm, nil)
 	policy := lm.ConfiguredFSMPolicy()
 	applyFSMCommand(t, f, Command{
 		Kind: KindAcquire, NowNanos: time.Unix(100, 0).UnixNano(),
@@ -127,7 +127,7 @@ func TestFSMRejectsPolicyDriftBeforeMutation(t *testing.T) {
 
 func TestFSMSnapshotRestoresReplicatedPolicy(t *testing.T) {
 	srcLM := newPolicyTestLM(t, 128, 64)
-	src := newFSM(srcLM)
+	src := newFSM(srcLM, nil)
 	policy := srcLM.ConfiguredFSMPolicy()
 	applyFSMCommand(t, src, Command{
 		Kind: KindAcquire, NowNanos: time.Unix(100, 0).UnixNano(),
@@ -138,7 +138,7 @@ func TestFSMSnapshotRestoresReplicatedPolicy(t *testing.T) {
 	snapshot := snapshotFSMBytes(t, src)
 
 	dstLM := newPolicyTestLM(t, 1, 0)
-	dst := newFSM(dstLM)
+	dst := newFSM(dstLM, nil)
 	if err := dst.Restore(bytes.NewReader(snapshot)); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}

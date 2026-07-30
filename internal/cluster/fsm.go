@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/mtingers/dflockd/internal/lock"
@@ -20,11 +21,17 @@ import (
 type fsm struct {
 	lm     *lock.LockManager
 	policy *lock.FSMPolicy
+	log    *slog.Logger
 }
 
 var _ raft.FSM = (*fsm)(nil)
 
-func newFSM(lm *lock.LockManager) *fsm { return &fsm{lm: lm} }
+func newFSM(lm *lock.LockManager, logger *slog.Logger) *fsm {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &fsm{lm: lm, log: logger}
+}
 
 // Apply decodes one log entry into a Command, dispatches to the matching
 // LockManager ApplyX, routes any produced grants, and returns the
@@ -85,9 +92,25 @@ func (f *fsm) ensurePolicy(proposed *lock.FSMPolicy) error {
 	if err := f.lm.InstallFSMPolicy(*proposed); err != nil {
 		return err
 	}
+	f.warnIfPolicyOverridesLocal(*proposed)
 	copy := *proposed
 	f.policy = &copy
 	return nil
+}
+
+// warnIfPolicyOverridesLocal reports that the cluster adopted a policy other
+// than this node's configuration. The replicated policy is authoritative -
+// that is what makes Apply deterministic - but silently ignoring an operator's
+// flags is exactly the kind of surprise that shows up later as an unexplained
+// limit, so it is worth one line in the log.
+func (f *fsm) warnIfPolicyOverridesLocal(adopted lock.FSMPolicy) {
+	local := f.lm.ConfiguredFSMPolicy()
+	if local == adopted {
+		return
+	}
+	f.log.Warn("cluster FSM policy differs from this node's configuration; the replicated policy wins",
+		"replicated", fmt.Sprintf("%+v", adopted),
+		"local", fmt.Sprintf("%+v", local))
 }
 
 func (f *fsm) applyAcquire(now time.Time, cmd Command) any {
