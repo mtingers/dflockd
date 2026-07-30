@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestRefIndexDisabledWithoutOrphanTTL(t *testing.T) {
+func TestRefIndexEnabledWithoutOrphanTTLForFailover(t *testing.T) {
 	lm := newApplyTestLM(t)
 	now := applyNow()
 	const key = "lock:k"
@@ -17,8 +17,8 @@ func TestRefIndexDisabledWithoutOrphanTTL(t *testing.T) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	st := sh.resources[key]
-	if st.indexRefs || st.refs != nil {
-		t.Fatalf("ref index enabled with OrphanTTL=0: enabled=%v refs=%v", st.indexRefs, st.refs)
+	if !st.indexRefs || st.refs == nil || st.refs["holder"] == nil || st.refs["waiter"] == nil {
+		t.Fatalf("ref index missing with OrphanTTL=0: enabled=%v refs=%v", st.indexRefs, st.refs)
 	}
 }
 

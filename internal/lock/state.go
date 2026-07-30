@@ -112,7 +112,7 @@ func (lm *LockManager) newResourceState(limit int, now time.Time) *ResourceState
 		Limit:        limit,
 		Holders:      make(map[string]*holder),
 		LastActivity: now,
-		indexRefs:    lm.cfg.OrphanTTL > 0,
+		indexRefs:    true,
 	}
 }
 
@@ -138,6 +138,10 @@ func (rs *ResourceState) addHolder(token string, h *holder) {
 		rs.unindexHolder(token, old)
 	}
 	rs.Holders[token] = h
+	rs.indexHolder(token, h)
+}
+
+func (rs *ResourceState) indexHolder(token string, h *holder) {
 	if h.ref == "" || !rs.indexRefs {
 		return
 	}
@@ -171,6 +175,13 @@ func (rs *ResourceState) unindexHolder(token string, h *holder) {
 
 func (rs *ResourceState) appendWaiter(w *waiter) {
 	rs.Waiters = append(rs.Waiters, w)
+	rs.indexWaiter(w)
+}
+
+func (rs *ResourceState) indexWaiter(w *waiter) {
+	if w == nil {
+		return
+	}
 	if w.ref == "" || !rs.indexRefs {
 		return
 	}
@@ -240,7 +251,7 @@ func (rs *ResourceState) removeWaitersByConn(connID uint64, closed map[chan stri
 		w := rs.Waiters[i]
 		if w.connID == connID {
 			rs.unindexWaiter(w)
-			if _, already := closed[w.ch]; !already {
+			if _, already := closed[w.ch]; !already && w.ch != nil {
 				close(w.ch)
 				closed[w.ch] = struct{}{}
 			}

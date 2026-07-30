@@ -45,10 +45,11 @@ func (lm *LockManager) resourceEvictionDue(st *ResourceState, now time.Time) boo
 // GCDue reports whether a GC command applied at now would remove at least one
 // idle resource. Like EvictionDue, this is only a local proposal gate.
 func (lm *LockManager) GCDue(now time.Time) bool {
+	maxIdle := lm.activeFSMPolicy().gcMaxIdleTime()
 	for i := range lm.shards {
 		sh := &lm.shards[i]
 		sh.mu.Lock()
-		due := shardGCDue(sh, now, lm.cfg.GCMaxIdleTime)
+		due := shardGCDue(sh, now, maxIdle)
 		sh.mu.Unlock()
 		if due {
 			return true

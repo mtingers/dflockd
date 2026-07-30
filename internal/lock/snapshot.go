@@ -16,12 +16,18 @@ import (
 
 const (
 	snapshotMagic = "dfllksn1"
-	// snapshotVer is the writer's version. Version 2 added the
-	// abandonedAtNanos field to each holder and waiter (PR-4 / stable
-	// client ref re-attach). Restore reads both versions: v1 entries
-	// have abandonedAtNanos = 0 implicitly.
-	snapshotVer  = byte(2)
+	// snapshotVer is the writer's version. Version 2 added abandonedAtNanos
+	// to holders and waiters. Version 3 adds the waiter salt to each queued
+	// two-phase index entry so Restore can identify its exact waiter.
+	//
+	// Readers must gate each optional field on the version that INTRODUCED it
+	// (snapshotVer2, snapshotVer3, …), never on snapshotVer — bumping the
+	// writer would otherwise silently stop reading every field of the prior
+	// format and desynchronise the byte stream.
+	snapshotVer  = snapshotVer3
 	snapshotVer1 = byte(1)
+	snapshotVer2 = byte(2)
+	snapshotVer3 = byte(3)
 	// snapshotMaxStr16 is the largest string the u16-length-prefixed
 	// encoding can represent. Keys are bounded far below this by the
 	// protocol (a key gets a "lock:"/"sem:" prefix, so up to ~261 bytes);
@@ -66,7 +72,7 @@ func (lm *LockManager) snapshotShards(w io.Writer) error {
 		return err
 	}
 	for _, e := range enqueued {
-		if err := writeOneEnqueued(w, e.ck, e.es); err != nil {
+		if err := writeOneEnqueued(w, e.ck, e.es, e.waiterSalt); err != nil {
 			return err
 		}
 	}
@@ -79,8 +85,9 @@ type resourceEntry struct {
 }
 
 type enqueuedEntry struct {
-	ck connKey
-	es *enqueuedState
+	ck         connKey
+	es         *enqueuedState
+	waiterSalt [8]byte
 }
 
 // collectSnapshotData locks each shard in turn, gathers a snapshot of
@@ -106,12 +113,40 @@ func (lm *LockManager) collectShard(sh *shard, res []resourceEntry, enq []enqueu
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	for k, st := range sh.resources {
-		res = append(res, resourceEntry{key: k, st: st})
+		res = append(res, resourceEntry{key: k, st: cloneResourceForSnapshot(st)})
 	}
 	for ck, es := range sh.connEnqueued {
-		enq = append(enq, enqueuedEntry{ck: ck, es: es})
+		copy := *es
+		entry := enqueuedEntry{ck: ck, es: &copy}
+		if es.waiter != nil {
+			entry.waiterSalt = es.waiter.salt
+		}
+		copy.waiter = nil // the snapshot index persists only token + lease TTL
+		enq = append(enq, entry)
 	}
 	return res, enq
+}
+
+func cloneResourceForSnapshot(st *ResourceState) *ResourceState {
+	copy := &ResourceState{
+		Limit:        st.Limit,
+		Holders:      make(map[string]*holder, len(st.Holders)),
+		LastActivity: st.LastActivity,
+	}
+	for token, live := range st.Holders {
+		holderCopy := *live
+		copy.Holders[token] = &holderCopy
+	}
+	copy.Waiters = make([]*waiter, 0, st.waiterCount())
+	for i := st.WaiterHead; i < len(st.Waiters); i++ {
+		if st.Waiters[i] == nil {
+			continue
+		}
+		waiterCopy := *st.Waiters[i]
+		waiterCopy.ch = nil
+		copy.Waiters = append(copy.Waiters, &waiterCopy)
+	}
+	return copy
 }
 
 func writeResource(w io.Writer, key string, st *ResourceState) error {
@@ -191,7 +226,7 @@ func writeWaiter(w io.Writer, wt *waiter) error {
 	return writeI64(w, wt.abandonedAtNanos) // snapshotVer 2+
 }
 
-func writeOneEnqueued(w io.Writer, ck connKey, es *enqueuedState) error {
+func writeOneEnqueued(w io.Writer, ck connKey, es *enqueuedState, waiterSalt [8]byte) error {
 	if err := writeU64(w, ck.ConnID); err != nil {
 		return err
 	}
@@ -201,7 +236,11 @@ func writeOneEnqueued(w io.Writer, ck connKey, es *enqueuedState) error {
 	if err := writeString16(w, es.token); err != nil {
 		return err
 	}
-	return writeI64(w, int64(es.leaseTTL))
+	if err := writeI64(w, int64(es.leaseTTL)); err != nil {
+		return err
+	}
+	_, err := w.Write(waiterSalt[:])
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -220,9 +259,19 @@ func (lm *LockManager) Restore(r io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("snapshot fence counter: %w", err)
 	}
-	lm.clearAllShards()
-	lm.fsmFenceCounter = fc
-	return lm.restoreShards(r, ver)
+	restored := newRestoreTarget(fc)
+	if err := restored.restoreShards(r, ver); err != nil {
+		return err
+	}
+	trailing, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("snapshot trailing data: %w", err)
+	}
+	if len(trailing) != 0 {
+		return fmt.Errorf("snapshot: %d trailing bytes", len(trailing))
+	}
+	lm.installRestoredState(restored)
+	return nil
 }
 
 func readSnapshotHeader(r io.Reader) (byte, error) {
@@ -237,25 +286,36 @@ func readSnapshotHeader(r io.Reader) (byte, error) {
 	if _, err := io.ReadFull(r, ver); err != nil {
 		return 0, fmt.Errorf("snapshot version: %w", err)
 	}
-	if ver[0] != snapshotVer && ver[0] != snapshotVer1 {
+	if ver[0] != snapshotVer && ver[0] != snapshotVer2 && ver[0] != snapshotVer1 {
 		return 0, fmt.Errorf("snapshot: unsupported version %d", ver[0])
 	}
 	return ver[0], nil
 }
 
-// clearAllShards wipes per-shard state ahead of Restore. resourceTotal
-// is reset; Restore will re-bump it as it reads.
-func (lm *LockManager) clearAllShards() {
-	for i := range lm.shards {
-		sh := &lm.shards[i]
-		sh.mu.Lock()
-		sh.resources = map[string]*ResourceState{}
-		sh.connOwned = map[uint64]map[string]map[string]struct{}{}
-		sh.connEnqueued = map[connKey]*enqueuedState{}
-		sh.connEnqueuedByID = map[uint64]map[string]struct{}{}
-		sh.mu.Unlock()
+func newRestoreTarget(fenceCounter uint64) *LockManager {
+	restored := &LockManager{fsmFenceCounter: fenceCounter}
+	for i := range restored.shards {
+		restored.shards[i].init()
 	}
-	lm.resourceTotal.Store(0)
+	return restored
+}
+
+// installRestoredState publishes only a fully decoded snapshot. The Restore
+// contract excludes concurrent Apply calls, but shard locks also keep
+// diagnostic readers from observing partially replaced maps.
+func (lm *LockManager) installRestoredState(restored *LockManager) {
+	for i := range lm.shards {
+		dst := &lm.shards[i]
+		src := &restored.shards[i]
+		dst.mu.Lock()
+		dst.resources = src.resources
+		dst.connOwned = src.connOwned
+		dst.connEnqueued = src.connEnqueued
+		dst.connEnqueuedByID = src.connEnqueuedByID
+		dst.mu.Unlock()
+	}
+	lm.resourceTotal.Store(restored.resourceTotal.Load())
+	lm.fsmFenceCounter = restored.fsmFenceCounter
 }
 
 func (lm *LockManager) restoreShards(r io.Reader, ver byte) error {
@@ -268,7 +328,7 @@ func (lm *LockManager) restoreShards(r io.Reader, ver byte) error {
 			return err
 		}
 	}
-	return lm.restoreEnqueuedIndex(r)
+	return lm.restoreEnqueuedIndex(r, ver)
 }
 
 func (lm *LockManager) restoreOneResource(r io.Reader, ver byte) error {
@@ -335,7 +395,7 @@ func readOneHolder(r io.Reader, st *ResourceState, ver byte) error {
 		return err
 	}
 	var abandoned int64
-	if ver >= snapshotVer {
+	if ver >= snapshotVer2 {
 		if abandoned, err = readI64(r); err != nil {
 			return err
 		}
@@ -377,7 +437,7 @@ func readOneWaiter(r io.Reader, ver byte) (*waiter, error) {
 		return nil, err
 	}
 	var abandoned int64
-	if ver >= snapshotVer {
+	if ver >= snapshotVer2 {
 		if abandoned, err = readI64(r); err != nil {
 			return nil, err
 		}
@@ -391,20 +451,20 @@ func rebuildOwnedIndex(sh *shard, key string, st *ResourceState) {
 	}
 }
 
-func (lm *LockManager) restoreEnqueuedIndex(r io.Reader) error {
+func (lm *LockManager) restoreEnqueuedIndex(r io.Reader, ver byte) error {
 	n, err := readU32(r)
 	if err != nil {
 		return err
 	}
 	for i := uint32(0); i < n; i++ {
-		if err := lm.restoreOneEnqueued(r); err != nil {
+		if err := lm.restoreOneEnqueued(r, ver); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (lm *LockManager) restoreOneEnqueued(r io.Reader) error {
+func (lm *LockManager) restoreOneEnqueued(r io.Reader, ver byte) error {
 	connID, err := readU64(r)
 	if err != nil {
 		return err
@@ -421,30 +481,47 @@ func (lm *LockManager) restoreOneEnqueued(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	return lm.installEnqueuedEntry(connID, key, token, time.Duration(leaseTTLNanos))
+	var salt [8]byte
+	haveSalt := false
+	if ver >= snapshotVer3 {
+		if _, err := io.ReadFull(r, salt[:]); err != nil {
+			return fmt.Errorf("snapshot enqueued waiter salt: %w", err)
+		}
+		haveSalt = true
+	}
+	return lm.installEnqueuedEntry(connID, key, token, time.Duration(leaseTTLNanos), salt, haveSalt)
 }
 
-func (lm *LockManager) installEnqueuedEntry(connID uint64, key, token string, leaseTTL time.Duration) error {
+func (lm *LockManager) installEnqueuedEntry(connID uint64, key, token string, leaseTTL time.Duration, salt [8]byte, haveSalt bool) error {
 	sh := lm.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	st := sh.resources[key]
 	es := &enqueuedState{token: token, leaseTTL: leaseTTL}
 	if token == "" {
-		es.waiter = findWaiterFor(st, connID)
+		es.waiter = findWaiterFor(st, connID, salt, haveSalt)
 	}
 	sh.setEnqueued(connKey{ConnID: connID, Key: key}, es)
 	return nil
 }
 
-func findWaiterFor(st *ResourceState, connID uint64) *waiter {
+// findWaiterFor re-links a restored enqueued-index entry to its waiter.
+// snapshotVer3+ carries the waiter's salt, which identifies the exact waiter
+// when one connection has several queued on the same key; older snapshots can
+// only fall back to the first waiter on that connection.
+func findWaiterFor(st *ResourceState, connID uint64, salt [8]byte, haveSalt bool) *waiter {
 	if st == nil {
 		return nil
 	}
 	for i := st.WaiterHead; i < len(st.Waiters); i++ {
-		if st.Waiters[i].connID == connID {
-			return st.Waiters[i]
+		w := st.Waiters[i]
+		if w.connID != connID {
+			continue
 		}
+		if haveSalt && w.salt != salt {
+			continue
+		}
+		return w
 	}
 	return nil
 }

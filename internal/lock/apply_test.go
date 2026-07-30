@@ -15,10 +15,11 @@ import (
 func newApplyTestLM(t *testing.T) *LockManager {
 	t.Helper()
 	cfg := &config.Config{
-		MaxLocks:        128,
-		MaxWaiters:      0,
-		DefaultLeaseTTL: 30 * time.Second,
-		GCMaxIdleTime:   60 * time.Second,
+		MaxLocks:                128,
+		MaxWaiters:              0,
+		DefaultLeaseTTL:         30 * time.Second,
+		GCMaxIdleTime:           60 * time.Second,
+		AutoReleaseOnDisconnect: true,
 	}
 	lm, err := NewLockManager(cfg, slog.Default())
 	if err != nil {
@@ -148,6 +149,152 @@ func TestApplyRenewExpiredEvictsAndPromotes(t *testing.T) {
 	}
 }
 
+func TestApplyRenewOwnedRebindsDisconnectOwner(t *testing.T) {
+	lm := newApplyTestLM(t)
+	acquired, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "old-ref", 1, 30*time.Second, saltOf(1))
+	renewed, _, err := lm.ApplyRenewOwned(at(110), "lock:k", acquired.Token, "new-ref", 2, 60*time.Second)
+	if err != nil || renewed.Status != StatusOK {
+		t.Fatalf("ApplyRenewOwned = %+v, %v", renewed, err)
+	}
+	if _, _, err := lm.ApplyCleanupConn(at(111), "old-ref", 1); err != nil {
+		t.Fatalf("old owner cleanup: %v", err)
+	}
+	if got := lm.DebugHolderTokens("lock:k"); len(got) != 1 || got[0] != acquired.Token {
+		t.Fatalf("old owner cleanup removed rebound holder: %v", got)
+	}
+	if _, _, err := lm.ApplyCleanupConn(at(112), "new-ref", 2); err != nil {
+		t.Fatalf("new owner cleanup: %v", err)
+	}
+	if got := lm.DebugHolderTokens("lock:k"); len(got) != 0 {
+		t.Fatalf("new owner cleanup left holder: %v", got)
+	}
+}
+
+func TestApplyCancelRemovesQueuedAcquire(t *testing.T) {
+	lm := newApplyTestLM(t)
+	holder, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "A", 1, time.Minute, saltOf(1))
+	_, _, _ = lm.ApplyAcquire(at(101), "lock:k", 1, "B", 2, time.Minute, saltOf(2))
+
+	result, grants, err := lm.ApplyCancel(at(102), "lock:k", "B", 2, saltOf(2), true)
+	if err != nil || result.Status != StatusOK || len(grants) != 0 {
+		t.Fatalf("ApplyCancel = %+v, grants=%+v, err=%v", result, grants, err)
+	}
+	if n := lm.CountWaitersForTest("lock:k"); n != 0 {
+		t.Fatalf("waiters after cancel = %d, want 0", n)
+	}
+	if _, grants, err := lm.ApplyRelease(at(103), "lock:k", holder.Token); err != nil || len(grants) != 0 {
+		t.Fatalf("release after cancel grants=%+v err=%v", grants, err)
+	}
+}
+
+func TestApplyCancelPromotionRacePromotesNext(t *testing.T) {
+	lm := newApplyTestLM(t)
+	holder, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "A", 1, time.Minute, saltOf(1))
+	_, _, _ = lm.ApplyAcquire(at(101), "lock:k", 1, "B", 2, time.Minute, saltOf(2))
+	_, _, _ = lm.ApplyAcquire(at(102), "lock:k", 1, "C", 3, time.Minute, saltOf(3))
+	if _, grants, err := lm.ApplyRelease(at(103), "lock:k", holder.Token); err != nil || len(grants) != 1 || grants[0].Ref != "B" {
+		t.Fatalf("initial promotion grants=%+v err=%v", grants, err)
+	}
+
+	_, grants, err := lm.ApplyCancel(at(104), "lock:k", "B", 2, saltOf(2), true)
+	if err != nil || len(grants) != 1 || grants[0].Ref != "C" {
+		t.Fatalf("cancel raced promotion grants=%+v err=%v", grants, err)
+	}
+	if got, want := grants[0].Token[16:], encodeToken(0, saltOf(3))[16:]; got != want {
+		t.Fatalf("promoted C token %q has wrong salt", grants[0].Token)
+	}
+}
+
+func TestApplyCancelDoesNotCrossConnectionIdentity(t *testing.T) {
+	lm := newApplyTestLM(t)
+	_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "A", 1, time.Minute, saltOf(1))
+	_, _, _ = lm.ApplyAcquire(at(101), "lock:k", 1, "B", 2, time.Minute, saltOf(2))
+	if _, _, err := lm.ApplyCancel(at(102), "lock:k", "B", 99, saltOf(2), true); err != nil {
+		t.Fatalf("ApplyCancel: %v", err)
+	}
+	if n := lm.CountWaitersForTest("lock:k"); n != 1 {
+		t.Fatalf("wrong-connection cancel removed waiter; count=%d", n)
+	}
+}
+
+func TestApplyCancelRequiresMatchingOperationSalt(t *testing.T) {
+	t.Run("waiter", func(t *testing.T) {
+		lm := newApplyTestLM(t)
+		_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "A", 1, time.Minute, saltOf(1))
+		_, _, _ = lm.ApplyAcquire(at(101), "lock:k", 1, "B", 2, time.Minute, saltOf(2))
+
+		if _, _, err := lm.ApplyCancel(at(102), "lock:k", "B", 2, saltOf(9), true); err != nil {
+			t.Fatalf("ApplyCancel: %v", err)
+		}
+		if n := lm.CountWaitersForTest("lock:k"); n != 1 {
+			t.Fatalf("wrong-salt cancel removed waiter; count=%d", n)
+		}
+	})
+
+	t.Run("promoted holder", func(t *testing.T) {
+		lm := newApplyTestLM(t)
+		first, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "A", 1, time.Minute, saltOf(1))
+		_, _, _ = lm.ApplyAcquire(at(101), "lock:k", 1, "B", 2, time.Minute, saltOf(2))
+		_, grants, err := lm.ApplyRelease(at(102), "lock:k", first.Token)
+		if err != nil || len(grants) != 1 {
+			t.Fatalf("promotion grants=%+v err=%v", grants, err)
+		}
+
+		if _, _, err := lm.ApplyCancel(at(103), "lock:k", "B", 2, saltOf(9), true); err != nil {
+			t.Fatalf("ApplyCancel: %v", err)
+		}
+		if got := lm.DebugHolderTokens("lock:k"); len(got) != 1 || got[0] != grants[0].Token {
+			t.Fatalf("wrong-salt cancel removed promoted holder: %v", got)
+		}
+	})
+}
+
+func TestApplyAttachRebindsQueuedWaiter(t *testing.T) {
+	lm := newApplyTestLM(t)
+	holder, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "holder", deadNodeConn(1), time.Minute, saltOf(1))
+	_, _, _ = lm.ApplyEnqueue(at(101), "lock:k", 1, "worker", deadNodeConn(2), time.Minute, saltOf(2))
+
+	attached, _, err := lm.ApplyAttach(at(102), "lock:k", "worker", newNodeConn(2))
+	if err != nil || attached.Status != StatusQueued {
+		t.Fatalf("ApplyAttach queued = %+v, %v", attached, err)
+	}
+	if !lm.HasActiveWaiterForTest("lock:k", "worker", newNodeConn(2)) {
+		t.Fatal("waiter was not rebound to the new connection")
+	}
+	if _, grants, err := lm.ApplyRelease(at(103), "lock:k", holder.Token); err != nil || len(grants) != 1 || grants[0].ConnID != newNodeConn(2) {
+		t.Fatalf("promotion after attach grants=%+v err=%v", grants, err)
+	}
+}
+
+func TestApplyAttachClaimsRacedPromotion(t *testing.T) {
+	lm := newApplyTestLM(t)
+	holder, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "holder", deadNodeConn(1), time.Minute, saltOf(1))
+	_, _, _ = lm.ApplyEnqueue(at(101), "lock:k", 1, "worker", deadNodeConn(2), time.Minute, saltOf(2))
+	_, grants, _ := lm.ApplyRelease(at(102), "lock:k", holder.Token)
+	if len(grants) != 1 {
+		t.Fatalf("promotion grants = %+v", grants)
+	}
+
+	attached, _, err := lm.ApplyAttach(at(103), "lock:k", "worker", newNodeConn(2))
+	if err != nil || attached.Status != StatusOK || attached.Token != grants[0].Token {
+		t.Fatalf("ApplyAttach promoted = %+v, %v; want %q", attached, err, grants[0].Token)
+	}
+	if _, _, err := lm.ApplyCleanupConn(at(104), "worker", newNodeConn(2)); err != nil {
+		t.Fatalf("cleanup rebound holder: %v", err)
+	}
+	if got := lm.DebugHolderTokens("lock:k"); len(got) != 0 {
+		t.Fatalf("cleanup left rebound holder: %v", got)
+	}
+}
+
+func TestApplyAttachRejectsMissingQueueState(t *testing.T) {
+	lm := newApplyTestLM(t)
+	result, grants, err := lm.ApplyAttach(at(100), "lock:missing", "worker", newNodeConn(1))
+	if err != nil || result.Status != StatusErrNotEnqueued || len(grants) != 0 {
+		t.Fatalf("ApplyAttach missing = %+v grants=%+v err=%v", result, grants, err)
+	}
+}
+
 func TestApplyEnqueueAcquiredFastPath(t *testing.T) {
 	lm := newApplyTestLM(t)
 	r, _, _ := lm.ApplyEnqueue(at(100), "lock:k", 1, "A", 1, 30*time.Second, saltOf(1))
@@ -175,6 +322,21 @@ func TestApplyCleanupConnReleasesAndPromotes(t *testing.T) {
 	}
 	if len(grants) != 1 || grants[0].Ref != "B" {
 		t.Fatalf("cleanup should promote B; got %+v", grants)
+	}
+}
+
+func TestApplyCleanupConnHonorsDisabledAutoRelease(t *testing.T) {
+	lm := newApplyTestLM(t)
+	lm.cfg.AutoReleaseOnDisconnect = false
+	held, _, err := lm.ApplyAcquire(at(100), "lock:k", 1, "A", 1, 30*time.Second, saltOf(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := lm.ApplyCleanupConn(at(101), "A", 1); err != nil {
+		t.Fatal(err)
+	}
+	if holders := lm.DebugHolderTokens("lock:k"); len(holders) != 1 || holders[0] != held.Token {
+		t.Fatalf("disabled auto-release dropped holder: %v", holders)
 	}
 }
 

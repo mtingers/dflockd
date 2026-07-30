@@ -54,6 +54,7 @@ type LockManager struct {
 	cfg           *config.Config
 	log           *slog.Logger
 	randBuf       randBuf
+	fsmPolicy     atomic.Pointer[FSMPolicy]
 	// fenceAlloc is the source of the lex-sortable prefix encoded in
 	// every issued token. With cfg.FenceStateFile set, ranges are
 	// pre-allocated to disk so cross-restart monotonicity holds even
@@ -372,8 +373,8 @@ func (lm *LockManager) enqueueWaiter(sh *shard, st *ResourceState, connID uint64
 // waiterCapAvailable reports whether enqueuing one more waiter is
 // permitted by MaxWaiters.
 func (lm *LockManager) waiterCapAvailable(st *ResourceState) bool {
-	max := lm.cfg.MaxWaiters
-	return max <= 0 || st.waiterCount() < max
+	max := lm.activeFSMPolicy().MaxWaiters
+	return max <= 0 || int64(st.waiterCount()) < max
 }
 
 // blockOnWaiter spans waitForGrant under a timeout-bound context.
@@ -847,6 +848,9 @@ func dropEnqueuedWaiter(sh *shard, key string, es *enqueuedState, closed map[cha
 // in the shared `closed` set so a waiter blocked on multiple shards
 // isn't double-closed.
 func closeOnce(ch chan string, closed map[chan string]struct{}) {
+	if ch == nil {
+		return
+	}
 	if _, already := closed[ch]; already {
 		return
 	}

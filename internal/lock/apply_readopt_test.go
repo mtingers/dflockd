@@ -19,14 +19,14 @@ import (
 // The reconnect therefore arrives on a connID minted by a DIFFERENT
 // server process, which is how the FSM tells "the owner's node is gone"
 // from "another live client is naming this ref" — cluster connIDs carry
-// a per-process epoch in their high 32 bits (server.randomConnIDEpoch).
+// a fixed process tag in their high 24 bits.
 // deadNodeConn / newNodeConn below make that explicit.
 
 // deadNodeConn returns a connID as minted by the node that later
 // crashed; newNodeConn returns one from the node the client reconnects
 // to. Distinct epochs, as in any real failover.
-func deadNodeConn(n uint64) uint64 { return uint64(0xDEAD0001)<<32 | n }
-func newNodeConn(n uint64) uint64  { return uint64(0xA11FE001)<<32 | n }
+func deadNodeConn(n uint64) uint64 { return uint64(0xDEAD01)<<40 | n }
+func newNodeConn(n uint64) uint64  { return uint64(0xA11FE0)<<40 | n }
 
 // TestEnqueueReAdoptsHardCrashedHolder: a client holds a lock (acquired
 // via the two-phase Enqueue fast-path), its node is killed without a
@@ -159,21 +159,21 @@ func TestAcquireReAdoptsHardCrashedWaiter(t *testing.T) {
 	}
 }
 
-// TestAcquireNoReAdoptWhenOrphanTTLZero guards the opt-in gate: with
-// OrphanTTL = 0 (the default), the new ApplyAcquire re-adopt path must
-// stay dormant — a second connection on the same ref queues behind the
-// holder exactly as before PR-5.
-func TestAcquireNoReAdoptWhenOrphanTTLZero(t *testing.T) {
+// TestAcquireReAdoptsHardCrashWithoutOrphanRetention verifies that
+// OrphanTTL controls graceful-disconnect retention, not failover recovery.
+// A holder left by a dead server epoch is reattached by its stable ref even
+// under the default OrphanTTL=0 policy.
+func TestAcquireReAdoptsHardCrashWithoutOrphanRetention(t *testing.T) {
 	lm := newApplyTestLM(t) // OrphanTTL = 0
 	res1, _, _ := lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", deadNodeConn(1), 30*time.Second, saltOf(1))
-	res2, _, _ := lm.ApplyAcquire(at(101), "lock:k", 1, "ref-A", 2, 30*time.Second, saltOf(2))
-	if res2.Status != StatusQueued {
-		t.Fatalf("status = %v, want StatusQueued (no re-adopt when OrphanTTL=0)", res2.Status)
+	res2, _, _ := lm.ApplyAcquire(at(101), "lock:k", 1, "ref-A", newNodeConn(2), 30*time.Second, saltOf(2))
+	if res2.Status != StatusOK || res2.Token != res1.Token {
+		t.Fatalf("re-adopt = %+v, want original token %q", res2, res1.Token)
 	}
 	if got := lm.HolderTokenForRefTest("lock:k", "ref-A"); got != res1.Token {
-		t.Fatalf("holder token changed to %q; OrphanTTL=0 must not re-adopt", got)
+		t.Fatalf("holder token changed to %q", got)
 	}
-	if n := lm.CountWaitersForTest("lock:k"); n != 1 {
-		t.Fatalf("waiter count = %d, want 1 (the queued second acquire)", n)
+	if n := lm.CountWaitersForTest("lock:k"); n != 0 {
+		t.Fatalf("waiter count = %d, want 0", n)
 	}
 }

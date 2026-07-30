@@ -16,15 +16,18 @@ import (
 // The FSM decides "is the previous owner really gone?" from data it
 // already replicates: an orphan stamp (the graceful path), or a connID
 // minted by a different server process (the failover path — connIDs
-// carry a per-process epoch in their high 32 bits).
+// carry a fixed process tag in their high 24 bits).
 
 const (
-	epochA = uint64(0x1111_1111) << 32 // "leader A's process"
-	epochB = uint64(0x2222_2222) << 32 // "leader B's process"
+	epochA = uint64(0x11_1111) << 40 // "leader A's process"
+	epochB = uint64(0x22_2222) << 40 // "leader B's process"
 )
 
 func reattachCfg() *config.Config {
-	return &config.Config{MaxLocks: 100, MaxWaiters: 100, OrphanTTL: time.Minute, GCMaxIdleTime: time.Hour}
+	return &config.Config{
+		MaxLocks: 100, MaxWaiters: 100, OrphanTTL: time.Minute,
+		GCMaxIdleTime: time.Hour, AutoReleaseOnDisconnect: true,
+	}
 }
 
 func applyNow() time.Time { return time.Unix(1700000000, 0) }
@@ -49,6 +52,25 @@ func TestReAttachRefusedForLiveHolderOnSameNode(t *testing.T) {
 	}
 	if got.Token != "" {
 		t.Fatalf("second acquire leaked the victim's token %q", got.Token)
+	}
+}
+
+func TestReAttachRefusedAcrossOld32BitCounterBoundary(t *testing.T) {
+	lm := managerWithCfg(t, reattachCfg())
+	now := applyNow()
+	before := epochA | (1<<32 - 1)
+	after := epochA | 1<<32
+
+	victim, _, err := lm.ApplyAcquire(now, "lock:k", 1, "worker-1", before, time.Minute, [8]byte{1})
+	if err != nil || victim.Status != StatusOK {
+		t.Fatalf("victim acquire: %v %+v", err, victim)
+	}
+	got, _, err := lm.ApplyAcquire(now, "lock:k", 1, "worker-1", after, time.Minute, [8]byte{2})
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if got.Status != StatusQueued || got.Token != "" {
+		t.Fatalf("status = %v token = %q, want queued across old counter boundary", got.Status, got.Token)
 	}
 }
 

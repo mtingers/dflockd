@@ -14,11 +14,12 @@ import (
 func newOrphanTestLM(t *testing.T, orphanTTL time.Duration) *LockManager {
 	t.Helper()
 	cfg := &config.Config{
-		MaxLocks:        128,
-		MaxWaiters:      0,
-		DefaultLeaseTTL: 30 * time.Second,
-		GCMaxIdleTime:   60 * time.Second,
-		OrphanTTL:       orphanTTL,
+		MaxLocks:                128,
+		MaxWaiters:              0,
+		DefaultLeaseTTL:         30 * time.Second,
+		GCMaxIdleTime:           60 * time.Second,
+		OrphanTTL:               orphanTTL,
+		AutoReleaseOnDisconnect: true,
 	}
 	lm, err := NewLockManager(cfg, slog.Default())
 	if err != nil {
@@ -55,11 +56,7 @@ func TestCleanupConnOrphansStableRefWaiter(t *testing.T) {
 // TestEnqueueReAdoptsOrphanedWaiter: after CleanupConn orphans a
 // stable-ref waiter, a re-Enqueue with the same (key, ref) must
 // re-adopt that waiter (same slot, new connID, original salt preserved).
-// The salt check distinguishes "re-adopt" from "create fresh" — the
-// caller passes a different salt on the second call, and a re-adopt
-// must preserve the first one (so when promoted, the resulting token
-// is deterministic across replicas independent of what the
-// reconnecting client's RNG happens to spit out).
+// Preserving the salt keeps the future token tied to the original queue slot.
 func TestEnqueueReAdoptsOrphanedWaiter(t *testing.T) {
 	lm := newOrphanTestLM(t, 30*time.Second)
 	_, _, _ = lm.ApplyAcquire(at(100), "lock:k", 1, "ref-A", 1, 30*time.Second, saltOf(1))
@@ -78,7 +75,7 @@ func TestEnqueueReAdoptsOrphanedWaiter(t *testing.T) {
 		t.Fatalf("waiter not re-adopted with new connID 99")
 	}
 	if got := lm.WaiterSaltForTest("lock:k", "ref-B"); got != originalSalt {
-		t.Fatalf("waiter salt = %v, want original %v (re-adopt should preserve)", got, originalSalt)
+		t.Fatalf("waiter salt = %v, want original %v", got, originalSalt)
 	}
 	// Crucially: there's only ONE waiter for ref-B (no duplicate slot).
 	if n := lm.CountWaitersForTest("lock:k"); n != 1 {
