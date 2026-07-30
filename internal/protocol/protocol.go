@@ -198,6 +198,20 @@ func ReadRequest(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultL
 	return parseRequest(frame.cmd, frame.key, frame.arg, defaultLeaseTTL)
 }
 
+// ReadRequestAfterIdle waits without a deadline for the first byte of the
+// next request, then applies timeout independently to each protocol line.
+// Established sessions may therefore remain idle while holding a lease,
+// without weakening the slow-frame deadline once a request begins.
+func ReadRequestAfterIdle(r *bufio.Reader, timeout time.Duration, conn net.Conn, defaultLeaseTTL time.Duration) (*Request, error) {
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, readDeadlineErr()
+	}
+	if _, err := r.Peek(1); err != nil {
+		return nil, readByteErr(err)
+	}
+	return ReadRequest(r, timeout, conn, defaultLeaseTTL)
+}
+
 type requestFrame struct {
 	cmd, key, arg string
 }

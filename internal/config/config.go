@@ -38,9 +38,9 @@ type Config struct {
 	MaxWaiters         int
 	FenceStateFile     string
 	// OrphanTTL bounds how long a stable-ref waiter/holder survives in
-	// the FSM after its TCP connection went away. Zero means today's
-	// strict behavior (CleanupConn removes immediately). Must be the
-	// same on every cluster member — it's read in the FSM apply path.
+	// the FSM after its connection went away. Zero means CleanupConn
+	// removes it immediately. Cluster mode captures this in the replicated
+	// versioned FSM policy; local values apply before that policy is adopted.
 	OrphanTTL time.Duration
 
 	// HTTP API (HTTPPort=0 disables).
@@ -69,7 +69,8 @@ type Config struct {
 	// Mutual TLS on the Raft transport. All three set → every inter-node
 	// connection is mTLS (each node presents RaftTLSCert and verifies the
 	// peer against RaftTLSCA). Certificate Common Names must equal NodeID.
-	// All empty leaves the shared-secret AEAD as the transport protection.
+	// All empty leaves shared-secret AEAD as the transport protection. That
+	// mode supports static membership only; dynamic membership requires mTLS.
 	RaftTLSCert string
 	RaftTLSKey  string
 	RaftTLSCA   string
@@ -481,6 +482,9 @@ func validateOrphanTTL(c *Config) error {
 // any of them is set, all required ones must be set.
 func validateClusterFields(c *Config) error {
 	if !c.IsCluster() {
+		if c.ClusterBootstrap {
+			return fmt.Errorf("--cluster-bootstrap requires cluster mode (--raft-dir)")
+		}
 		return nil
 	}
 	if c.NodeID == "" {
@@ -508,12 +512,22 @@ func peersIncludeNode(peers []ClusterPeer, id string) bool {
 }
 
 func validateClusterPeerUniqueness(peers []ClusterPeer) error {
-	seen := map[string]bool{}
+	nodeIDs := map[string]bool{}
+	raftAddrs := map[string]string{}
+	clientAddrs := map[string]string{}
 	for _, p := range peers {
-		if seen[p.NodeID] {
+		if nodeIDs[p.NodeID] {
 			return fmt.Errorf("--cluster-peers: duplicate node id %q", p.NodeID)
 		}
-		seen[p.NodeID] = true
+		nodeIDs[p.NodeID] = true
+		if id, exists := raftAddrs[p.RaftAddr]; exists {
+			return fmt.Errorf("--cluster-peers: duplicate raft address %q for %q and %q", p.RaftAddr, id, p.NodeID)
+		}
+		raftAddrs[p.RaftAddr] = p.NodeID
+		if id, exists := clientAddrs[p.ClientAddr]; exists {
+			return fmt.Errorf("--cluster-peers: duplicate client address %q for %q and %q", p.ClientAddr, id, p.NodeID)
+		}
+		clientAddrs[p.ClientAddr] = p.NodeID
 	}
 	return nil
 }

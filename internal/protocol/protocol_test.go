@@ -340,6 +340,43 @@ func TestReadRequest_FullFrame(t *testing.T) {
 	}
 }
 
+func TestReadRequestAfterIdleDoesNotExpireIdleSession(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	result := make(chan error, 1)
+	go func() {
+		_, err := ReadRequestAfterIdle(bufio.NewReader(serverConn), 20*time.Millisecond, serverConn, 33*time.Second)
+		result <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := clientConn.Write([]byte("ping\n_\n\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("idle request: %v", err)
+	}
+}
+
+func TestReadRequestAfterIdleTimesOutStartedLine(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	result := make(chan error, 1)
+	go func() {
+		_, err := ReadRequestAfterIdle(bufio.NewReader(serverConn), 20*time.Millisecond, serverConn, 33*time.Second)
+		result <- err
+	}()
+	if _, err := clientConn.Write([]byte("p")); err != nil {
+		t.Fatalf("write partial line: %v", err)
+	}
+	err := <-result
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) || protocolErr.Code != ErrCodeReadTimeout {
+		t.Fatalf("partial request error = %v, want read timeout", err)
+	}
+}
+
 func TestReadRequest_StripsCR(t *testing.T) {
 	r, conn := newReader("l\r\nkey1\r\n10\r\n")
 	req, err := ReadRequest(r, time.Second, conn, 33*time.Second)

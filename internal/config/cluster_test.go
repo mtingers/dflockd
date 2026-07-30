@@ -97,9 +97,12 @@ func TestClusterFieldValidation(t *testing.T) {
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001"}, "--cluster-peers"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n2=h:1@c:1"}, "must include this node"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1,n1=h:2@c:2"}, "duplicate node id"},
+		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1,n2=h:1@c:2"}, "duplicate raft address"},
+		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1,n2=h:2@c:1"}, "duplicate client address"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--fence-state-file", "/fence"}, "--fence-state-file is incompatible"},
 		{[]string{"--raft-dir", "/d", "--node-id", "n1", "--raft-addr", ":7001", "--cluster-peers", "n1=h:1@c:1", "--raft-tls-cert", "/c.pem"}, "must be set together"},
 		{[]string{"--raft-tls-cert", "/c.pem", "--raft-tls-key", "/k.pem", "--raft-tls-ca", "/ca.pem"}, "requires cluster mode"},
+		{[]string{"--cluster-bootstrap"}, "--cluster-bootstrap requires cluster mode"},
 	}
 	for _, bad := range bads {
 		t.Run(strings.Join(bad.args, " "), func(t *testing.T) {
