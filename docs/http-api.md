@@ -43,12 +43,14 @@ curl -sS -X POST http://node-a:6389/v1/sessions \
   -d '{"stable_ref":"worker-01-6f1b7e8c"}'
 ```
 
-Set `--orphan-ttl > 0` identically on every member. After a leader
-failure or redirect, create a new node-local session on the new leader
-with the **same** `stable_ref`, then retry `acquire` or `enqueue`. The
-FSM re-attaches the original holder or waiter: a held token and a
-waiter's FIFO position are preserved. The empty-body create request
-remains supported and uses the default, failover-unstable identity.
+After a leader failure or redirect, create a new node-local session on
+the new leader with the **same** `stable_ref`, then retry `acquire` or
+`enqueue`. The FSM re-attaches the original holder or waiter: a held
+token and a waiter's FIFO position are preserved. A positive
+`--orphan-ttl` additionally retains stable-ref state after graceful
+disconnect; hard-failover reattachment does not require it. The
+empty-body create request remains supported and uses node-local,
+failover-unstable identity.
 
 Stable refs are caller-supplied identifiers, not authentication
 credentials. Generate them randomly, do not log or share them, and
@@ -57,13 +59,13 @@ do not use it concurrently from multiple live sessions.
 
 Sessions die in three ways:
 
-1. **Explicit `DELETE`.** Synchronous. Default sessions release held
-   tokens before the response returns. In an orphan-enabled cluster,
-   stable-ref session slots are marked abandoned for re-attachment and
-   expire after `--orphan-ttl`. Release known tokens before deletion
-   when the logical session is finished. If immediate cleanup cannot
-   allocate a fence for the next waiter, the response is
-   `503 fence_persistence`.
+1. **Explicit `DELETE`.** Synchronous. With the default disconnect
+   policy, ordinary sessions release held tokens before the response.
+   Stable-ref slots are retained for reattachment only when
+   `--orphan-ttl > 0`; otherwise they are released. When
+   `--auto-release-on-disconnect=false`, holders remain until explicit
+   release or lease expiry. If cleanup cannot allocate a fence for the
+   next waiter, the response is `503 fence_persistence`.
 2. **Idle timeout.** A background sweeper reaps any session whose
    `lastSeen` falls behind 2× `--http-session-idle-timeout`.
    In-flight handlers are immune for the duration of the request.
@@ -77,7 +79,7 @@ Sessions die in three ways:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness probe. Always 200 unless the server is hard-down. |
-| `GET` | `/ready` | Readiness. 503 with `{"status":"draining"}` during graceful shutdown. |
+| `GET` | `/ready` | Readiness. In cluster mode requires a running local voter, not leadership. Returns 503 `draining` or `not_ready`. |
 | `GET` | `/metrics` | Prometheus exposition. |
 
 ### Stats
@@ -225,6 +227,7 @@ code mapping:
 | 503 | `max_sessions_per_ip` | Per-IP session cap reached |
 | 503 | `fence_persistence` | `--fence-state-file` write failed (disk full, EIO, counter exhausted) |
 | 503 | `draining` | Server is in graceful shutdown |
+| 503 | `not_ready` | Cluster Raft is stopped, detached, or this node is no longer a voter |
 
 ## Cancellation
 

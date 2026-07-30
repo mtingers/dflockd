@@ -64,6 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The required build toolchain is Go 1.26.5. CI and tagged releases both run
+  unit, race, vet, and reachable-vulnerability gates before packaging.
 - Raft replication now permits only one in-flight `AppendEntries` RPC per
   follower. Successful replies immediately chain the next bounded batch while
   transport errors defer retry to the next heartbeat, avoiding repeated
@@ -84,6 +86,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (cluster mode)
 
+- **Single-node startup no longer panics.** The Raft supervisor added for
+  fatal-failure detection received the cluster node through an interface
+  parameter. Outside cluster mode that value is a nil `*cluster.Node`, and a
+  nil pointer boxed in an interface is not a nil interface — so every
+  non-cluster process supervised a node that did not exist and
+  nil-dereferenced on its first `Done()` call. Boxing now goes through
+  `clusterRuntimeOf`, and a subprocess test starts a real single-node server
+  and shuts it down on `SIGTERM`.
+- **Snapshot version gating no longer breaks older generations.** Optional
+  fields were gated on `ver >= snapshotVer`, the *writer's* version, so raising
+  the writer to v3 stopped the reader consuming v2's `abandonedAtNanos` for
+  holders and waiters. The byte stream then desynchronised and restore failed
+  with `unexpected EOF`, which would have stopped any node upgraded in place
+  over an existing snapshot. Each field is now gated on the version that
+  introduced it, and `Restore` is tested against hand-built v1, v2, and v3
+  byte layouts.
+- **`InstallSnapshot` no longer regresses the effective configuration.**
+  Installing a snapshot keeps a tail whose term matches at the snapshot index,
+  so the log can still hold an `EntryConfig` above it. Adopting the snapshot's
+  configuration unconditionally pushed `cfgIndex` below that entry, and
+  `configurationAt` then served the stale voter set — the same defect class the
+  conflict-truncation path already handled. The follower now reconstructs the
+  configuration from durable state, preferring the newest surviving config
+  entry and falling back to snapshot metadata only when none survives.
+- **A blocked acquire no longer starves lease renewal in `client.Cluster`.**
+  Every operation serialized on one mutex held across the whole call, so a
+  caller holding lock A and blocking on lock B could not renew A and silently
+  lost it at lease expiry. The client now carries its single logical session
+  over two connections: a session lane for calls that block for a grant
+  (`Acquire`, `Enqueue`, `Wait`, `Sem*`) and a control lane for
+  `Release`/`Renew`/`Barrier`. Both send the same stable ref, which is safe
+  because disconnect cleanup is scoped by connection ID. Note that a `Cluster`
+  now opens up to two connections, and a successful `Renew` rebinds that
+  lock's holder to the control lane.
 - **The replicated FSM fence counter now refuses `uint64` exhaustion.**
   Attempting to mint after fence `ffffffffffffffff` returns
   `ErrFencePersistence` without wrapping to zero or issuing a duplicate,
@@ -105,7 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Raft TCP connections no longer self-recycle ~5 s after they're established.** The handshake's read deadline was never cleared, so every connection died and was redialed every ~5 s — harmless on loopback (so tests/smoke missed it) but on a real network it caused constant churn, spurious RPC failures, and, with aggressive election timers, spurious leader elections. The steady-state read loops now use a 60 s idle deadline (a dead/partitioned peer is reaped, an idle-by-design conn is recycled), writes have a 10 s deadline, every conn enables TCP keepalive, and a 250 ms per-peer dial backoff stops continuous heartbeats from hammering a downed peer.
 - **Lease expiry and idle GC now actually run in cluster mode.** A leader-bound sweep loop proposes `EvictExpired` every `--lease-sweep-interval` (default 1 s) and `GC` every 30 ticks; previously neither ran, so a holder whose client crashed held its lock forever and idle resources accumulated unbounded.
 - **`CleanupConn` is now byte-deterministic across replicas** — a connection holding multiple contended keys had its waiters promoted (and tokens minted) in Go map-iteration order, which could differ per replica and diverge the FSM. The cleanup now processes owned keys in sorted order.
-- **Cluster connection ids are now globally unique** (a per-process random epoch in the high bits + the counter in the low bits), so after a leader failover a survivor's fresh low ids can't collide with the dead leader's orphaned holders/waiters — which would have made `CleanupConn` release the wrong client's locks.
+- **Cluster connection IDs now use a fixed randomized 24-bit process tag and
+  a 40-bit monotonic counter.** The tag never changes within one process,
+  the counter supplies more than one trillion identities (about 35 years at
+  1,000 accepts/second), and exhaustion fails closed instead of aliasing an
+  older live or orphaned session.
 - **Two-phase enqueue → wait no longer has a lost-wakeup window** — the grant listener is registered when the `Enqueue` commits (not only when the `Wait` arrives) and held on the connection, so a promotion in between is captured rather than dropped.
 - **Persistence durability hardening:** the WAL and HardState directory entries are fsync'd after creation (so the first `SaveHardState` survives a crash on a brand-new `--raft-dir`); a corrupt snapshot file now fails the open loudly instead of being silently treated as "no snapshot" (which, after a log compaction, would reset the node to empty state at term 0); WAL/snapshot reads are size-capped (≤ 64 MiB) so a corrupt length can't OOM the process; a partial WAL write is rolled back; `walFile.rewrite` no longer leaves the handle nil on a mid-rewrite error; `handleInstallSnapshot` ignores a snapshot at-or-below the committed index; a decoded `cluster.Command` is validated (key/ref length, limit range, TTL sign) before it touches the FSM.
 - **Data race fixed:** `cluster.Node`'s members map (read by `LeaderClientAddr` on every redirect, written by `AddVoter`/`RemoveServer`) is now mutex-guarded; `TCPTransport`'s handler field is an `atomic.Pointer`; `Send`/`dialFresh` check the closed flag so a `Send` racing `Close` can't misuse the WaitGroup. Also: `node.shipApplyBatch` drains `snapSavec` while blocked on a full `applyc`, removing a (rare) deadlock under sustained writes with a tiny snapshot threshold.

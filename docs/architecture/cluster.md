@@ -53,7 +53,13 @@ derived `--host:--port`).
   prefix is a `FenceCounter` kept in FSM state (snapshotted), bumped on
   every grant during apply; tokens are deterministic on every node.
 - **Configuration changes** (`AddVoter` / `RemoveServer`) are themselves
-  Raft log entries; they take effect on append (Raft §4.3).
+  Raft log entries; they take effect on append (Raft §4.3). Each
+  configuration also carries the client-facing address used for status
+  and redirects, so metadata survives failover, snapshot, and restart.
+- **FSM policy** is versioned and carried by commands, then persisted in
+  snapshots: `MaxLocks`, `MaxWaiters`, `OrphanTTL`, `GCMaxIdleTime`, and
+  `AutoReleaseOnDisconnect`. The first policy-bearing command establishes
+  cluster behavior; later commands must match it.
 
 ## What's persisted
 
@@ -77,8 +83,12 @@ Every Raft connection requires the same high-entropy shared secret
 (`--raft-auth-token-file`, direct flag, or environment). A fresh-nonce
 HMAC-SHA256 challenge-response authenticates the peer and derives
 directional AES-GCM keys; sequence numbers reject replayed secure
-frames. Optional mTLS additionally verifies the issuing CA and requires
+frames. Mutual TLS additionally verifies the issuing CA and requires
 each certificate Common Name to exactly equal its Raft node ID.
+
+Shared-secret-only transport supports static bootstrap. Runtime
+`AddVoter` and `RemoveServer` require mutual TLS because a common secret
+does not provide revocable per-node identity.
 
 The authenticated-encryption handshake uses the `raft.v3` protocol
 marker. Upgrading from an older plaintext Raft build requires an
@@ -102,8 +112,8 @@ nodes with identical state produce identical snapshot bytes.
 | Leader lost | A new election begins. A follower wins (Raft §5.4 election restriction guarantees its log is up-to-date) and serves writes. Clients see one or more `error_not_leader` redirects and retry. |
 | Full restart | Each node recovers its HardState + WAL + latest snapshot from `--raft-dir`. Once a quorum is alive an election runs. State is intact. |
 | Partition into a minority | Minority cannot commit (no quorum). Its local `stats` view may be stale; mutating clients see `error_not_leader` and retry against the majority. |
-| Client connection drops mid-`acquire` | Default connection-scoped refs lose blocked FIFO position after leader failure; a hard-failed leader's granted holder expires by lease. TCP connections and replacement HTTP sessions using a stable ref with `--orphan-ttl` can re-attach to the same waiter or holder after the old owner is provably gone. |
-| Node disk fills | A failure on any durable HardState, WAL, or snapshot mutation logs the error and fail-stops the node before it can acknowledge non-durable state. |
+| Client connection drops mid-`acquire` | `client.Cluster` uses a generated stable ref and re-attaches after failover. Low-level TCP and HTTP callers need their own stable ref. `OrphanTTL` controls retention after graceful disconnect; hard-failover reattachment does not require it. |
+| Node disk fills | A failure on any durable HardState, WAL, or snapshot mutation fail-stops Raft, removes readiness, cancels listeners, and causes a nonzero process exit before the node can acknowledge non-durable state. |
 
 ## Clock-skew posture
 

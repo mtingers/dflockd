@@ -75,7 +75,7 @@ single node; cluster awareness is opt-in (`client.Cluster` or explicit
 | `internal/httpapi` | Maps follower mutations to `503 {"error":"not_leader"}` + `X-Dflockd-Leader`; exposes `GET /v1/readindex`, `POST /v1/admin/voters`, `DELETE /v1/admin/voters/{id}`, cluster status, and metrics. |
 | `cmd/dflockd` | Wires `cluster.Node` when configured; graceful SIGINT/SIGTERM shutdown calls `cluster.Node.Close`, which attempts leadership transfer; fatal on storage-init failure. |
 | `cmd/cluster-soak` | In-process N-node harness with periodic leader kills plus an external real-cluster mode with pluggable partition, restart, and process-clock-skew hooks. |
-| `client` | Adds the standalone, failover-aware `client.Cluster` wrapper. It caches a leader address, follows member-clamped redirects, rotates after dial failures, bounds attempts, and optionally sets auth + stable refs on each fresh connection. Existing `Lock`/`Semaphore` APIs remain unchanged. |
+| `client` | Adds the standalone, failover-aware `client.Cluster` wrapper. It owns a persistent logical session over two lanes (blocking session + non-blocking control), generates a random stable ref, caches a leader address, follows member-clamped redirects, rotates after dial failures, bounds attempts, and supports client TLS + auth. Existing `Lock`/`Semaphore` APIs remain unchanged. |
 
 ### Relationship to the existing `feat/replication` branch
 
@@ -178,17 +178,20 @@ Commands use a bounded, validated internal JSON codec with a stable numeric
 | `EvictExpired` | leader maintenance loop when expiry is due | scan and evict every expired holder deterministically |
 | `GC` | periodic leader maintenance when GC is due | drop idle resources deterministically |
 | `CleanupConn{ref, connID}` | leader on client disconnect | release or orphan this connection's slots, then promote as needed |
+| `Cancel{key, ref, connID, salt}` | canceled acquire/enqueue cleanup | idempotently remove the exact waiter or raced promotion through Raft |
+| `Attach{key, ref, connID}` | failover-aware two-phase wait | rebind an existing stable-ref waiter or promoted holder |
 
 Raft `NoOp` and `ConfigEntry` entries are handled by `raft.Node`, outside this
-application command codec. The `w` / `sw` phase does not append another log
-entry; it waits on the listener registered by `Enqueue`.
+application command codec. Each command also carries the versioned FSM policy
+that affects deterministic transitions. The `w` / `sw` path proposes `Attach`
+after reconnect, then waits on the listener registered for that session.
 
-The default client ref is the decimal form of a connection ID with a random
-per-process epoch in its high bits. TCP callers may instead send
+The default client ref is the decimal form of a full-width randomized,
+monotonic process connection ID. TCP callers may instead send
 `stable-ref <opaque-id>` before their first operation; HTTP callers may supply
-`stable_ref` when creating a session. With `--orphan-ttl > 0`, reconnecting or
-creating a replacement node-local session with that ref can reclaim the same
-waiter/holder after failover.
+`stable_ref` when creating a session. Reconnecting or creating a replacement
+node-local session with that ref can reclaim the same waiter/holder after hard
+failover. `OrphanTTL` additionally controls graceful-disconnect retention.
 
 ### 4.4 Who can mutate; client routing
 
@@ -201,13 +204,14 @@ waiter/holder after failover.
 - `ping` is answered by anyone. `stats` reports the local applied-state view on
   any member; callers needing a linearization point use `barrier` or
   `GET /v1/readindex` on the leader first.
-- The **Go `client.Cluster` wrapper** keeps an atomic leader-address hint. Each
-  operation dials a fresh connection, follows a known-member
-  `error_not_leader <addr>` immediately, rotates through configured members
-  after dial/unknown-hint failures, and stops at a fixed attempt budget. The
-  exhaustion error matches `ErrTooManyRedirects` and wraps the terminal cause.
-  `WithClusterStableRef` re-sends the caller's ref on every connection so
-  acquire/enqueue/wait can re-attach after failover.
+- The **Go `client.Cluster` wrapper** owns one random stable identity carried
+  over two persistent connections: a session lane for calls that block for a
+  grant and a control lane for renew/release/barrier, so lifecycle calls are
+  never starved by a blocked acquire. It follows a known-member `error_not_leader <addr>`
+  immediately, rotates through configured members after transport or
+  unknown-hint failures, and stops at a fixed attempt budget. Reconnects restore
+  TLS, auth, and stable identity before retrying. The exhaustion error matches
+  `ErrTooManyRedirects` and wraps the terminal cause.
 
 ### 4.5 Persistence layout
 
@@ -226,9 +230,10 @@ waiter/holder after failover.
 - Reuse the patterns already in `internal/lock/fence.go`: `flock(2)` the dir
   (refuse to start if another dflockd holds it; refuse on non-Unix), CRC records,
   and `fsync` the file *and* directory entry after an atomic rename.
-- On startup: acquire the dir lock → load the newest valid snapshot → validate
-  the single WAL and truncate a torn tail → load `hardstate` → `FSM.Restore`
-  the snapshot → replay committed WAL entries through `commitIndex` → ready.
+- On startup: acquire the dir lock → parse snapshot metadata and HardState →
+  inspect the WAL without mutation → reject corruption at or below the durable
+  commit point → truncate only a provably uncommitted torn tail → restore the
+  snapshot → replay committed WAL entries through `commitIndex` → ready.
 - Compaction rewrites the WAL atomically with only entries after the snapshot.
   Local snapshot serialization and the initial compacted-WAL write happen off
   the Raft run loop; the run loop validates and commits the prepared files.
@@ -274,14 +279,13 @@ waiter/holder after failover.
   reconnects to the new leader and re-issues the op:
   - It was a *holder* already (had a token): `renew`/`release` work as-is (no
     connID check — §2 note) → seamless.
-  - With the default connection-derived ref, a waiter re-enqueues at the back
-    and a promoted-but-unobserved holder expires by lease.
-  - With `--orphan-ttl > 0` and a stable ref, `ApplyAcquire` /
-    `ApplyEnqueue` re-adopt the existing `(key, ref)` slot when the previous
-    owner is provably gone (abandoned stamp or a different server-process
-    connID epoch). FIFO position, salt, and any minted token are preserved.
-    TCP uses `client.WithClusterStableRef`; HTTP creates a replacement
-    node-local session with the same optional `stable_ref`.
+  - `client.Cluster` uses a generated stable ref by default.
+    `ApplyAcquire` / `ApplyEnqueue` re-adopt the existing `(key, ref)` slot when
+    the previous owner is provably gone. FIFO position, salt, and any minted
+    token are preserved. Low-level TCP uses `stable-ref`; HTTP creates a
+    replacement node-local session with the same optional `stable_ref`.
+  - A low-level caller using only connection-derived identity re-enqueues at
+    the back, and a promoted-but-unobserved holder expires by lease.
 - `trySendGrant` semantics carry over: a notice that can't be delivered
   (full/closed/absent channel) is dropped; the holder entry persists; lease
   expiry is the backstop. This is already how the single-node code behaves on a
@@ -291,11 +295,9 @@ waiter/holder after failover.
 
 In cluster mode all *stateful* client connections live on the leader (followers
 redirect them away), so connection-close cleanup happens on the leader, which
-proposes `CleanupConn{ref}`. A node crash skips cleanup → those holders persist
-until lease expiry (correct: a crash/partition must not auto-release). `ref`
-embeds the node id so a `CleanupConn` is unambiguous even right after a failover
-(the new leader inherits old-leader-ref'd holders; their `ref`s never "close" on
-the new leader → they ride lease expiry, as intended).
+proposes `CleanupConn{ref, connID}`. Full-width randomized connection IDs avoid
+cross-process cleanup aliasing and fail closed on exhaustion. A node crash skips
+cleanup, so holders persist until lease expiry or stable-ref reattachment.
 
 ### 4.9 Security & limits
 
@@ -521,7 +523,8 @@ note staged. Phases are ordered so each builds on tested foundations.
   `--advertise-addr`, `--cluster-bootstrap`, mandatory
   `--raft-auth-token[-file]`, optional `--raft-tls-cert/-key/-ca`, and
   `--orphan-ttl`. Static bootstrap lists the full initial membership on every
-  node; single-node bootstrap grows through the admin voter endpoint.
+  node; single-node bootstrap grows through the admin voter endpoint. Runtime
+  membership changes require the Raft mTLS triple for revocable node identity.
 - `cmd/dflockd/main.go`: `startCluster` opens storage, builds mTLS + authenticated
   TCP transport, registers peers, constructs and starts `cluster.Node`, and
   wires it with `srv.SetCluster`. Reverse-order shutdown unwires the server,
@@ -534,9 +537,11 @@ note staged. Phases are ordered so each builds on tested foundations.
 ### Phase 10 — Go client cluster mode (`client/`)
 - Shipped as a separate `client.Cluster` wrapper, leaving the existing
   `Lock`/`Semaphore` and CRC-sharding APIs unchanged.
-- The wrapper caches a known-member leader hint, dials a fresh connection per
-  operation, follows redirects and dial fallbacks within a fixed attempt budget,
-  preserves the final retry cause, and supports per-connection auth + stable ref.
+- The wrapper owns a persistent logical session split into a blocking session
+  lane and a non-blocking control lane, generates a random stable ref,
+  caches a known-member leader hint, follows redirects and dial fallbacks within
+  a fixed attempt budget, preserves the final retry cause, and supports TLS +
+  auth.
 - Tests cover direct redirects, cached routing, unknown-hint clamping, exact
   budget exhaustion, terminal diagnostics, and concurrent use under `-race`.
 - Done: cluster operations retry transparently; TCP stable refs preserve
@@ -555,7 +560,9 @@ note staged. Phases are ordered so each builds on tested foundations.
 ### Phase 12 — dynamic membership changes
 - `cluster.Node.AddVoter(id, raftAddr, advertiseAddr)` and
   `RemoveServer(id)` append one-at-a-time configuration entries; the published
-  client-member map changes only after commit.
+  client-member metadata is part of the same replicated configuration and
+  changes only after commit. Both operations fail closed without identity-bound
+  transport (mTLS in production).
 - The admin voter endpoints expose both operations. Operators start a new node
   with empty storage and the full `--cluster-peers` view; a compacted leader
   catches it up through `InstallSnapshot`. There is no `--cluster-join` client.
@@ -642,7 +649,8 @@ green; race-clean; docs complete.
 **Security & resource bounds**
 - [x] Raft transport: mandatory shared-secret HMAC handshake; directional
       AES-GCM RPC sessions; optional mTLS binds certificate CN to NodeID;
-      protocol mismatch refused.
+      protocol mismatch refused. Runtime membership changes require mTLS;
+      shared-secret-only transport is static-bootstrap only.
 - [x] All Raft frames length-bounded (normal vs. snapshot caps); a peer sending
       garbage is dropped without affecting the node.
 - [x] `MaxLocks`/`MaxWaiters` enforced at `Apply` (deterministically); per-node
@@ -691,7 +699,7 @@ green; race-clean; docs complete.
 | FSM non-determinism (the silent killer — divergence). | `now`-in-command + `salt`-in-command + `FenceCounter`-in-state; a determinism property test; a grep-gate against `time.Now`/`rand` in the apply package. |
 | Cluster FSM work regresses single-node behaviour. | The direct methods remain the standalone path over shared resource structures; the existing `lock_test.go` suite is the regression guard. |
 | Lease semantics + clock skew. | Absolute deadlines in the FSM; leader-only sweep via `EvictExpired`; documented NTP assumption; renew-at-TTL/2 leaves margin for small skew. |
-| FIFO across failover. | TCP and HTTP stable refs + `--orphan-ttl` preserve waiter/holder identity across reconnect; hard-failover regression tests assert the same token is returned. |
+| FIFO across failover. | Generated `client.Cluster` identity and explicit low-level TCP/HTTP stable refs preserve waiter/holder identity; hard-failover tests assert the same token is returned. `OrphanTTL` governs graceful-disconnect retention. |
 | Scope creep / one giant unmergeable change. | Phased; each phase is independently green and reviewable; cluster code is wholly behind opt-in flags so it can land incrementally without affecting the shipped single-node server. |
 | Import cycles (`lock` ↔ `cluster`, `server` ↔ `cluster`). | `internal/raft` is application-agnostic; `cluster` imports `lock` + `raft`; `server` depends on its own `Cluster` interface; `cmd/dflockd` wires the concrete node. |
 
@@ -758,8 +766,8 @@ partial (sub-deliverable deferred — see note), `❌` = not shipped.*
       optional session `stable_ref` preserves replicated identity across
       replacement node-local sessions)
 - [x] Phase 12 — dynamic membership changes ✅ (`AddVoter` /
-      `RemoveServer`, admin surface, post-commit member publication,
-      cold-node snapshot catch-up)
+      `RemoveServer`, mTLS identity requirement, replicated client metadata,
+      post-commit publication, cold-node snapshot catch-up)
 - [x] Phase 13 — integration & soak tests ✅ (`internal/cluster/e2e3_test.go`
       + real-TCP failover tests + `tools/cluster-smoke` +
       `cmd/cluster-soak` in-process and external fault modes +

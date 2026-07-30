@@ -133,8 +133,8 @@ The TCP wire format is stable; client libraries hash keys with CRC-32 (IEEE) so 
 ## Tests
 
 ```bash
-go test ./...             # full suite
-go test -race ./...       # with the race detector
+make test                 # full suite
+make test-race            # with the race detector
 make complexity           # per-function lines + cyclomatic complexity
 make openapi-sync         # mirror internal/httpapi/openapi.json → docs/
 ```

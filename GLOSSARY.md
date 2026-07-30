@@ -46,10 +46,10 @@ references and quoted in the "See also" line where helpful.
   middleware patterns that need to know they're in the queue before
   parking the request. See `internal/lock/state.go:enqueuedState`.
 - **Connection ID (`connID`)** — A per-`server.Server`-instance uint64
-  identifying a TCP connection. In cluster mode it's globally unique
-  across a failover (high bits = random per-process epoch, low bits =
-  counter), so a leader-survivor's fresh IDs never collide with a
-  dead leader's orphans.
+  identifying a TCP connection or HTTP session. In cluster mode its high
+  24 bits are a randomized process tag and its low 40 bits are a monotonic
+  counter. The fixed tag distinguishes failover lineages; the counter
+  fails closed after more than one trillion allocations.
 - **Fencing token** — A 32-lowercase-hex string returned on every
   acquire. Layout: first 16 hex = a server- (or in cluster mode,
   cluster-) monotonic uint64 *fence number*, big-endian; last 16 hex

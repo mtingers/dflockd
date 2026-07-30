@@ -12,6 +12,7 @@ it, and recovering from common failures. See
 | `--node-id <id>` | Stable identifier for this node (any string; must be unique within the cluster and never reused). |
 | `--raft-addr <host:port>` | This node's Raft transport bind (peer-to-peer consensus traffic). |
 | `--cluster-peers <list>` | Every member of the cluster as `id=raftHost:raftPort@clientHost:clientPort,...`. Must include this node. |
+| `--cluster-bootstrap` (optional) | Seed a new Raft directory as a one-voter cluster containing only this node. Other listed peers are not counted until added through the admin API. Omit for static bootstrap. |
 | `--raft-auth-token-file <path>` | File containing the shared high-entropy cluster secret (minimum 32 bytes). Every member must use the same value. |
 | `--advertise-addr <host:port>` (optional) | This node's client-facing address. Defaults to `--host:--port`. Clients connect here when redirected. |
 
@@ -45,6 +46,12 @@ All three must be set together (or all omitted). When set, every
 connection is also mutual TLS (TLS 1.3, `RequireAndVerifyClientCert`).
 The transport rejects a hello whose NodeID differs from the verified
 leaf certificate's Common Name.
+
+Mutual TLS is **required for runtime membership changes**. The shared
+secret authenticates a cluster but cannot distinguish two holders of
+that common secret after one is removed. `AddVoter` and `RemoveServer`
+therefore fail closed unless all three Raft TLS flags are configured.
+Shared-secret-only transport is supported for static bootstrap clusters.
 
 The authenticated wire format is `raft.v3`; upgrading from an older
 release requires an all-node restart because mixed protocol versions
@@ -94,6 +101,12 @@ error_not_leader 10.0.0.2:6389
 # automatically when you check for *client.NotLeaderError.
 ```
 
+For a one-node-then-grow deployment, start the first node with
+`--cluster-bootstrap` and a `--cluster-peers` entry for itself. It initially
+elects with a one-voter quorum. Configure Raft mTLS, start each joining node,
+then add it through the admin endpoint below. Do not set
+`--cluster-bootstrap` on joining nodes.
+
 ## Adding a node
 
 Add a voting member via the leader's admin endpoint:
@@ -112,10 +125,12 @@ node must be **started** before it can apply incoming AppendEntries —
 boot it with `--cluster-peers` listing every member (including itself)
 so its membership view matches.
 
-Requires the operator to have set `--admin-token` (or
-`DFLOCKD_ADMIN_TOKEN`) on the leader; without it the endpoint returns
-`503 admin_disabled`. On a follower the endpoint returns `503 not_leader`
-with the leader's raft client address in `X-Dflockd-Leader`.
+Requires mutual TLS on the Raft transport and `--admin-token` (or
+`DFLOCKD_ADMIN_TOKEN`) on the leader. Without an admin token the endpoint
+returns `503 admin_disabled`; without identity-bound mTLS the request is
+rejected without proposing a configuration entry. On a follower the
+endpoint returns `503 not_leader` with the leader's client address in
+`X-Dflockd-Leader`.
 
 ## Removing a node
 
@@ -126,6 +141,7 @@ curl -X DELETE https://leader:6388/v1/admin/voters/d \
 ```
 
 A leader removing itself steps down once the entry commits.
+Removal has the same mutual-TLS and admin-token requirements as addition.
 
 ## Linearizable reads
 
@@ -204,13 +220,16 @@ follower the HTTP returns `503 not_leader` and the TCP returns
 The HTTP API works in cluster mode: mutating endpoints
 (`acquire`/`enqueue`/`wait`/`release`/`renew`, session delete) are
 proposed through Raft. On a **follower** they return
-`503 {"error":"not_leader","detail":...}` with the leader's *raft client
-address* in an `X-Dflockd-Leader` header — note that's the leader's TCP
-port, not its HTTP port (the cluster config doesn't carry HTTP
-addresses), so an HTTP client should retry against another node it knows
-rather than blindly following the header. Read-only endpoints
-(`/health`, `/ready`, `/v1/stats`, `/metrics`, `/openapi.json`) work on
-any node.
+`503 {"error":"not_leader","detail":...}` with the leader's replicated
+client-facing address in an `X-Dflockd-Leader` header. That is the
+leader's TCP port, not its HTTP port, so an HTTP client should retry
+against another node it knows rather than blindly following the header.
+Read-only endpoints
+(`/health`, `/v1/stats`, `/metrics`, `/openapi.json`) work on any node.
+`/ready` returns 200 only while the local Raft node is running and is a
+current voter. Leadership is not required. A fatal Raft failure, local
+removal, or shutdown detach returns `503 {"status":"not_ready"}`;
+graceful draining returns `503 {"status":"draining"}`.
 
 HTTP session IDs remain node-local. `POST /v1/sessions` accepts an
 optional body containing a caller-generated stable identity:
@@ -219,34 +238,31 @@ optional body containing a caller-generated stable identity:
 {"stable_ref":"worker-01-6f1b7e8c"}
 ```
 
-With `--orphan-ttl > 0`, recreate the session on the new leader with the
-same `stable_ref`, then retry `acquire` or `enqueue`. The new session
+After failover, recreate the session on the new leader with the same
+`stable_ref`, then retry `acquire` or `enqueue`. The new session
 re-attaches the replicated holder or waiter, preserving its token or
-FIFO position. Empty-body session creation keeps the default behavior:
-after failover the caller creates a new session and re-enters at the
-back. A token the caller already observed remains valid for `renew` or
+FIFO position. `--orphan-ttl` is not required after a hard leader
+failure; when positive, it additionally controls how long stable-ref
+state is retained after a graceful disconnect. Empty-body session
+creation uses node-local identity and cannot re-attach after failover.
+A token the caller already observed remains valid for `renew` or
 `release` either way.
 
 ## FIFO across leader failover (stable client refs)
 
-A caller holding — or blocked waiting on — a lock when the leader fails
-ordinarily loses its place because the holder/waiter slot is keyed by a
-node-local connection id. **Stable client refs** give TCP connections
-and HTTP replacement sessions the same replicated identity.
-
-1. Set `--orphan-ttl 30` (seconds; or `DFLOCKD_ORPHAN_TTL_S`) on every
-   node so the FSM retains a ref-tagged holder/waiter that long after
-   its connection drops. The value must be identical on every member —
-   it's read in the replicated apply path — and cluster-mode only (the
-   loader rejects `--orphan-ttl > 0` without `--raft-dir`).
-2. A Go TCP client opts in via
-   `client.WithClusterStableRef("session-X")`. An HTTP caller supplies
-   `{"stable_ref":"session-X"}` when creating each replacement session.
+A caller holding, or blocked waiting on, a lock when the leader fails
+needs a stable replicated identity to reclaim that state.
+`client.Cluster` generates a cryptographically random stable ref by
+default. `client.WithClusterStableRef("session-X")` overrides it when
+the caller must persist or coordinate the identity. HTTP callers opt in
+by supplying `{"stable_ref":"session-X"}` when creating each replacement
+session.
 
 ```go
 cl, _ := client.NewCluster(members,
     client.WithClusterStableRef(uuid.NewString()), // any opaque per-session id
 )
+defer cl.Close()
 // Works for both the single-phase Acquire and the two-phase Enqueue/Wait:
 token, _, _ := cl.Acquire(ctx, "deploy", 30*time.Second)
 // ... if the leader dies, the Cluster wrapper reconnects to the new
@@ -255,18 +271,14 @@ token, _, _ := cl.Acquire(ctx, "deploy", 30*time.Second)
 // position the same way.
 ```
 
-Under the hood: re-adopt matches on `(key, ref)` in **both** the
-`ApplyAcquire` and `ApplyEnqueue` paths, but only for a slot whose
-owner is demonstrably gone. The FSM accepts one of two proofs, both of
-which it replicates:
+Under the hood, re-adopt matches on `(key, ref)` in **both** the
+`ApplyAcquire` and `ApplyEnqueue` paths, but only for a slot whose owner
+is demonstrably gone. The FSM accepts one of two replicated proofs:
 
 - the previous connection closed **gracefully** — `ApplyCleanupConn`
   stamped the slot `abandonedAtNanos` and cleared its conn id; or
-- the slot's conn id was minted by a **different server process**. Conn
-  ids carry a per-process epoch in their high 32 bits, so a slot the
-  new leader inherited from the crashed one (no `CleanupConn` ever ran;
-  `abandonedAtNanos` is still 0) is recognisable as belonging to a
-  process that is no longer serving that client.
+- the slot's randomized conn id carries a different process lineage from
+  the conn id serving the reconnect.
 
 The reconnect then rebinds the slot to the new connection, renews the
 lease, and evicts the dead connection's stale index entries.
@@ -278,10 +290,10 @@ without its TCP connection being reaped cannot re-attach on the *same*
 leader until the connection teardown stamps the slot (or the lease
 lapses) — the conservative direction.
 
-Slots never reclaimed by a reconnect still go away: the `EvictExpired`
-sweep retires gracefully-orphaned slots past `OrphanTTL`; a
-hard-crashed holder is bounded by its lease, and a hard-crashed waiter
-by promotion-then-lease.
+Slots never reclaimed by a reconnect still go away: with a positive
+`OrphanTTL`, the `EvictExpired` sweep retires gracefully abandoned
+stable-ref slots after that interval. A hard-crashed holder remains
+bounded by its lease and a hard-crashed waiter by promotion then lease.
 
 **Security note:** stable refs are caller-supplied identifiers, not
 authenticated credentials. They are not a capability for taking over a
@@ -292,11 +304,12 @@ connection closed. Treat refs like session tokens: generate randomly
 `--auth-token` mechanism, when set, gates the connection before the ref
 is accepted.
 
-**One ref, one logical session.** Do not share one across concurrent
-TCP connections or HTTP sessions. Two operations on the same key under
-one ref are two claims on the same slot, and `Cluster` dials a fresh
-connection per call, so give each concurrent worker its own `Cluster`
-(or its own ref).
+**One ref, one logical session.** Do not share one across unrelated
+workers. A single `Cluster` carries its ref over two connections of its
+own (a blocking session lane and a non-blocking control lane), which is
+safe because disconnect cleanup is scoped by connection ID rather than
+by ref. Concurrent blocking calls still serialize on the session lane;
+give each independent worker its own `Cluster` and ref.
 
 ## Using the cluster-aware Go client
 
@@ -305,22 +318,24 @@ cl, err := client.NewCluster(
     []string{"10.0.0.1:6388", "10.0.0.2:6389", "10.0.0.3:6390"},
     client.WithClusterRedirectBudget(3), // default
     client.WithClusterAuthToken(os.Getenv("DFLOCKD_AUTH_TOKEN")),
+    client.WithClusterTLS(&tls.Config{RootCAs: roots}),
 )
+if err != nil { /* handle */ }
+defer cl.Close()
 ctx := context.Background()
 token, ttl, err := cl.Acquire(ctx, "deploy-job", 60*time.Second)
 // ... use lock ...
 _ = cl.Release(ctx, "deploy-job", token)
 ```
 
-`client.Cluster` keeps a process-local leader cache and transparently
-follows `*NotLeaderError` redirects up to the configured budget. The
-cache only honors hints that name an address in the operator-supplied
-members list — a hostile or stale `error_not_leader evil:6388` does
-not cause the client to dial an arbitrary host. An exhausted budget
-surfaces an error matching `client.ErrTooManyRedirects` and wrapping
-the final dial or `*client.NotLeaderError` cause. Use `errors.Is` /
-`errors.As` to inspect both the retry exhaustion and its terminal
-diagnostic. The operation context bounds connection establishment,
+`client.Cluster` owns one persistent logical session (a blocking session
+lane plus a non-blocking control lane, so a `Renew` never queues behind a
+blocked `Acquire`), generates a random stable ref by default, keeps a
+process-local leader cache, and follows
+`*NotLeaderError` redirects up to the configured budget. The cache only
+honors hints in the operator-supplied member list. An exhausted budget
+matches `client.ErrTooManyRedirects` and wraps the final dial or redirect
+cause. The operation context bounds connection establishment,
 authentication, request I/O, and the complete retry loop.
 
 The single-`*Conn` package-level API (`client.Acquire(conn, …)`) is
@@ -339,10 +354,10 @@ go run ./cmd/cluster-soak --nodes 3 --workers 4 --duration 30s --kill-interval 5
 
 External mode drives an already-running odd-sized cluster through every
 member's client address. Each worker uses a unique stable ref and workers
-share a bounded pool of contended keys (`--keys`, default `1`), so every node
-must run with the same positive `--orphan-ttl` and that TTL should cover the
-expected fault and reconnect window. Use `--fault-interval 0` for
-workload-only validation:
+share a bounded pool of contended keys (`--keys`, default `1`). A positive
+`--orphan-ttl` is recommended when the campaign includes graceful
+connection teardown; hard-failover reattachment does not depend on it.
+Use `--fault-interval 0` for workload-only validation:
 
 ```bash
 go run ./cmd/cluster-soak \
@@ -416,15 +431,11 @@ violations.
 
 ## v1 caveats
 
-- **FIFO across leader failover** — *by default* a client blocked in
-  `acquire` / `wait` when the leader fails loses its queue position;
-  the holder entry (if any was minted) expires via its lease.
-  Already-granted tokens survive seamlessly (the client can `renew` /
-  `release` them against the new leader). To preserve queue position
-  and re-attach to a held lock across failover — including a
-  hard-crashed leader — enable stable client refs (`--orphan-ttl` plus
-  `WithClusterStableRef` for TCP or `stable_ref` at HTTP session
-  creation); see "FIFO across leader failover" above.
+- **FIFO across leader failover** — `client.Cluster` uses a generated
+  stable ref by default and preserves queue/holder identity. Low-level
+  TCP callers must send `stable-ref`; HTTP callers must create
+  replacement sessions with the same `stable_ref`. Without a stable
+  ref, a blocked operation loses its queue position after failover.
 - **Dynamic-join with snapshot transfer** to a node started with
   empty `--raft-dir` works as of PR-3. Operator flow: `AddVoter` on
   the leader, then start the new node with empty storage and

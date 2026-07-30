@@ -16,10 +16,10 @@ CLI flag > environment variable > flag default.
 | `--max-connections-per-ip` | `DFLOCKD_MAX_CONNECTIONS_PER_IP` | `0` | Cap per remote IP (0 = unlimited) |
 | `--auto-release-on-disconnect` | `DFLOCKD_AUTO_RELEASE_ON_DISCONNECT` | `true` | Release held tokens when a connection closes |
 
-`--read-timeout` is per-line on the line-based protocol, *not*
-per-request. Each of the three lines (cmd / key / arg) gets its own
-deadline. The default is large enough for human typing during ad-hoc
-`nc` debugging.
+`--read-timeout` begins when the first byte of a request arrives and is
+then applied per line, *not* per request. An established connection may
+remain idle between complete requests without expiring. Each started
+line (cmd / key / arg) gets its own deadline.
 
 ## Lock manager
 
@@ -144,9 +144,10 @@ Logs are slog text format on stderr.
 When `--http-port` is set:
 
 - `GET /health` — unauthenticated. Returns `{"status":"ok"}`.
-- `GET /ready` — unauthenticated. Returns `{"status":"draining"}`
-  with HTTP 503 during graceful shutdown; otherwise
-  `{"status":"ok"}`.
+- `GET /ready` — unauthenticated. Returns HTTP 503 with
+  `{"status":"draining"}` during graceful shutdown. In cluster mode it
+  also returns `{"status":"not_ready"}` when local Raft has failed,
+  detached, or is no longer a voter. Followers are ready.
 - `GET /metrics` — Prometheus exposition. Includes per-route
   request counts/durations, lock-manager gauges, and cluster-mode Raft
   counters plus the FSM apply-latency histogram. Unlike `/health` and
@@ -181,7 +182,16 @@ enables the cluster reconfiguration HTTP endpoints
 **default-deny** — when unset, those endpoints return `503
 admin_disabled`. The admin token is separate from the session-auth
 token (`--auth-token`); pair it with `--http-port` and TLS at the
-ingress. See:
+ingress. Runtime reconfiguration also requires the Raft mTLS triple;
+shared-secret-only clusters support static bootstrap but cannot safely
+revoke one holder of the common secret.
+
+The FSM-affecting values `--max-locks`, `--max-waiters`,
+`--orphan-ttl`, `--gc-max-idle`, and
+`--auto-release-on-disconnect` form a versioned replicated policy.
+The first policy-bearing command establishes it and snapshots persist
+it; later commands carrying a different policy fail rather than
+diverging replicas. See:
 
 - [architecture/cluster.md](architecture/cluster.md) — design,
   topology, FSM, durability layout, failure modes.

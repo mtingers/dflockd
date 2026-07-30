@@ -4,18 +4,60 @@
 go get github.com/mtingers/dflockd/client
 ```
 
-Three layers, low to high:
+Four client shapes are available:
 
 1. `Conn` — one TCP/TLS connection, request/response framing.
 2. Package-level functions (`Acquire`, `Release`, `Enqueue`,
    `Wait`, `SemAcquire`, …) — raw protocol calls on a `Conn`.
-3. `Lock` and `Semaphore` — high-level types that own a connection,
+3. `Cluster` — one persistent, failover-aware logical session over a
+   Raft member list.
+4. `Lock` and `Semaphore` — high-level types that own a connection,
    run lease renewal in the background, and translate the two-phase
    API into a familiar shape.
 
-For most code, use `Lock` or `Semaphore`. Drop down to the lower
-layers only when you need explicit connection management (e.g. one
-TCP connection holding many short-lived locks).
+Use `Cluster` for Raft deployments. Use `Lock` or `Semaphore` for
+standalone or explicitly sharded servers.
+
+## Cluster client
+
+```go
+cl, err := client.NewCluster(
+    []string{"lock-a:6388", "lock-b:6388", "lock-c:6388"},
+    client.WithClusterAuthToken(os.Getenv("DFLOCKD_AUTH_TOKEN")),
+    client.WithClusterTLS(&tls.Config{RootCAs: roots}),
+)
+if err != nil { /* handle */ }
+defer cl.Close()
+
+token, ttl, err := cl.Acquire(ctx, "deploy", 30*time.Second)
+if err != nil { /* handle */ }
+defer cl.Release(context.Background(), "deploy", token)
+```
+
+`Cluster` caches member-clamped leader hints, rotates through known
+members after transport failure, and retries up to its redirect budget.
+It generates a random stable ref by default and re-sends it after
+failover, preserving held-token and FIFO waiter identity.
+`WithClusterStableRef` overrides that identity; one ref must identify one
+logical session.
+
+Calls are safe from concurrent goroutines. One session carries two
+connections: a *session lane* for the calls that block for a grant
+(`Acquire`, `Enqueue`, `Wait`, and their `Sem` variants) and a *control
+lane* for the token-authorized lifecycle calls (`Release`, `Renew`) plus
+`Barrier`. That split is what lets you renew a lease you already hold
+while another goroutine is parked waiting on a different key. Two
+consequences: a `Cluster` uses up to two connections, so size
+`--max-conns` / `--max-conns-per-ip` accordingly; and a successful
+`Renew` rebinds that lock's holder to the control lane, so from then on
+it is the control lane's disconnect that auto-releases it. Concurrent
+blocking calls still serialize on the session lane — give independent
+workers their own `Cluster`.
+
+`WithClusterRedirectBudget` changes the default three-attempt budget.
+After exhaustion the error matches `ErrTooManyRedirects` and wraps the
+terminal dial or redirect cause. `Close` is idempotent; later operations
+return `ErrClusterClosed`.
 
 ## High-level: `Lock`
 
@@ -186,9 +228,10 @@ closes the underlying connection, which interrupts the in-flight
 server I/O. A token granted as the ctx fires is best-effort released
 back to the server before `Acquire` returns ctx.Err().
 
-For `client.Cluster`, the same context also controls TCP connection
-establishment and the redirect retry loop. A blackholed member cannot
-extend an operation beyond the caller's context deadline.
+For `client.Cluster`, the same context controls connection
+establishment, authentication, request I/O, and the redirect retry loop.
+Cancellation drops the current connection so a later operation
+re-establishes the stable logical session on a healthy member.
 
 ## Dial timeouts and TLS
 
