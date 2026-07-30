@@ -11,7 +11,7 @@ build: ## Build the dflockd binary
 	go build -ldflags "-X main.version=$(VERSION)" -o dflockd ./cmd/dflockd
 
 test: ## Run tests
-	go test ./... -v
+	go test -p=2 -count=1 -timeout=240s ./...
 
 test-race: ## Run tests with -race (parallelism capped to avoid raft timer flakes under whole-tree load)
 	go test -race -p=2 -count=1 -timeout=240s ./...
