@@ -66,29 +66,31 @@ func run(cfg *config.Config) int {
 	srv := server.New(lm, cfg, log)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	var clusterNode *cluster.Node
 	if cfg.IsCluster() {
-		closer, err := startCluster(cfg, lm, srv, log)
+		closer, node, err := startCluster(cfg, lm, srv, log)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cluster init failed: %v\n", err)
 			return 1
 		}
 		defer closer()
+		clusterNode = node
 	}
-	return runAll(ctx, srv, cfg, log, cancel)
+	return runAll(ctx, srv, cfg, log, cancel, clusterRuntimeOf(clusterNode))
 }
 
 // startCluster opens persistent Raft state, the inter-node transport,
 // and a cluster.Node bound to this lock manager and server. Returns a
 // closer that tears everything down in reverse.
-func startCluster(cfg *config.Config, lm *lock.LockManager, srv *server.Server, log *slog.Logger) (func(), error) {
+func startCluster(cfg *config.Config, lm *lock.LockManager, srv *server.Server, log *slog.Logger) (func(), *cluster.Node, error) {
 	storage, err := raft.OpenFileStorage(cfg.RaftDir)
 	if err != nil {
-		return nil, fmt.Errorf("open raft storage at %s: %w", cfg.RaftDir, err)
+		return nil, nil, fmt.Errorf("open raft storage at %s: %w", cfg.RaftDir, err)
 	}
 	tlsCfg, err := raft.NewMutualTLSConfig(cfg.RaftTLSCert, cfg.RaftTLSKey, cfg.RaftTLSCA)
 	if err != nil {
 		_ = storage.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	if tlsCfg != nil {
 		log.Info("raft transport: shared-secret encryption + mutual TLS enabled")
@@ -101,18 +103,22 @@ func startCluster(cfg *config.Config, lm *lock.LockManager, srv *server.Server, 
 	)
 	if err != nil {
 		_ = storage.Close()
-		return nil, fmt.Errorf("open raft transport on %s: %w", cfg.RaftAddr, err)
+		return nil, nil, fmt.Errorf("open raft transport on %s: %w", cfg.RaftAddr, err)
 	}
 	registerPeers(transport, cfg)
 	node, err := buildClusterNode(cfg, lm, storage, transport, log)
 	if err != nil {
 		_ = transport.Close()
 		_ = storage.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	node.Start()
+	if err := node.Start(); err != nil {
+		_ = transport.Close()
+		_ = storage.Close()
+		return nil, nil, fmt.Errorf("start cluster node: %w", err)
+	}
 	srv.SetCluster(node)
-	return clusterCloser(srv, node, transport, storage, log), nil
+	return clusterCloser(srv, node, transport, storage, log), node, nil
 }
 
 func registerPeers(transport *raft.TCPTransport, cfg *config.Config) {
@@ -159,6 +165,15 @@ func clusterClockFromEnv(log *slog.Logger) (func() time.Time, error) {
 }
 
 func membersFromConfig(cfg *config.Config) map[raft.NodeID]cluster.Member {
+	if cfg.ClusterBootstrap {
+		for _, p := range cfg.ClusterPeers {
+			if p.NodeID == cfg.NodeID {
+				return map[raft.NodeID]cluster.Member{
+					raft.NodeID(p.NodeID): {RaftAddr: p.RaftAddr, ClientAddr: p.ClientAddr},
+				}
+			}
+		}
+	}
 	out := make(map[raft.NodeID]cluster.Member, len(cfg.ClusterPeers))
 	for _, p := range cfg.ClusterPeers {
 		out[raft.NodeID(p.NodeID)] = cluster.Member{RaftAddr: p.RaftAddr, ClientAddr: p.ClientAddr}
@@ -191,18 +206,52 @@ func newLogger(debug bool) *slog.Logger {
 // runAll spawns the TCP server and (optionally) the HTTP server,
 // waits for both to exit, and returns 0 on clean shutdown / 1 on
 // any runner error.
-func runAll(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger, cancel context.CancelFunc) int {
+func runAll(ctx context.Context, srv *server.Server, cfg *config.Config, log *slog.Logger, cancel context.CancelFunc, clusterNode clusterRuntime) int {
 	var wg sync.WaitGroup
 	var failed atomic.Bool
 	runOne(&wg, "tcp server", &failed, cancel, log, func() error { return srv.Run(ctx) })
 	if cfg.HTTPPort > 0 {
 		runOne(&wg, "http server", &failed, cancel, log, func() error { return httpapi.Run(ctx, srv, cfg, log) })
 	}
+	if clusterNode != nil {
+		runOne(&wg, "raft node", &failed, cancel, log, func() error {
+			return superviseClusterNode(ctx, clusterNode)
+		})
+	}
 	wg.Wait()
 	if failed.Load() {
 		return 1
 	}
 	return 0
+}
+
+type clusterRuntime interface {
+	Done() <-chan struct{}
+	Err() error
+}
+
+// clusterRuntimeOf boxes node only when one exists. Assigning a nil
+// *cluster.Node straight into a clusterRuntime yields a NON-nil interface
+// holding a nil pointer, so runAll would supervise an absent node and
+// superviseClusterNode would nil-dereference on the first Done() call —
+// crashing every single-node process at startup.
+func clusterRuntimeOf(node *cluster.Node) clusterRuntime {
+	if node == nil {
+		return nil
+	}
+	return node
+}
+
+func superviseClusterNode(ctx context.Context, node clusterRuntime) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-node.Done():
+		if err := node.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("raft node stopped unexpectedly")
+	}
 }
 
 // runOne launches one server goroutine. Real errors are logged and
