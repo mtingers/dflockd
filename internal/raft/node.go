@@ -198,11 +198,19 @@ type NodeStatus struct {
 	Configuration     Configuration
 }
 
+// leadershipState is the lock-free view of this node's role, published by the
+// run loop on every role or configuration change. Every field must stay
+// comparable: publishLeadership skips the store when nothing changed, which
+// keeps redirect-path readers from seeing a new pointer on every heartbeat.
 type leadershipState struct {
 	role     role
 	term     Term
 	leaderID NodeID
 	voter    bool
+	// leaderClientAddr is the current leader's client-facing address, taken
+	// from the effective configuration's replicated metadata. Publishing it
+	// here keeps the follower redirect path off the run loop.
+	leaderClientAddr string
 }
 
 type fatalState struct{ err error }
@@ -514,10 +522,24 @@ func (n *Node) LeaderID() NodeID {
 	return state.leaderID
 }
 
+// LeaderClientAddr returns the current leader's client-facing address from
+// the replicated configuration metadata, or ok=false when there is no known
+// leader or the effective configuration carries no address for it. It is a
+// lock-free read: the follower redirect path calls this per request, so it
+// must never wait on the run loop.
+func (n *Node) LeaderClientAddr() (string, bool) {
+	state := n.leadership.Load()
+	if state == nil || state.leaderID == "" || state.leaderClientAddr == "" {
+		return "", false
+	}
+	return state.leaderClientAddr, true
+}
+
 func (n *Node) publishLeadership() {
 	next := &leadershipState{
 		role: n.role, term: n.term, leaderID: n.leaderID,
-		voter: n.isVoter(n.cfg.ID),
+		voter:            n.isVoter(n.cfg.ID),
+		leaderClientAddr: n.config.ClientAddrs[n.leaderID], // nil map reads as ""
 	}
 	if current := n.leadership.Load(); current != nil && *current == *next {
 		return

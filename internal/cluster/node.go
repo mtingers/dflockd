@@ -240,14 +240,25 @@ func (n *Node) LockManager() *lock.LockManager { return n.lm }
 
 // LeaderClientAddr returns the client-facing address of the current
 // leader (suitable for an error_not_leader redirect). ok=false if
-// there's no known leader, or if the leader's address isn't in Members.
+// there's no known leader, or if no address is known for it.
+//
+// Every redirected request on a follower calls this, so it must not touch the
+// Raft run loop: reading membership through Status() would make each redirect
+// wait behind whatever the loop is doing — including a snapshot send, which
+// reads the whole snapshot inline. Both paths here are lock-free. The
+// replicated address is preferred; the static startup map is the fallback for
+// configurations that predate replicated client metadata, and it is immutable
+// after construction (membership changes publish through Raft, not into it).
 func (n *Node) LeaderClientAddr() (string, bool) {
+	if addr, ok := n.raft.LeaderClientAddr(); ok {
+		return addr, true
+	}
 	id := n.LeaderID()
 	if id == "" {
 		return "", false
 	}
-	m, ok := n.member(id)
-	if !ok {
+	m, ok := n.cfg.Members[id]
+	if !ok || m.ClientAddr == "" {
 		return "", false
 	}
 	return m.ClientAddr, true
@@ -480,6 +491,12 @@ func (n *Node) MetricsSnapshot() raft.ClusterMetrics {
 	}
 }
 
+// member resolves full metadata (Raft + client address) for id from the
+// effective replicated configuration, falling back to the static startup map.
+//
+// This reads through Status(), which is a Raft run-loop round trip with no
+// timeout. Keep it off per-request paths — LeaderClientAddr deliberately uses
+// the lock-free published leadership state instead.
 func (n *Node) member(id raft.NodeID) (Member, bool) {
 	effective := n.raft.Status().Configuration
 	if effective.ClientAddrs != nil {
