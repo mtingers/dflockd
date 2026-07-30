@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -46,5 +47,44 @@ func TestClearStableRefReleasesSlot(t *testing.T) {
 	}
 	if !srv.BindStableRef(9, "second") {
 		t.Fatalf("re-set after clear: want true, got false")
+	}
+}
+
+func TestClusterConnIDDoesNotAliasAfter32Bits(t *testing.T) {
+	srv, _ := newTestServer(t)
+	first := uint64(7)
+	afterOldWrap := first + 1<<32
+	if srv.clusterConnID(first) == srv.clusterConnID(afterOldWrap) {
+		t.Fatal("cluster connection ID still aliases after 32 bits")
+	}
+}
+
+func TestNextConnIDFailsClosedAtExhaustion(t *testing.T) {
+	srv, _ := newTestServer(t)
+	processTag := uint64(0xabcdef) << connIDCounterBits
+	last := processTag | connIDCounterMask
+	srv.connSeq.Store(last - 1)
+	if got, err := srv.NextConnID(); err != nil || got != last {
+		t.Fatalf("last connection ID = (%d, %v), want (%d, nil)", got, err, last)
+	}
+	if got, err := srv.NextConnID(); got != 0 || !errors.Is(err, ErrConnIDExhausted) {
+		t.Fatalf("exhausted allocation = (%d, %v)", got, err)
+	}
+}
+
+func TestConnIDProcessTagDoesNotChangeAcrossCounterBoundary(t *testing.T) {
+	srv, _ := newTestServer(t)
+	processTag := uint64(0xabcdef) << connIDCounterBits
+	srv.connSeq.Store(processTag | (1<<32 - 1))
+	first, err := srv.NextConnID()
+	if err != nil {
+		t.Fatalf("NextConnID at old boundary: %v", err)
+	}
+	second, err := srv.NextConnID()
+	if err != nil {
+		t.Fatalf("NextConnID after old boundary: %v", err)
+	}
+	if first>>connIDCounterBits != second>>connIDCounterBits {
+		t.Fatalf("process tag changed: %x then %x", first, second)
 	}
 }

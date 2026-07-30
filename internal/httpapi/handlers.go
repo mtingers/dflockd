@@ -38,6 +38,10 @@ func (h *httpServer) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, statusResponse{Status: "draining"})
 		return
 	}
+	if !h.sessions.Server().Ready() {
+		writeJSON(w, http.StatusServiceUnavailable, statusResponse{Status: "not_ready"})
+		return
+	}
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
@@ -326,12 +330,12 @@ func (h *httpServer) serveRelease(w http.ResponseWriter, r *http.Request, prefix
 }
 
 func (h *httpServer) serveRenew(w http.ResponseWriter, r *http.Request, prefixedKey string) {
-	_, req, done, ok := preludeJSON(h, w, r, validateRenew)
+	s, req, done, ok := preludeJSON(h, w, r, validateRenew)
 	if !ok {
 		return
 	}
 	defer done()
-	h.runRenew(w, r, prefixedKey, req.Token, req.LeaseTTLS)
+	h.runRenew(w, r, s, prefixedKey, req.Token, req.LeaseTTLS)
 }
 
 // ---------------------------------------------------------------------------
@@ -390,9 +394,9 @@ func (h *httpServer) runRelease(w http.ResponseWriter, r *http.Request, prefixed
 	writeError(w, http.StatusNotFound, "not_held", "")
 }
 
-func (h *httpServer) runRenew(w http.ResponseWriter, r *http.Request, prefixedKey, token string, leaseS int) {
+func (h *httpServer) runRenew(w http.ResponseWriter, r *http.Request, s *Session, prefixedKey, token string, leaseS int) {
 	if h.sessions.Server().IsClusterMode() {
-		h.runRenewCluster(w, r, prefixedKey, token, leaseS)
+		h.runRenewCluster(w, r, s, prefixedKey, token, leaseS)
 		return
 	}
 	leaseTTL := h.leaseDuration(leaseS)
@@ -494,10 +498,17 @@ func (h *httpServer) cleanupCanceledEnqueue(s *Session, prefix, key, status, tok
 	}
 }
 
-// dequeueAfterPromote issues a 0-timeout Wait. If the waiter was
-// promoted between Enqueue and now, Wait returns the granted token;
-// release it instead of stranding the slot.
+// dequeueAfterPromote atomically cancels a clustered enqueue through Raft.
+// The FSM handles both queued and raced-promotion states.
 func (h *httpServer) dequeueAfterPromote(s *Session, prefix, key string) {
+	if srv := h.sessions.Server(); srv.IsClusterMode() {
+		ctx, cancel := context.WithTimeout(context.Background(), h.cfg.ReadTimeout)
+		defer cancel()
+		if _, err := srv.ClusterCancel(ctx, prefix+key, s.ConnID); err != nil {
+			h.log.Warn("cluster enqueue cancel failed", "key", prefix+key, "err", err)
+		}
+		return
+	}
 	cleanupTok, _, err := h.sessions.LockManager().Wait(context.Background(), prefix+key, 0, s.ConnID)
 	if err != nil {
 		h.log.Warn("dequeue-after-promote wait failed", "key", prefix+key, "err", err)
@@ -512,6 +523,14 @@ func (h *httpServer) dequeueAfterPromote(s *Session, prefix, key string) {
 // response left to write. A failure here (e.g. fence persistence) is
 // logged so operators see it; the lease-expiry sweep reclaims the slot.
 func (h *httpServer) bestEffortRelease(prefixedKey, tok string) {
+	if srv := h.sessions.Server(); srv.IsClusterMode() {
+		ctx, cancel := context.WithTimeout(context.Background(), h.cfg.ReadTimeout)
+		defer cancel()
+		if _, err := srv.ClusterRelease(ctx, prefixedKey, tok); err != nil {
+			h.log.Warn("cluster best-effort release failed", "key", prefixedKey, "err", err)
+		}
+		return
+	}
 	if _, err := h.sessions.LockManager().Release(prefixedKey, tok); err != nil {
 		h.log.Warn("best-effort release failed", "key", prefixedKey, "err", err)
 	}

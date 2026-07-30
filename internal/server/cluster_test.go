@@ -29,11 +29,18 @@ type fakeCluster struct {
 	cleanupCalls  int
 	cleanupRef    string
 	cleanupConnID uint64
+	cancelCalls   int
+	cancelKey     string
+	cancelRef     string
+	cancelConnID  uint64
+	renewRef      string
+	renewConnID   uint64
 	proposeErr    error
 	acquireResult lock.ApplyResult
 	releaseResult lock.ApplyResult
 	renewResult   lock.ApplyResult
 	enqueueResult lock.ApplyResult
+	attachResult  lock.ApplyResult
 	lm            *lock.LockManager // for delivering follow-on grants
 	promotion     *promotion
 }
@@ -49,6 +56,8 @@ func (f *fakeCluster) IsLeader() bool {
 	defer f.mu.Unlock()
 	return f.leader
 }
+
+func (f *fakeCluster) Ready() bool { return true }
 
 func (f *fakeCluster) LeaderClientAddr() (string, bool) {
 	f.mu.Lock()
@@ -101,11 +110,38 @@ func (f *fakeCluster) ProposeRelease(ctx context.Context, key, token string) (lo
 	return f.releaseResult, nil
 }
 
-func (f *fakeCluster) ProposeRenew(ctx context.Context, key, token string, leaseTTL time.Duration) (lock.ApplyResult, error) {
+func (f *fakeCluster) ProposeRenewOwned(ctx context.Context, key, token, ref string, connID uint64, leaseTTL time.Duration) (lock.ApplyResult, error) {
+	f.mu.Lock()
+	f.renewRef = ref
+	f.renewConnID = connID
+	f.mu.Unlock()
 	if f.proposeErr != nil {
 		return lock.ApplyResult{}, f.proposeErr
 	}
 	return f.renewResult, nil
+}
+
+func (f *fakeCluster) ProposeCancel(ctx context.Context, key, ref string, connID uint64, salt [8]byte, matchSalt bool) (lock.ApplyResult, error) {
+	f.mu.Lock()
+	f.cancelCalls++
+	f.cancelKey = key
+	f.cancelRef = ref
+	f.cancelConnID = connID
+	f.mu.Unlock()
+	if f.proposeErr != nil {
+		return lock.ApplyResult{}, f.proposeErr
+	}
+	return lock.ApplyResult{Status: lock.StatusOK}, nil
+}
+
+func (f *fakeCluster) ProposeAttach(ctx context.Context, key, ref string, connID uint64) (lock.ApplyResult, error) {
+	if f.proposeErr != nil {
+		return lock.ApplyResult{}, f.proposeErr
+	}
+	if f.attachResult.Status == lock.StatusUnused {
+		return lock.ApplyResult{Status: lock.StatusQueued}, nil
+	}
+	return f.attachResult, nil
 }
 
 func (f *fakeCluster) ProposeCleanupConn(ctx context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
@@ -179,6 +215,30 @@ func TestSetClusterToggles(t *testing.T) {
 	s.SetCluster(nil)
 	if s.clusterOrNil() != nil {
 		t.Fatalf("after SetCluster(nil): not nil")
+	}
+	if !s.IsClusterMode() || s.Ready() {
+		t.Fatal("detached clustered server fell back to ready single-node mode")
+	}
+}
+
+func TestDetachedClusterNeverMutatesFSMThroughLocalFallback(t *testing.T) {
+	s, lm := newTestServer(t)
+	token, err := lm.Acquire(context.Background(), "lock:k", 0, time.Minute, 7, 1)
+	if err != nil || token == "" {
+		t.Fatalf("seed acquire = (%q, %v)", token, err)
+	}
+	s.SetCluster(&fakeCluster{leader: true})
+	s.SetCluster(nil)
+
+	if err := s.CleanupConnID(7); err == nil {
+		t.Fatal("detached cluster cleanup used local FSM")
+	}
+	if got := lm.DebugHolderTokens("lock:k"); len(got) != 1 || got[0] != token {
+		t.Fatalf("detached cleanup changed holder: %v", got)
+	}
+	ack := s.handleAcquire(context.Background(), reqAcquire("other", time.Minute, 0), 8)
+	if ack.Status != protocol.StatusError {
+		t.Fatalf("detached acquire status = %q, want error", ack.Status)
 	}
 }
 
@@ -258,6 +318,12 @@ func TestClusterAcquireQueuedTimesOut(t *testing.T) {
 	if ack.Status != protocol.StatusTimeout {
 		t.Fatalf("queued no-grant ack = %+v, want timeout", ack)
 	}
+	fc.mu.Lock()
+	cancelCalls := fc.cancelCalls
+	fc.mu.Unlock()
+	if cancelCalls != 1 {
+		t.Fatalf("cancel calls = %d, want 1", cancelCalls)
+	}
 }
 
 func TestClusterReleaseRouting(t *testing.T) {
@@ -284,9 +350,15 @@ func TestClusterRenewRouting(t *testing.T) {
 	s, _ := newTestServer(t)
 	fc := &fakeCluster{leader: true, renewResult: lock.ApplyResult{Status: lock.StatusOK, LeaseSec: 60}}
 	s.SetCluster(fc)
-	ack := s.handleRenew(&protocol.Request{Cmd: protocol.CmdRenew, Key: "k", Token: "t", LeaseTTL: 60 * time.Second})
+	ack := s.handleRenew(&protocol.Request{Cmd: protocol.CmdRenew, Key: "k", Token: "t", LeaseTTL: 60 * time.Second}, 1)
 	if ack.Status != protocol.StatusOK || ack.Extra != "60" {
 		t.Fatalf("renew ack = %+v", ack)
+	}
+	fc.mu.Lock()
+	ref, cid := fc.renewRef, fc.renewConnID
+	fc.mu.Unlock()
+	if ref == "" || cid == 0 {
+		t.Fatalf("renew owner = (%q, %d), want connection identity", ref, cid)
 	}
 }
 

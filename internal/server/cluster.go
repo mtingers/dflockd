@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +22,7 @@ import (
 // from many handler goroutines at once.
 type Cluster interface {
 	IsLeader() bool
+	Ready() bool
 	LeaderClientAddr() (string, bool)
 	// StatusJSON returns this node's Raft status as a JSON object
 	// (role, term, leader, commit/last-log indices, voters …) — spliced
@@ -31,7 +31,9 @@ type Cluster interface {
 	ProposeAcquire(ctx context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error)
 	ProposeEnqueue(ctx context.Context, key string, limit int, ref string, connID uint64, leaseTTL time.Duration, salt [8]byte) (lock.ApplyResult, error)
 	ProposeRelease(ctx context.Context, key, token string) (lock.ApplyResult, error)
-	ProposeRenew(ctx context.Context, key, token string, leaseTTL time.Duration) (lock.ApplyResult, error)
+	ProposeRenewOwned(ctx context.Context, key, token, ref string, connID uint64, leaseTTL time.Duration) (lock.ApplyResult, error)
+	ProposeCancel(ctx context.Context, key, ref string, connID uint64, salt [8]byte, matchSalt bool) (lock.ApplyResult, error)
+	ProposeAttach(ctx context.Context, key, ref string, connID uint64) (lock.ApplyResult, error)
 	ProposeCleanupConn(ctx context.Context, ref string, connID uint64) (lock.ApplyResult, error)
 	// Barrier proposes a no-op and waits for it to apply — the public
 	// linearizable-read primitive. Returns ErrNotLeader on a follower.
@@ -49,39 +51,21 @@ type Cluster interface {
 // SetCluster wires a cluster.Node into this server. After this call,
 // all mutating handlers route through the cluster (returning
 // error_not_leader off-leader, proposing on-leader). Pass nil to
-// disable; the legacy single-node path resumes.
+// detach during shutdown; a server that has hosted replicated state never
+// falls back to local mutation.
 func (s *Server) SetCluster(c Cluster) {
 	if c == nil {
 		s.cluster.Store(nil)
 		return
 	}
-	if s.connIDEpoch.Load() == 0 {
-		s.connIDEpoch.Store(randomConnIDEpoch())
-	}
+	s.clusterConfigured.Store(true)
 	s.cluster.Store(&c)
 }
 
-// randomConnIDEpoch returns a non-zero value to OR into the high 32 bits
-// of cluster-mode connection ids. Pure collision-avoidance across
-// process restarts — crypto strength isn't required, but crypto/rand is
-// already on hand and cheap.
-func randomConnIDEpoch() uint64 {
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return uint64(time.Now().UnixNano()&0xFFFFFFFF) << 32
-	}
-	e := uint64(binary.BigEndian.Uint32(b[:]))
-	if e == 0 {
-		e = 1
-	}
-	return e << 32
-}
-
-// clusterConnID maps a per-process connection counter value to the
-// globally-unique id the FSM sees (epoch in the high bits, the 32-bit
-// counter in the low bits).
+// clusterConnID returns the already randomized, full-width process connection
+// ID. It remains a helper so every FSM identity path stays centralized.
 func (s *Server) clusterConnID(raw uint64) uint64 {
-	return s.connIDEpoch.Load() | uint64(uint32(raw))
+	return raw
 }
 
 // clusterOrNil returns the installed Cluster, or nil if running in
@@ -89,6 +73,23 @@ func (s *Server) clusterConnID(raw uint64) uint64 {
 func (s *Server) clusterOrNil() Cluster {
 	if c := s.cluster.Load(); c != nil {
 		return *c
+	}
+	return nil
+}
+
+// Ready reports whether this process can serve traffic. Single-node mode is
+// ready whenever its servers are running; cluster mode additionally requires
+// a live local Raft voter.
+func (s *Server) Ready() bool {
+	if c := s.clusterOrNil(); c != nil {
+		return c.Ready()
+	}
+	return !s.clusterConfigured.Load()
+}
+
+func (s *Server) clusterUnavailableAck() *protocol.Ack {
+	if s.clusterConfigured.Load() {
+		return &protocol.Ack{Status: protocol.StatusError}
 	}
 	return nil
 }
@@ -105,9 +106,9 @@ func notLeaderAck(c Cluster) *protocol.Ack {
 // the legacy ones; the table in conn.go switches on s.clusterOrNil().
 // ---------------------------------------------------------------------------
 
-// clusterRef stamps the requester id the FSM routes grants by. It's the
-// decimal form of clusterConnID, so it's globally unique (across process
-// restarts) and stable within a connection.
+// clusterRef stamps the requester id the FSM routes grants by. It is the
+// decimal form of the full-width randomized connection ID, making reuse across
+// process restarts negligibly likely and remaining stable within a connection.
 func (s *Server) clusterRef(connID uint64) string {
 	return fmt.Sprintf("%d", s.clusterConnID(connID))
 }
@@ -115,21 +116,33 @@ func (s *Server) clusterRef(connID uint64) string {
 // pendingGrant is a grant listener registered by a queued two-phase
 // Enqueue, held until the matching Wait consumes it (or the conn dies).
 type pendingGrant struct {
-	ch     <-chan lock.Grant
-	cancel func()
+	ch        <-chan lock.Grant
+	cancel    func()
+	key       string
+	ref       string
+	connID    uint64
+	salt      [8]byte
+	matchSalt bool
 }
 
-func (s *Server) stashPendingGrant(connID uint64, ch <-chan lock.Grant, cancel func()) {
-	// Overwrite any prior entry without cancelling it: a fresh
-	// WatchGrants on the same ref already replaced the registry slot, so
-	// the old channel is simply unreferenced. (A connection with two
-	// concurrent queued enqueues is already loosely-handled — one grant
-	// fits in the buffer-1 channel — and this doesn't make it worse.)
-	s.pendingGrants.Store(connID, &pendingGrant{ch: ch, cancel: cancel})
+type pendingGrantKey struct {
+	connID uint64
+	key    string
 }
 
-func (s *Server) takePendingGrant(connID uint64) (*pendingGrant, bool) {
-	v, ok := s.pendingGrants.LoadAndDelete(connID)
+func (s *Server) stashPendingGrant(rawConnID uint64, ch <-chan lock.Grant, cancel func(), key, ref string, connID uint64, salt [8]byte) {
+	mapKey := pendingGrantKey{connID: rawConnID, key: key}
+	next := &pendingGrant{
+		ch: ch, cancel: cancel, key: key, ref: ref, connID: connID,
+		salt: salt, matchSalt: true,
+	}
+	if prior, loaded := s.pendingGrants.Swap(mapKey, next); loaded {
+		prior.(*pendingGrant).cancel()
+	}
+}
+
+func (s *Server) takePendingGrant(connID uint64, key string) (*pendingGrant, bool) {
+	v, ok := s.pendingGrants.LoadAndDelete(pendingGrantKey{connID: connID, key: key})
 	if !ok {
 		return nil, false
 	}
@@ -139,9 +152,16 @@ func (s *Server) takePendingGrant(connID uint64) (*pendingGrant, bool) {
 // dropPendingGrant cancels and discards any pending grant listener for
 // connID (used on disconnect).
 func (s *Server) dropPendingGrant(connID uint64) {
-	if pg, ok := s.takePendingGrant(connID); ok {
-		pg.cancel()
-	}
+	s.pendingGrants.Range(func(key, _ any) bool {
+		mapKey, ok := key.(pendingGrantKey)
+		if !ok || mapKey.connID != connID {
+			return true
+		}
+		if value, loaded := s.pendingGrants.LoadAndDelete(mapKey); loaded {
+			value.(*pendingGrant).cancel()
+		}
+		return true
+	})
 }
 
 // clusterSalt generates a fresh 8-byte salt for one token.
@@ -174,6 +194,7 @@ func (s *Server) clusterDoAcquire(ctx context.Context, c Cluster, req *protocol.
 	leaseTTL := req.LeaseTTL
 	result, err := c.ProposeAcquire(ctx, requestKey(req), requestLimit(req), ref, cid, leaseTTL, salt)
 	if err != nil {
+		s.cancelClusterOperation(c, requestKey(req), ref, cid, salt, true)
 		return clusterProposeErrAck(err, c)
 	}
 	if result.Status == lock.StatusOK {
@@ -182,13 +203,16 @@ func (s *Server) clusterDoAcquire(ctx context.Context, c Cluster, req *protocol.
 	if result.Status != lock.StatusQueued {
 		return ackForLockStatus(result.Status)
 	}
-	return s.clusterWaitForGrant(ctx, grants, req.AcquireTimeout)
+	ack := s.clusterWaitForGrant(ctx, grants, req.AcquireTimeout)
+	if ack.Status != protocol.StatusOK {
+		s.cancelClusterOperation(c, requestKey(req), ref, cid, salt, true)
+	}
+	return ack
 }
 
-// clusterWaitForGrant blocks on grants or the acquire timeout. A
-// timeout that hits before the grant arrives leaves the holder entry
-// in the FSM until its lease expires; that's the documented cluster
-// semantic (see PLAN.md §4.7).
+// clusterWaitForGrant blocks on grants or the acquire timeout. A timeout is
+// followed by a replicated cancellation in the caller, which atomically
+// removes either the queued waiter or a raced promotion.
 func (s *Server) clusterWaitForGrant(ctx context.Context, grants <-chan lock.Grant, timeout time.Duration) *protocol.Ack {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -223,10 +247,11 @@ func (s *Server) clusterEnqueue(ctx context.Context, c Cluster, req *protocol.Re
 	result, err := c.ProposeEnqueue(ctx, requestKey(req), requestLimit(req), ref, cid, req.LeaseTTL, salt)
 	if err != nil {
 		cancel()
+		s.cancelClusterOperation(c, requestKey(req), ref, cid, salt, true)
 		return clusterProposeErrAck(err, c)
 	}
 	if result.Status == lock.StatusQueued {
-		s.stashPendingGrant(connID, ch, cancel)
+		s.stashPendingGrant(connID, ch, cancel, requestKey(req), ref, cid, salt)
 	} else {
 		cancel() // acquired fast-path, or an error status — nothing will Wait
 	}
@@ -251,15 +276,48 @@ func (s *Server) clusterWait(ctx context.Context, c Cluster, req *protocol.Reque
 	// Prefer the listener the matching Enqueue stashed (so a promotion
 	// between the Enqueue and this Wait was already captured); otherwise
 	// register one now.
-	if pg, ok := s.takePendingGrant(connID); ok {
+	key := requestKey(req)
+	if pg, ok := s.takePendingGrant(connID, key); ok {
 		defer pg.cancel()
-		return s.clusterWaitForGrant(ctx, pg.ch, req.AcquireTimeout)
+		attached, err := c.ProposeAttach(ctx, pg.key, pg.ref, pg.connID)
+		if err != nil {
+			s.cancelClusterOperation(c, pg.key, pg.ref, pg.connID, pg.salt, pg.matchSalt)
+			return clusterProposeErrAck(err, c)
+		}
+		if attached.Status == lock.StatusOK {
+			return &protocol.Ack{Status: protocol.StatusOK, Token: attached.Token, LeaseTTL: attached.LeaseSec}
+		}
+		if attached.Status != lock.StatusQueued {
+			return ackForLockStatus(attached.Status)
+		}
+		ack := s.clusterWaitForGrant(ctx, pg.ch, req.AcquireTimeout)
+		if ack.Status != protocol.StatusOK {
+			s.cancelClusterOperation(c, pg.key, pg.ref, pg.connID, pg.salt, pg.matchSalt)
+		}
+		return ack
 	}
 	// No stashed listener (a Wait without its Enqueue, or after a
 	// reconnect): watch the ref this connection actually proposes under.
-	grants, cancel := s.lm.WatchGrantsFor(s.effectiveRef(connID, s.clusterConnID(connID)), requestKey(req))
+	cid := s.clusterConnID(connID)
+	ref := s.effectiveRef(connID, cid)
+	grants, cancel := s.lm.WatchGrantsFor(ref, requestKey(req))
 	defer cancel()
-	return s.clusterWaitForGrant(ctx, grants, req.AcquireTimeout)
+	attached, err := c.ProposeAttach(ctx, requestKey(req), ref, cid)
+	if err != nil {
+		s.cancelClusterOperation(c, requestKey(req), ref, cid, [8]byte{}, false)
+		return clusterProposeErrAck(err, c)
+	}
+	if attached.Status == lock.StatusOK {
+		return &protocol.Ack{Status: protocol.StatusOK, Token: attached.Token, LeaseTTL: attached.LeaseSec}
+	}
+	if attached.Status != lock.StatusQueued {
+		return ackForLockStatus(attached.Status)
+	}
+	ack := s.clusterWaitForGrant(ctx, grants, req.AcquireTimeout)
+	if ack.Status != protocol.StatusOK {
+		s.cancelClusterOperation(c, requestKey(req), ref, cid, [8]byte{}, false)
+	}
+	return ack
 }
 
 func (s *Server) clusterRelease(ctx context.Context, c Cluster, req *protocol.Request) *protocol.Ack {
@@ -276,11 +334,12 @@ func (s *Server) clusterRelease(ctx context.Context, c Cluster, req *protocol.Re
 	return ackForLockStatus(result.Status)
 }
 
-func (s *Server) clusterRenew(ctx context.Context, c Cluster, req *protocol.Request) *protocol.Ack {
+func (s *Server) clusterRenew(ctx context.Context, c Cluster, req *protocol.Request, connID uint64) *protocol.Ack {
 	if !c.IsLeader() {
 		return notLeaderAck(c)
 	}
-	result, err := c.ProposeRenew(ctx, requestKey(req), req.Token, req.LeaseTTL)
+	cid := s.clusterConnID(connID)
+	result, err := c.ProposeRenewOwned(ctx, requestKey(req), req.Token, s.effectiveRef(connID, cid), cid, req.LeaseTTL)
 	if err != nil {
 		return clusterProposeErrAck(err, c)
 	}
@@ -289,6 +348,17 @@ func (s *Server) clusterRenew(ctx context.Context, c Cluster, req *protocol.Requ
 		return &protocol.Ack{Status: protocol.StatusOK, Extra: fmtSeconds(result.LeaseSec)}
 	}
 	return ackForLockStatus(result.Status)
+}
+
+func (s *Server) cancelClusterOperation(c Cluster, key, ref string, connID uint64, salt [8]byte, matchSalt bool) {
+	if c == nil || !c.IsLeader() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
+	defer cancel()
+	if _, err := c.ProposeCancel(ctx, key, ref, connID, salt, matchSalt); err != nil {
+		s.log.Warn("cluster cancel propose failed", "key", key, "ref", ref, "conn_id", connID, "err", err)
+	}
 }
 
 // clusterProposeErrAck classifies a Propose failure. The two big

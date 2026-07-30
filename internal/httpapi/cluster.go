@@ -124,10 +124,10 @@ func (h *httpServer) runReleaseCluster(w http.ResponseWriter, r *http.Request, p
 	}
 }
 
-func (h *httpServer) runRenewCluster(w http.ResponseWriter, r *http.Request, prefixedKey, token string, leaseS int) {
+func (h *httpServer) runRenewCluster(w http.ResponseWriter, r *http.Request, s *Session, prefixedKey, token string, leaseS int) {
 	srv := h.sessions.Server()
 	leaseTTL := h.leaseDuration(leaseS)
-	res, err := srv.ClusterRenew(r.Context(), prefixedKey, token, leaseTTL)
+	res, err := srv.ClusterRenew(r.Context(), prefixedKey, token, s.ConnID, leaseTTL)
 	if h.handleClusterNotLeader(w, srv, err) {
 		return
 	}

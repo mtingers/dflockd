@@ -41,7 +41,7 @@ func TestClusterOps_LeaderAndFollower(t *testing.T) {
 		func() error { _, e := s.ClusterEnqueue(ctx, "lock:k", 1, 1, time.Second); return e },
 		func() error { _, e := s.ClusterWait(ctx, "lock:k", 1, time.Second); return e },
 		func() error { _, e := s.ClusterRelease(ctx, "lock:k", "tk"); return e },
-		func() error { _, e := s.ClusterRenew(ctx, "lock:k", "tk", time.Second); return e },
+		func() error { _, e := s.ClusterRenew(ctx, "lock:k", "tk", 1, time.Second); return e },
 	} {
 		if err := call(); !errors.Is(err, ErrNotClusterLeader) {
 			t.Fatalf("follower op = %v, want ErrNotClusterLeader", err)
@@ -51,11 +51,18 @@ func TestClusterOps_LeaderAndFollower(t *testing.T) {
 
 func TestClusterOps_QueuedAcquireTimesOut(t *testing.T) {
 	s, _ := newTestServer(t)
-	s.SetCluster(&fakeCluster{leader: true, acquireResult: lock.ApplyResult{Status: lock.StatusQueued}})
+	fc := &fakeCluster{leader: true, acquireResult: lock.ApplyResult{Status: lock.StatusQueued}}
+	s.SetCluster(fc)
 	// timeout 0 → the wait timer fires immediately → still StatusQueued.
 	res, err := s.ClusterAcquire(context.Background(), "lock:k", 1, 1, 30*time.Second, 0)
 	if err != nil || res.Status != lock.StatusQueued {
 		t.Fatalf("queued+timeout = %+v, %v", res, err)
+	}
+	fc.mu.Lock()
+	cancelCalls := fc.cancelCalls
+	fc.mu.Unlock()
+	if cancelCalls != 1 {
+		t.Fatalf("cancel calls = %d, want 1", cancelCalls)
 	}
 }
 
@@ -66,15 +73,64 @@ func TestClusterOps_EnqueueStashesGrantListener(t *testing.T) {
 	if _, err := s.ClusterEnqueue(context.Background(), "lock:k", 1, 5, time.Second); err != nil {
 		t.Fatalf("ClusterEnqueue: %v", err)
 	}
-	if _, ok := s.pendingGrants.Load(uint64(5)); !ok {
+	mapKey := pendingGrantKey{connID: 5, key: "lock:k"}
+	if _, ok := s.pendingGrants.Load(mapKey); !ok {
 		t.Fatalf("queued enqueue should have stashed a grant listener for connID 5")
 	}
 	// Wait consumes it.
 	if _, err := s.ClusterWait(context.Background(), "lock:k", 5, 0); err != nil {
 		t.Fatalf("ClusterWait: %v", err)
 	}
-	if _, ok := s.pendingGrants.Load(uint64(5)); ok {
+	if _, ok := s.pendingGrants.Load(mapKey); ok {
 		t.Fatalf("ClusterWait should have consumed the stashed listener")
+	}
+	fc.mu.Lock()
+	cancelCalls := fc.cancelCalls
+	fc.mu.Unlock()
+	if cancelCalls != 1 {
+		t.Fatalf("natural Wait timeout cancel calls=%d, want 1", cancelCalls)
+	}
+}
+
+func TestClusterOps_PendingListenersAreScopedByKey(t *testing.T) {
+	s, _ := newTestServer(t)
+	fc := &fakeCluster{leader: true, enqueueResult: lock.ApplyResult{Status: lock.StatusQueued}}
+	s.SetCluster(fc)
+	for _, key := range []string{"lock:a", "lock:b"} {
+		if _, err := s.ClusterEnqueue(context.Background(), key, 1, 5, time.Second); err != nil {
+			t.Fatalf("ClusterEnqueue(%s): %v", key, err)
+		}
+	}
+	for _, key := range []string{"lock:a", "lock:b"} {
+		if _, ok := s.pendingGrants.Load(pendingGrantKey{connID: 5, key: key}); !ok {
+			t.Fatalf("missing listener for %s", key)
+		}
+	}
+	s.dropPendingGrant(5)
+	for _, key := range []string{"lock:a", "lock:b"} {
+		if _, ok := s.pendingGrants.Load(pendingGrantKey{connID: 5, key: key}); ok {
+			t.Fatalf("listener for %s survived connection cleanup", key)
+		}
+	}
+}
+
+func TestClusterOps_CanceledWaitProposesCancel(t *testing.T) {
+	s, _ := newTestServer(t)
+	fc := &fakeCluster{leader: true, enqueueResult: lock.ApplyResult{Status: lock.StatusQueued}}
+	s.SetCluster(fc)
+	if _, err := s.ClusterEnqueue(context.Background(), "lock:k", 1, 5, time.Second); err != nil {
+		t.Fatalf("ClusterEnqueue: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.ClusterWait(ctx, "lock:k", 5, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ClusterWait error = %v, want context.Canceled", err)
+	}
+	fc.mu.Lock()
+	calls, key := fc.cancelCalls, fc.cancelKey
+	fc.mu.Unlock()
+	if calls != 1 || key != "lock:k" {
+		t.Fatalf("cancel = (%d, %q), want (1, lock:k)", calls, key)
 	}
 }
 

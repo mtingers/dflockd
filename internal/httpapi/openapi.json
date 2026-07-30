@@ -4,7 +4,7 @@
     "title": "dflockd HTTP API",
     "version": "2.1.0",
     "summary": "REST surface for dflockd's distributed FIFO lock and semaphore primitives.",
-    "description": "dflockd is a distributed FIFO lock server with leases and semaphores. This HTTP API and the native line-based TCP protocol share the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.\n\n## Sessions\n\nTwo-phase operations (`enqueue` + `wait`) need a stable identity that survives across requests. That identity is a session: a server-side token bound to a unique `connID` in the LockManager.\n\n1. `POST /v1/sessions` mints an opaque ID and allocates a connID. In cluster mode, an optional caller-generated `stable_ref` lets a replacement session re-attach after leader failover when `--orphan-ttl` is enabled.\n2. Carry `X-Dflockd-Session: <id>` on every lock-modifying request.\n3. `DELETE /v1/sessions/{id}` cleans up session state. Default sessions release immediately; stable-ref sessions in an orphan-enabled cluster preserve their slots until re-attachment or orphan expiry.\n\nSession IDs remain node-local. After a redirect or leader failure, create a session on the new leader with the same `stable_ref`, then retry acquire or enqueue. Stable refs are bearer-like opaque identifiers, not authentication credentials; generate them randomly, do not log or share them, and use bearer auth on untrusted networks.\n\n## Idle sessions\n\nA background sweeper reaps any session whose `lastSeen` falls behind 2× `--http-session-idle-timeout`. In-flight handlers (e.g. a long-poll `/wait`) are immune for the duration of the request. `POST /v1/sessions/{id}/ping` refreshes `lastSeen` without acquiring any lock.\n\n## Lease renewal\n\nAcquire returns a `token` and `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the slot and grants it to the next waiter. The Go client renews at 50% of the TTL with early-only jitter.\n\n## Auth, rate limit, CORS\n\nWhen `--auth-token` is set, every endpoint except `/health`, `/ready`, and `/v1/openapi.json` requires `Authorization: Bearer <token>`. `--http-rate-limit-per-ip` enforces a token-bucket per remote IP and surfaces excess as `429 rate_limited`. `--http-cors-allowed-origins` controls cross-origin behaviour.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
+    "description": "dflockd is a distributed FIFO lock server with leases and semaphores. This HTTP API and the native line-based TCP protocol share the same in-memory `LockManager`, so a TCP client and an HTTP session contending on the same key are ordered together in a single FIFO queue.\n\n## Sessions\n\nTwo-phase operations (`enqueue` + `wait`) need a stable identity that survives across requests. That identity is a session: a server-side token bound to a unique `connID` in the LockManager.\n\n1. `POST /v1/sessions` mints an opaque ID and allocates a connID. In cluster mode, an optional caller-generated `stable_ref` lets a replacement session re-attach after leader failover. A positive `--orphan-ttl` additionally retains stable-ref state after graceful disconnect; hard-failover reattachment does not require it.\n2. Carry `X-Dflockd-Session: <id>` on every lock-modifying request.\n3. `DELETE /v1/sessions/{id}` cleans up session state according to the replicated disconnect policy.\n\nSession IDs remain node-local. After a redirect or leader failure, create a session on the new leader with the same `stable_ref`, then retry acquire or enqueue. Stable refs are bearer-like opaque identifiers, not authentication credentials; generate them randomly, do not log or share them, and use bearer auth on untrusted networks.\n\n## Idle sessions\n\nA background sweeper reaps any session whose `lastSeen` falls behind 2× `--http-session-idle-timeout`. In-flight handlers (e.g. a long-poll `/wait`) are immune for the duration of the request. `POST /v1/sessions/{id}/ping` refreshes `lastSeen` without acquiring any lock.\n\n## Lease renewal\n\nAcquire returns a `token` and `lease_ttl_s`. If the client doesn't `POST .../renew` before the TTL expires, the server reclaims the slot and grants it to the next waiter. The Go client renews at 50% of the TTL with early-only jitter.\n\n## Auth, rate limit, CORS\n\nWhen `--auth-token` is set, every endpoint except `/health`, `/ready`, and `/v1/openapi.json` requires `Authorization: Bearer <token>`. `--http-rate-limit-per-ip` enforces a token-bucket per remote IP and surfaces excess as `429 rate_limited`. `--http-cors-allowed-origins` controls cross-origin behaviour.\n\nSee the [architecture docs](https://mtingers.github.io/dflockd/architecture/overview/) for the full model."
   },
   "servers": [
     {
@@ -41,11 +41,22 @@
         "tags": ["introspection"],
         "summary": "Readiness probe",
         "operationId": "getReady",
-        "description": "Returns 200 while the API should accept traffic and 503 during graceful shutdown. Exempt from bearer auth.",
+        "description": "Returns 200 while the API should accept traffic. In cluster mode the local Raft node must be running and remain a voter; leadership is not required. Returns 503 while draining or when cluster state is not ready. Exempt from bearer auth.",
         "security": [],
         "responses": {
           "200": {"description": "Ready", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "ok"}}}},
-          "503": {"description": "Draining", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatusResponse"}, "example": {"status": "draining"}}}}
+          "503": {
+            "description": "Draining or cluster not ready",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/StatusResponse"},
+                "examples": {
+                  "draining": {"value": {"status": "draining"}},
+                  "not_ready": {"value": {"status": "not_ready"}}
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -77,7 +88,7 @@
         "tags": ["sessions"],
         "summary": "Create a session",
         "operationId": "createSession",
-        "description": "Mints a new node-local session with a server-generated 32-character lowercase hex ID. The body is optional for backward compatibility. In an orphan-enabled cluster, send a caller-generated stable ref and reuse it when creating a replacement session on a new leader; retrying acquire or enqueue then re-attaches the replicated slot and preserves FIFO position or an existing token. The response advertises the configured idle timeout so clients know how often to ping.",
+        "description": "Mints a new node-local session with a server-generated 32-character lowercase hex ID. The body is optional for backward compatibility. In cluster mode, send a caller-generated stable ref and reuse it when creating a replacement session on a new leader; retrying acquire or enqueue then re-attaches the replicated slot and preserves FIFO position or an existing token. The response advertises the configured idle timeout so clients know how often to ping.",
         "requestBody": {
           "required": false,
           "content": {
@@ -100,7 +111,7 @@
         "tags": ["sessions"],
         "summary": "Delete a session",
         "operationId": "deleteSession",
-        "description": "Synchronously closes the session. Default sessions release held locks and semaphore slots. In a cluster with `--orphan-ttl > 0`, stable-ref session slots are instead marked abandoned for re-attachment and expire after the orphan TTL. Idempotent; deleting an unknown id returns 410.",
+        "description": "Synchronously closes the session. The replicated disconnect policy controls held slots: default sessions release them; stable-ref slots are retained for reattachment when `--orphan-ttl > 0`; `--auto-release-on-disconnect=false` retains holders until release or lease expiry. Idempotent; deleting an unknown id returns 410.",
         "parameters": [{"$ref": "#/components/parameters/SessionIdPath"}],
         "responses": {
           "204": {"description": "Closed"},
@@ -148,7 +159,7 @@
           "200": {"description": "Barrier applied", "content": {"application/json": {"schema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["ok"]}}}}}},
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"description": "Not in cluster mode", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "cluster_disabled"}}}},
-          "503": {"description": "Not leader (X-Dflockd-Leader header carries the leader's raft client address)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_leader"}}}}
+          "503": {"description": "Not leader (X-Dflockd-Leader carries the replicated client-facing TCP address)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}, "example": {"error": "not_leader"}}}}
         }
       }
     },
@@ -157,7 +168,7 @@
         "tags": ["admin"],
         "summary": "Add a voting cluster member",
         "operationId": "adminAddVoter",
-        "description": "Proposes a single-server addition through Raft. Requires X-Dflockd-Admin (constant-time compared against --admin-token / DFLOCKD_ADMIN_TOKEN). 503 admin_disabled when no admin token is configured; 503 not_leader on a follower (X-Dflockd-Leader carries the leader address).",
+        "description": "Proposes a single-server addition through Raft. Requires identity-bound Raft mutual TLS and X-Dflockd-Admin (constant-time compared against --admin-token / DFLOCKD_ADMIN_TOKEN). 503 admin_disabled when no admin token is configured; 503 not_leader on a follower (X-Dflockd-Leader carries the leader address).",
         "parameters": [
           {"name": "X-Dflockd-Admin", "in": "header", "required": true, "schema": {"type": "string"}, "description": "Admin secret. Constant-time compared."}
         ],
@@ -178,7 +189,7 @@
         "tags": ["admin"],
         "summary": "Remove a voting cluster member",
         "operationId": "adminRemoveVoter",
-        "description": "Proposes a single-server removal through Raft. Same auth model as POST /v1/admin/voters. A leader that removes itself steps down once the entry commits.",
+        "description": "Proposes a single-server removal through Raft. Requires identity-bound Raft mutual TLS and the same admin-token model as POST /v1/admin/voters. A leader that removes itself steps down once the entry commits.",
         "parameters": [
           {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Stable node id."},
           {"name": "X-Dflockd-Admin", "in": "header", "required": true, "schema": {"type": "string"}}
@@ -468,7 +479,7 @@
       "StatusResponse": {
         "type": "object",
         "required": ["status"],
-        "properties": {"status": {"type": "string", "enum": ["ok", "draining"]}}
+        "properties": {"status": {"type": "string", "enum": ["ok", "draining", "not_ready"]}}
       },
       "ErrorBody": {
         "type": "object",
@@ -487,7 +498,7 @@
             "minLength": 1,
             "maxLength": 64,
             "pattern": "^[ -~]*[!-~][ -~]*$",
-            "description": "Optional caller-generated printable ASCII identity. Leading and trailing whitespace is trimmed before the 64-byte limit is applied. Reuse on the new leader with `--orphan-ttl > 0` to preserve replicated holder or waiter state. Treat as a bearer-like session secret."
+            "description": "Optional caller-generated printable ASCII identity. Leading and trailing whitespace is trimmed before the 64-byte limit is applied. Reuse on the new leader to preserve replicated holder or waiter state. A positive `--orphan-ttl` additionally retains state after graceful disconnect. Treat as a bearer-like session secret."
           }
         }
       },

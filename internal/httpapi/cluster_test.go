@@ -22,11 +22,15 @@ import (
 type httpFakeCluster struct {
 	mu            sync.Mutex
 	leader        bool
+	ready         bool
 	leaderAddr    string
 	acquireResult lock.ApplyResult
 	enqueueResult lock.ApplyResult
 	releaseResult lock.ApplyResult
 	renewResult   lock.ApplyResult
+	releaseCalls  int
+	cancelCalls   int
+	cancelKey     string
 	cleanupCalls  int
 	cleanupRef    string
 	cleanupConnID uint64
@@ -37,6 +41,12 @@ var _ server.Cluster = (*httpFakeCluster)(nil)
 func (f *httpFakeCluster) setLeader(v bool) { f.mu.Lock(); f.leader = v; f.mu.Unlock() }
 
 func (f *httpFakeCluster) IsLeader() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.leader }
+
+func (f *httpFakeCluster) Ready() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ready
+}
 
 func (f *httpFakeCluster) LeaderClientAddr() (string, bool) {
 	f.mu.Lock()
@@ -55,10 +65,23 @@ func (f *httpFakeCluster) ProposeEnqueue(_ context.Context, _ string, _ int, _ s
 	return f.enqueueResult, nil
 }
 func (f *httpFakeCluster) ProposeRelease(_ context.Context, _, _ string) (lock.ApplyResult, error) {
+	f.mu.Lock()
+	f.releaseCalls++
+	f.mu.Unlock()
 	return f.releaseResult, nil
 }
-func (f *httpFakeCluster) ProposeRenew(_ context.Context, _, _ string, _ time.Duration) (lock.ApplyResult, error) {
+func (f *httpFakeCluster) ProposeRenewOwned(_ context.Context, _, _, _ string, _ uint64, _ time.Duration) (lock.ApplyResult, error) {
 	return f.renewResult, nil
+}
+func (f *httpFakeCluster) ProposeCancel(_ context.Context, key, _ string, _ uint64, _ [8]byte, _ bool) (lock.ApplyResult, error) {
+	f.mu.Lock()
+	f.cancelCalls++
+	f.cancelKey = key
+	f.mu.Unlock()
+	return lock.ApplyResult{Status: lock.StatusOK}, nil
+}
+func (f *httpFakeCluster) ProposeAttach(_ context.Context, _, _ string, _ uint64) (lock.ApplyResult, error) {
+	return lock.ApplyResult{Status: lock.StatusQueued}, nil
 }
 func (f *httpFakeCluster) ProposeCleanupConn(_ context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
 	f.mu.Lock()
@@ -95,6 +118,25 @@ func newClusterHTTPTest(t *testing.T, fc server.Cluster) *httpServer {
 	hs, _ := buildHTTPServer(context.Background(), srv, cfg, log)
 	t.Cleanup(func() { hs.limiter.Stop(); hs.sessions.Shutdown() })
 	return hs
+}
+
+func TestReadyRequiresLiveClusterNode(t *testing.T) {
+	fc := &httpFakeCluster{leader: false, ready: false}
+	hs := newClusterHTTPTest(t, fc)
+	rec := httptest.NewRecorder()
+	hs.handleReady(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "not_ready") {
+		t.Fatalf("unready response: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	fc.mu.Lock()
+	fc.ready = true
+	fc.mu.Unlock()
+	rec = httptest.NewRecorder()
+	hs.handleReady(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ready follower status = %d, want %d", rec.Code, http.StatusOK)
+	}
 }
 
 func TestHTTPCluster_AcquireOnLeaderReturnsToken(t *testing.T) {
@@ -188,6 +230,7 @@ func TestHTTPCluster_ReleaseAndRenew(t *testing.T) {
 		renewResult:   lock.ApplyResult{Status: lock.StatusOK, LeaseSec: 42},
 	}
 	hs := newClusterHTTPTest(t, fc)
+	s, _ := hs.sessions.Create("127.0.0.1")
 
 	rec := httptest.NewRecorder()
 	hs.runReleaseCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/release", nil), "lock:k", "tok-x")
@@ -196,7 +239,7 @@ func TestHTTPCluster_ReleaseAndRenew(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	hs.runRenewCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/renew", nil), "lock:k", "tok-x", 42)
+	hs.runRenewCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/renew", nil), s, "lock:k", "tok-x", 42)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("renew status = %d, want 200", rec.Code)
 	}
@@ -222,6 +265,40 @@ func TestHTTPCluster_NotHeldRelease(t *testing.T) {
 	hs.runReleaseCluster(rec, httptest.NewRequest(http.MethodPost, "/v1/locks/k/release", nil), "lock:k", "ghost")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("release of unheld status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHTTPCluster_CleanupPathsOnlyMutateThroughRaft(t *testing.T) {
+	fc := &httpFakeCluster{leader: true, releaseResult: lock.ApplyResult{Status: lock.StatusOK}}
+	hs := newClusterHTTPTest(t, fc)
+	session, _ := hs.sessions.Create("127.0.0.1")
+	lm := hs.sessions.LockManager()
+
+	holder, _, err := lm.ApplyAcquire(time.Now(), "lock:held", 1, "local", 99, time.Minute, [8]byte{1})
+	if err != nil {
+		t.Fatalf("seed holder: %v", err)
+	}
+	hs.bestEffortRelease("lock:held", holder.Token)
+	if got := lm.DebugHolderTokens("lock:held"); len(got) != 1 {
+		t.Fatalf("cluster cleanup mutated local holder directly: %v", got)
+	}
+
+	if _, _, err := lm.ApplyAcquire(time.Now(), "lock:queued", 1, "blocker", 98, time.Minute, [8]byte{2}); err != nil {
+		t.Fatalf("seed blocker: %v", err)
+	}
+	if _, _, err := lm.ApplyEnqueue(time.Now(), "lock:queued", 1, "queued", session.ConnID, time.Minute, [8]byte{3}); err != nil {
+		t.Fatalf("seed waiter: %v", err)
+	}
+	hs.dequeueAfterPromote(session, lock.LockPrefix, "queued")
+	if got := lm.CountWaitersForTest("lock:queued"); got != 1 {
+		t.Fatalf("cluster cleanup mutated local waiter directly: count=%d", got)
+	}
+
+	fc.mu.Lock()
+	releaseCalls, cancelCalls, cancelKey := fc.releaseCalls, fc.cancelCalls, fc.cancelKey
+	fc.mu.Unlock()
+	if releaseCalls != 1 || cancelCalls != 1 || cancelKey != "lock:queued" {
+		t.Fatalf("raft cleanup calls = release:%d cancel:%d key:%q", releaseCalls, cancelCalls, cancelKey)
 	}
 }
 
@@ -322,6 +399,12 @@ func (f *applyHTTPCluster) ProposeEnqueue(_ context.Context, key string, limit i
 
 func (f *applyHTTPCluster) ProposeCleanupConn(_ context.Context, ref string, connID uint64) (lock.ApplyResult, error) {
 	result, grants, err := f.lm.ApplyCleanupConn(time.Now(), ref, connID)
+	f.lm.RouteGrants(grants)
+	return result, err
+}
+
+func (f *applyHTTPCluster) ProposeAttach(_ context.Context, key, ref string, connID uint64) (lock.ApplyResult, error) {
+	result, grants, err := f.lm.ApplyAttach(time.Now(), key, ref, connID)
 	f.lm.RouteGrants(grants)
 	return result, err
 }

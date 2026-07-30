@@ -82,6 +82,8 @@ func (s *Server) teardownConn(conn net.Conn, peer string, connID uint64, cancelC
 	cancelConn()
 	if c := s.clusterOrNil(); c != nil {
 		s.teardownConnClustered(c, peer, connID)
+	} else if s.clusterConfigured.Load() {
+		s.dropPendingGrant(connID)
 	} else if err := s.lm.CleanupConnection(connID); err != nil {
 		s.log.Error("connection cleanup failed", "peer", peer, "conn_id", connID, "err", err)
 	}
@@ -136,7 +138,7 @@ func (s *Server) dispatchReadRequest(ctx, connCtx context.Context, req *protocol
 }
 
 func (s *Server) readRequest(cs *connSession, conn net.Conn, peer string) (*protocol.Request, bool) {
-	req, err := protocol.ReadRequest(cs.reader, s.cfg.ReadTimeout, conn, cs.defaultLeaseTTL)
+	req, err := protocol.ReadRequestAfterIdle(cs.reader, s.cfg.ReadTimeout, conn, cs.defaultLeaseTTL)
 	if err != nil {
 		return nil, s.handleReadErr(err, peer, cs.writeResp)
 	}
@@ -333,11 +335,11 @@ var commandTable = map[string]commandHandler{
 	protocol.CmdSemRelease: func(s *Server, _ context.Context, req *protocol.Request, _ uint64) *protocol.Ack {
 		return s.handleRelease(req)
 	},
-	protocol.CmdRenew: func(s *Server, _ context.Context, req *protocol.Request, _ uint64) *protocol.Ack {
-		return s.handleRenew(req)
+	protocol.CmdRenew: func(s *Server, _ context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
+		return s.handleRenew(req, connID)
 	},
-	protocol.CmdSemRenew: func(s *Server, _ context.Context, req *protocol.Request, _ uint64) *protocol.Ack {
-		return s.handleRenew(req)
+	protocol.CmdSemRenew: func(s *Server, _ context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
+		return s.handleRenew(req, connID)
 	},
 	protocol.CmdEnqueue: func(s *Server, _ context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
 		return s.handleEnqueue(req, connID)
@@ -399,6 +401,9 @@ func (s *Server) unknownCommand(req *protocol.Request, connID uint64) *protocol.
 func (s *Server) handleBarrier(ctx context.Context) *protocol.Ack {
 	c := s.clusterOrNil()
 	if c == nil {
+		if unavailable := s.clusterUnavailableAck(); unavailable != nil {
+			return unavailable
+		}
 		return &protocol.Ack{Status: protocol.StatusOK}
 	}
 	if err := s.ClusterBarrier(ctx); err != nil {
@@ -468,6 +473,9 @@ func (s *Server) handleAcquire(ctx context.Context, req *protocol.Request, connI
 	if c := s.clusterOrNil(); c != nil {
 		return s.clusterAcquire(ctx, c, req, connID)
 	}
+	if unavailable := s.clusterUnavailableAck(); unavailable != nil {
+		return unavailable
+	}
 	tok, err := s.acquireToken(ctx, req, connID)
 	if err != nil {
 		return ackForLockErr(err)
@@ -492,6 +500,9 @@ func (s *Server) handleRelease(req *protocol.Request) *protocol.Ack {
 		defer cancel()
 		return s.clusterRelease(ctx, c, req)
 	}
+	if unavailable := s.clusterUnavailableAck(); unavailable != nil {
+		return unavailable
+	}
 	ok, err := s.lm.Release(requestKey(req), req.Token)
 	if err != nil {
 		return ackForLockErr(err)
@@ -502,11 +513,14 @@ func (s *Server) handleRelease(req *protocol.Request) *protocol.Ack {
 	return &protocol.Ack{Status: protocol.StatusError}
 }
 
-func (s *Server) handleRenew(req *protocol.Request) *protocol.Ack {
+func (s *Server) handleRenew(req *protocol.Request, connID uint64) *protocol.Ack {
 	if c := s.clusterOrNil(); c != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReadTimeout)
 		defer cancel()
-		return s.clusterRenew(ctx, c, req)
+		return s.clusterRenew(ctx, c, req, connID)
+	}
+	if unavailable := s.clusterUnavailableAck(); unavailable != nil {
+		return unavailable
 	}
 	remaining, ok, err := s.lm.Renew(requestKey(req), req.Token, req.LeaseTTL)
 	if err != nil {
@@ -524,6 +538,9 @@ func (s *Server) handleEnqueue(req *protocol.Request, connID uint64) *protocol.A
 		defer cancel()
 		return s.clusterEnqueue(ctx, c, req, connID)
 	}
+	if unavailable := s.clusterUnavailableAck(); unavailable != nil {
+		return unavailable
+	}
 	status, tok, lease, err := s.enqueue(req, connID)
 	if err != nil {
 		return ackForLockErr(err)
@@ -538,6 +555,9 @@ func (s *Server) enqueue(req *protocol.Request, connID uint64) (string, string, 
 func (s *Server) handleWait(ctx context.Context, req *protocol.Request, connID uint64) *protocol.Ack {
 	if c := s.clusterOrNil(); c != nil {
 		return s.clusterWait(ctx, c, req, connID)
+	}
+	if unavailable := s.clusterUnavailableAck(); unavailable != nil {
+		return unavailable
 	}
 	tok, lease, err := s.lm.Wait(ctx, requestKey(req), req.AcquireTimeout, connID)
 	if err != nil {

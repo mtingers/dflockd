@@ -210,8 +210,13 @@ func newSession(srv *server.Server, ownerIP string) (*Session, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	connID, err := srv.NextConnID()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	s := &Session{
-		ID: id, ConnID: srv.NextConnID(), OwnerIP: ownerIP,
+		ID: id, ConnID: connID, OwnerIP: ownerIP,
 		ctx: ctx, cancel: cancel,
 	}
 	s.Touch()

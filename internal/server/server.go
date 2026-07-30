@@ -6,7 +6,9 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,20 +32,16 @@ type Server struct {
 	connCount  atomic.Int64
 	conns      sync.Map // net.Conn → struct{}
 	extraConns atomic.Pointer[connCounter]
-	// cluster routes mutating commands through a Raft cluster when set;
-	// nil leaves the legacy single-node path in charge.
-	cluster atomic.Pointer[Cluster]
-	// connIDEpoch is a per-process random value OR'd into the high bits
-	// of the FSM-visible connection id in cluster mode, so a restarted
-	// node's fresh low connIDs can't collide with a dead leader's
-	// orphaned ones (which would make CleanupConn release the wrong
-	// client's locks). Set lazily on SetCluster; 0 in single-node mode.
-	connIDEpoch atomic.Uint64
-	// pendingGrants holds, per connection id, the grant listener
-	// registered by a two-phase Enqueue so the matching Wait (or the
-	// disconnect cleanup) can consume/cancel it — closing the lost-
-	// wakeup window between the Enqueue's commit and the client's Wait.
-	pendingGrants sync.Map // uint64 connID → *pendingGrant
+	// cluster routes mutating commands through a Raft cluster when set.
+	// clusterConfigured remains true after shutdown detaches the node so no
+	// request can fall back to mutating the replicated FSM locally.
+	cluster           atomic.Pointer[Cluster]
+	clusterConfigured atomic.Bool
+	// pendingGrants holds, per connection and key, the grant listener
+	// registered by a two-phase Enqueue so the matching Wait (or disconnect
+	// cleanup) can consume/cancel it. Key scoping lets one logical session
+	// queue independently on several resources.
+	pendingGrants sync.Map // pendingGrantKey -> *pendingGrant
 	// stableRefs maps connID → caller-supplied stable ref. TCP and HTTP
 	// callers can opt in; when non-empty, the ref overrides the
 	// connID-derived ref in cluster-mode propose calls so a reconnect
@@ -55,10 +53,31 @@ type Server struct {
 // atomic.Pointer (which can't directly hold a function value).
 type connCounter struct{ fn func() int64 }
 
+var ErrConnIDExhausted = errors.New("dflockd: connection ID space exhausted")
+
+const (
+	connIDCounterBits = 40
+	connIDCounterMask = uint64(1<<connIDCounterBits) - 1
+	connIDProcessMask = uint64(1<<(64-connIDCounterBits)) - 1
+)
+
 // New constructs a Server wrapping lm. The Server does not start any
 // background work until Run (or RunOnListener) is called.
 func New(lm *lock.LockManager, cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{lm: lm, cfg: cfg, log: log}
+	s := &Server{lm: lm, cfg: cfg, log: log}
+	s.connSeq.Store(randomConnIDSeed())
+	return s
+}
+
+// randomConnIDSeed places a randomized process-lineage tag above a 40-bit
+// monotonic counter. At 1,000 new connections per second, one process has
+// almost 35 years of IDs before explicit exhaustion.
+func randomConnIDSeed() uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return (binary.BigEndian.Uint64(b[:]) & connIDProcessMask) << connIDCounterBits
+	}
+	return (uint64(time.Now().UnixNano()) & connIDProcessMask) << connIDCounterBits
 }
 
 // LockManager exposes the underlying LockManager (used by the HTTP API).
@@ -105,10 +124,21 @@ func (s *Server) effectiveRef(rawConnID, cid uint64) string {
 // Config exposes the server config (used by the HTTP API).
 func (s *Server) Config() *config.Config { return s.cfg }
 
-// NextConnID allocates a fresh connection ID. The HTTP API uses this to
+// NextConnID allocates a fresh full-width connection ID. The HTTP API uses it to
 // give every session a connID that's unique across both transports so
-// CleanupConnection doesn't collide.
-func (s *Server) NextConnID() uint64 { return s.connSeq.Add(1) }
+// CleanupConnection doesn't collide. Exhaustion fails closed rather than
+// silently wrapping into an older identity.
+func (s *Server) NextConnID() (uint64, error) {
+	for {
+		current := s.connSeq.Load()
+		if current&connIDCounterMask == connIDCounterMask {
+			return 0, ErrConnIDExhausted
+		}
+		if s.connSeq.CompareAndSwap(current, current+1) {
+			return current + 1, nil
+		}
+	}
+}
 
 // ConnCount returns the number of currently-active TCP connections.
 func (s *Server) ConnCount() int64 { return s.connCount.Load() }
@@ -251,9 +281,9 @@ func (s *Server) runServe(listener net.Listener, st *serveState) error {
 // They exit when serveCtx is cancelled. In cluster mode they're
 // suppressed: the only deterministic source of lease eviction and idle
 // GC must be Raft-replicated commands, and those are driven by the
-// cluster's leader-only loops (Phase 8b — currently stubbed).
+// cluster's leader-only sweep loop.
 func (s *Server) startBackgroundLoops(serveCtx context.Context, wg *sync.WaitGroup) {
-	if s.clusterOrNil() != nil {
+	if s.clusterConfigured.Load() {
 		return
 	}
 	wg.Add(2)
@@ -406,15 +436,21 @@ func (s *Server) rejectGlobalCap(conn net.Conn) {
 // spawnConnHandler bumps accounting, allocates a connID, and runs
 // ServeConn in a goroutine.
 func (s *Server) spawnConnHandler(serveCtx context.Context, conn net.Conn, ip string, tracker *ipTracker, wg *sync.WaitGroup) {
-	connID := s.registerConn(conn)
+	connID, err := s.NextConnID()
+	if err != nil {
+		s.log.Error("rejecting connection", "err", err)
+		conn.Close()
+		tracker.release(ip)
+		return
+	}
+	s.registerConn(conn)
 	wg.Add(1)
 	go s.runConnHandler(serveCtx, conn, connID, ip, tracker, wg)
 }
 
-func (s *Server) registerConn(conn net.Conn) uint64 {
+func (s *Server) registerConn(conn net.Conn) {
 	s.connCount.Add(1)
 	s.conns.Store(conn, struct{}{})
-	return s.NextConnID()
 }
 
 func (s *Server) runConnHandler(serveCtx context.Context, conn net.Conn, connID uint64, ip string, tracker *ipTracker, wg *sync.WaitGroup) {

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -199,10 +200,10 @@ func TestHTTPReadIndex_FollowerReturns503(t *testing.T) {
 // 404s when the server isn't in cluster mode. Built using the same
 // harness as the cluster tests but without calling SetCluster.
 func TestHTTPReadIndex_SingleNodeReturns404(t *testing.T) {
-	// Re-use the cluster harness; just don't wire a fake cluster.
-	fc := &httpFakeCluster{leader: true}
-	hs := newClusterHTTPTest(t, fc)
-	hs.sessions.Server().SetCluster(nil) // drop the cluster — single-node mode
+	cfg := defaultTestConfig()
+	log := discardLogger()
+	hs, _ := buildHTTPServer(context.Background(), testTCPServer(t, cfg, log), cfg, log)
+	t.Cleanup(func() { hs.limiter.Stop(); hs.sessions.Shutdown() })
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/readindex", nil)
